@@ -23,7 +23,7 @@ Program owns personas and journeys. Delivery owns the product surface and the re
 6. Define the first release as a set of journeys and name the later releases. Write `program/product.md`.
 7. Start `program/traceability.yaml` with the journeys (`journeys:` section: ID, title, empty `requirements:` list). Run `pk trace validate --stage 2`.
 8. Write back your understanding and have the user correct it. Run `pk interview report 2`.
-9. Challenge round: run `pk interview challenge 2`. Each lens reviews `product.md` and the ledger against its charter, in its own session, and adds a row for every gap. Resolve each with the user or defer it with an owner and a date. Write the resolution in the row. A row with an empty resolution blocks approval.
+9. Challenge round: run `pk interview challenge 2`. Each lens reviews `product.md` and the ledger against its charter, in its own session, and adds a row for every gap. Resolve each with the user or defer it with an owner and a date. Write the resolution in the row. A row with an empty resolution blocks approval. A lens with no findings writes `No findings.` under its table; the untouched skeleton does not count as a round.
 10. Run `pk interview validate`, get the user's approval, then run `pk interview approve 2`.
 
 ## Outputs

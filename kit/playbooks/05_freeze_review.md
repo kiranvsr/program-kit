@@ -22,9 +22,9 @@ All five. Each lens records its sign-off in the review. The reviewer is a separa
 5. The reviewer re-checks only the findings and any regression the fixes caused. Repeat from step 4 until no critical or important finding is open.
 6. Settle every assumption. Each `A-` entry in the ledger is either confirmed by the user (`confirmed: true`) or replaced by a decision. None survives the freeze unconfirmed. Show the user the list in one batch.
 7. Run `pk trace validate --stage 5`. Fix every problem it lists.
-8. Run `pk interview challenge 5`. Each lens adds its sign-off line to the review and a row for any remaining gap.
+8. Run `pk interview challenge 5`. Each lens adds its sign-off line to the review and a row for any remaining gap. A lens with no findings writes `No findings.` under its table; the untouched skeleton does not count as a round.
 9. The user reads the review and signs `program/freeze/signoff.md`: a dated paragraph in the user's own words saying the specification is accepted as frozen. Never write this for the user.
-10. Run `pk interview report 5`, then `pk interview approve 5`. This freezes the specification.
+10. Run `pk interview report 5`, then `pk interview approve 5`. This freezes the specification. The approval runs the topic and blocking-question checks of stages 1 to 4 again: a topic reopened or a question raised since is refused with the stage named, and you go back to that stage (a correction is `pk interview amend N`, a change of meaning needs the user).
 
 ## Outputs
 

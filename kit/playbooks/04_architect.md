@@ -25,7 +25,7 @@ Architect owns candidate approaches, components, cross-cutting concerns and tech
 7. Fill `program/checks.yaml` with argv lists (never shell strings): `build`, `test`, `scan`, `compile_check`, `extra_gate` and `guarded_files`. Add the bytecode and build-output patterns the commands write to `.gitignore`. Run `pk doctor` to confirm the file reads.
 8. Update `program/traceability.yaml`: add `components`, give each requirement its `components`, list the gates. Run `pk trace validate --stage 4`.
 9. Write back, get corrections, run `pk interview report 4`.
-10. Challenge round: `pk interview challenge 4`, each lens in its own session, every row resolved or deferred with an owner and a date.
+10. Challenge round: `pk interview challenge 4`, each lens in its own session, every row resolved or deferred with an owner and a date. A lens with no findings writes `No findings.` under its table; the untouched skeleton does not count as a round.
 11. Run `pk interview validate` and get the user's approval. Then run `pk interview approve 4 --artifact program/ARCHITECTURE.md program/gates.yaml` followed by each ADR path, so the ADRs are hashed too.
 
 ## Outputs

@@ -23,7 +23,7 @@ Architect owns the whole stage: functional requirements, data, integrations, non
 6. Close every open question by an answer or a ruling (`pk rulings add --role interviewer --question Q --decision D`). Write `program/SPEC.md`.
 7. Add the requirements to `program/traceability.yaml` (`requirements:` with `journeys`, and `nfr: true` where it applies). A requirement has a `release` field (default `first`). Give a requirement for a later release `release: <name>`; otherwise the stage 6 check demands a task for it. Run `pk trace validate --stage 3`.
 8. Write back and have the user correct it. Run `pk interview report 3`.
-9. Challenge round: `pk interview challenge 3`, each lens in its own session, every row resolved or deferred with an owner and date.
+9. Challenge round: `pk interview challenge 3`, each lens in its own session, every row resolved or deferred with an owner and date. A lens with no findings writes `No findings.` under its table; the untouched skeleton does not count as a round.
 10. Run `pk interview validate`, get the user's approval, then run `pk interview approve 3`.
 
 ## Outputs
