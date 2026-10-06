@@ -199,6 +199,23 @@ class StatusTests(unittest.TestCase):
         self.refused("source_commit", TID, "done", "qa", evidence=[self.evidence(drop=("source_commit",))])
         self.assertEqual(status.transition(self.root, TID, "done", "qa", evidence=[self.evidence()])["status"], "done")
 
+    def test_done_refuses_an_acceptance_of_another_commit_than_the_results_name(self):
+        self.to_review()
+        for wrong in ("not-a-commit", "b" * 40, "a" * 39, None, ["a" * 40]):
+            with self.subTest(source_commit=wrong):
+                acceptance = self.evidence(source_commit=wrong)
+                with self.assertRaises(KitError) as ctx:
+                    status.transition(self.root, TID, "done", "qa", evidence=[acceptance])
+                self.assertIn("acceptance.json: source_commit is ", str(ctx.exception))
+                self.assertIn("a" * 40, str(ctx.exception))  # the commit the results name
+                self.assertNotIn("\n", str(ctx.exception))
+                self.assertEqual(status.read(self.root, TID)["status"], "review")
+        rec = status.transition(self.root, TID, "done", "qa", evidence=[self.evidence()])
+        self.assertEqual(rec["status"], "done")
+        self.evidence(source_commit="b" * 40)  # rewritten after done: validate reports it
+        self.assertEqual(len(status.validate(self.root)), 1)
+        self.assertIn("source_commit is ", status.validate(self.root)[0])
+
     def test_done_refuses_a_one_field_rejection_over_empty_results(self):
         self.to_review()
         folder = self.root / "program" / "evidence" / TID

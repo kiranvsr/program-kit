@@ -138,6 +138,8 @@ else
     # The installed kit is verified with the SOURCE kit's manifest module against the installed MANIFEST.sha256, so
     # nothing under the target is imported or run. A manifest that still lists kit/tests (older kits installed
     # them) checks clean: tests are not kit content, and the upgrade removes them with the rest of the old kit.
+    # A file under kit/tests that the manifest does not list is a local addition and refuses the upgrade, unless
+    # this installer sits beside the target's kit/ (a copy of the whole template, whose kit/tests are the kit's).
     problems=$(manifest_problems "$kit_dir") || {
         printf '%s\n' "$problems" >&2
         fail "$kit_dir does not match its manifest; refusing to upgrade"

@@ -143,7 +143,7 @@ class InstallTests(InstallCase):
 
     def test_upgrade_uses_source_check_when_installed_kit_predates_manifest_command(self):
         target = self.repo()
-        shutil.copytree(KIT, target / "kit", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        shutil.copytree(KIT, target / "kit", ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "tests"))
         (target / "kit" / "scripts" / "manifest.py").unlink()
         pk_py = target / "kit" / "scripts" / "pk.py"
         pk_py.write_text(pk_py.read_text().replace(', "manifest")', ")"))
@@ -505,6 +505,35 @@ class KitTestsStayInTheKitRepositoryTests(InstallCase):
         self.assert_ok(result)
         self.assertFalse((target / "kit" / "tests").exists())
         self.assertEqual(self.pk(target, "manifest", "check").stdout, "manifest: clean\n")
+        self.assertEqual(self.leftovers(target), [])
+
+
+    def test_a_file_added_under_kit_tests_of_an_installed_project_is_reported_and_refuses_the_upgrade(self):
+        target = self.repo()
+        self.assert_ok(self.install(target))
+        mine = target / "kit" / "tests" / "test_mine.py"
+        mine.parent.mkdir()
+        mine.write_text("# the project's own\n", encoding="utf-8")
+        check = self.pk(target, "manifest", "check")
+        self.assertEqual((check.returncode, check.stdout, check.stderr), (1, "", "error: added: tests/test_mine.py\n"))
+        before = snapshot(target)
+        result = self.install(target, "--upgrade")
+        self.assert_refused(result, "does not match its manifest; refusing to upgrade")
+        self.assertIn("error: added: tests/test_mine.py\n", result.stderr)
+        self.assertEqual(snapshot(target), before)
+        (target / "install.sh").write_text("#!/bin/sh\necho the project's own installer\n", encoding="utf-8")
+        self.assert_refused(self.install(target, "--upgrade"), "refusing to upgrade")  # not the kit's installer
+        self.assertTrue(mine.is_file())
+
+    def test_upgrade_of_a_copy_of_the_whole_template_works_and_removes_its_tests(self):
+        target = self.repo()
+        shutil.copy(INSTALL, target / "install.sh")  # README, a new repository: the template's files, tests included
+        shutil.copytree(KIT, target / "kit", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        self.assertTrue((target / "kit" / "tests" / "test_manifest.py").is_file())
+        check = self.pk(target, "manifest", "check")
+        self.assertEqual((check.returncode, check.stdout, check.stderr), (0, "manifest: clean\n", ""))
+        self.assert_ok(self.install(target, "--upgrade"))
+        self.assertFalse((target / "kit" / "tests").exists())
         self.assertEqual(self.leftovers(target), [])
 
 

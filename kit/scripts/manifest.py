@@ -5,9 +5,13 @@ sorted); `check` compares the directory with the recorded lines and reports modi
 and added files. The upgrade path of install.sh uses `check` to refuse replacing a kit
 that has local changes.
 
-The kit's own tests (the top-level `tests/` directory) are neither recorded nor checked: they run in the
-kit's own repository and are not installed into projects. A manifest written by an older kit that did
-record them still checks clean, so an upgrade from such an install works and removes them.
+The kit's own tests (the top-level `tests/` directory) are never recorded: they run in the kit's own
+repository and are not installed into projects. Where the kit's installer (`install.sh`) sits beside the
+kit directory, which is the kit's own repository or a copy of the whole template, `check` does not look at
+them either. Anywhere else the directory is an installed kit: a file under `tests/` that its manifest does
+not list is reported as `added:`, like any other local addition. A manifest written by an older kit that did
+record its tests still checks clean (those entries are not compared), so an upgrade from such an install
+works and removes them.
 """
 from __future__ import annotations
 
@@ -23,12 +27,21 @@ KIT_DIR = Path(__file__).resolve().parent.parent
 MANIFEST_NAME = "MANIFEST.sha256"
 _SKIPPED_DIRS = {"__pycache__"}
 _UNRECORDED_TOP = "tests"
+_INSTALLER = "install.sh"  # beside the kit directory in the kit's own repository; never copied into a project
 _SKIPPED_FILES = {".DS_Store"}
 _LINE = re.compile(r"([0-9a-f]{64})  (\S.*)\Z")
 
 
-def _files(kit_dir: Path) -> dict[str, Path]:
-    """Relative POSIX path -> file, for every regular file the manifest covers."""
+def _own_repository(kit_dir: Path) -> bool:
+    """Whether the kit's installer sits beside `kit_dir`: a script of that name that reads the kit's manifest."""
+    try:
+        return MANIFEST_NAME.encode("ascii") in (Path(kit_dir).parent / _INSTALLER).read_bytes()
+    except OSError:
+        return False
+
+
+def _files(kit_dir: Path, with_tests: bool = False) -> dict[str, Path]:
+    """Relative POSIX path -> file, for every regular file the manifest covers (`with_tests`: and the tests)."""
     kit_dir = Path(kit_dir)
     found: dict[str, Path] = {}
     for current, dirs, names in os.walk(kit_dir):
@@ -37,7 +50,7 @@ def _files(kit_dir: Path) -> dict[str, Path]:
             if (base / name).is_symlink():
                 raise KitError(f"{(base / name).relative_to(kit_dir).as_posix()}: symlinks are not allowed in the kit")
         dirs[:] = sorted(name for name in dirs if name not in _SKIPPED_DIRS
-                         and not (base == kit_dir and name == _UNRECORDED_TOP))
+                         and not (base == kit_dir and name == _UNRECORDED_TOP and not with_tests))
         for name in names:
             path = base / name
             relative = path.relative_to(kit_dir).as_posix()
@@ -89,11 +102,14 @@ def _read(kit_dir: Path) -> dict[str, str]:
 
 
 def check(kit_dir: Path) -> list[str]:
-    """Sorted `modified: `, `missing: ` and `added: ` lines; empty when the kit matches its manifest."""
-    recorded = {name: digest for name, digest in _read(kit_dir).items()
-                if not name.startswith(_UNRECORDED_TOP + "/")}
-    present = _files(kit_dir)
-    problems = [f"added: {name}" for name in present if name not in recorded]
+    """Sorted `modified: `, `missing: ` and `added: ` lines; empty when the kit matches its manifest.
+
+    Under `tests/` the only line is `added: ` for a file an installed kit's manifest does not list.
+    """
+    listed = _read(kit_dir)
+    recorded = {name: digest for name, digest in listed.items() if not name.startswith(_UNRECORDED_TOP + "/")}
+    present = _files(kit_dir, with_tests=not _own_repository(kit_dir))
+    problems = [f"added: {name}" for name in present if name not in listed]
     for name, digest in recorded.items():
         if name not in present:
             problems.append(f"missing: {name}")

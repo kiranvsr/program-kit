@@ -973,6 +973,67 @@ class MergeCheckTests(HandbackBase):
         self.assertEqual((rc, out.splitlines()[-1]), (1, f"FAILED: {BRANCH} moved during the merge check"))
 
 
+class ReviewRecordTests(HandbackBase):
+    """The spec-QA record `review.md` is frozen with the SPEC and the PLAN: both gates compare it with main's."""
+
+    REVIEW = f"program/tasks/{TASK}/review.md"
+    LINE = f"FAILED: review program/tasks/{TASK}/review.md differs from main"
+
+    def dispatch_with_a_review(self):
+        put(self.root, self.REVIEW, "# Review\n\n| 1 | SPEC names no failure mode | important | open |\n")
+        commit(self.root, "the spec-QA record")
+        sh(self.wt, "git", "merge", "-q", "main")
+        return sh(self.wt, "git", "rev-parse", "HEAD").strip()
+
+    def assert_both_gates_refuse(self):
+        for run in (self.handback, self.merge_check):
+            rc, out = run()
+            self.assertEqual((rc, out.splitlines()[-1]), (1, self.LINE), run.__name__)
+            self.assertEqual([ln for ln in out.splitlines() if ln.startswith("step ")], [])  # before anything runs
+            self.assert_no_trial_left()
+
+    def test_a_branch_that_rewrites_the_review_record_is_refused_by_both_gates(self):
+        self.dispatch_with_a_review()
+        put(self.wt, self.REVIEW, "# Review\n\nNo findings.\n")
+        commit(self.wt, "a kinder review")
+        self.assert_both_gates_refuse()
+        sh(self.wt, "git", "checkout", "-q", "main", "--", self.REVIEW)
+        commit(self.wt, "back to the record on main")
+        self.assertEqual(self.merge_check()[0], 0)
+        rc, out = self.handback()
+        self.assertEqual(rc, 0, out)
+
+    def test_a_branch_that_removes_the_review_record_is_refused_by_both_gates(self):
+        self.dispatch_with_a_review()
+        (self.wt / self.REVIEW).unlink()
+        commit(self.wt, "drop the review")
+        self.assert_both_gates_refuse()
+
+    def test_a_branch_that_adds_a_review_record_main_does_not_have_is_refused_by_both_gates(self):
+        put(self.wt, self.REVIEW, "# Review\n\nNo findings.\n")
+        commit(self.wt, "a review of its own")
+        self.assert_both_gates_refuse()
+
+    def test_a_record_changed_on_main_alone_fails_until_the_branch_merges_main(self):
+        self.dispatch_with_a_review()
+        put(self.root, self.REVIEW, "# Review\n\nRe-checked: resolved.\n")
+        commit(self.root, "spec QA re-check")
+        rc, out = self.handback()
+        self.assertEqual((rc, out.splitlines()[-1]), (1, self.LINE))
+        sh(self.wt, "git", "merge", "-q", "main")
+        rc, out = self.handback()
+        self.assertEqual(rc, 0, out)
+
+    def test_the_spec_and_the_plan_are_named_before_the_review_record(self):
+        self.dispatch_with_a_review()
+        put(self.wt, self.REVIEW, "# Review\n\nNo findings.\n")
+        put(self.wt, f"program/tasks/{TASK}/SPEC.md", "# Narrower\n")
+        commit(self.wt, "both")
+        rc, out = self.handback()
+        self.assertEqual((rc, out.splitlines()[-1]),
+                         (1, f"FAILED: spec program/tasks/{TASK}/SPEC.md differs from main"))
+
+
 class FixedMainTests(HandbackBase):
     """The rules are always read from `main`: no argument can make a branch the judge of itself."""
 

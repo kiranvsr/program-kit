@@ -28,7 +28,7 @@ Build the register's tasks one at a time with an implementer, independent QA and
    - It records the head and main shas, the sha256 of every consumed input, every PLAN command literally with its real exit code and parsed fields, and the planted-bug table.
    - A planted bug counts only when a test fails, never when the build fails. The runner needs a build command and always carries one non-building row recorded as not caught.
 6. Hand-back gate (implementer, from the main checkout, in the background): `pk gate handback <ID> --branch task/<ID>`.
-   - It runs, in order: the guarded-file check; the check that the branch's SPEC.md and PLAN.md are byte-identical to main's; a trial merge of the branch into main; the build and compile check on the trial merge; then the test, scan and extra gate commands; the PLAN's `## Exact Commands` lines (each starts `$ `, with an optional ` # expect N`); evidence production (`produce.py`); the stale list.
+   - It runs, in order: the guarded-file check; the check that the branch's SPEC.md and PLAN.md, and the spec-QA `review.md`, are byte-identical to main's; a trial merge of the branch into main; the build and compile check on the trial merge; then the test, scan and extra gate commands; the PLAN's `## Exact Commands` lines (each starts `$ `, with an optional ` # expect N`); evidence production (`produce.py`); the stale list.
    - It fails a branch that changed its own SPEC.md or PLAN.md, or a guarded file without its `Guarded edit:` line.
    - On success its last line is exactly `OK: <branch> passes the hand-back gate at <sha>`. Exit code 0 alone is never accepted: read the last line.
    - A failure returns to the implementer with no QA round.
