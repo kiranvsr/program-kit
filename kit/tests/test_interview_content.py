@@ -18,6 +18,103 @@ CHARTERS = {"architect": "architect.md", "engineering": "engineering_manager.md"
             "project": "project_manager.md", "delivery": "delivery_manager.md"}
 SECTIONS = ["Owns", "Must leave knowing", "Writes", "Challenges", "Nominating a question", "Sign-off line"]
 STAGE_TOPIC_COUNTS = {1: 9, 2: 4, 3: 5, 4: 7, 5: 0, 6: 3, 7: 0}
+STAGE_ARTIFACTS = {
+    1: ["discovery.md", "environments.yaml", "CLAIM_BOUNDARIES.md"], 2: ["product.md"], 3: ["SPEC.md"],
+    4: ["ARCHITECTURE.md", "gates.yaml"], 5: ["freeze/review.md", "freeze/signoff.md"],
+    6: ["roadmap.md", "register.yaml"], 7: [],
+}
+
+# Pins: a deliberate content change must change these in the same commit.
+OWNERS = {
+    "T1.1": "program",
+    "T1.2": "program",
+    "T1.3": "architect",
+    "T1.4": "program",
+    "T1.5": "project",
+    "T1.6": "delivery",
+    "T1.7": "engineering",
+    "T1.8": "program",
+    "T1.9": "program",
+    "T2.1": "program",
+    "T2.2": "program",
+    "T2.3": "delivery",
+    "T2.4": "delivery",
+    "T3.1": "architect",
+    "T3.2": "architect",
+    "T3.3": "architect",
+    "T3.4": "architect",
+    "T3.5": "architect",
+    "T4.1": "architect",
+    "T4.2": "architect",
+    "T4.3": "architect",
+    "T4.4": "delivery",
+    "T4.5": "architect",
+    "T4.6": "engineering",
+    "T4.7": "engineering",
+    "T6.1": "project",
+    "T6.2": "project",
+    "T6.3": "project",
+}
+PROMPT_COUNTS = {
+    "T1.1": 4,
+    "T1.2": 4,
+    "T1.3": 4,
+    "T1.4": 3,
+    "T1.5": 5,
+    "T1.6": 4,
+    "T1.7": 4,
+    "T1.8": 4,
+    "T1.9": 3,
+    "T2.1": 1,
+    "T2.2": 3,
+    "T2.3": 2,
+    "T2.4": 3,
+    "T3.1": 3,
+    "T3.2": 5,
+    "T3.3": 2,
+    "T3.4": 10,
+    "T3.5": 3,
+    "T4.1": 1,
+    "T4.2": 3,
+    "T4.3": 1,
+    "T4.4": 2,
+    "T4.5": 2,
+    "T4.6": 1,
+    "T4.7": 2,
+    "T6.1": 3,
+    "T6.2": 2,
+    "T6.3": 1,
+}
+NEEDS = {
+    "T1.1": ["outcome", "beneficiary", "measures", "cost_of_not_building"],
+    "T1.2": ["user_kinds", "dependent_systems", "decider_acceptor_payer", "conflict_priority"],
+    "T1.3": ["system_owners", "system_health", "must_stay_unchanged", "prior_documents"],
+    "T1.4": ["exclusions", "reduced_first_release", "deferred_items"],
+    "T1.5": ["dates", "budget", "mandated_technology", "forbidden_technology", "organisational_constraints"],
+    "T1.6": ["environment_inventory", "environment_operators", "missing_environment_owner"],
+    "T1.7": ["team_and_split", "reviewer_merger", "on_call", "conventions", "response_time"],
+    "T1.8": ["top_risk", "prior_failures", "unverified_assumptions", "spike_decision"],
+    "T1.9": ["regulations", "contractual_commitments", "compliance_owner"],
+    "T2.1": ["persona_goals", "persona_frequency", "persona_expertise", "persona_context", "persona_frustration"],
+    "T2.2": ["journey_ids", "journey_flow", "failure_paths", "walking_skeleton_journey"],
+    "T2.3": ["surface_items_decided", "surface_later_releases_named", "surface_exclusion_reasons"],
+    "T2.4": ["release_mode", "pilot_users", "later_release_entry"],
+    "T3.1": ["journey_step_coverage", "requirement_ids", "rules", "inputs_outputs", "validation", "errors"],
+    "T3.2": ["entities_ownership", "volumes_growth", "sensitivity_class", "retention_residency", "source_of_truth"],
+    "T3.3": ["integration_interface", "integration_limits", "integration_owner", "sandbox_availability", "down_behaviour"],
+    "T3.4": ["scale_latency", "availability_recovery", "security_tenancy", "observability_cost", "accessibility"],
+    "T3.5": ["failure_modes", "user_visible_behaviour", "operator_action"],
+    "T4.1": ["candidate_approaches", "recommendation", "user_choice"],
+    "T4.2": ["component_ids", "responsibility_interface", "component_data", "owner_role", "build_buy_reuse"],
+    "T4.3": ["authn_authz", "tenancy_enforcement", "config_secrets", "observability_policy", "migration_versioning_errors"],
+    "T4.4": ["runtime_per_environment", "merge_to_production_path", "rollback", "migration_ordering"],
+    "T4.5": ["adr_options_decision", "consequences_reversibility", "licences_checked"],
+    "T4.6": ["gate_per_claim", "gate_evidence", "gate_environment", "blocked_gates"],
+    "T4.7": ["repo_branching_review", "definition_of_done", "test_expectations", "merge_gating_checks", "agent_roles"],
+    "T6.1": ["walking_skeleton", "phase_order", "milestone_gates"],
+    "T6.2": ["implementer_count", "task_size", "consultation_frequency", "reporting"],
+    "T6.3": ["parked_tasks", "parking_owner", "parking_date"],
+}
 
 
 def load_map() -> dict:
@@ -61,7 +158,7 @@ class CoverageContentTest(unittest.TestCase):
     def test_every_topic_has_closes_when_and_needs(self):
         for topic_id, topic in all_topics(load_map()).items():
             self.assertTrue(topic["closes_when"].strip(), topic_id)
-            self.assertTrue(2 <= len(topic["needs"]) <= 5, f"{topic_id}: {topic['needs']}")
+            self.assertTrue(2 <= len(topic["needs"]) <= 6, f"{topic_id}: {topic['needs']}")
             self.assertEqual(len(set(topic["needs"])), len(topic["needs"]), topic_id)
             for tag in topic["needs"]:
                 self.assertRegex(tag, r"^[a-z][a-z0-9_]*$", topic_id)
@@ -127,10 +224,142 @@ class LensCharterTest(unittest.TestCase):
                 body = text[start + len(section) + 3:end].strip()
                 self.assertTrue(body, f"{filename}: {section} is empty")
 
-    def test_charters_name_only_known_lenses(self):
-        coverage = load_map()
-        owners = {t["owner"] for t in all_topics(coverage).values()}
+    def test_owners_in_the_map_are_exactly_the_five_lenses(self):
+        owners = {t["owner"] for t in all_topics(load_map()).values()}
         self.assertEqual(owners, LENS_IDS)
+
+
+class PinnedContentTest(unittest.TestCase):
+    """Exact shapes pinned in this file, so a content change is a deliberate, reviewed edit."""
+
+    def test_owner_per_topic(self):
+        self.assertEqual({k: t["owner"] for k, t in all_topics(load_map()).items()}, OWNERS)
+
+    def test_needs_per_topic(self):
+        self.assertEqual({k: t["needs"] for k, t in all_topics(load_map()).items()}, NEEDS)
+
+    def test_prompt_count_per_topic(self):
+        counts = {k: len(v["prompts"]) for k, v in load_seeds().items()}
+        self.assertEqual(counts, PROMPT_COUNTS)
+        self.assertEqual(sum(counts.values()), 85)  # 84 bullets in the spec plus the T2.3 lead-in line
+
+    def test_artifacts_per_stage(self):
+        self.assertEqual({n: s["artifacts"] for n, s in load_map()["stages"].items()}, STAGE_ARTIFACTS)
+
+
+SPEC = ROOT / "docs" / "superpowers" / "specs" / "2026-10-06-program-kit-design.md"
+LENS_NAMES = {"architect": "architect", "engineering manager": "engineering", "program manager": "program",
+              "project manager": "project", "delivery manager": "delivery"}
+
+
+def _norm(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip().rstrip(".;,").strip().lower()
+
+
+def _spec_appendix() -> str:
+    text = SPEC.read_text(encoding="utf-8")
+    return text[text.index("## Appendix A"):]
+
+
+def _spec_rows(appendix: str) -> dict:
+    rows = {}
+    for line in appendix.splitlines():
+        match = re.match(r"\| (T\d\.\d) (.+?) \| (\w+) \| (.+?) \| (.+) \|$", line)
+        if match:
+            topic_id, title, owner, contributes, closes = match.groups()
+            title = re.sub(r"\s*\(conditional:.*\)$", "", title)
+            owner = owner.lower()
+            if contributes == "all":
+                listed = [lens for lens in interview.LENSES if lens != owner]
+            else:
+                listed = [c.strip().lower() for c in contributes.split(",")]
+            rows[topic_id] = {"title": title, "owner": owner, "contributes": listed, "closes_when": closes}
+    return rows
+
+
+def _spec_prompts(appendix: str) -> dict:
+    section = appendix[appendix.index("### A.3"):]
+    prompts, current = {}, None
+    for line in section.splitlines():
+        match = re.match(r"\*\*(T\d\.\d) .+?\*\* \((required|optional)", line)
+        if match:
+            current = match.group(1)
+            prompts[current] = {"required": match.group(2) == "required", "prompts": []}
+        elif line.startswith("### "):
+            current = None
+        elif current and line.startswith("- "):
+            prompts[current]["prompts"].append(line[2:])
+        elif current and line.strip():
+            prompts[current]["prompts"].append(line.strip())  # a lead-in line before the bullets
+    return prompts
+
+
+def _spec_charters(appendix: str) -> dict:
+    section = appendix[appendix.index("### A.1"):appendix.index("### A.2")]
+    charters = {}
+    for paragraph in re.findall(r"^\*\*(.+?)\.\*\* (.+)$", section, flags=re.M):
+        name, body = paragraph
+        match = re.fullmatch(r"Owns (.+?)\. Must leave knowing: (.+?)\. Writes: (.+?)\. Challenges: (.+?)\.", body)
+        owns, knows, writes, challenges = match.groups()
+        charters[LENS_NAMES[name.lower()]] = {
+            "Owns": [owns],
+            "Must leave knowing": [re.sub(r"^and ", "", c) for c in knows.split(", ")],
+            "Writes": writes.split("; "),
+            "Challenges": challenges.split("; "),
+        }
+    return charters
+
+
+def _charter_section(lens: str, section: str) -> list[str]:
+    text = (LENS_DIR / CHARTERS[lens]).read_text(encoding="utf-8")
+    start = text.index(f"## {section}")
+    following = re.search(r"^## ", text[start + 3:], flags=re.M)
+    body = text[start:start + 3 + following.start()] if following else text[start:]
+    return [line[2:] for line in body.splitlines() if line.startswith("- ")]
+
+
+class SpecFidelityTest(unittest.TestCase):
+    """Compare the shipped content with Appendix A of the design spec, when the spec is in the checkout."""
+
+    def setUp(self):
+        if not SPEC.exists():
+            self.skipTest("design spec not in this checkout")
+        self.appendix = _spec_appendix()
+
+    def test_coverage_rows_match_spec_table(self):
+        rows = _spec_rows(self.appendix)
+        topics = all_topics(load_map())
+        self.assertEqual(set(rows), set(topics))
+        for topic_id, row in rows.items():
+            topic = topics[topic_id]
+            self.assertEqual(topic["title"], row["title"], topic_id)
+            self.assertEqual(topic["owner"], row["owner"], topic_id)
+            self.assertEqual(topic["contributes"], row["contributes"], topic_id)
+            self.assertEqual(topic["closes_when"], row["closes_when"], topic_id)
+
+    def test_seed_prompts_match_spec_verbatim(self):
+        spec = _spec_prompts(self.appendix)
+        seeds = load_seeds()
+        self.assertEqual(set(spec), set(seeds))
+        for topic_id, block in spec.items():
+            self.assertEqual(seeds[topic_id]["prompts"], block["prompts"], topic_id)
+            self.assertEqual(seeds[topic_id]["required"], block["required"], topic_id)
+
+    def test_charters_contain_every_spec_clause(self):
+        charters = _spec_charters(self.appendix)
+        self.assertEqual(set(charters), LENS_IDS)
+        for lens, sections in charters.items():
+            for section, clauses in sections.items():
+                joined = _norm(" ".join(_charter_section(lens, section)))
+                bullets = [_norm(b) for b in _charter_section(lens, section)]
+                self.assertEqual(len(bullets), len(clauses), f"{lens}: {section}")
+                for clause in clauses:
+                    self.assertIn(_norm(clause), joined, f"{lens}: {section}: {clause}")
+
+    def test_charter_titles_follow_the_spec_names(self):
+        for lens, filename in CHARTERS.items():
+            title = (LENS_DIR / filename).read_text(encoding="utf-8").splitlines()[0][2:]
+            self.assertEqual(_norm(title), next(n for n, i in LENS_NAMES.items() if i == lens))
 
 
 class ForbiddenTokensTest(unittest.TestCase):

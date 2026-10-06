@@ -221,6 +221,7 @@ stages:
         condition: null
         closes_when: "Every journey step has requirements with IDs covering rule, input, output, validation and error"
         needs:
+          - journey_step_coverage
           - requirement_ids
           - rules
           - inputs_outputs
@@ -396,7 +397,6 @@ stages:
     artifacts:
       - roadmap.md
       - register.yaml
-      - briefs/CATALOG.md
     topics:
       T6.1:
         title: Phase shaping
