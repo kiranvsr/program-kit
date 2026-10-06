@@ -1,0 +1,42 @@
+phases:
+  - id: P1
+    title: Walking skeleton
+    gate: G-P1
+    milestones:
+      - id: P1-M01
+        title: Health, echo and access log
+        gate: G-P1
+        steps:
+          - id: P1-M01-S01
+            title: The service
+            tasks:
+              - id: P1-M01-S01-T01
+                title: Health and echo endpoints
+                text: Build src/tiny_service.py with GET /health and POST /echo over http.server, the 1024 byte body limit and JSON errors, bound to 127.0.0.1 by default, with unit tests for every requirement.
+                role: backend
+                size: M
+                environments:
+                  - dev
+                depends_on: []
+                gate: G-P1
+                closes:
+                  - J1
+                  - J2
+                  - REQ-001
+                  - REQ-002
+                  - REQ-003
+                  - REQ-004
+                  - REQ-005
+                  - NFR-001
+              - id: P1-M01-S01-T02
+                title: Access log line per request
+                text: Write one access log line per request on standard error with method, path and status, never the body.
+                role: backend
+                size: S
+                environments:
+                  - dev
+                depends_on:
+                  - P1-M01-S01-T01
+                gate: G-P1
+                closes:
+                  - NFR-002

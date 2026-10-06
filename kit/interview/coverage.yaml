@@ -1,0 +1,444 @@
+# Interview coverage map: per stage, the topics that must be closed, the lens that owns each, the lenses that
+# contribute, and the closing criterion (closes_when). It holds no question wording; see seeds.yaml for that.
+#
+# A topic is closed when the ledger holds entries that meet its closing criterion. Each `needs` tag names one
+# clause of the criterion; an entry carries the tags it settles, and the topic closes when every tag is present on
+# a fact, a decision or a confirmed assumption. A conditional topic applies only when its condition is true over
+# the tags present anywhere in the ledger.
+#
+# Lens ids: architect, engineering, program, project, delivery.
+#
+# Tags that conditions may test with has:<tag>. A ledger entry carries a tag when the stated thing is true.
+condition_tags:
+  - regulated          # the product operates in a regulated industry
+  - personal_data      # the product stores or processes personal data
+  - payments           # the product takes or moves payments
+  - government         # a government body is a customer, user or sponsor
+  - healthcare         # the product touches healthcare settings or health data
+  - external_customers # customers outside the owning organisation use the product
+  - external_system    # the user named a system outside the program that the product must talk to
+stages:
+  1:
+    name: discover
+    budget: 12
+    artifacts:
+      - discovery.md
+      - environments.yaml
+      - CLAIM_BOUNDARIES.md
+    topics:
+      T1.1:
+        title: Outcome
+        owner: program
+        contributes:
+          - delivery
+        required: true
+        condition: null
+        closes_when: "The outcome is one sentence; the first beneficiary is named; up to three measures each have a target and date or an explicit \"no target yet\"; the cost of not building is stated"
+        needs:
+          - outcome
+          - beneficiary
+          - measures
+          - cost_of_not_building
+      T1.2:
+        title: Users and stakeholders
+        owner: program
+        contributes:
+          - architect
+        required: true
+        condition: null
+        closes_when: "Every kind of user and dependent system is listed; the decider, the acceptor and the payer are named; conflicting needs have a stated priority"
+        needs:
+          - user_kinds
+          - dependent_systems
+          - decider_acceptor_payer
+          - conflict_priority
+      T1.3:
+        title: Existing landscape
+        owner: architect
+        contributes:
+          - engineering
+        required: true
+        condition: null
+        closes_when: "Each existing system has an owner and a health note; what must stay unchanged is listed; prior documents are ingested or declared absent"
+        needs:
+          - system_owners
+          - system_health
+          - must_stay_unchanged
+          - prior_documents
+      T1.4:
+        title: Scope edges
+        owner: program
+        contributes:
+          - project
+        required: true
+        condition: null
+        closes_when: "At least three explicit exclusions; a reduced first release is described; deferred items are listed"
+        needs:
+          - exclusions
+          - reduced_first_release
+          - deferred_items
+      T1.5:
+        title: Constraints
+        owner: project
+        contributes:
+          - engineering
+          - program
+        required: true
+        condition: null
+        closes_when: "Dates with their reasons, budget shape, mandated and forbidden technologies and licences, and organisational constraints are each stated or declared none"
+        needs:
+          - dates
+          - budget
+          - mandated_technology
+          - forbidden_technology
+          - organisational_constraints
+      T1.6:
+        title: Environments
+        owner: delivery
+        contributes:
+          - architect
+          - engineering
+        required: true
+        condition: null
+        closes_when: "`environments.yaml` has a row per environment with whether it exists today and who runs it; each missing one has an owner or is declared out"
+        needs:
+          - environment_inventory
+          - environment_operators
+          - missing_environment_owner
+      T1.7:
+        title: Team and ways of working
+        owner: engineering
+        contributes:
+          - project
+        required: true
+        condition: null
+        closes_when: "Builders and skills, the human and agent split, reviewer and merger, on-call, conventions in force and expected response time are stated"
+        needs:
+          - team_and_split
+          - reviewer_merger
+          - on_call
+          - conventions
+          - response_time
+      T1.8:
+        title: Risks and unknowns
+        owner: program
+        contributes:
+          - architect
+          - engineering
+          - project
+          - delivery
+        required: true
+        condition: null
+        closes_when: "The top risk is named; prior failures are recorded; each unverified assumption has a verifier and a date; a spike is decided for or against"
+        needs:
+          - top_risk
+          - prior_failures
+          - unverified_assumptions
+          - spike_decision
+      T1.9:
+        title: Regulatory and contractual
+        # Conditional: regulated industry, personal data, payments, government, healthcare or external customers.
+        owner: program
+        contributes:
+          - architect
+        required: false
+        condition: has:regulated or has:personal_data or has:payments or has:government or has:healthcare or has:external_customers
+        closes_when: "Applicable regulations and standards, existing commitments and the compliance sign-off owner are named"
+        needs:
+          - regulations
+          - contractual_commitments
+          - compliance_owner
+  2:
+    name: define the product
+    budget: 8
+    artifacts:
+      - product.md
+    topics:
+      T2.1:
+        title: Personas
+        owner: program
+        contributes:
+          - delivery
+        required: true
+        condition: null
+        closes_when: "Each user kind has goals, frequency, expertise, context and main frustration"
+        needs:
+          - persona_goals
+          - persona_frequency
+          - persona_expertise
+          - persona_context
+          - persona_frustration
+      T2.2:
+        title: Journeys
+        owner: program
+        contributes:
+          - architect
+        required: true
+        condition: null
+        closes_when: "Each first-release journey has an ID, trigger, steps, end state and failure paths; the walking-skeleton journey is chosen"
+        needs:
+          - journey_ids
+          - journey_flow
+          - failure_paths
+          - walking_skeleton_journey
+      T2.3:
+        title: Product surface
+        owner: delivery
+        contributes:
+          - engineering
+          - program
+        required: true
+        condition: null
+        closes_when: "Every checklist item is in the first release, in a named later release, or out with a reason"
+        needs:
+          - surface_items_decided
+          - surface_later_releases_named
+          - surface_exclusion_reasons
+      T2.4:
+        title: Release shape
+        owner: delivery
+        contributes:
+          - project
+        required: true
+        condition: null
+        closes_when: "Incremental or single release, pilot users, and the entry condition for each later release are stated"
+        needs:
+          - release_mode
+          - pilot_users
+          - later_release_entry
+  3:
+    name: specify
+    budget: 8
+    artifacts:
+      - SPEC.md
+    topics:
+      T3.1:
+        title: Functional requirements
+        owner: architect
+        contributes:
+          - program
+        required: true
+        condition: null
+        closes_when: "Every journey step has requirements with IDs covering rule, input, output, validation and error"
+        needs:
+          - journey_step_coverage
+          - requirement_ids
+          - rules
+          - inputs_outputs
+          - validation
+          - errors
+      T3.2:
+        title: Data
+        owner: architect
+        contributes:
+          - delivery
+        required: true
+        condition: null
+        closes_when: "Entities and ownership, volumes and growth, sensitivity class, retention and deletion, residency where relevant, and the source of truth are stated"
+        needs:
+          - entities_ownership
+          - volumes_growth
+          - sensitivity_class
+          - retention_residency
+          - source_of_truth
+      T3.3:
+        title: Integrations
+        # Conditional: an external system was named.
+        owner: architect
+        contributes:
+          - engineering
+        required: false
+        condition: has:external_system
+        closes_when: "Each integration has direction, protocol, authentication, limits, owner, sandbox availability and behaviour when it is down"
+        needs:
+          - integration_interface
+          - integration_limits
+          - integration_owner
+          - sandbox_availability
+          - down_behaviour
+      T3.4:
+        title: Non-functional targets
+        owner: architect
+        contributes:
+          - engineering
+          - delivery
+        required: true
+        condition: null
+        closes_when: "Scale, latency, availability, recovery, security, tenancy, observability, cost and accessibility each have a number or an explicit \"no target yet\" with owner and date"
+        needs:
+          - scale_latency
+          - availability_recovery
+          - security_tenancy
+          - observability_cost
+          - accessibility
+      T3.5:
+        title: Failure and recovery
+        owner: architect
+        contributes:
+          - delivery
+        required: true
+        condition: null
+        closes_when: "Each integration and stateful component has its slow, down, corrupt and data-loss behaviour, what the user sees and what the operator does"
+        needs:
+          - failure_modes
+          - user_visible_behaviour
+          - operator_action
+  4:
+    name: architect
+    budget: 8
+    artifacts:
+      - ARCHITECTURE.md
+      - gates.yaml
+    topics:
+      T4.1:
+        title: Candidate approaches
+        owner: architect
+        contributes:
+          - engineering
+          - project
+        required: true
+        condition: null
+        closes_when: "Two or three approaches with trade-offs, a recommendation, and the user's choice recorded as a decision"
+        needs:
+          - candidate_approaches
+          - recommendation
+          - user_choice
+      T4.2:
+        title: Components and boundaries
+        owner: architect
+        contributes:
+          - engineering
+        required: true
+        condition: null
+        closes_when: "Each component has an ID, one responsibility, an interface, its data and an owner role; build, buy or reuse is stated"
+        needs:
+          - component_ids
+          - responsibility_interface
+          - component_data
+          - owner_role
+          - build_buy_reuse
+      T4.3:
+        title: Cross-cutting concerns
+        owner: architect
+        contributes:
+          - engineering
+        required: true
+        condition: null
+        closes_when: "Authentication and authorization, tenancy enforcement, configuration and secrets, observability, migration policy, versioning and error policy are decided"
+        needs:
+          - authn_authz
+          - tenancy_enforcement
+          - config_secrets
+          - observability_policy
+          - migration_versioning_errors
+      T4.4:
+        title: Deployment and environments
+        owner: delivery
+        contributes:
+          - architect
+        required: true
+        condition: null
+        closes_when: "The runtime per environment, the path from merge to production, rollback and migration ordering are stated"
+        needs:
+          - runtime_per_environment
+          - merge_to_production_path
+          - rollback
+          - migration_ordering
+      T4.5:
+        title: Technology decisions
+        owner: architect
+        contributes:
+          - engineering
+        required: true
+        condition: null
+        closes_when: "Each major choice has an ADR with options, decision, consequences and reversibility; licences are checked against the forbidden list"
+        needs:
+          - adr_options_decision
+          - consequences_reversibility
+          - licences_checked
+      T4.6:
+        title: Quality gates
+        owner: engineering
+        contributes:
+          - architect
+          - delivery
+        required: true
+        condition: null
+        closes_when: "Each quality claim has a gate with its evidence and environment in `gates.yaml`; gates needing a missing environment are marked blocked"
+        needs:
+          - gate_per_claim
+          - gate_evidence
+          - gate_environment
+          - blocked_gates
+      T4.7:
+        title: Delivery mechanics
+        owner: engineering
+        contributes:
+          - delivery
+        required: true
+        condition: null
+        closes_when: "Repository layout, branching and review rules, definition of done, test expectations per component, merge-gating checks and agent roles per component are stated"
+        needs:
+          - repo_branching_review
+          - definition_of_done
+          - test_expectations
+          - merge_gating_checks
+          - agent_roles
+  5:
+    name: freeze review
+    budget: 0
+    artifacts:
+      - freeze/review.md
+      - freeze/signoff.md
+    topics: {}
+  6:
+    name: roadmap and register
+    budget: 4
+    artifacts:
+      - roadmap.md
+      - register.yaml
+    topics:
+      T6.1:
+        title: Phase shaping
+        owner: project
+        contributes:
+          - architect
+          - program
+        required: true
+        condition: null
+        closes_when: "The walking skeleton is defined; phases are ordered by risk and value; each milestone has a gate"
+        needs:
+          - walking_skeleton
+          - phase_order
+          - milestone_gates
+      T6.2:
+        title: Capacity and cadence
+        owner: project
+        contributes:
+          - engineering
+        required: true
+        condition: null
+        closes_when: "Parallel implementer count, expected task size, consultation frequency and reporting are agreed"
+        needs:
+          - implementer_count
+          - task_size
+          - consultation_frequency
+          - reporting
+      T6.3:
+        title: Parking and blockers
+        owner: project
+        contributes:
+          - program
+          - delivery
+        required: true
+        condition: null
+        closes_when: "Every task that needs a missing environment, decision, vendor or person is parked with an owner and a date"
+        needs:
+          - parked_tasks
+          - parking_owner
+          - parking_date
+  7:
+    name: task specs
+    budget: 0
+    artifacts: []
+    topics: {}

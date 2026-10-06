@@ -1,0 +1,31 @@
+{
+  "title": "program/evidence/<ID>/acceptance.json",
+  "description": "A QA acceptance bound to one evidence file and one source commit. Documents the shape for readers. Setting a task to done requires every listed key, the decision accepted_development, the role qa and the task's own ID.",
+  "type": "object",
+  "required": ["task_id", "decision", "evidence_sha256", "source_commit", "accepted_at", "role", "commands",
+               "planted_bugs", "findings", "blocked_by"],
+  "properties": {
+    "task_id": {"type": "string"},
+    "decision": {"enum": ["accepted_development", "rejected"]},
+    "evidence_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$", "description": "sha256 of the results.json that was reviewed"},
+    "source_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "accepted_at": {"type": "string", "description": "UTC, YYYY-MM-DDTHH:MM:SSZ"},
+    "role": {"enum": ["qa"]},
+    "commands": {"type": "array", "description": "the commands QA re-ran, in the results.json command shape"},
+    "planted_bugs": {"type": "array", "description": "the planted bugs QA re-ran, in the results.json row shape"},
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["n", "severity", "location", "fix"],
+        "properties": {
+          "n": {"type": "integer"},
+          "severity": {"type": "string"},
+          "location": {"type": "string"},
+          "fix": {"type": "string"}
+        }
+      }
+    },
+    "blocked_by": {"type": "array", "items": {"type": "string"}}
+  }
+}

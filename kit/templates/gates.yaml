@@ -1,0 +1,14 @@
+# Gates: the claims a phase makes and the records that prove them. Each gate needs at least one
+# record from stage 4. One entry per gate, keyed by ID G-<NAME>. claims say what the gate asserts
+# is true, environment names an entry in environments.yaml, and each record gives a path and what
+# accepting it means.
+#
+#   G-P0:
+#     title: Phase 0 exit
+#     claims:
+#       - Sign-up works end to end
+#     environment: dev
+#     records:
+#       - path: program/evidence/G-P0/results.json
+#         acceptance: All checks pass
+gates: {}

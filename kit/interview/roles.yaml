@@ -1,0 +1,31 @@
+# Roles a task can be assigned to. may_touch lists the component IDs the role
+# may change; "*" means any component.
+roles:
+  - id: backend
+    name: Backend
+    may_touch:
+      - "*"
+  - id: frontend
+    name: Frontend
+    may_touch:
+      - "*"
+  - id: platform
+    name: Platform
+    may_touch:
+      - "*"
+  - id: data
+    name: Data
+    may_touch:
+      - "*"
+  - id: security
+    name: Security
+    may_touch:
+      - "*"
+  - id: docs
+    name: Docs
+    may_touch:
+      - docs
+  - id: qa
+    name: QA
+    may_touch:
+      - tests

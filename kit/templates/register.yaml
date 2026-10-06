@@ -1,0 +1,47 @@
+# The task register: phases contain milestones, milestones contain steps, steps
+# contain tasks. IDs are P<n>, P<n>-M<nn>, P<n>-M<nn>-S<nn> and P<n>-M<nn>-S<nn>-T<nn>;
+# leave one out and `pk register assign-ids` fills it in from its position.
+# gate is G-<NAME> or null. Lists are block style: a dash per entry, one entry per line.
+#
+# Replace `phases: []` below with the real phases. One task, in the shape every task has:
+#
+#   phases:
+#     - id: P1
+#       title: First phase
+#       gate: null
+#       milestones:
+#         - id: P1-M01
+#           title: First milestone
+#           gate: null
+#           steps:
+#             - id: P1-M01-S01
+#               title: First step
+#               tasks:
+#                 - id: P1-M01-S01-T01
+#                   title: First task
+#                   # What the task delivers, in a sentence or two.
+#                   text: Describe the work.
+#                   # One of the role ids in kit/interview/roles.yaml.
+#                   role: backend
+#                   # S or M; split anything larger into steps.
+#                   size: S
+#                   # Named environments (program/environments.yaml) the task needs. One that does not
+#                   # exist yet must also be listed under blocked_by, the same way.
+#                   environments:
+#                     - staging
+#                   blocked_by:
+#                     - staging
+#                   # IDs this task waits for (at most 6, no cycles).
+#                   depends_on:
+#                     - P1-M01-S01-T00
+#                   gate: null
+#                   # Requirement IDs this task closes: REQ-<nnn>, NFR-<nnn> or J<n>.
+#                   closes:
+#                     - REQ-001
+#
+# Optional text fields, copied into the task brief when present:
+#
+#   tests_unit: the unit tests the task adds.
+#   tests_integration: the integration tests the task adds.
+#   done: what must be true for the task to count as done.
+phases: []

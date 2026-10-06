@@ -1,0 +1,202 @@
+import _paths  # noqa: F401  (must come first: puts kit/scripts on sys.path)
+import contextlib
+import io
+import os
+import tempfile
+import unittest
+from pathlib import Path
+
+import manifest
+import pk
+from common import KitError
+
+REPO_KIT = Path(__file__).resolve().parent.parent
+
+
+class ManifestTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.kit = Path(self._tmp.name).resolve() / "kit"
+        (self.kit / "sub").mkdir(parents=True)
+        (self.kit / "b.txt").write_text("b\n")
+        (self.kit / "a.txt").write_text("a\n")
+        (self.kit / "sub" / "c.txt").write_text("c\n")
+
+    def test_write_lists_sorted_posix_paths_and_skips_noise(self):
+        (self.kit / "__pycache__").mkdir()
+        (self.kit / "__pycache__" / "x.cpython-311.pyc").write_bytes(b"x")
+        (self.kit / "sub" / "y.pyc").write_bytes(b"y")
+        (self.kit / ".DS_Store").write_bytes(b"z")
+        path = manifest.write(self.kit)
+        self.assertEqual(path, self.kit / "MANIFEST.sha256")
+        lines = path.read_text().splitlines()
+        self.assertEqual([line.split("  ", 1)[1] for line in lines], ["a.txt", "b.txt", "sub/c.txt"])
+        self.assertTrue(all(len(line.split("  ", 1)[0]) == 64 for line in lines))
+        self.assertEqual(manifest.check(self.kit), [])
+
+    def test_check_reports_modified_missing_added(self):
+        manifest.write(self.kit)
+        (self.kit / "a.txt").write_text("changed\n")
+        (self.kit / "b.txt").unlink()
+        (self.kit / "new.txt").write_text("n\n")
+        self.assertEqual(manifest.check(self.kit), ["added: new.txt", "missing: b.txt", "modified: a.txt"])
+
+    def test_check_without_manifest_or_malformed_raises(self):
+        with self.assertRaises(KitError):
+            manifest.check(self.kit)
+        (self.kit / "MANIFEST.sha256").write_text("not a manifest line\n")
+        with self.assertRaises(KitError):
+            manifest.check(self.kit)
+
+    def test_symlink_is_an_error(self):
+        os.symlink("a.txt", self.kit / "link")
+        with self.assertRaises(KitError):
+            manifest.write(self.kit)
+
+    def test_write_rejects_names_that_do_not_round_trip(self):
+        for name in ("bad\nname.txt", "bad\rname.txt", "bad\x0bname.txt", "bad\u2028name.txt", " lead.txt"):
+            with self.subTest(name=ascii(name)):
+                try:
+                    (self.kit / name).write_text("x\n")
+                except OSError:
+                    self.skipTest("file system refuses this name")
+                with self.assertRaises(KitError):
+                    manifest.write(self.kit)
+                (self.kit / name).unlink()
+        self.assertFalse((self.kit / "MANIFEST.sha256").exists())
+
+    def test_check_rejects_crlf_and_unterminated_manifests(self):
+        manifest.write(self.kit)
+        path = self.kit / "MANIFEST.sha256"
+        good = path.read_bytes()
+        path.write_bytes(good.replace(b"\n", b"\r\n"))
+        with self.assertRaises(KitError):
+            manifest.check(self.kit)
+        path.write_bytes(good.rstrip(b"\n"))
+        with self.assertRaises(KitError):
+            manifest.check(self.kit)
+        path.write_bytes(good)
+        self.assertEqual(manifest.check(self.kit), [])
+
+    def test_cli_write_and_check(self):
+        def run(*argv):
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = pk.main(list(argv))
+            return rc, out.getvalue(), err.getvalue()
+
+        from unittest import mock
+        with mock.patch.object(manifest, "KIT_DIR", self.kit):
+            self.assertEqual(run("manifest", "write"), (0, "manifest: 3 files\n", ""))
+            self.assertEqual(run("manifest", "check"), (0, "manifest: clean\n", ""))
+            (self.kit / "a.txt").write_text("changed\n")
+            (self.kit / "z.txt").write_text("z\n")
+            rc, out, err = run("manifest", "check")
+        self.assertEqual((rc, out), (1, ""))
+        self.assertEqual(err.splitlines(), ["error: added: z.txt", "error: modified: a.txt"])
+
+    def test_committed_manifest_is_current(self):
+        self.assertEqual(manifest.check(REPO_KIT), [])
+
+
+class KitTestsAreNotKitContentTests(unittest.TestCase):
+    """Finding 15: the kit's own tests (top-level kit/tests) are not part of what is installed or recorded.
+
+    N5: that holds where the kit's installer sits beside kit/ (the kit's own repository, or a copy of the whole
+    template). Anywhere else kit/ is an installed kit, and a file under kit/tests its manifest does not list is
+    a local addition like any other.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.kit = Path(self._tmp.name).resolve() / "kit"
+        (self.kit / "sub").mkdir(parents=True)
+        (self.kit / "b.txt").write_text("b\n")
+        (self.kit / "a.txt").write_text("a\n")
+        (self.kit / "sub" / "c.txt").write_text("c\n")
+
+    def put_tests(self):
+        (self.kit / "tests" / "fixtures").mkdir(parents=True)
+        (self.kit / "tests" / "test_a.py").write_text("t\n")
+        (self.kit / "tests" / "fixtures" / "f.txt").write_text("f\n")
+
+    def put_installer(self, text=None):
+        """Make the tree the kit's own repository: the kit's installer beside kit/."""
+        (self.kit.parent / "install.sh").write_text(
+            (REPO_KIT.parent / "install.sh").read_text(encoding="utf-8") if text is None else text, encoding="utf-8")
+
+    def test_write_does_not_list_the_top_level_tests_directory(self):
+        self.put_tests()
+        self.put_installer()
+        manifest.write(self.kit)
+        names = [line.split("  ", 1)[1] for line in (self.kit / "MANIFEST.sha256").read_text().splitlines()]
+        self.assertEqual(names, ["a.txt", "b.txt", "sub/c.txt"])
+        self.assertEqual(manifest.check(self.kit), [])
+
+    def test_a_file_under_tests_of_an_installed_kit_is_an_added_file(self):
+        manifest.write(self.kit)
+        self.assertEqual(manifest.check(self.kit), [])  # an installed kit has no tests directory
+        self.put_tests()
+        self.assertEqual(manifest.check(self.kit), ["added: tests/fixtures/f.txt", "added: tests/test_a.py"])
+        manifest.write(self.kit)  # never recorded, so writing the manifest again does not hide them
+        self.assertEqual(manifest.check(self.kit), ["added: tests/fixtures/f.txt", "added: tests/test_a.py"])
+        self.put_installer()
+        self.assertEqual(manifest.check(self.kit), [])
+
+    def test_only_the_kits_installer_beside_the_kit_makes_it_the_kits_own_repository(self):
+        self.put_tests()
+        manifest.write(self.kit)
+        for text in ("#!/bin/sh\nmake install\n", ""):  # a project's own script of the same name
+            with self.subTest(text=text):
+                self.put_installer(text)
+                self.assertEqual(manifest.check(self.kit), ["added: tests/fixtures/f.txt", "added: tests/test_a.py"])
+        (self.kit.parent / "install.sh").unlink()
+        (self.kit.parent / "install.sh").mkdir()
+        self.assertEqual(manifest.check(self.kit), ["added: tests/fixtures/f.txt", "added: tests/test_a.py"])
+
+    def test_the_cli_reports_an_added_test_file_in_an_installed_kit(self):
+        from unittest import mock
+
+        manifest.write(self.kit)
+        self.put_tests()
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(manifest, "KIT_DIR", self.kit), contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(err):
+            rc = pk.main(["manifest", "check"])
+        self.assertEqual((rc, out.getvalue()), (1, ""))
+        self.assertEqual(err.getvalue().splitlines(),
+                         ["error: added: tests/fixtures/f.txt", "error: added: tests/test_a.py"])
+
+    def test_only_the_top_level_directory_is_skipped(self):
+        (self.kit / "sub" / "tests").mkdir()
+        (self.kit / "sub" / "tests" / "x.txt").write_text("x\n")
+        manifest.write(self.kit)
+        self.assertIn("sub/tests/x.txt", (self.kit / "MANIFEST.sha256").read_text())
+
+    def test_tests_recorded_by_an_older_kit_check_clean_and_only_an_unrecorded_file_is_added(self):
+        self.put_tests()
+        manifest.write(self.kit)
+        text = (self.kit / "MANIFEST.sha256").read_text()
+        older = text + "".join(f"{manifest.sha256_file(self.kit / rel)}  {rel}\n"
+                               for rel in ("tests/fixtures/f.txt", "tests/test_a.py"))
+        (self.kit / "MANIFEST.sha256").write_text(older)  # an older kit installed and recorded its tests
+        self.assertEqual(manifest.check(self.kit), [])
+        (self.kit / "tests" / "test_a.py").write_text("edited\n")
+        (self.kit / "tests" / "fixtures" / "f.txt").unlink()
+        self.assertEqual(manifest.check(self.kit), [])  # the recorded tests are still not kit content
+        (self.kit / "tests" / "new.py").write_text("n\n")
+        self.assertEqual(manifest.check(self.kit), ["added: tests/new.py"])
+        self.put_installer()  # in the kit's own repository the whole directory is the kit's test suite
+        self.assertEqual(manifest.check(self.kit), [])
+        (self.kit / "a.txt").write_text("changed\n")  # everything else is still checked
+        self.assertEqual(manifest.check(self.kit), ["modified: a.txt"])
+
+    def test_the_shipped_manifest_does_not_list_the_kits_tests(self):
+        recorded = (REPO_KIT / "MANIFEST.sha256").read_text().splitlines()
+        self.assertEqual([line for line in recorded if line.split("  ", 1)[1].startswith("tests/")], [])
+
+
+if __name__ == "__main__":
+    unittest.main()

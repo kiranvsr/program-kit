@@ -1,0 +1,24 @@
+# Commands the gate runs, as argv lists (never a shell). build, test and scan must each list a command.
+build:
+  - - go
+    - build
+    - ./...
+test:
+  - - go
+    - test
+    - ./...
+scan:
+  - - gosec
+    - ./...
+  - - gitleaks
+    - detect
+    - '--no-git'
+compile_check:
+  - - go
+    - vet
+    - ./...
+extra_gate: []
+guarded_files:
+  - go.mod
+  - go.sum
+  - program/checks.yaml
