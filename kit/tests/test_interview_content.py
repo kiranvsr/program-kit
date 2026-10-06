@@ -164,6 +164,14 @@ class CoverageContentTest(unittest.TestCase):
             for tag in topic["needs"]:
                 self.assertRegex(tag, r"^[a-z][a-z0-9_]*$", topic_id)
 
+    def test_the_ruling_that_every_kind_of_entry_counts_for_a_tag_is_written_down(self):
+        phrase = "an unanswered question and an unconfirmed assumption"
+        for path in (COVERAGE, ROOT / "kit" / "playbooks" / "01_discover.md", ROOT / "docs" / "DESIGN.md"):
+            self.assertIn(phrase, " ".join(path.read_text(encoding="utf-8").split()), path.name)
+        lines = COVERAGE.read_text(encoding="utf-8").splitlines()
+        beside = lines[lines.index("condition_tags:") - 1]  # a comment line, directly above the key
+        self.assertTrue(beside.startswith("# ") and phrase in beside, beside)
+
     def test_conditions_reference_known_tags(self):
         data = miniyaml.loads(COVERAGE.read_text(encoding="utf-8"))
         known = data["condition_tags"]

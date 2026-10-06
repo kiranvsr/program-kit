@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import briefs
 import interview
 import pk
 from common import KitError, read_json, read_yaml, sha256_file, write_yaml
@@ -68,8 +69,9 @@ class InterviewBase(unittest.TestCase):
         return path
 
     def put_register(self, *tasks):
-        """A register `stopping_rule` accepts at stage 6 (the default is one task needing no environment)."""
+        """A register `stopping_rule` accepts at stage 6 (the default is one task needing no environment), with its briefs."""
         write_yaml(self.root / "program" / "register.yaml", reg(*(tasks or (task("P1-M01-S01-T01"),))))
+        briefs.generate(self.root)
 
     def states(self, stage=1):
         return interview.topic_states(self.root, stage)
@@ -93,6 +95,18 @@ class TopicStateTests(InterviewBase):
         self.put_ledger([entry("F-1", tags=["measure"]), entry("Q-1", tags=["beneficiary"]),
                          entry("F-2", topics=["T2.1"], tags=["beneficiary"])])
         self.assertEqual(self.states()["T1.1"]["missing"], ["beneficiary"])
+
+    def test_a_condition_tag_counts_from_every_kind_of_entry(self):
+        """Controller ruling: switching a conditional topic on too early is the safe direction."""
+        self.assertEqual(self.states()["T1.9"]["state"], "not_applicable")
+        for item in (entry("Q-1", topics=["T2.1"], tags=["regulated"]),  # a question nobody has answered
+                     entry("A-1", topics=["T2.1"], tags=["payments"], confirmed=False),
+                     entry("A-2", topics=["T2.1"], tags=["regulated"], confirmed=None),
+                     entry("D-1", topics=["T2.1"], tags=["regulated"]),
+                     entry("F-1", topics=["T2.1"], tags=["regulated"])):
+            with self.subTest(entry=item["id"]):
+                self.put_ledger([item])
+                self.assertEqual(self.states()["T1.9"]["state"], "open")
 
     def test_empty_needs_closes_on_any_fact_assumption_or_decision(self):
         self.assertEqual(self.states(2)["T2.1"]["state"], "open")
@@ -212,6 +226,40 @@ class StoppingRuleTests(InterviewBase):
         self.assertEqual(interview.stopping_rule(self.root, 1), ["stage-1-challenge.md: 2 findings unresolved"])
         with self.assertRaises(KitError):
             interview.challenge_init(self.root, 1)  # never overwrites
+
+    def test_a_challenge_report_with_a_byte_order_mark_reads_like_one_without(self):
+        self.put_ledger(CLOSING)
+        path = interview.challenge_init(self.root, 1)
+        skeleton = path.read_text(encoding="utf-8")
+        finished = "".join(f"## {lens}\n\n| # | Finding | Severity | Resolution |\n|---|---|---|---|\n\nNo findings.\n\n"
+                           for lens in interview.LENSES)  # starts on a heading: a mark would hide the first one
+        for name, text, expected in (("skeleton", skeleton, interview.stopping_rule(self.root, 1)),
+                                     ("finished", finished, [])):
+            with self.subTest(report=name):
+                path.write_text(text, encoding="utf-8")
+                plain = interview.stopping_rule(self.root, 1)
+                self.assertEqual(plain, expected)
+                path.write_bytes(b"\xef\xbb\xbf" + text.encode("utf-8"))
+                self.assertEqual(interview.stopping_rule(self.root, 1), plain)
+        self.assertEqual(interview.stopping_rule(self.root, 1), [])
+        path.write_bytes(b"\xff\xfe not utf-8")
+        with self.assertRaises(KitError) as caught:
+            interview.stopping_rule(self.root, 1)
+        self.assertTrue(str(caught.exception).startswith(f"cannot read {path}: "), str(caught.exception))
+        self.assertEqual(len(str(caught.exception).splitlines()), 1)
+
+    def test_a_template_with_a_byte_order_mark_does_not_put_one_in_the_report(self):
+        kit = self.root / "kitcopy"
+        shutil.copytree(interview.KIT_DIR / "templates", kit / "templates")
+        for name in ("challenge_report.md", "stage_report.md"):
+            template = kit / "templates" / name
+            template.write_bytes(b"\xef\xbb\xbf" + template.read_bytes())
+        self.put_ledger(CLOSING)
+        with mock.patch("interview.KIT_DIR", kit):
+            challenge = interview.challenge_init(self.root, 1)
+            report = interview.report(self.root, 1)
+        for path in (challenge, report):
+            self.assertFalse(path.read_bytes().startswith(b"\xef\xbb\xbf"), path.name)
 
     def test_missing_challenge_report_blocks_from_stage_2(self):
         self.put_ledger(CLOSING + [entry("F-3", topics=["T2.1"])])
@@ -345,7 +393,7 @@ class ApprovalTests(InterviewBase):
             self.assertEqual(interview.next_stage(self.root), 5)
             self.put_ledger(stage2 + [entry("F-11"), entry("F-12")])
             self.challenge(6)
-            write_yaml(self.root / "program" / "register.yaml", reg(task("P1-M01-S01-T01")))
+            self.put_register()
             interview.approve(self.root, 6, [product])
         # stage 7 is never approved: once stages 1 to 6 are current, 7 is the final value
         self.assertEqual(interview.next_stage(self.root), 7)
@@ -500,6 +548,39 @@ class SourceTests(InterviewBase):
         self.assertEqual(len(list((self.root / "program" / "sources").iterdir())), 0)
         self.assertEqual(interview.ingest(self.root, doc), "S2")
         self.assertEqual(len(list((self.root / "program" / "sources").iterdir())), 1)
+
+    def failing_replace(self, name):
+        """os.replace that fails when it would put a file called `name` in place (the ledger or the stored copy)."""
+        real = interview.os.replace
+
+        def replace(src, dst, *args, **kwargs):
+            if name == "ledger.yaml" and Path(dst).name == name or name == "stored" and "sources" in Path(dst).parts:
+                raise PermissionError(13, "Permission denied")
+            return real(src, dst, *args, **kwargs)
+
+        return mock.patch("os.replace", side_effect=replace)
+
+    def test_ingest_leaves_file_and_ledger_as_they_were_when_a_final_replace_fails(self):
+        doc = self.write("incoming/notes.md", "hello\n")
+        ledger = self.root / "program" / "ledger.yaml"
+        sources = self.root / "program" / "sources"
+        for name in ("ledger.yaml", "stored"):
+            with self.subTest(failing=name):
+                before = ledger.read_bytes()
+                with self.failing_replace(name), self.assertRaises(KitError) as caught:
+                    interview.ingest(self.root, doc)
+                self.assertTrue(str(caught.exception).startswith("cannot write "), str(caught.exception))
+                self.assertEqual(ledger.read_bytes(), before)  # no half-written ledger
+                self.assertEqual(sorted(p.name for p in sources.iterdir()) if sources.exists() else [], [])
+        self.assertEqual(interview.ingest(self.root, doc), "S2")  # nothing is left in the way
+        # a stored copy that was there before the call is not a leftover of it
+        stored = next(iter(sources.iterdir()))
+        before = ledger.read_bytes()
+        with self.failing_replace("ledger.yaml"), self.assertRaises(KitError):
+            interview.ingest(self.root, doc)
+        self.assertEqual(stored.read_bytes(), b"hello\n")
+        self.assertEqual(ledger.read_bytes(), before)
+        self.assertEqual([p.name for p in sources.iterdir()], [stored.name])
 
     def test_ingest_refusals(self):
         bad_name = self.write("incoming/-weird name.txt")
@@ -992,6 +1073,14 @@ class MalformedLedgerValueTests(InterviewBase):
                 self.assertTrue(err.startswith("error: "), err)
                 self.assertNotIn("Traceback", err)
 
+    def test_validate_prints_one_error_line_per_problem(self):
+        self.put_ledger(CLOSING + [entry("F-3", source="S9"), entry("F-4", source="S8")])
+        expected = interview.ledger_validate(self.root)
+        self.assertEqual(len(expected), 2, expected)
+        code, out, err = self.run_cli("interview", "validate")
+        self.assertEqual((code, out), (1, ""))
+        self.assertEqual(err.splitlines(), ["error: " + problem for problem in expected])
+
     def test_a_non_ascii_digit_is_not_an_entry_number(self):
         self.put_ledger([entry("F-\u0661")])
         self.assertEqual(interview.ledger_validate(self.root),
@@ -1208,7 +1297,28 @@ class StaleTaskCopyTests(InterviewBase):
     def test_an_empty_register_with_an_old_tasks_section_is_refused(self):
         self.trace.sync(self.root)
         write_yaml(self.root / "program" / "register.yaml", {"phases": []})
+        briefs.generate(self.root)
         self.assertEqual(interview.stopping_rule(self.root, 6), [self.SYNC])
+
+    def test_briefs_missing_or_out_of_date_refuse_stage_6_until_generated(self):
+        self.trace.sync(self.root)
+        self.assertEqual(interview.stopping_rule(self.root, 6), [])
+        write_yaml(self.root / "program" / "register.yaml", reg(
+            task("P1-M01-S01-T01", closes=["REQ-001", "J1"]), task("P1-M01-S01-T02", closes=["NFR-001"], text="new")))
+        reasons = interview.stopping_rule(self.root, 6)  # the register is edited, the briefs are not regenerated
+        self.assertEqual(reasons, ["program/briefs/MANIFEST.json: differs from the register",
+                                   "program/briefs/tasks/P1-M01-S01-T02.md: differs from the register"])
+        with self.assertRaises(KitError) as caught:
+            interview.approve(self.root, 6, [self.root / "program" / "register.yaml"])
+        self.assertEqual(str(caught.exception), "; ".join(reasons))
+        self.assertFalse((self.root / "program" / "approvals").exists())
+        briefs.generate(self.root)
+        self.assertEqual(interview.stopping_rule(self.root, 6), [])
+        shutil.rmtree(self.root / "program" / "briefs")  # never generated
+        self.assertTrue(all("missing; run `pk briefs generate`" in line for line in interview.stopping_rule(self.root, 6)))
+        # an invalid register is reported by its own check only, not once more by the briefs
+        write_yaml(self.root / "program" / "register.yaml", {"phases": [{"id": "P1", "title": "p", "milestones": 5}]})
+        self.assertEqual(interview.stopping_rule(self.root, 6), ["P1.milestones: must be a list"])
 
     def test_a_changed_closes_list_is_refused_until_synced(self):
         self.trace.sync(self.root)

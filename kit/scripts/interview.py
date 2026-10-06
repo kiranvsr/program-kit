@@ -20,8 +20,8 @@ import sys
 import tempfile
 from pathlib import Path, PurePosixPath
 
-from common import (KitError, find_root, read_json, read_yaml, sha256_bytes, sha256_file, utc_now, write_json,
-                    write_yaml)
+from common import (KitError, find_root, read_json, read_text, read_yaml, sha256_bytes, sha256_file, utc_now,
+                    write_json, write_yaml)
 
 KIT_DIR = Path(__file__).resolve().parent.parent
 LENSES = ("architect", "engineering", "program", "project", "delivery")
@@ -400,13 +400,6 @@ def _challenge_path(root: Path, stage: int) -> Path:
     return Path(root) / "program" / "reports" / f"stage-{stage}-challenge.md"
 
 
-def _read_challenge(path: Path) -> str:
-    try:
-        return path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as exc:
-        raise KitError(f"cannot read {path}: {getattr(exc, 'strerror', None) or exc}") from exc
-
-
 def _row_cells(line: str) -> list[str] | None:
     """The cells of a findings-table data row, or None for any other line (header, separator, blank row, text)."""
     line = line.strip()
@@ -442,7 +435,7 @@ def _answered_lenses(text: str) -> set[str]:
 
 def _challenge_reasons(root: Path, stage: int, path: Path) -> list[str]:
     """Why the challenge report is not a finished round: untouched skeleton, an empty lens, unresolved rows."""
-    text = _read_challenge(path)
+    text = read_text(path)
     name = f"stage-{stage}-challenge.md"
     if text.strip() == _challenge_skeleton(root, stage).strip():
         return [f"{name}: still the untouched skeleton; each lens needs a finding row or a No findings. line"]
@@ -470,24 +463,13 @@ def _open_reasons(root: Path, coverage: dict, entries: list[dict], stage: int, w
     return reasons
 
 
-def _register_reasons(root: Path) -> list[str]:
-    """The problems `pk register validate` reports for `program/register.yaml`; a missing register is one."""
-    import register as register_module  # lazy, and not the module-level `register` command hook
-
-    path = Path(root) / "program" / "register.yaml"
-    if not path.exists():
-        return ["program/register.yaml is missing"]
-    environments = Path(root) / "program" / "environments.yaml"
-    return register_module.validate(register_module.load(root), read_yaml(environments) if environments.exists() else None,
-                                    read_yaml(register_module.KIT_DIR / "interview" / "roles.yaml"))
-
-
 def stopping_rule(root: Path, stage: int) -> list[str]:
     """Reasons `stage` cannot be approved, each starting with a topic or entry ID or a file name.
 
     From the freeze (stage 5) on, the topic and blocking-question checks of every earlier stage run again, so a
     topic reopened or a question raised after its own approval blocks the freeze; stage 6 also validates the register
-    and, for a register that is valid, refuses a matrix whose copy of the tasks `pk trace sync` would change.
+    and, for a register that is valid, refuses a matrix whose copy of the tasks `pk trace sync` would change and
+    briefs that are missing or differ from what `pk briefs generate` would write.
     """
     _refuse_per_task(stage)
     coverage = load_coverage(root)
@@ -507,23 +489,24 @@ def stopping_rule(root: Path, stage: int) -> list[str]:
         reasons.extend(f"{item.get('id')}: assumption unconfirmed at stage {stage}" for item in entries
                        if item.get("kind") == "assumption" and item.get("confirmed") is not True)
     if stage in (5, 6):
+        import register as register_module  # lazy, and not the module-level `register` command hook
         import trace as trace_module  # lazy: trace imports register and status
 
         reasons.extend(trace_module.validate(root, stage))
     if stage == 6:
-        invalid = _register_reasons(root)
+        invalid = register_module.problems_in(root)
         reasons.extend(invalid or trace_module.unsynced(root))  # the requirement check above read that copy
+        if not invalid:
+            import briefs  # lazy: briefs imports register
+
+            reasons.extend(briefs.check(root))  # playbook 06 generates the briefs before this approval
     return reasons
 
 
 # --- reports -----------------------------------------------------------------
 
 def _template(name: str) -> string.Template:
-    path = KIT_DIR / "templates" / name
-    try:
-        return string.Template(path.read_text(encoding="utf-8"))
-    except OSError as exc:
-        raise KitError(f"cannot read {path}: {exc.strerror or exc}") from exc
+    return string.Template(read_text(KIT_DIR / "templates" / name))
 
 
 def _make_parent(path: Path) -> None:
@@ -855,7 +838,9 @@ def ingest(root: Path, file: Path) -> str:
     _make_parent(stored)
     ledger["sources"][source_id] = {"kind": "document", "ref": stored.relative_to(Path(root)).as_posix(),
                                     "at": utc_now()}
+    existed = stored.exists()
     temp = None
+    placed = False
     try:
         descriptor, temp_name = tempfile.mkstemp(dir=stored.parent, prefix=".ingest.", suffix=".tmp")
         temp = Path(temp_name)
@@ -864,15 +849,22 @@ def ingest(root: Path, file: Path) -> str:
         mask = os.umask(0)
         os.umask(mask)
         os.chmod(temp, 0o666 & ~mask)
-        write_yaml(_ledger_path(root), ledger)
-        os.replace(temp, stored)
+        os.replace(temp, stored)  # the copy first: a ledger never names a file that is not there
         temp = None
+        placed = not existed
+        write_yaml(_ledger_path(root), ledger)
+        placed = False
     except OSError as exc:
         raise KitError(f"cannot write {stored}: {exc.strerror or exc}") from exc
     finally:
         if temp is not None:
             try:
                 temp.unlink()
+            except FileNotFoundError:
+                pass
+        if placed:  # the ledger was not written: take back the copy this call made
+            try:
+                stored.unlink()
             except FileNotFoundError:
                 pass
     return source_id
