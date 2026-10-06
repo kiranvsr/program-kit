@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import sys
 from pathlib import Path
 
 from common import KitError, find_root, utc_now
@@ -169,7 +170,8 @@ def cmd_rulings(args: argparse.Namespace) -> int:
     elif action == "validate":
         problems = validate(root)
         if problems:
-            raise KitError("; ".join(problems))
+            print("\n".join("error: " + problem for problem in problems), file=sys.stderr)
+            return 1
         print("rulings: ok")
     else:
         raise KitError("rulings needs an action: add, list or validate")

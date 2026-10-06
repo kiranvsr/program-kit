@@ -198,6 +198,14 @@ class RulingsTests(unittest.TestCase):
         self.assertIn("supersedes R1", lines[1])
         self.assertEqual(self.run_cli("rulings", "validate"), (0, "rulings: ok\n", ""))
 
+    def test_cli_validate_prints_one_error_line_per_problem(self):
+        self.seed(HEADER + self.block(1) + self.block(3) + self.block(2))
+        expected = rulings.validate(self.root)
+        self.assertEqual(len(expected), 2)
+        code, out, err = self.run_cli("rulings", "validate")
+        self.assertEqual((code, out), (1, ""))
+        self.assertEqual(err.splitlines(), ["error: " + problem for problem in expected])
+
     def test_cli_errors_are_one_line_and_exit_1(self):
         self.seed(HEADER + self.block(1) + self.block(3))
         code, out, err = self.run_cli("rulings", "validate")

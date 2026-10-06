@@ -128,40 +128,97 @@ def assign_ids(register: dict) -> dict:
 # --- validation --------------------------------------------------------------
 
 def _id_list(node: dict, field: str, who: str, problems: list[str]) -> list[str]:
-    """The strings in node[field] (absent means empty); anything else is reported and ignored."""
-    value = node.get(field)
-    if field not in node:
+    """The strings in node[field] (absent or null means empty); anything else is reported and ignored."""
+    if node.get(field) is None:
         return []
+    value = node[field]
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
         problems.append(f"{who}: {field} must be a list of strings")
         return []
     return value
 
 
-def _find_cycles(graph: dict[str, list[str]]) -> list[list[str]]:
-    """Every back edge in `graph` as the cycle it closes, by iterative DFS (no recursion)."""
-    cycles: list[list[str]] = []
-    state: dict[str, int] = {}  # 1 on the current path, 2 finished
-    for start in graph:
-        if start in state:
+def _find_cycles(graph: dict[str, list[str]]) -> list[str]:
+    """One line per group of tasks that depend on each other: a path closing on its first member.
+
+    The groups are the strongly connected components of `graph` with a cycle in them (more than one task, or
+    a task that depends on itself), found without recursion. A path starts at the group's smallest ID and is
+    the shortest way back to it, following dependencies in ID order, so the line does not depend on the order
+    of the register; members the path does not pass through are named after it, sorted. Groups come out in
+    order of their smallest ID.
+    """
+    index: dict[str, int] = {}
+    low: dict[str, int] = {}
+    on_stack: set[str] = set()
+    stack: list[str] = []
+    groups: list[list[str]] = []
+    for root in graph:
+        if root in index:
             continue
-        path = [start]
-        state[start] = 1
-        stack = [iter(graph[start])]
-        while stack:
-            target = next(stack[-1], None)
+        index[root] = low[root] = len(index)
+        stack.append(root)
+        on_stack.add(root)
+        work = [(root, iter(graph[root]))]
+        while work:
+            node, targets = work[-1]
+            target = next(targets, None)
             if target is None:
-                state[path.pop()] = 2
-                stack.pop()
+                work.pop()
+                if work:
+                    parent = work[-1][0]
+                    low[parent] = min(low[parent], low[node])
+                if low[node] == index[node]:
+                    group = []
+                    while True:
+                        member = stack.pop()
+                        on_stack.discard(member)
+                        group.append(member)
+                        if member == node:
+                            break
+                    if len(group) > 1 or node in graph[node]:
+                        groups.append(group)
             elif target not in graph:
                 continue
-            elif state.get(target) == 1:
-                cycles.append(path[path.index(target):] + [target])
-            elif target not in state:
-                state[target] = 1
-                path.append(target)
-                stack.append(iter(graph[target]))
+            elif target not in index:
+                index[target] = low[target] = len(index)
+                stack.append(target)
+                on_stack.add(target)
+                work.append((target, iter(graph[target])))
+            elif target in on_stack:
+                low[node] = min(low[node], index[target])
+    cycles = []
+    for group in sorted(groups, key=min):
+        members = set(group)
+        start = min(members)
+        came_from = {start: None}
+        queue = [start]
+        closing = None
+        for node in queue:  # breadth first inside the group, so the first way back to `start` is the shortest
+            for target in sorted(set(graph[node]) & members):
+                if target == start:
+                    closing = node
+                    break
+                if target not in came_from:
+                    came_from[target] = node
+                    queue.append(target)
+            if closing is not None:
+                break
+        path = [closing]
+        while path[-1] != start:
+            path.append(came_from[path[-1]])
+        path.reverse()
+        rest = sorted(members - set(path))
+        cycles.append(" -> ".join(path + [start]) + (f"; also in it: {', '.join(rest)}" if rest else ""))
     return cycles
+
+
+def problems_in(root: Path) -> list[str]:
+    """The problems `pk register validate` reports for `program/register.yaml`; a missing register is one."""
+    if not _path(root).exists():
+        return ["program/register.yaml is missing"]
+    environments = Path(root) / "program" / "environments.yaml"
+    return validate(load(root), read_yaml(environments) if environments.exists() else None,
+                    read_yaml(KIT_DIR / "interview" / "roles.yaml"))
 
 
 def validate(register: dict, environments: dict | None, roles: dict | None) -> list[str]:
@@ -235,8 +292,7 @@ def validate(register: dict, environments: dict | None, roles: dict | None) -> l
                                     f"(the line blocked_by:, then - {env} on the next line)")
         if isinstance(ident, str) and ident:
             graph[ident] = [t for t in depends if t != "" and t in known]
-    for cycle in _find_cycles(graph):
-        problems.append("cycle: " + " -> ".join(cycle))
+    problems.extend("cycle: " + line for line in _find_cycles(graph))
     return problems
 
 
@@ -249,7 +305,9 @@ def change(root: Path, note: str) -> list[Path]:
     """Append `- <date>: <note>` to program/changes/register-log.md, then regenerate the briefs.
 
     Returns the generated brief paths. The log is append-only. A note that is empty or spans several
-    lines, or a register the briefs cannot be built from, is refused before anything is written.
+    lines, or a register the briefs cannot be built from, is refused before anything is written. When the
+    briefs cannot be written after the log line was appended, the line is removed again and the briefs are
+    put back as they were, so a failed change leaves the log and the briefs unchanged.
     """
     import briefs  # lazy: briefs imports this module
 
@@ -261,18 +319,32 @@ def change(root: Path, note: str) -> list[Path]:
     try:
         data = path.read_bytes()
     except FileNotFoundError:
-        data = b""
+        data = None
     except OSError as exc:
         raise KitError(f"cannot read {path}: {exc.strerror or exc}") from exc
-    prefix = _LOG_TITLE + "\n" if not data else ("" if data.endswith(b"\n") else "\n")
+    old = data or b""
+    prefix = _LOG_TITLE + "\n" if not old else ("" if old.endswith(b"\n") else "\n")
     entry = f"- {utc_now()[:10]}: {note}\n"
+    saved = briefs.snapshot(root)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "ab") as handle:
             handle.write((prefix + entry).encode("utf-8"))
     except OSError as exc:
         raise KitError(f"cannot write {path}: {exc.strerror or exc}") from exc
-    return briefs.generate(root)
+    try:
+        return briefs.generate(root)
+    except BaseException:
+        try:
+            if data is None:
+                path.unlink()
+                path.parent.rmdir()  # only when it came with the log line
+            else:
+                path.write_bytes(data)
+            briefs.restore(root, saved)
+        except (OSError, KitError):
+            pass  # the original failure is the one to report
+        raise
 
 
 # --- command -----------------------------------------------------------------

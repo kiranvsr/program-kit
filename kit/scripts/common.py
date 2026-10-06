@@ -90,7 +90,7 @@ def write_text(path: Path, text: str) -> None:
     _atomic_write(path, text)
 
 
-def _read_text(path: Path) -> str:
+def read_text(path: Path) -> str:
     """The file's text; a leading UTF-8 byte-order mark (common in files saved by other tools) is dropped."""
     try:
         text = Path(path).read_text(encoding="utf-8")
@@ -103,7 +103,7 @@ def _read_text(path: Path) -> str:
 def read_yaml(path: Path):
     import miniyaml  # lazy: miniyaml imports KitError from this module
 
-    text = _read_text(path)
+    text = read_text(path)
     try:
         return miniyaml.loads(text)
     except miniyaml.YAMLError as exc:
@@ -123,7 +123,7 @@ def write_yaml(path: Path, data) -> None:
 
 
 def read_json(path: Path):
-    text = _read_text(path)
+    text = read_text(path)
     try:
         return json.loads(text)
     except ValueError as exc:
