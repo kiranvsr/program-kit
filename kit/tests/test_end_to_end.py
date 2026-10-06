@@ -43,7 +43,8 @@ QA_BUGS = [  # planted by QA, not by the implementer's producer
 
 def _pip_available() -> bool:
     try:
-        return subprocess.run(["python3", "-m", "pip", "--version"], capture_output=True).returncode == 0
+        # The interpreter running the suite is the one the gate's `python3` wrapper starts.
+        return subprocess.run([sys.executable, "-m", "pip", "--version"], capture_output=True).returncode == 0
     except OSError:
         return False
 
@@ -267,8 +268,8 @@ class EndToEndTests(unittest.TestCase):
         self.assertTrue(all(c["as_expected"] for c in commands))
         with mock.patch.object(tempfile, "tempdir", str(project.scratch)):
             qa = evidence_module.Evidence(wt, TASK)
-            qa_bugs = qa.planted_bugs(QA_BUGS, ["python3", "-m", "compileall", "-q", "."],
-                                      ["python3", "-m", "unittest"])
+            qa_bugs = qa.planted_bugs(QA_BUGS, [sys.executable, "-m", "compileall", "-q", "."],
+                                      [sys.executable, "-m", "unittest"])
         self.assertEqual([row["id"] for row in qa_bugs if row["killed"]], [b["id"] for b in QA_BUGS])
         acceptance = {"task_id": TASK, "decision": "accepted_development",
                       "evidence_sha256": sha256_file(results_file), "source_commit": results["head"],

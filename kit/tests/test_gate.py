@@ -36,6 +36,7 @@ PLAN = ("# Plan\n\n## Exact Commands\n\n"
         "$ python3 -c \"import calc; print(calc.add(1, 2))\"\n"
         "$ python3 -c \"import sys; sys.exit(3)\" # expect 3\n\n"
         "## Notes\n\n$ not-a-command\n")
+REVIEW = "# Review\n\n| 1 | SPEC names no failure mode | important | fixed |\n"
 PRODUCE = '''import os
 import sys
 from pathlib import Path
@@ -190,6 +191,7 @@ class HandbackBase(GitBase):
         put(self.root, "a", "a\n")
         put(self.root, f"program/tasks/{TASK}/SPEC.md", "# Spec\n")
         put(self.root, f"program/tasks/{TASK}/PLAN.md", PLAN)
+        put(self.root, f"program/tasks/{TASK}/review.md", REVIEW)  # the dispatch commit carries the spec-QA record
         self.write_checks()
         commit(self.root, "init")
         self.wt = self.root / ".worktrees" / TASK.lower()
@@ -974,26 +976,58 @@ class MergeCheckTests(HandbackBase):
 
 
 class ReviewRecordTests(HandbackBase):
-    """The spec-QA record `review.md` is frozen with the SPEC and the PLAN: both gates compare it with main's."""
+    """The spec-QA record `review.md` is frozen with the SPEC and the PLAN: both gates need it on main and
+    compare the branch's with it."""
 
     REVIEW = f"program/tasks/{TASK}/review.md"
     LINE = f"FAILED: review program/tasks/{TASK}/review.md differs from main"
+    MISSING = f"FAILED: review program/tasks/{TASK}/review.md is missing on main"
 
-    def dispatch_with_a_review(self):
+    def recheck_on_main(self):
         put(self.root, self.REVIEW, "# Review\n\n| 1 | SPEC names no failure mode | important | open |\n")
-        commit(self.root, "the spec-QA record")
+        commit(self.root, "the spec-QA record, re-checked")
         sh(self.wt, "git", "merge", "-q", "main")
         return sh(self.wt, "git", "rev-parse", "HEAD").strip()
 
-    def assert_both_gates_refuse(self):
+    def dispatch_without_a_review(self):
+        (self.root / self.REVIEW).unlink()
+        commit(self.root, "a dispatch that skipped spec QA")
+        sh(self.wt, "git", "merge", "-q", "main")
+
+    def assert_both_gates_refuse(self, line=None):
         for run in (self.handback, self.merge_check):
             rc, out = run()
-            self.assertEqual((rc, out.splitlines()[-1]), (1, self.LINE), run.__name__)
+            self.assertEqual((rc, out.splitlines()[-1]), (1, line or self.LINE), run.__name__)
             self.assertEqual([ln for ln in out.splitlines() if ln.startswith("step ")], [])  # before anything runs
             self.assert_no_trial_left()
 
+    def test_the_fixture_dispatch_carries_the_record_and_both_gates_pass(self):
+        self.assertEqual(sh(self.root, "git", "show", f"main:{self.REVIEW}"), REVIEW)
+        self.assertEqual(self.merge_check()[0], 0)
+        rc, out = self.handback()
+        self.assertEqual(rc, 0, out)
+
+    def test_a_task_dispatched_without_a_review_record_is_refused_by_both_gates(self):
+        self.dispatch_without_a_review()  # main and the branch agree: neither has one
+        self.assert_both_gates_refuse(self.MISSING)
+        put(self.root, self.REVIEW, REVIEW)
+        commit(self.root, "spec QA ran after all")
+        rc, out = self.handback()  # on main now, not yet in the task worktree
+        self.assertEqual((rc, out.splitlines()[-1]), (1, self.LINE))
+        self.assertEqual(self.merge_check()[0], 0)  # the trial merge carries main's record
+        sh(self.wt, "git", "merge", "-q", "main")
+        self.assertEqual(self.merge_check()[0], 0)
+        rc, out = self.handback()
+        self.assertEqual(rc, 0, out)
+
+    def test_a_missing_record_is_one_failed_line_from_the_command_too(self):
+        self.dispatch_without_a_review()
+        for argv in (("handback", TASK, "--branch", BRANCH), ("merge-check", "--branch", BRANCH)):
+            rc, out, err = self.run_cli(*argv)
+            self.assertEqual((rc, out, err), (1, self.MISSING + "\n", ""), argv)
+
     def test_a_branch_that_rewrites_the_review_record_is_refused_by_both_gates(self):
-        self.dispatch_with_a_review()
+        self.recheck_on_main()
         put(self.wt, self.REVIEW, "# Review\n\nNo findings.\n")
         commit(self.wt, "a kinder review")
         self.assert_both_gates_refuse()
@@ -1004,18 +1038,17 @@ class ReviewRecordTests(HandbackBase):
         self.assertEqual(rc, 0, out)
 
     def test_a_branch_that_removes_the_review_record_is_refused_by_both_gates(self):
-        self.dispatch_with_a_review()
         (self.wt / self.REVIEW).unlink()
         commit(self.wt, "drop the review")
         self.assert_both_gates_refuse()
 
     def test_a_branch_that_adds_a_review_record_main_does_not_have_is_refused_by_both_gates(self):
+        self.dispatch_without_a_review()
         put(self.wt, self.REVIEW, "# Review\n\nNo findings.\n")
         commit(self.wt, "a review of its own")
-        self.assert_both_gates_refuse()
+        self.assert_both_gates_refuse(self.MISSING)  # a branch cannot supply the record of its own dispatch
 
     def test_a_record_changed_on_main_alone_fails_until_the_branch_merges_main(self):
-        self.dispatch_with_a_review()
         put(self.root, self.REVIEW, "# Review\n\nRe-checked: resolved.\n")
         commit(self.root, "spec QA re-check")
         rc, out = self.handback()
@@ -1025,13 +1058,55 @@ class ReviewRecordTests(HandbackBase):
         self.assertEqual(rc, 0, out)
 
     def test_the_spec_and_the_plan_are_named_before_the_review_record(self):
-        self.dispatch_with_a_review()
         put(self.wt, self.REVIEW, "# Review\n\nNo findings.\n")
         put(self.wt, f"program/tasks/{TASK}/SPEC.md", "# Narrower\n")
         commit(self.wt, "both")
         rc, out = self.handback()
         self.assertEqual((rc, out.splitlines()[-1]),
                          (1, f"FAILED: spec program/tasks/{TASK}/SPEC.md differs from main"))
+
+
+class ByteOrderMarkTests(HandbackBase):
+    """A file saved with a leading UTF-8 byte-order mark reads the same from a git object as from the disk."""
+
+    BOM = b"\xef\xbb\xbf"
+
+    def put_on_main(self, name, text):
+        path = self.root / "program" / "tasks" / TASK / name
+        path.write_bytes(self.BOM + text.encode("utf-8"))
+        commit(self.root, f"{name} saved with a byte-order mark")
+        sh(self.wt, "git", "merge", "-q", "main")
+
+    def test_a_guarded_edit_line_on_the_first_line_of_a_marked_spec_counts(self):
+        put(self.wt, "pyproject.toml", "[project]\nname = 'x'\n")
+        commit(self.wt, "touch guarded")
+        self.put_on_main("SPEC.md", "Guarded edit: pyproject.toml\n")
+        rc, out = self.handback()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.merge_check()[0], 0)
+
+    def test_the_commands_of_a_marked_plan_that_opens_with_its_section_are_run(self):
+        self.put_on_main("PLAN.md", "## Exact Commands\n\n$ python3 -c pass\n")
+        rc, out = self.handback()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("step plan: ok", out.splitlines())
+
+    def test_a_marked_checks_file_on_main_is_read(self):
+        path = self.root / "program" / "checks.yaml"
+        path.write_bytes(self.BOM + path.read_bytes())
+        commit(self.root, "checks saved with a byte-order mark")
+        self.assertEqual(self.merge_check()[0], 0)
+
+    def test_binding_reads_a_marked_record(self):
+        rc, out = self.handback()
+        self.assertEqual(rc, 0, out)
+        record = self.wt / "program" / "evidence" / TASK / "results.json"
+        record.write_bytes(self.BOM + record.read_bytes())
+        commit(self.wt, "commit the evidence")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(gate.binding(self.root, TASK, BRANCH), [])
+        self.assertIn("binding holds", out.getvalue())
 
 
 class FixedMainTests(HandbackBase):

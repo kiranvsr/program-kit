@@ -3,9 +3,10 @@ import re
 import unittest
 from pathlib import Path
 
+import evidence
 import miniyaml
 from _tokens import FORBIDDEN
-from common import read_yaml
+from common import read_json, read_yaml
 
 TEMPLATES = Path(__file__).resolve().parent.parent / "templates"
 NEW_TEMPLATES = ("discovery.md", "product.md", "SPEC.md", "ARCHITECTURE.md", "adr.md", "roadmap.md",
@@ -108,6 +109,42 @@ class YamlTemplateTests(unittest.TestCase):
     def test_the_register_template_holds_no_placeholder_task(self):
         data = miniyaml.loads((TEMPLATES / "register.yaml").read_text(encoding="utf-8"))
         self.assertEqual(data, {"phases": []})
+
+
+class ResultsSchemaTests(unittest.TestCase):
+    """The planted-bug row fields the gate, the binding check and `done` require are required by the schema too."""
+
+    def row_schema(self) -> dict:
+        return read_json(TEMPLATES / "results.schema.json")["properties"]["planted_bugs"]["items"]
+
+    def test_the_required_row_fields_are_the_codes_own_list(self):
+        self.assertEqual(self.row_schema()["required"], [*evidence.ROW_KEYS, *evidence.PLANTED_KEYS])
+        self.assertEqual(evidence.PLANTED_KEYS, ("path", "find", "replace", "build_argv", "test_argv"))
+
+    def test_every_required_row_field_is_described_and_nothing_else_is(self):
+        items = self.row_schema()
+        self.assertEqual(sorted(items["properties"]), sorted(items["required"]))
+
+    def test_a_row_without_a_required_field_is_what_the_gate_refuses(self):
+        row = {"id": "flip", "builds": True, "killed": True, "kill_reason": "test failed",
+               "test_output_sha256": "0" * 64, "path": "calc.py", "find": "a + b", "replace": "a - b",
+               "build_argv": ["make"], "test_argv": ["make", "test"]}
+        self.assertEqual(sorted(row), sorted(self.row_schema()["required"]))
+        own = dict(row, id=evidence.SELF_TEST_ID, builds=False, killed=False, kill_reason="build failed",
+                   test_output_sha256="", find="", replace=evidence.BROKEN_LINE)
+        digest = "0" * 64
+        record = {"task_id": "T-1", "head": "a" * 40, "main": "b" * 40, "merge_base": "b" * 40,
+                  "produced_at": "2026-01-01T00:00:00Z", "inputs": {"calc.py": digest},
+                  "commands": [{"label": "unit", "argv": ["make", "test"], "exit": 0, "expected_exit": 0,
+                                "as_expected": True, "derived": {}, "output_sha256": digest, "output_tail": ""}],
+                  "planted_bugs": [row, own], "planted_bugs_all_killed": True, "all_commands_as_expected": True,
+                  "tree_unchanged_by_run": True, "stale": {"checked": False, "records": []}, "blocked_by": [],
+                  "deviations": []}
+        self.assertEqual(evidence.gate_problems(record, "T-1"), [])
+        for key in self.row_schema()["required"]:
+            with self.subTest(key=key):
+                stripped = dict(record, planted_bugs=[{k: v for k, v in row.items() if k != key}, own])
+                self.assertTrue(evidence.gate_problems(stripped, "T-1"), key)
 
 
 class HandoffTemplateTests(unittest.TestCase):

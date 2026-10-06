@@ -10,6 +10,7 @@ from unittest import mock
 
 import change
 import pk
+import register as register_module
 import trace as trace_module
 from common import KitError, write_json, write_yaml
 from test_register import reg, task
@@ -54,7 +55,8 @@ class ChangeBase(unittest.TestCase):
                 for p in sorted((self.program / "evidence").rglob("*")) if p.is_file()}
 
     def put_status(self, task_id, state):
-        record = {"task_id": task_id, "status": state, "role": "", "updated_at": "", "note": "",
+        role = "" if state == "not_started" else "qa" if state == "done" else "controller"
+        record = {"task_id": task_id, "status": state, "role": role, "updated_at": "", "note": "",
                   "evidence": [], "blocked_by": [], "history": []}
         write_json(self.program / "status" / f"{task_id}.json", record)
 
@@ -152,6 +154,37 @@ class CreateTests(ChangeBase):
         self.assertEqual(self.section(cr_id, "Change"), "use {why} and {id}")
         self.assertEqual(self.section(cr_id, "Why"), "{asked_by}")
         self.assertEqual(self.section(cr_id, "Asked by"), "{change}")
+
+
+class ByteOrderMarkTests(ChangeBase):
+    BOM = b"\xef\xbb\xbf"
+
+    def test_a_change_request_saved_with_a_byte_order_mark_reads_like_one_without(self):
+        cr_id = put_cr(self.root, 1)
+        path = self.path(cr_id)
+        text = path.read_bytes().replace(b"# CR-001\n\n", b"")  # starts on a heading, which a mark would hide
+        path.write_bytes(self.BOM + text)
+        self.assertEqual(change.section(change._read(self.root, cr_id)[1], "Change"), "a change")
+        change.impact(self.root, cr_id, ["REQ-001"])
+        change.approve(self.root, cr_id, "Grace")
+        change.apply(self.root, cr_id, "amended")
+        self.assertIn("amended", change.section(change._read(self.root, cr_id)[1], "Applied"))
+        self.assertEqual([r["id"] for r in change.open_requests(self.root)], [])
+
+    def test_a_template_with_a_byte_order_mark_does_not_put_one_in_the_request(self):
+        marked = self.root / "change_request.md"
+        marked.write_bytes(self.BOM + change.TEMPLATE.read_bytes())
+        with mock.patch("change.TEMPLATE", marked):
+            cr_id = self.make()
+        self.assertFalse(self.path(cr_id).read_bytes().startswith(self.BOM))
+
+    def test_an_unreadable_change_request_is_one_error_line(self):
+        cr_id = put_cr(self.root, 1)
+        self.path(cr_id).write_bytes(b"\xff\xfe")
+        with self.assertRaises(KitError) as caught:
+            change.approve(self.root, cr_id, "Grace")
+        self.assertTrue(str(caught.exception).startswith("cannot read "), str(caught.exception))
+        self.assertEqual(len(str(caught.exception).splitlines()), 1)
 
 
 class ImpactTests(ChangeBase):
@@ -257,20 +290,106 @@ class ApplyTests(ChangeBase):
         self.assertIn("already", str(caught.exception))
         self.assertEqual(log, (self.program / "changes" / "register-log.md").read_text())
 
-    def test_apply_with_trace_problems_leaves_applied_empty(self):
-        cr_id = self.approved()
-        matrix = full_matrix(tasks={T1: {"closes": ["REQ-001"]}})  # NFR-001 is no longer closed
-        write_yaml(self.program / "traceability.yaml", matrix)
+    def test_apply_with_trace_problems_writes_nothing(self):
+        cr_id = self.start_from_a_logged_register()
+        before, cr_text = self.snapshot(), self.text(cr_id)
+        write_yaml(self.program / "register.yaml", reg(task(T1, closes=["REQ-001"]), task(T2, closes=["J1"])))
+        trace_module.sync(self.root)  # NFR-001 is no longer closed by any task
         with self.assertRaises(KitError) as caught:
             change.apply(self.root, cr_id, "amended SPEC")
         self.assertIn("NFR-001", str(caught.exception))
-        self.assertEqual(self.section(cr_id, "Applied"), "")
-        # the register log is append-only: its entry stays
-        self.assertIn(f"{cr_id}: amended SPEC", (self.program / "changes" / "register-log.md").read_text())
-        write_yaml(self.program / "traceability.yaml", full_matrix(tasks={
-            T1: {"closes": ["REQ-001"]}, T3: {"closes": ["NFR-001"]}}))
+        self.assertTrue(str(caught.exception).startswith(f"{cr_id} not applied: "))
+        self.assertEqual(self.snapshot(), before)  # no log line, no regenerated brief
+        self.assertEqual(self.text(cr_id), cr_text)
+        write_yaml(self.program / "register.yaml",
+                   reg(task(T1, closes=["REQ-001"]), task(T2, closes=["J1"]), task(T3, closes=["NFR-001"])))
+        trace_module.sync(self.root)
         change.apply(self.root, cr_id, "amended SPEC, fixed")  # can be applied once the matrix is valid
         self.assertIn("fixed", self.section(cr_id, "Applied"))
+
+    def test_apply_with_a_register_the_briefs_cannot_render_writes_nothing(self):
+        cr_id = self.start_from_a_logged_register()
+        before, cr_text = self.snapshot(), self.text(cr_id)
+        write_yaml(self.program / "register.yaml", reg(
+            task(T1, closes=["REQ-001"]), task(T2, closes=["J1"]), task(T3, closes=["NFR-001"], text=5)))
+        with self.assertRaises(KitError):
+            change.apply(self.root, cr_id, "amended")
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(self.text(cr_id), cr_text)
+
+    def test_apply_rolls_back_when_the_change_request_cannot_be_written(self):
+        cr_id = self.start_from_a_logged_register()
+        before, cr_text = self.snapshot(), self.text(cr_id)
+        write_yaml(self.program / "register.yaml", reg(
+            task(T1, closes=["REQ-001"]), task(T2, closes=["J1"]), task(T3, closes=["NFR-001"], text="new text")))
+        with mock.patch("change.write_text", side_effect=KitError("cannot write: disk full")), \
+                self.assertRaises(KitError):
+            change.apply(self.root, cr_id, "amended")
+        self.assertEqual(self.snapshot(), before)  # the log line and the regenerated brief are taken back
+        self.assertEqual(self.text(cr_id), cr_text)
+        change.apply(self.root, cr_id, "amended")
+        self.assertIn("new text", self.snapshot()["program/briefs/tasks/" + T3 + ".md"].decode())
+
+    def snapshot(self):
+        """Every file under program/changes (the log) and program/briefs, as {path: bytes}."""
+        return {str(p.relative_to(self.root)): p.read_bytes() for folder in ("changes", "briefs")
+                for p in sorted((self.program / folder).rglob("*")) if p.is_file()}
+
+    def start_from_a_logged_register(self):
+        """An approved change request on a register whose briefs and log exist; returns its id."""
+        cr_id = self.approved()
+        register_module.change(self.root, "baseline")
+        return cr_id
+
+    def test_apply_refuses_a_register_change_that_was_not_synced_and_writes_nothing(self):
+        cr_id = self.start_from_a_logged_register()
+        before, cr_text = self.snapshot(), self.text(cr_id)
+        write_yaml(self.program / "register.yaml", reg(
+            task(T1, closes=["REQ-001"]), task(T2, closes=["J1"]), task(T3, closes=["NFR-001"]),
+            task("P1-M01-S01-T04", closes=["REQ-001"])))  # the follow-up task, never synced
+        with self.assertRaises(KitError) as caught:
+            change.apply(self.root, cr_id, "added the follow-up")
+        self.assertEqual(str(caught.exception),
+                         f"{cr_id} not applied: program/traceability.yaml: tasks section differs from the "
+                         "register; run pk trace sync")
+        self.assertEqual(self.snapshot(), before)  # no log line, no regenerated brief
+        self.assertEqual(self.text(cr_id), cr_text)
+        trace_module.sync(self.root)
+        change.apply(self.root, cr_id, "added the follow-up")
+        self.assertIn("added the follow-up", self.section(cr_id, "Applied"))
+        self.assertIn("P1-M01-S01-T04", self.snapshot()["program/briefs/CATALOG.md"].decode())
+
+    def test_apply_refuses_an_invalid_register_and_writes_nothing(self):
+        cr_id = self.start_from_a_logged_register()
+        before = self.snapshot()
+        write_yaml(self.program / "register.yaml", reg(
+            task(T1, closes=["REQ-001"]), task(T2, closes=["J1"]), task(T3, closes=["NFR-001"], size="L")))
+        with self.assertRaises(KitError) as caught:
+            change.apply(self.root, cr_id, "amended")
+        self.assertIn("program/register.yaml has 1 problem(s)", str(caught.exception))
+        self.assertIn("pk register validate", str(caught.exception))
+        self.assertEqual(len(str(caught.exception).splitlines()), 1)
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(self.section(cr_id, "Applied"), "")
+
+    def test_removing_the_only_task_closing_a_requirement_is_refused_before_and_after_the_sync(self):
+        cr_id = self.start_from_a_logged_register()
+        before = self.snapshot()
+        write_yaml(self.program / "register.yaml", reg(task(T1, closes=["REQ-001"]), task(T2, closes=["J1"])))
+        with self.assertRaises(KitError) as caught:
+            change.apply(self.root, cr_id, "dropped the task")
+        self.assertIn("run pk trace sync", str(caught.exception))  # the sync guard comes first
+        self.assertEqual(self.snapshot(), before)
+        trace_module.sync(self.root)
+        with self.assertRaises(KitError) as caught:
+            change.apply(self.root, cr_id, "dropped the task")
+        self.assertIn("NFR-001: first-release requirement is not closed by any task", str(caught.exception))
+        self.assertEqual(self.snapshot(), before)  # still nothing written
+        self.assertEqual(self.section(cr_id, "Applied"), "")
+        code, out, err = self.run_cli("change", "apply", cr_id, "--note", "dropped the task")
+        self.assertEqual((code, out), (1, ""))
+        self.assertTrue(err.startswith(f"error: {cr_id} not applied: ") and err.count("\n") == 1, err)
+        self.assertEqual(self.snapshot(), before)
 
     def test_apply_refuses_a_bad_note(self):
         cr_id = self.approved()
@@ -286,6 +405,16 @@ class ApplyTests(ChangeBase):
         change.apply(self.root, cr_id, "amended SPEC")
         self.assertEqual(self.evidence_digest(), self.before)
         self.assertNotIn("program/evidence", Path(change.__file__).read_text())
+
+
+class DocsTests(unittest.TestCase):
+    def test_the_playbook_and_the_design_say_that_apply_checks_the_sync_before_writing(self):
+        playbook = " ".join((KIT / "playbooks" / "10_change.md").read_text(encoding="utf-8").split())
+        design = " ".join((KIT.parent / "docs" / "DESIGN.md").read_text(encoding="utf-8").split())
+        self.assertIn("before it writes anything, when the register is invalid or the matrix's `tasks` section "
+                      "differs from what `pk trace sync` would write", playbook)
+        self.assertIn("Before it writes anything `pk change apply` checks that the register is valid, that the "
+                      "matrix's `tasks` section is what `pk trace sync` would write", design)
 
 
 class CliTests(ChangeBase):

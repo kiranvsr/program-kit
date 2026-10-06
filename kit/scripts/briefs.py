@@ -13,11 +13,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from string import Template
 
-from common import KitError, find_root, sha256_bytes, write_text
+from common import KitError, find_root, read_text, sha256_bytes, write_text
 from register import ID_PATTERNS, KINDS, load
 
 KIT_DIR = Path(__file__).resolve().parent.parent
@@ -98,11 +99,7 @@ def _children(node: dict, level: int) -> list[dict]:
 # --- rendering -------------------------------------------------------------------
 
 def _template(name: str) -> Template:
-    path = TEMPLATES / name
-    try:
-        return Template(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError) as exc:
-        raise KitError(f"cannot read template {path}: {getattr(exc, 'strerror', None) or exc}") from exc
+    return Template(read_text(TEMPLATES / name))
 
 
 def _fill(name: str, template: Template, values: dict[str, str]) -> str:
@@ -150,17 +147,66 @@ def render(root: Path) -> dict[str, bytes]:
     return data
 
 
+def _links(root: Path) -> list[str]:
+    """The brief directories (the tree and each of its four folders) that are symbolic links, as relative paths.
+
+    A generated tree never contains a link, and one is never followed: a brief written or removed through it
+    would land outside the tree.
+    """
+    root = Path(root)
+    found = [BRIEFS] if (root / BRIEFS).is_symlink() else []
+    if not found:
+        found = [f"{BRIEFS}/{sub}" for sub in SUBDIRS.values() if (root / BRIEFS / sub).is_symlink()]
+    return found
+
+
 def _stale(root: Path, wanted) -> list[str]:
-    """Files under the four brief directories that the register no longer produces."""
-    found = []
+    """Paths under the four brief directories that the register no longer produces; a linked directory is one path."""
+    links = _links(root)
+    found = list(links)
+    if BRIEFS in links:
+        return found
     for sub in SUBDIRS.values():
         folder = Path(root) / BRIEFS / sub
-        if folder.is_dir():
+        if f"{BRIEFS}/{sub}" not in links and folder.is_dir():
             for entry in sorted(folder.iterdir()):
                 rel = f"{BRIEFS}/{sub}/{entry.name}"
                 if (entry.is_file() or entry.is_symlink()) and rel not in wanted:
                     found.append(rel)
     return found
+
+
+def snapshot(root: Path) -> dict[str, bytes]:
+    """Every regular file under the brief tree as {path relative to root (posix): bytes}; links are not followed."""
+    root = Path(root)
+    found = {}
+    for folder, _, names in os.walk(root / BRIEFS):
+        for name in names:
+            path = Path(folder) / name
+            if not path.is_symlink():
+                try:
+                    found[path.relative_to(root).as_posix()] = path.read_bytes()
+                except OSError as exc:
+                    raise KitError(f"cannot read {path}: {exc.strerror or exc}") from exc
+    return found
+
+
+def restore(root: Path, saved: dict[str, bytes]) -> None:
+    """Put the brief tree back as `snapshot` saw it: files rewritten or removed, directories that came with them removed."""
+    root = Path(root)
+    for rel, data in saved.items():
+        try:
+            if (root / rel).read_bytes() == data:
+                continue
+        except OSError:
+            pass
+        write_text(root / rel, data.decode("utf-8"))
+    for rel in snapshot(root):
+        if rel not in saved:
+            (root / rel).unlink()
+    for folder, _, _ in os.walk(root / BRIEFS, topdown=False):
+        if not os.listdir(folder) and not any(Path(folder) in (root / r).parents for r in saved):
+            os.rmdir(folder)
 
 
 # --- public interface ------------------------------------------------------------
@@ -169,6 +215,9 @@ def generate(root: Path) -> list[Path]:
     """Write the brief tree; remove briefs the register no longer has. Returns the written paths, sorted."""
     root = Path(root)
     files = render(root)  # everything is built before the first write
+    links = _links(root)
+    if links:
+        raise KitError(f"{links[0]}: is a symbolic link; generated briefs are never links, remove it")
     try:
         for rel, data in sorted(files.items()):
             path = root / rel
@@ -190,7 +239,10 @@ def check(root: Path) -> list[str]:
     root = Path(root)
     files = render(root)
     problems = []
+    links = _links(root)
     for rel, data in sorted(files.items()):
+        if any(rel.startswith(link + "/") for link in links):
+            continue  # a linked directory is reported once below, never read through
         try:
             current = (root / rel).read_bytes()
         except FileNotFoundError:
@@ -200,8 +252,14 @@ def check(root: Path) -> list[str]:
             raise KitError(f"cannot read {root / rel}: {exc.strerror or exc}") from exc
         if current != data:
             problems.append(f"{rel}: differs from the register")
-    problems += [f"{rel}: not generated from the register" for rel in _stale(root, files)]
-    if problems:
+    drift = len(problems)
+    for rel in _stale(root, files):
+        if rel in links:
+            problems.append(f"{rel}: is a symbolic link; generated briefs are never links")
+        else:
+            problems.append(f"{rel}: not generated from the register")
+            drift += 1
+    if drift:  # a link is not drift from the register: it gets its own line and no freeze hint
         approval = root / "program" / "approvals" / "stage-6.json"
         log = root / "program" / "changes" / "register-log.md"
         if approval.exists() and not (log.exists() and log.stat().st_mtime_ns > approval.stat().st_mtime_ns):

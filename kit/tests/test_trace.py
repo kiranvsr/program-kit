@@ -55,7 +55,8 @@ class TraceBase(unittest.TestCase):
         write_yaml(self.root / "program" / "register.yaml", reg(*tasks))
 
     def put_status(self, task_id, state):
-        record = {"task_id": task_id, "status": state, "role": "", "updated_at": "", "note": "",
+        role = "" if state == "not_started" else "qa" if state == "done" else "controller"
+        record = {"task_id": task_id, "status": state, "role": role, "updated_at": "", "note": "",
                   "evidence": [], "blocked_by": [], "history": []}
         write_json(self.root / "program" / "status" / f"{task_id}.json", record)
 
@@ -326,6 +327,42 @@ class ImpactTests(TraceBase):
         self.assertEqual(result["gates"], ["G-P1"])  # via the record path; C10 in G-P1 claims is not C1
         self.assertEqual(result["tasks"], {"done": [], "in_flight": [], "not_started": [T3]})
         self.assertEqual(trace_module.impact(self.root, ["C1"])["gates"], ["G-P0"])  # C1 is not C10
+
+    def test_impact_refuses_a_gate_entry_of_the_wrong_shape_naming_it(self):
+        gates = GATES["gates"]["G-P0"]
+        cases = (("gates.yaml", {"gates": {"G-P0": "closed"}}, "program/gates.yaml: G-P0 must be a mapping"),
+                 ("gates.yaml", {"gates": {"G-P0": dict(gates, claims="REQ-001 works")}},
+                  "program/gates.yaml: G-P0: claims must be a list of strings"),
+                 ("gates.yaml", {"gates": {"G-P0": dict(gates, claims=[1])}},
+                  "program/gates.yaml: G-P0: claims must be a list of strings"),
+                 ("gates.yaml", {"gates": {"G-P0": dict(gates, records="g.json")}},
+                  "program/gates.yaml: G-P0: records must be a list of strings or mappings"),
+                 ("gates.yaml", {"gates": {"G-P0": dict(gates, records=[["x"]])}},
+                  "program/gates.yaml: G-P0: records must be a list of strings or mappings"),
+                 ("gates.yaml", {"gates": ["G-P0"]}, "program/gates.yaml: 'gates' must be a mapping"),
+                 ("gates.yaml", ["G-P0"], "program/gates.yaml: expected a mapping"))
+        for name, data, message in cases:
+            with self.subTest(message=message):
+                self.put(data, name)
+                with self.assertRaises(KitError) as caught:
+                    trace_module.impact(self.root, ["REQ-001"])
+                self.assertEqual(str(caught.exception), message)
+                code, out, err = self.run_cli("trace", "impact", "REQ-001")
+                self.assertEqual((code, out, err), (1, "", f"error: {message}\n"))
+        self.put(GATES, "gates.yaml")
+        matrix_gates = {"G-P0": {"claims": "REQ-001 works", "records": []}}
+        self.put(full_matrix(gates=matrix_gates))
+        with self.assertRaises(KitError) as caught:
+            trace_module.impact(self.root, ["REQ-001"])
+        self.assertEqual(str(caught.exception), "program/traceability.yaml: G-P0: claims must be a list of strings")
+        self.put(full_matrix(gates={"G-P0": ["REQ-001"]}))
+        with self.assertRaises(KitError) as caught:
+            trace_module.impact(self.root, ["REQ-001"])
+        self.assertEqual(str(caught.exception), "program/traceability.yaml: G-P0 must be a mapping")
+
+    def test_impact_accepts_empty_gate_entries_and_fields(self):
+        self.put({"gates": {"G-P0": None, "G-P1": {"claims": None, "records": None}}}, "gates.yaml")
+        self.assertEqual(trace_module.impact(self.root, ["G-P0"])["gates"], ["G-P0"])
 
     def test_impact_of_a_gate_and_mixed_ids(self):
         result = trace_module.impact(self.root, ["G-P2", "NFR-001", "J2"])

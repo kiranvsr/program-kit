@@ -26,7 +26,7 @@ import status as status_module
 import trace as trace_module
 import worktree as worktree_module
 import register as register_module
-from common import KitError, find_root, git, primary_branch_problem, read_json, write_text
+from common import KitError, find_root, git, primary_branch_problem, read_json, read_text, write_text
 
 START, END = "<!-- generated:start -->", "<!-- generated:end -->"
 COMMIT_PREFIX = "Commit: "
@@ -158,11 +158,11 @@ def _split(text: str) -> tuple[int, int]:
 def _read(root: Path) -> tuple[Path, str]:
     path = Path(root) / "program" / "HANDOFF.md"
     try:
-        return path, path.read_bytes().decode("utf-8")
-    except FileNotFoundError:
-        raise KitError("program/HANDOFF.md not found; run: pk init") from None
-    except (OSError, UnicodeDecodeError) as exc:
-        raise KitError(f"cannot read {path}: {getattr(exc, 'strerror', None) or exc}") from exc
+        return path, read_text(path, newline="")  # line endings as they are: the file is written back
+    except KitError as exc:
+        if isinstance(exc.__cause__, FileNotFoundError):
+            raise KitError("program/HANDOFF.md not found; run: pk init") from None
+        raise
 
 
 def check(root: Path) -> bool:

@@ -4,8 +4,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import secrets
 import subprocess
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -57,21 +57,34 @@ def _atomic_write(path: Path, text: str) -> None:
         raise KitError(f"cannot write {path}: text is not encodable as UTF-8") from exc
 
 
+def new_file(directory: Path, prefix: str) -> tuple[int, str]:
+    """A new, exclusively created file in `directory`: (open descriptor, path).
+
+    It gets the mode any new file gets (0666 narrowed by the umask, applied by the system), so the process
+    umask is never read or changed. The name is this call's alone: process id and a random part.
+    """
+    while True:
+        name = os.path.join(directory, f"{prefix}{os.getpid()}.{secrets.token_hex(8)}.tmp")
+        try:
+            return os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o666), name
+        except FileExistsError:
+            continue
+
+
 def _write_through_temp(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        mode = path.stat().st_mode & 0o777
+        mode = path.stat().st_mode & 0o777  # a file that exists keeps its mode
     except FileNotFoundError:
-        umask = os.umask(0)
-        os.umask(umask)
-        mode = 0o666 & ~umask
-    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+        mode = None
+    fd, tmp_name = new_file(path.parent, f".{path.name}.")
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
-        os.chmod(tmp_name, mode)
+        if mode is not None:
+            os.chmod(tmp_name, mode)
         os.replace(tmp_name, path)
     except BaseException:
         try:
@@ -90,20 +103,30 @@ def write_text(path: Path, text: str) -> None:
     _atomic_write(path, text)
 
 
-def _read_text(path: Path) -> str:
-    """The file's text; a leading UTF-8 byte-order mark (common in files saved by other tools) is dropped."""
+def drop_bom(text: str) -> str:
+    """`text` without a leading UTF-8 byte-order mark (common in files saved by other tools)."""
+    return text[1:] if text.startswith("\ufeff") else text
+
+
+def read_text(path: Path, *, newline: str | None = None) -> str:
+    """The file's text, UTF-8, without a leading byte-order mark: the one reader for every file the kit reads as text.
+
+    A file that cannot be read or is not UTF-8 is a KitError naming the path. Line endings are translated to
+    `\\n` as `open` does; pass `newline=""` to get them as they are on disk.
+    """
     try:
-        text = Path(path).read_text(encoding="utf-8")
+        with open(path, encoding="utf-8", newline=newline) as handle:
+            text = handle.read()
     except (OSError, UnicodeDecodeError) as exc:
         reason = exc.strerror if isinstance(exc, OSError) and exc.strerror else exc
         raise KitError(f"cannot read {path}: {reason}") from exc
-    return text[1:] if text.startswith("\ufeff") else text
+    return drop_bom(text)
 
 
 def read_yaml(path: Path):
     import miniyaml  # lazy: miniyaml imports KitError from this module
 
-    text = _read_text(path)
+    text = read_text(path)
     try:
         return miniyaml.loads(text)
     except miniyaml.YAMLError as exc:
@@ -123,7 +146,7 @@ def write_yaml(path: Path, data) -> None:
 
 
 def read_json(path: Path):
-    text = _read_text(path)
+    text = read_text(path)
     try:
         return json.loads(text)
     except ValueError as exc:
@@ -141,7 +164,11 @@ def write_json(path: Path, data) -> None:
 
 
 def git(root: Path, *args: str) -> str:
-    """Run git in `root`; return stripped stdout, raise KitError with stderr on failure."""
+    """Run git in `root`; return stripped stdout, raise KitError on failure.
+
+    The error names git's own `fatal:` or `error:` line, else its first line: from stderr, from stdout when
+    stderr is blank, and `exit N` when both are.
+    """
     try:
         proc = subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True,
                               encoding="utf-8", errors="replace")
@@ -150,7 +177,8 @@ def git(root: Path, *args: str) -> str:
     except ValueError as exc:  # an argument git cannot be given, such as one with a NUL byte
         raise KitError("git: invalid argument") from exc
     if proc.returncode != 0:
-        lines = [ln.strip() for ln in (proc.stderr or proc.stdout).splitlines() if ln.strip()]
+        said = proc.stderr if proc.stderr.strip() else proc.stdout  # some failures are reported on stdout only
+        lines = [ln.strip() for ln in said.splitlines() if ln.strip()]
         reason = next((ln for ln in lines if ln.startswith(("fatal:", "error:"))),
                       lines[0] if lines else f"exit {proc.returncode}")
         raise KitError(f"git {' '.join(args)} failed: {reason}")

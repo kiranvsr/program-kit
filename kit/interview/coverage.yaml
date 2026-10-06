@@ -9,6 +9,7 @@
 # Lens ids: architect, engineering, program, project, delivery.
 #
 # Tags that conditions may test with has:<tag>. A ledger entry carries a tag when the stated thing is true.
+# A tag counts from every kind of ledger entry, including an unanswered question and an unconfirmed assumption: switching a conditional topic on too early is the safe direction.
 condition_tags:
   - regulated          # the product operates in a regulated industry
   - personal_data      # the product stores or processes personal data

@@ -300,6 +300,49 @@ class StatusTests(unittest.TestCase):
         write_json(self.record_path(), dict(FULL, history=[entry], evidence=["a"], blocked_by=["b"]))
         self.assertEqual(status.read(self.root, TID)["history"], [entry])
 
+    def test_history_entries_have_the_shape_the_schema_gives(self):
+        entry = {"status": "in_progress", "role": "controller", "at": "2026-01-01T00:00:00Z"}
+        cases = ((dict(entry, status="shipped"), "history entry 2: unknown status 'shipped'"),
+                 (dict(entry, role="boss"), "history entry 2: unknown role 'boss'"),
+                 (dict(entry, extra=1), "history entry 2: unknown field(s) extra"),
+                 ([entry], "history entry 2: must be an object"))
+        for bad, problem in cases:
+            with self.subTest(problem=problem):
+                write_json(self.record_path(), dict(FULL, history=[entry, bad]))
+                with self.assertRaises(KitError) as ctx:
+                    status.read(self.root, TID)
+                self.assertEqual(str(ctx.exception), f"{self.record_path()}: {problem}")
+                self.assertEqual(status.validate(self.root), [f"{TID}: {problem}"])
+
+    def test_a_field_the_schema_does_not_name_is_refused(self):
+        write_json(self.record_path(), dict(FULL, owner="someone", zeta=1))
+        self.assertEqual(status.validate(self.root), [f"{TID}: unknown field(s) owner, zeta"])
+        with self.assertRaisesRegex(KitError, r"unknown field\(s\) owner, zeta"):
+            status.read(self.root, TID)
+
+    def test_every_shape_problem_is_reported_not_only_the_first(self):
+        entry = {"status": "in_progress", "role": "controller", "at": "2026-01-01T00:00:00Z"}
+        record = {"task_id": 5, "status": "shipped", "role": "controller", "updated_at": "",
+                  "evidence": ["a", 1, None], "blocked_by": "X-1",
+                  "history": [entry, {"status": "gone", "role": 7}, "x"]}
+        expected = ["missing field(s) note",
+                    "unknown status 'shipped'",
+                    "task_id must be text, not 5",
+                    "evidence item 2 must be text, not 1",
+                    "evidence item 3 must be text, not None",
+                    "blocked_by must be a list",
+                    "history entry 2: missing at",
+                    "history entry 2: unknown status 'gone'",
+                    "history entry 2: unknown role 7",
+                    "history entry 3: must be an object"]
+        write_json(self.record_path(), record)
+        self.assertEqual(status.validate(self.root), [f"{TID}: {problem}" for problem in expected])
+        for reader in (lambda: status.read(self.root, TID), lambda: status.list_all(self.root),
+                       lambda: status.transition(self.root, TID, "review", "implementer")):
+            with self.assertRaises(KitError) as ctx:
+                reader()
+            self.assertEqual(str(ctx.exception), f"{self.record_path()}: " + "; ".join(expected))  # one line
+
     def test_done_is_terminal(self):
         self.to_review()
         status.transition(self.root, TID, "done", "qa", evidence=[self.evidence()])
@@ -385,6 +428,47 @@ class StatusTests(unittest.TestCase):
         for bad in ("../x.json", "program/../../x.json", outside):
             self.refused("evidence path", TID, "in_progress", "controller", evidence=[bad])
         self.assertFalse((self.root / "program" / "status").exists())
+
+    def test_evidence_path_through_a_symlink_that_leaves_the_root_is_refused(self):
+        outside = self.root.parent / f"{self.root.name}-outside"
+        outside.mkdir()
+        self.addCleanup(lambda: [p.unlink() for p in outside.iterdir()] and None or outside.rmdir())
+        (outside / "acceptance.json").write_text("{}", encoding="utf-8")
+        (self.root / "program" / "evidence").mkdir(parents=True)
+        (self.root / "program" / "evidence" / "away").symlink_to(outside, target_is_directory=True)
+        (self.root / "program" / "evidence" / "file-away.json").symlink_to(outside / "acceptance.json")
+        for bad in ("program/evidence/away/acceptance.json", "program/evidence/away/not-there.json",
+                    "program/evidence/file-away.json", str(self.root / "program/evidence/away/acceptance.json")):
+            with self.subTest(bad=bad):
+                self.refused("evidence path .* leaves the project root through a symbolic link",
+                             TID, "in_progress", "controller", evidence=[bad])
+        self.assertFalse((self.root / "program" / "status").exists())
+
+    def test_evidence_path_through_a_symlink_that_stays_inside_is_kept_as_written(self):
+        real = self.root / "program" / "evidence" / TID
+        real.mkdir(parents=True)
+        (real / "notes.txt").write_text("n", encoding="utf-8")
+        (self.root / "latest").symlink_to(real, target_is_directory=True)
+        (self.root / "loop").symlink_to("loop")
+        rec = status.transition(self.root, TID, "in_progress", "controller", evidence=["latest/notes.txt"])
+        self.assertEqual(rec["evidence"], ["latest/notes.txt"])
+        self.assertEqual(status.validate(self.root), [])
+        try:  # a link that loops leads nowhere outside; an interpreter that cannot resolve it gives one line
+            status.transition(self.root, TID, "blocked", "controller", blocked_by=["X"], evidence=["loop/x.json"])
+        except KitError as exc:
+            self.assertRegex(str(exc), r"\Aevidence path loop/x\.json cannot be resolved: .+\Z")
+
+    def test_validate_reports_a_stored_evidence_path_that_leaves_the_root(self):
+        outside = self.root.parent / f"{self.root.name}-elsewhere"
+        outside.mkdir()
+        self.addCleanup(lambda: [p.unlink() for p in outside.iterdir()] and None or outside.rmdir())
+        (outside / "x.json").write_text("{}", encoding="utf-8")
+        (self.root / "away").symlink_to(outside, target_is_directory=True)
+        write_json(self.record_path(), dict(FULL, evidence=["away/x.json", f"../{outside.name}/x.json"]))
+        problems = status.validate(self.root)
+        self.assertEqual(len(problems), 2, problems)
+        self.assertIn("away/x.json leaves the project root through a symbolic link", problems[0])
+        self.assertIn("must not contain '..'", problems[1])
 
     def test_wrong_shape_record_is_a_kit_error_not_a_traceback(self):
         full = dict(FULL)
@@ -486,15 +570,15 @@ class StatusCliTests(unittest.TestCase):
         path = self.root / "program" / "status" / f"{TID}.json"
         write_json(path, dict(FULL, task_id=5, role=7))
         before = path.read_bytes()
-        for argv in (("status", "list"), ("status", "show", TID), ("status", "validate"),
+        for argv in (("status", "list"), ("status", "show", TID),
                      ("status", "set", TID, "review", "--role", "implementer")):
             with self.subTest(argv=argv):
                 rc, out, err = self.run_pk(*argv)
                 self.assertEqual((rc, out), (1, ""))
-                self.assertTrue(err.startswith("error: "), err)
-                self.assertEqual(err.count("\n"), 1, err)
-                self.assertIn("task_id", err)
-                self.assertNotIn("Traceback", err)
+                self.assertEqual(err, f"error: {path}: task_id must be text, not 5; role must be text, not 7\n")
+        rc, out, err = self.run_pk("status", "validate")  # validate gives each problem its own line
+        self.assertEqual((rc, out), (1, ""))
+        self.assertEqual(err, f"error: {TID}: task_id must be text, not 5\nerror: {TID}: role must be text, not 7\n")
         self.assertEqual(path.read_bytes(), before)
         write_json(path, dict(FULL, role=7))
         rc, out, err = self.run_pk("status", "list")
@@ -535,8 +619,27 @@ class StatusCliTests(unittest.TestCase):
         write_json(path, rec)
         rc, out, err = self.run_pk("status", "validate")
         self.assertEqual((rc, out), (1, ""))
-        self.assertEqual(err.count("\n"), 1)
-        self.assertIn("unknown status 'shipped'", err)
+        self.assertEqual(err, f"error: {TID}: unknown status 'shipped'\n")
+        rec["evidence"] = [3]
+        write_json(path, rec)
+        write_json(path.with_name("A-1.json"), dict(FULL, task_id="A-1", status="blocked"))
+        rc, out, err = self.run_pk("status", "validate")
+        self.assertEqual((rc, out), (1, ""))
+        self.assertEqual(err.splitlines(), ["error: A-1: blocked without blocked_by",
+                                            f"error: {TID}: unknown status 'shipped'",
+                                            f"error: {TID}: evidence item 1 must be text, not 3"])
+
+    def test_an_evidence_path_that_leaves_through_a_symlink_is_one_error_line(self):
+        outside = self.root.parent / f"{self.root.name}-outside"
+        outside.mkdir()
+        self.addCleanup(outside.rmdir)
+        (self.root / "away").symlink_to(outside, target_is_directory=True)
+        rc, out, err = self.run_pk("status", "set", TID, "in_progress", "--role", "controller",
+                                   "--evidence", "away/acceptance.json")
+        self.assertEqual((rc, out), (1, ""))
+        self.assertEqual(err, "error: evidence path away/acceptance.json leaves the project root through a "
+                              "symbolic link\n")
+        self.assertFalse((self.root / "program" / "status").exists())
 
 
 if __name__ == "__main__":

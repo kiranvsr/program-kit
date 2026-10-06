@@ -25,7 +25,7 @@ Give a task its SPEC and PLAN when it reaches the front of the queue, not before
 5. If the task needs an environment marked `exists: false`, name it in the SPEC as unclaimable and keep the task `blocked_by` that environment.
 6. Start a spec-QA agent (not the author; `kit/briefs/spec_qa.md`). It reviews both files against the register text, the architecture and the traceability matrix, and writes `program/tasks/<ID>/review.md` as a finding-to-fix table.
 7. The author fixes. The reviewer re-checks only the findings. Repeat until accepted.
-8. Leave SPEC.md, PLAN.md and review.md uncommitted in the controller's checkout. The controller commits them to main together with the task's `in_progress` status as one dispatch commit, before the worktree is created (`08_execute.md`, step 3). The implementer never edits its own PLAN.
+8. Leave SPEC.md, PLAN.md and review.md uncommitted in the controller's checkout. The controller commits them to main together with the task's `in_progress` status as one dispatch commit, before the worktree is created (`08_execute.md`, step 3). The implementer never edits its own PLAN. All three are required: a task dispatched without its `review.md` on main fails the hand-back gate and the merge check, and the branch cannot add it.
 
 ## Outputs
 
@@ -33,7 +33,7 @@ Give a task its SPEC and PLAN when it reaches the front of the queue, not before
 
 ## Done when
 
-The spec-QA agent has accepted the SPEC and PLAN and `pk register validate` still passes.
+The spec-QA agent has accepted the SPEC and PLAN, its `review.md` is written and `pk register validate` still passes.
 
 ## Next playbook
 

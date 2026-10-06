@@ -25,7 +25,7 @@ Project owns phase shaping, capacity and parking. Architect, program, delivery a
 8. Run `pk briefs generate`, then `pk briefs check`. The briefs under `program/briefs/` are generated and immutable once approved.
 9. Write back, get corrections, run `pk interview report 6`.
 10. Challenge round: `pk interview challenge 6`, each lens in its own session, every row resolved or deferred with an owner and a date.
-11. Run `pk interview validate`, get the user's approval, then run `pk interview approve 6`. It refuses a register edited since step 7 until `pk trace sync` has run again. This freezes the register and, with it, the whole ledger: from here any ledger change makes stage 6 modified.
+11. Run `pk interview validate`, get the user's approval, then run `pk interview approve 6`. It refuses a register edited since step 7 until `pk trace sync` has run again, and briefs generated before an edit to the register until `pk briefs generate` has run again. This freezes the register and, with it, the whole ledger: from here any ledger change makes stage 6 modified.
 
 ## Outputs
 

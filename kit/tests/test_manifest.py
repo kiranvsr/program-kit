@@ -79,6 +79,23 @@ class ManifestTests(unittest.TestCase):
         path.write_bytes(good)
         self.assertEqual(manifest.check(self.kit), [])
 
+    def test_a_leading_byte_order_mark_is_ignored_but_crlf_still_is_not(self):
+        manifest.write(self.kit)
+        path = self.kit / "MANIFEST.sha256"
+        good = path.read_bytes()
+        path.write_bytes(b"\xef\xbb\xbf" + good)  # saved again by an editor that marks UTF-8
+        self.assertEqual(manifest.check(self.kit), [])
+        (self.kit / "a.txt").write_text("changed\n")
+        self.assertEqual(manifest.check(self.kit), ["modified: a.txt"])
+        path.write_bytes(b"\xef\xbb\xbf" + good.replace(b"\n", b"\r\n"))
+        with self.assertRaisesRegex(KitError, "line 1: malformed manifest line"):
+            manifest.check(self.kit)
+        path.write_bytes(b"\xff\xfe" + good)
+        with self.assertRaises(KitError) as ctx:
+            manifest.check(self.kit)
+        self.assertTrue(str(ctx.exception).startswith(f"cannot read {path}: "), ctx.exception)
+        self.assertNotIn("\n", str(ctx.exception))
+
     def test_cli_write_and_check(self):
         def run(*argv):
             out, err = io.StringIO(), io.StringIO()

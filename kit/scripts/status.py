@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 from pathlib import Path
 
 import evidence as evidence_module
@@ -58,17 +59,25 @@ def _record_path(root: Path, task_id: str) -> Path:
 def _norm(root: Path, path: str) -> str:
     """Evidence path as stored: relative to root, posix separators, no `./` parts.
 
-    A `..` component or an absolute path outside the root is refused.
+    A `..` component, an absolute path outside the root and a path that leaves the root through a symbolic
+    link are refused. A link that stays inside the root is fine, and the path is stored as it was written.
     """
+    base = Path(root).resolve()
     candidate = Path(path)
     if candidate.is_absolute():
         try:
-            candidate = candidate.relative_to(Path(root).resolve())
+            candidate = candidate.relative_to(base)
         except ValueError:
             raise KitError(f"evidence path {path} is outside the project root") from None
     parts = [part for part in candidate.as_posix().split("/") if part not in ("", ".")]
     if ".." in parts:
         raise KitError(f"evidence path {path} must not contain '..'")
+    try:
+        resolved = base.joinpath(*parts).resolve()
+    except (OSError, RuntimeError, ValueError) as exc:  # a link that loops, or a name the system refuses
+        raise KitError(f"evidence path {path} cannot be resolved: {getattr(exc, 'strerror', None) or exc}") from exc
+    if resolved != base and base not in resolved.parents:
+        raise KitError(f"evidence path {path} leaves the project root through a symbolic link")
     return "/".join(parts)
 
 
@@ -77,28 +86,60 @@ def _blank(task_id: str) -> dict:
             "evidence": [], "blocked_by": [], "history": []}
 
 
-def _shape_problem(record) -> str | None:
-    """Why `record` is not a usable status record, or None. Shared by read and validate."""
+def _entry_problems(entry) -> list[str]:
+    """What is wrong with one history entry, in the terms of status.schema.json (empty when nothing is)."""
+    if not isinstance(entry, dict):
+        return ["must be an object"]
+    problems = []
+    missing = [key for key in _ENTRY_FIELDS if key not in entry]
+    if missing:
+        problems.append(f"missing {', '.join(missing)}")
+    for key, known in (("status", STATUSES), ("role", ROLES)):
+        if key in entry and (not isinstance(entry[key], str) or entry[key] not in known):
+            problems.append(f"unknown {key} {entry[key]!r}")
+    if "at" in entry and not isinstance(entry["at"], str):
+        problems.append(f"at must be text, not {entry['at']!r}")
+    unknown = sorted(str(key) for key in entry if key not in _ENTRY_FIELDS)
+    if unknown:
+        problems.append(f"unknown field(s) {', '.join(unknown)}")
+    return problems
+
+
+def _shape_problems(record) -> list[str]:
+    """Every reason `record` is not the record status.schema.json describes, one line each; empty when it is.
+
+    Shared by read and validate. Nothing stops at the first problem: each field is checked on its own, down to
+    the items of `evidence` and `blocked_by` and the entries of `history`.
+    """
     if not isinstance(record, dict):
-        return "not a status record (expected a JSON object)"
+        return ["not a status record (expected a JSON object)"]
+    problems = []
     missing = [field for field in _FIELDS if field not in record]
     if missing:
-        return f"missing field(s) {', '.join(missing)}"
-    if not isinstance(record["status"], str) or record["status"] not in STATUSES:
-        return f"unknown status {record['status']!r}"
+        problems.append(f"missing field(s) {', '.join(missing)}")
+    unknown = sorted(str(key) for key in record if key not in _FIELDS)
+    if unknown:
+        problems.append(f"unknown field(s) {', '.join(unknown)}")
+    if "status" in record and (not isinstance(record["status"], str) or record["status"] not in STATUSES):
+        problems.append(f"unknown status {record['status']!r}")
     for field in _TEXT_FIELDS:
-        if not isinstance(record[field], str):
-            return f"{field} must be text, not {record[field]!r}"
+        if field in record and not isinstance(record[field], str):
+            problems.append(f"{field} must be text, not {record[field]!r}")
+    role = record.get("role")
+    if isinstance(role, str) and role not in ROLES and not (role == "" and record.get("status") == "not_started"):
+        problems.append(f"unknown role {role!r}")  # empty only on a record nobody has set yet
     for field in ("evidence", "blocked_by", "history"):
+        if field not in record:
+            continue
         if not isinstance(record[field], list):
-            return f"{field} must be a list"
-    for field in ("evidence", "blocked_by"):
-        if not all(isinstance(item, str) for item in record[field]):
-            return f"{field} must be a list of text items"
-    for number, entry in enumerate(record["history"], 1):
-        if not isinstance(entry, dict) or not all(isinstance(entry.get(key), str) for key in _ENTRY_FIELDS):
-            return f"history entry {number} must be an object with text {', '.join(_ENTRY_FIELDS)}"
-    return None
+            problems.append(f"{field} must be a list")
+        elif field == "history":
+            problems.extend(f"history entry {number}: {problem}" for number, entry in enumerate(record[field], 1)
+                            for problem in _entry_problems(entry))
+        else:
+            problems.extend(f"{field} item {number} must be text, not {item!r}"
+                            for number, item in enumerate(record[field], 1) if not isinstance(item, str))
+    return problems
 
 
 def read(root: Path, task_id: str) -> dict:
@@ -106,9 +147,9 @@ def read(root: Path, task_id: str) -> dict:
     if not path.exists():
         return _blank(task_id)
     record = read_json(path)
-    problem = _shape_problem(record)
-    if problem:
-        raise KitError(f"{path}: {problem}")
+    problems = _shape_problems(record)
+    if problems:
+        raise KitError(f"{path}: {'; '.join(problems)}")
     return record
 
 
@@ -232,22 +273,28 @@ def validate(root: Path) -> list[str]:
         except KitError as exc:
             problems.append(f"{name}: {exc}")
             continue
-        problem = _shape_problem(record)
-        if problem:
-            problems.append(f"{name}: {problem}")
+        shape = _shape_problems(record)
+        if shape:
+            problems.extend(f"{name}: {problem}" for problem in shape)
             continue
         if record["task_id"] != name:
             problems.append(f"{name}: task_id {record['task_id']!r} does not match the file name")
         state = record["status"]
-        evidence = record["evidence"]
-        for item in evidence:
-            if not isinstance(item, str) or not (root / item).is_file():
+        evidence = []  # the stored paths that stay inside the project
+        for item in record["evidence"]:
+            try:
+                _norm(root, item)
+            except KitError as exc:
+                problems.append(f"{name}: {exc}")
+                continue
+            evidence.append(item)
+            if not (root / item).is_file():
                 problems.append(f"{name}: evidence file missing: {item}")
         if state == "blocked" and not record["blocked_by"]:
             problems.append(f"{name}: blocked without blocked_by")
         if state == "done":
             try:
-                problem = _acceptance_problem(root, name, [item for item in evidence if isinstance(item, str)])
+                problem = _acceptance_problem(root, name, evidence)
             except KitError as exc:
                 problem = f"{name}: {exc}"
             if problem:
@@ -272,8 +319,10 @@ def cmd_status(args: argparse.Namespace) -> int:
             print("\t".join([record["task_id"], record["status"], record["role"], record["updated_at"]]))
     elif action == "validate":
         problems = validate(_root())
+        for problem in problems:  # each on its own line, like every other check that can find several
+            print("error: " + " ".join(problem.split()), file=sys.stderr)
         if problems:
-            raise KitError("; ".join(problems))
+            return 1
         print("status: ok")
     else:
         raise KitError("status needs an action: set, show, list or validate")

@@ -22,7 +22,7 @@ from pathlib import Path
 
 import register as register_module
 import trace as trace_module
-from common import KitError, find_root, utc_now, write_text
+from common import KitError, find_root, read_text, utc_now, write_text
 
 TEMPLATE = Path(__file__).resolve().parent.parent / "templates" / "change_request.md"
 HEADINGS = ("Change", "Why", "Asked by", "Impact", "Approval", "Applied")
@@ -89,12 +89,9 @@ def _path(root: Path, cr_id: str) -> Path:
 
 def _read(root: Path, cr_id: str) -> tuple[Path, str]:
     path = _path(root, cr_id)
-    try:
-        return path, path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        raise KitError(f"{cr_id}: no such change request (program/changes/{cr_id}.md)") from None
-    except (OSError, UnicodeDecodeError) as exc:
-        raise KitError(f"cannot read {path}: {getattr(exc, 'strerror', None) or exc}") from exc
+    if not path.exists():
+        raise KitError(f"{cr_id}: no such change request (program/changes/{cr_id}.md)")
+    return path, read_text(path)
 
 
 def _create_exclusive(path: Path, text: str) -> bool:
@@ -134,10 +131,7 @@ def create(root: Path, title: str, why: str, asked_by: str) -> str:
     title = _text("title", title)
     why = _text("why", why, one_line=False)
     asked_by = _text("asked-by", asked_by)
-    try:
-        template = TEMPLATE.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as exc:
-        raise KitError(f"cannot read {TEMPLATE}: {getattr(exc, 'strerror', None) or exc}") from exc
+    template = read_text(TEMPLATE)
     for _ in range(_ATTEMPTS):
         cr_id = _next_id(root)
         values = {"id": cr_id, "change": title, "why": why, "asked_by": asked_by}
@@ -189,12 +183,14 @@ def approve(root: Path, cr_id: str, by: str) -> None:
 
 
 def apply(root: Path, cr_id: str, note: str) -> None:
-    """Record the register change, check the matrix at stage 6, then fill Applied.
+    """Check the register and the matrix at stage 6, record the register change, then fill Applied.
 
-    Refused without Approval or when already applied. The register log entry
-    (`<CR-id>: <note>`) is written first and the log is append-only, so when the matrix
-    check reports problems the entry stays, Applied stays empty and KitError lists the
-    problems; apply again after fixing them (which appends a further log line).
+    Refused without Approval or when already applied. Every check runs before anything is written: the register
+    must be valid, the matrix's copy of the tasks must equal what `pk trace sync` would write (the stage 6
+    requirement check reads that copy), `trace.validate` at stage 6 must pass and the briefs must render. When
+    one fails KitError says why and the register log, the briefs and the change request are as they were. Only
+    then are the log line (`<CR-id>: <note>`) and the briefs written and Applied filled; if a write fails part-way
+    the log and the briefs are put back.
     """
     note = _text("note", note)
     path, text = _read(root, cr_id)
@@ -202,12 +198,19 @@ def apply(root: Path, cr_id: str, note: str) -> None:
         raise KitError(f"{cr_id} is already applied")
     if not section(text, "Approval", cr_id):
         raise KitError(f"{cr_id} is not approved; apply needs an Approval")
-    register_module.change(root, f"{cr_id}: {note}")
+    invalid = register_module.problems_in(root)
+    if invalid:
+        raise KitError(f"{cr_id} not applied: program/register.yaml has {len(invalid)} problem(s); "
+                       "run pk register validate")
+    unsynced = trace_module.unsynced(root)
+    if unsynced:
+        raise KitError(f"{cr_id} not applied: {unsynced[0]}")
     problems = trace_module.validate(root, 6)
     if problems:
         raise KitError(f"{cr_id} not applied: traceability at stage 6 has {len(problems)} problem(s): "
-                       + "; ".join(problems) + ". The register log entry stays (the log is append-only)")
-    write_text(path, _replace(text, "Applied", f"{utc_now()[:10]}: {note}", cr_id))
+                       + "; ".join(problems))
+    register_module.change(root, f"{cr_id}: {note}",
+                           after=lambda: write_text(path, _replace(text, "Applied", f"{utc_now()[:10]}: {note}", cr_id)))
 
 
 def open_requests(root: Path) -> list[dict]:

@@ -87,6 +87,36 @@ class RegisterTests(unittest.TestCase):
         acyclic = self.messages(reg(task(a), task(b, depends_on=[a]), task(c, depends_on=[a, b])))
         self.assertEqual(acyclic, [])
 
+    def test_a_cycle_is_one_line_however_many_edges_close_it(self):
+        a, b, c = "P1-M01-S01-T01", "P1-M01-S01-T02", "P1-M01-S01-T03"
+        everyone = reg(task(a, depends_on=[b, c]), task(b, depends_on=[a, c]), task(c, depends_on=[a, b]))
+        lines = [p for p in self.messages(everyone) if p.startswith("cycle")]
+        self.assertEqual(len(lines), 1, lines)
+        for ident in (a, b, c):  # a path through two of them, then the rest named
+            self.assertIn(ident, lines[0])
+        # members come out in a stable order, whatever order the register lists the tasks in
+        shuffled = self.messages(reg(task(c, depends_on=[a]), task(a, depends_on=[b]), task(b, depends_on=[c])))
+        self.assertEqual(shuffled, [f"cycle: {a} -> {b} -> {c} -> {a}"])
+        # two separate cycles are two lines, the one holding the smaller ID first
+        d, e = "P1-M01-S01-T04", "P1-M01-S01-T05"
+        pairs = self.messages(reg(task(e, depends_on=[d]), task(d, depends_on=[e]), task(b, depends_on=[a]),
+                                  task(a, depends_on=[b])))
+        self.assertEqual(pairs, [f"cycle: {a} -> {b} -> {a}", f"cycle: {d} -> {e} -> {d}"])
+        # a task that only depends on a cycle is not part of it
+        self.assertEqual(self.messages(reg(task(a, depends_on=[b]), task(b, depends_on=[a]), task(c, depends_on=[a]))),
+                         [f"cycle: {a} -> {b} -> {a}"])
+
+    def test_a_list_field_that_is_absent_or_null_is_not_reported(self):
+        tid = "P1-M01-S01-T01"
+        without = task(tid)
+        for field in ("depends_on", "closes", "environments", "blocked_by"):
+            without.pop(field, None)
+        self.assertEqual(self.messages(reg(without), ENVS), [])
+        nulled = task(tid, depends_on=None, closes=None, environments=None, blocked_by=None)
+        self.assertEqual(self.messages(reg(nulled), ENVS), [])
+        wrong = self.messages(reg(task(tid, closes="REQ-001")))
+        self.assertEqual(wrong, [f"{tid}: closes must be a list of strings"])
+
     def test_cycle_detection_does_not_recurse(self):
         ids = [f"P1-M01-S01-T{n}" for n in range(1, 3001)]
         chain = [task(ids[n], depends_on=[ids[n + 1]] if n + 1 < len(ids) else [ids[0]]) for n in range(len(ids))]
