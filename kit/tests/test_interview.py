@@ -54,6 +54,10 @@ class InterviewBase(unittest.TestCase):
         path.write_text(text, encoding="utf-8")
         return path
 
+    def challenge(self, stage):
+        """The (empty) challenge report of `stage`; stages 2 and later cannot be approved without one."""
+        return interview.challenge_init(self.root, stage)
+
     def states(self, stage=1):
         return interview.topic_states(self.root, stage)
 
@@ -156,7 +160,7 @@ class CoverageTests(InterviewBase):
                 interview.load_coverage(self.root, other)
             self.assertIn(needle, str(ctx.exception))
         with self.assertRaises(KitError):
-            interview.load_coverage(self.root / "nowhere")  # no kit/ here and no default file at the kit itself
+            interview.load_coverage(self.root, self.root / "missing.yaml")
 
 
 class StoppingRuleTests(InterviewBase):
@@ -196,21 +200,52 @@ class StoppingRuleTests(InterviewBase):
         with self.assertRaises(KitError):
             interview.challenge_init(self.root, 1)  # never overwrites
 
+    def test_missing_challenge_report_blocks_from_stage_2(self):
+        self.put_ledger(CLOSING + [entry("F-3", topics=["T2.1"])])
+        self.assertEqual(interview.stopping_rule(self.root, 1), [])  # stage 1 has no challenge round
+        self.assertEqual(interview.stopping_rule(self.root, 2), ["stage-2-challenge.md: missing"])
+        self.challenge(2)
+        self.assertEqual(interview.stopping_rule(self.root, 2), [])
+
+    def test_invalid_ledger_is_listed_first_and_blocks_approval(self):
+        artifact = self.write("program/discovery.md")
+        self.put_ledger(CLOSING + [entry("F-3", source="S9"), entry("Q-9", blocking=True)])
+        expected = ["F-3: source S9 is not in sources", "Q-9: blocking question unanswered"]
+        self.assertEqual(interview.stopping_rule(self.root, 1), expected)
+        with self.assertRaises(KitError) as ctx:
+            interview.approve(self.root, 1, [artifact])
+        self.assertEqual(str(ctx.exception), "; ".join(expected))
+        self.assertFalse((self.root / "program" / "approvals").exists())
+
+    def test_only_facts_decisions_and_confirmed_assumptions_answer_a_question(self):
+        base = CLOSING + [entry("Q-3", blocking=True)]
+        for answerer, answered in ((entry("F-3", answers=["Q-3"]), True), (entry("D-3", answers=["Q-3"]), True),
+                                   (entry("A-3", answers=["Q-3"], confirmed=True), True),
+                                   (entry("A-3", answers=["Q-3"]), False),
+                                   (entry("Q-4", answers=["Q-3"]), False)):
+            self.put_ledger(base + [answerer])
+            self.assertEqual(interview.stopping_rule(self.root, 1),
+                             [] if answered else ["Q-3: blocking question unanswered"], answerer["id"])
+
     def test_unconfirmed_assumption_blocks_stage_5(self):
         self.put_ledger([entry("A-4", topics=["T2.1"]), entry("A-5", topics=["T2.1"], confirmed=True)])
+        for stage in (4, 5, 6):
+            self.challenge(stage)
         self.assertEqual(interview.stopping_rule(self.root, 4), [])
         with mock.patch("trace.validate", return_value=[]):
             self.assertEqual(interview.stopping_rule(self.root, 5), ["A-4: assumption unconfirmed at stage 5"])
             self.assertEqual(interview.stopping_rule(self.root, 6), ["A-4: assumption unconfirmed at stage 6"])
 
     def test_stage_5_and_6_include_trace_problems(self):
+        self.challenge(5)
         with mock.patch("trace.validate", return_value=["REQ-001: names no component"]) as validate:
             self.assertEqual(interview.stopping_rule(self.root, 5), ["REQ-001: names no component"])
             validate.assert_called_once_with(self.root, 5)
-            self.assertEqual(interview.stopping_rule(self.root, 4), [])
+            self.assertEqual(interview.stopping_rule(self.root, 4), ["stage-4-challenge.md: missing"])
 
     def test_stage_7_includes_register_problems_when_register_exists(self):
-        self.assertEqual(interview.stopping_rule(self.root, 7), [])
+        self.challenge(7)
+        self.assertEqual(interview.stopping_rule(self.root, 7), ["program/register.yaml: missing"])
         write_yaml(self.root / "program" / "register.yaml", {"phases": [{"id": "P1", "title": "a", "milestones": []}]})
         with mock.patch("register.validate", return_value=["P1: has no milestones"]):
             self.assertEqual(interview.stopping_rule(self.root, 7), ["P1: has no milestones"])
@@ -265,22 +300,46 @@ class ApprovalTests(InterviewBase):
         artifact.unlink()
         self.assertEqual(interview.next_stage(self.root), 1)
 
-    def test_next_stage_detects_changed_ledger_and_returns_8_when_all_current(self):
+    def test_ledger_changes_only_matter_after_the_freeze(self):
         artifact = self.approve_one()
+        # stages 1 to 4 compare artifact hashes only
         self.put_ledger(CLOSING + [entry("F-9", tags=["extra"])])
-        self.assertEqual(interview.next_stage(self.root), 1)
-        interview.approve(self.root, 1, [artifact])
-        # a later stage's work grows the ledger without invalidating earlier approvals
-        self.put_ledger(CLOSING + [entry("F-9"), entry("F-10", topics=["T2.1"])])
+        self.assertEqual(interview.next_stage(self.root), 2)
         product = self.write("program/product.md")
+        self.challenge(2)
+        stage2 = CLOSING + [entry("F-9"), entry("F-10", topics=["T2.1"])]
+        self.put_ledger(stage2)
         interview.approve(self.root, 2, [product])
+        # entries added while working on stage 3 do not make stage 2 stale
+        self.put_ledger(stage2 + [entry("F-11")])
         self.assertEqual(interview.next_stage(self.root), 3)
-        for stage in range(3, 8):
-            with mock.patch("trace.validate", return_value=[]):
-                interview.approve(self.root, stage, [product])
+        for stage in (3, 4):
+            self.challenge(stage)
+            interview.approve(self.root, stage, [product])
+        self.put_ledger(stage2 + [entry("F-11"), entry("F-12")])
+        self.assertEqual(interview.next_stage(self.root), 5)
+        self.challenge(5)
+        with mock.patch("trace.validate", return_value=[]):
+            interview.approve(self.root, 5, [product])
+            self.assertEqual(interview.next_stage(self.root), 6)
+            self.put_ledger(stage2 + [entry("F-11"), entry("F-12"), entry("F-14")])  # a change after the freeze
+            self.assertEqual(interview.next_stage(self.root), 5)
+            self.put_ledger(stage2 + [entry("F-11"), entry("F-12")])
+            self.challenge(6)
+            interview.approve(self.root, 6, [product])
+            self.challenge(7)
+            write_yaml(self.root / "program" / "register.yaml", {"phases": []})
+            with mock.patch("register.validate", return_value=[]):
+                interview.approve(self.root, 7, [product])
         self.assertEqual(interview.next_stage(self.root), 8)
-        self.put_ledger(CLOSING + [entry("F-9"), entry("F-10", topics=["T2.1"]), entry("F-11")])
+        # a ledger change after the freeze makes the highest frozen approval stale, and only that one
+        self.put_ledger(stage2 + [entry("F-11"), entry("F-12"), entry("F-13")])
         self.assertEqual(interview.next_stage(self.root), 7)
+        # an artifact change is caught at any stage
+        self.put_ledger(stage2 + [entry("F-11"), entry("F-12")])
+        self.assertEqual(interview.next_stage(self.root), 8)
+        artifact.write_text("changed\n", encoding="utf-8")
+        self.assertEqual(interview.next_stage(self.root), 1)
 
     def test_amend_rehashes_and_reports_changed_paths(self):
         artifact = self.approve_one()
@@ -336,6 +395,27 @@ class LedgerValidateTests(InterviewBase):
         self.assertEqual(interview.ledger_validate(self.root),
                          ["F-1: kind must be fact, assumption, decision or question"])
 
+    def test_ledger_validate_field_types_and_sources(self):
+        no_tags, no_text, str_tags = entry("F-1"), entry("F-2"), entry("F-3")
+        del no_tags["tags"]
+        str_tags["tags"] = "a"
+        no_text["text"] = " "
+        sources = {"S1": {"kind": "user", "ref": "m", "at": "t"}, "S2": {"kind": "guess", "ref": "m", "at": "t"},
+                   "S3": {"kind": "user", "ref": 5}, "S4": "x"}
+        self.put_ledger([no_tags, no_text, str_tags, entry("Q-1"),
+                         entry("F-4", answers=["Q-1", "Q-7", "F-1"]), entry("F-5", answers="Q-1"),
+                         entry("Q-2", answered="yes")], sources=sources)
+        self.assertEqual(interview.ledger_validate(self.root), [
+            "S2: source kind must be user, document or inference",
+            "S3: source ref must be a string", "S3: source at must be a string",
+            "S4: source must be a mapping",
+            "F-1: tags must be a list of strings", "F-2: text must be a non-empty string",
+            "F-3: tags must be a list of strings",
+            "F-4: answers Q-7 which is not a question in the ledger",
+            "F-4: answers F-1 which is not a question in the ledger",
+            "F-5: answers must be a list of question ids",
+            "Q-2: answered must be true or false"])
+
     def test_wrong_shape_raises(self):
         for data in ([], {"sources": {}, "entries": {}}, {"sources": [], "entries": []},
                      {"sources": {}, "entries": ["F-1"]}):
@@ -382,6 +462,17 @@ class SourceTests(InterviewBase):
         self.assertRegex(record["at"], r"\A\d{4}-\d\d-\d\dT")
         self.assertEqual(interview.ingest(self.root, doc), "S3")
 
+    def test_ingest_failure_leaves_no_orphan_and_ledger_unchanged(self):
+        doc = self.write("incoming/notes.md", "hello\n")
+        with mock.patch("interview.write_yaml", side_effect=KitError("boom")):
+            with self.assertRaises(KitError):
+                interview.ingest(self.root, doc)
+        self.assertEqual(list((self.root / "program" / "sources").iterdir()), [])
+        self.assertEqual(read_yaml(self.root / "program" / "ledger.yaml")["sources"], SOURCES)
+        self.assertEqual(len(list((self.root / "program" / "sources").iterdir())), 0)
+        self.assertEqual(interview.ingest(self.root, doc), "S2")
+        self.assertEqual(len(list((self.root / "program" / "sources").iterdir())), 1)
+
     def test_ingest_refusals(self):
         bad_name = self.write("incoming/-weird name.txt")
         with self.assertRaises(KitError):
@@ -409,6 +500,9 @@ class ReplayTests(InterviewBase):
         artifacts.mkdir()
         (artifacts / "discovery.md").write_text("d\n", encoding="utf-8")
         (artifacts / "product.md").write_text("p\n", encoding="utf-8")
+        (artifacts / "reports").mkdir()
+        (artifacts / "reports" / "stage-2-challenge.md").write_text(
+            "# challenge\n\n| # | Finding | Severity | Resolution |\n|---|---|---|---|\n", encoding="utf-8")
         return recorded, artifacts
 
     def test_replay_approves_in_order_and_stops_on_first_gap(self):
@@ -430,6 +524,23 @@ class ReplayTests(InterviewBase):
         self.assertEqual(str(ctx.exception), "replay stopped at stage 2: T2.1: required topic open (missing: any fact, confirmed assumption or decision)")
         self.assertTrue((self.root / "program" / "approvals" / "stage-1.json").exists())
         self.assertFalse((self.root / "program" / "approvals" / "stage-2.json").exists())
+
+    def test_replay_stops_without_a_challenge_report_and_refuses_reserved_names(self):
+        recorded, artifacts = self.make_inputs(CLOSING + [entry("F-3", topics=["T2.1"])])
+        (artifacts / "reports" / "stage-2-challenge.md").unlink()
+        with self.assertRaises(KitError) as ctx:
+            interview.replay(self.root, recorded, artifacts)
+        self.assertEqual(str(ctx.exception), "replay stopped at stage 2: stage-2-challenge.md: missing")
+        for name in ("ledger.yaml", "approvals"):
+            shutil.rmtree(self.root / "program")
+            (self.root / "program").mkdir()
+            target = artifacts / name
+            target.mkdir() if name == "approvals" else target.write_text("x", encoding="utf-8")
+            with self.assertRaises(KitError) as ctx:
+                interview.replay(self.root, recorded, artifacts)
+            self.assertIn(name, str(ctx.exception))
+            self.assertEqual(list((self.root / "program").iterdir()), [])  # nothing written
+            shutil.rmtree(target) if name == "approvals" else target.unlink()
 
     def test_replay_rejects_invalid_ledger_and_missing_artifact(self):
         recorded, artifacts = self.make_inputs([entry("F-1", source="S9")])

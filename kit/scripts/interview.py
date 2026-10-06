@@ -11,9 +11,11 @@ artifact and ledger hashes in `program/approvals/stage-N.json`, and `next_stage`
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import string
 import sys
+import tempfile
 from pathlib import Path
 
 from common import (KitError, find_root, read_json, read_yaml, sha256_bytes, sha256_file, utc_now, write_json,
@@ -23,10 +25,12 @@ KIT_DIR = Path(__file__).resolve().parent.parent
 LENSES = ("architect", "engineering", "program", "project", "delivery")
 STAGES = range(1, 8)
 LAST_REPLAY_STAGE = 6
+FREEZE_STAGE = 5
 MAX_SOURCE_BYTES = 20 * 1024 * 1024
 CHALLENGE_HEADER = "| # | Finding | Severity | Resolution |"
 STATES = ("closed", "open", "deferred", "not_applicable")
 
+SOURCE_KINDS = ("user", "document", "inference")
 _KIND_PREFIX = {"fact": "F", "assumption": "A", "decision": "D", "question": "Q"}
 _ENTRY_ID = re.compile(r"([FADQ])-(\d+)\Z")
 _SOURCE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
@@ -245,6 +249,17 @@ def _problems(coverage: dict, ledger: dict) -> list[str]:
     topics = {topic for stage in coverage["stages"].values() for topic in stage["topics"]}
     sources = ledger["sources"]
     problems: list[str] = []
+    for source_id, record in sources.items():
+        if not isinstance(record, dict):
+            problems.append(f"{source_id}: source must be a mapping")
+            continue
+        if record.get("kind") not in SOURCE_KINDS:
+            problems.append(f"{source_id}: source kind must be {', '.join(SOURCE_KINDS[:-1])} or {SOURCE_KINDS[-1]}")
+        for field in ("ref", "at"):
+            if not isinstance(record.get(field), str):
+                problems.append(f"{source_id}: source {field} must be a string")
+    question_ids = {item["id"] for item in ledger["entries"]
+                    if isinstance(item.get("id"), str) and item["id"].startswith("Q-")}
     seen: set[str] = set()
     for position, item in enumerate(ledger["entries"], 1):
         who = _label(item, position)
@@ -264,6 +279,20 @@ def _problems(coverage: dict, ledger: dict) -> list[str]:
             problems.append(f"{who}: topics must be a non-empty list")
         else:
             problems.extend(f"{who}: topic {t} is not in the coverage map" for t in listed if t not in topics)
+        tags = item.get("tags")
+        if not isinstance(tags, list) or not all(isinstance(tag, str) for tag in tags):
+            problems.append(f"{who}: tags must be a list of strings")
+        if not _nonempty_string(item.get("text")):
+            problems.append(f"{who}: text must be a non-empty string")
+        if "answers" in item:
+            answers = item["answers"]
+            if not isinstance(answers, list) or not all(isinstance(a, str) for a in answers):
+                problems.append(f"{who}: answers must be a list of question ids")
+            else:
+                problems.extend(f"{who}: answers {a} which is not a question in the ledger"
+                                for a in answers if a not in question_ids)
+        if "answered" in item and not isinstance(item["answered"], bool):
+            problems.append(f"{who}: answered must be true or false")
         if "source" not in item or item["source"] in (None, ""):
             problems.append(f"{who}: source is missing")
         elif item["source"] not in sources:
@@ -340,11 +369,13 @@ def _answers(item: dict) -> list[str]:
 
 
 def _unanswered(entries: list[dict]) -> set[str]:
-    """IDs of questions with neither `answered: true` nor a later fact or decision listing them in `answers`."""
+    """IDs of questions with neither `answered: true` nor a later fact, decision or confirmed assumption
+    listing them in `answers` (a later question or unconfirmed assumption does not answer)."""
     later: set[str] = set()
     open_ids: set[str] = set()
     for item in reversed(entries):
-        if item.get("kind") in ("fact", "decision"):
+        if item.get("kind") in ("fact", "decision") or (item.get("kind") == "assumption"
+                                                         and item.get("confirmed") is True):
             later.update(_answers(item))
         elif item.get("kind") == "question" and item.get("answered") is not True and item.get("id") not in later:
             open_ids.add(str(item.get("id")))
@@ -357,8 +388,6 @@ def _challenge_path(root: Path, stage: int) -> Path:
 
 def _unresolved_findings(path: Path) -> int:
     """Rows of the findings tables whose Resolution cell (the last one) is empty."""
-    if not path.exists():
-        return 0
     try:
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
@@ -380,7 +409,7 @@ def _register_problems(root: Path) -> list[str]:
     import register as register_module
 
     if not (Path(root) / "program" / "register.yaml").exists():
-        return []
+        return ["program/register.yaml: missing"]
     environments_path = Path(root) / "program" / "environments.yaml"
     environments = read_yaml(environments_path) if environments_path.exists() else None
     roles = read_yaml(KIT_DIR / "interview" / "roles.yaml")
@@ -391,8 +420,9 @@ def stopping_rule(root: Path, stage: int) -> list[str]:
     """Reasons `stage` cannot be approved, each starting with a topic or entry ID or a file name."""
     coverage = load_coverage(root)
     topics = _stage(coverage, stage)["topics"]
-    entries = _load_ledger(root)["entries"]
-    reasons: list[str] = []
+    ledger = _load_ledger(root)
+    entries = ledger["entries"]
+    reasons: list[str] = _problems(coverage, ledger)
     for topic_id, state in topic_states(root, stage).items():
         if state["state"] == "open" and topics[topic_id]["required"]:
             missing = ", ".join(state["missing"]) or "any fact, confirmed assumption or decision"
@@ -401,10 +431,14 @@ def stopping_rule(root: Path, stage: int) -> list[str]:
     for item in _stage_questions(entries, topics):
         if item.get("blocking") is True and str(item.get("id")) in unanswered:
             reasons.append(f"{item.get('id')}: blocking question unanswered")
-    findings = _unresolved_findings(_challenge_path(root, stage))
-    if findings:
-        noun = "finding" if findings == 1 else "findings"
-        reasons.append(f"stage-{stage}-challenge.md: {findings} {noun} unresolved")
+    challenge = _challenge_path(root, stage)
+    if challenge.exists():
+        findings = _unresolved_findings(challenge)
+        if findings:
+            noun = "finding" if findings == 1 else "findings"
+            reasons.append(f"stage-{stage}-challenge.md: {findings} {noun} unresolved")
+    elif stage >= 2:  # stage 1 has no challenge round; every later stage needs its report
+        reasons.append(f"stage-{stage}-challenge.md: missing")
     if stage >= 5:
         reasons.extend(f"{item.get('id')}: assumption unconfirmed at stage {stage}" for item in entries
                        if item.get("kind") == "assumption" and item.get("confirmed") is not True)
@@ -542,13 +576,16 @@ def _stale(root: Path, record, check_ledger: bool) -> bool:
 def next_stage(root: Path) -> int:
     """First stage 1..7 that is unapproved or whose approved files changed; 8 when all are current.
 
-    The ledger grows during later stages, so its hash is compared only for the latest approval.
+    The ledger grows while stages 1 to 4 are worked, so their approvals compare artifact hashes only. After the
+    freeze (stage 5 on) a ledger change is a change request: the ledger hash is compared for the highest approval
+    of stage 5 or later.
     """
     approved = [stage for stage in STAGES if _approval_path(root, stage).exists()]
+    frozen = [stage for stage in approved if stage >= FREEZE_STAGE]
     for stage in STAGES:
         if stage not in approved:
             return stage
-        if _stale(root, read_json(_approval_path(root, stage)), check_ledger=stage == approved[-1]):
+        if _stale(root, read_json(_approval_path(root, stage)), check_ledger=bool(frozen) and stage == frozen[-1]):
             return stage
     return STAGES[-1] + 1
 
@@ -600,13 +637,28 @@ def ingest(root: Path, file: Path) -> str:
     source_id = f"S{max(numbers, default=0) + 1}"
     stored = Path(root) / "program" / "sources" / f"{sha256_bytes(data)[:12]}-{source.name}"
     stored.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        stored.write_bytes(data)
-    except OSError as exc:
-        raise KitError(f"cannot write {stored}: {exc.strerror or exc}") from exc
     ledger["sources"][source_id] = {"kind": "document", "ref": stored.relative_to(Path(root)).as_posix(),
                                     "at": utc_now()}
-    write_yaml(_ledger_path(root), ledger)
+    temp = None
+    try:
+        descriptor, temp_name = tempfile.mkstemp(dir=stored.parent, prefix=".ingest.", suffix=".tmp")
+        temp = Path(temp_name)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(data)
+        mask = os.umask(0)
+        os.umask(mask)
+        os.chmod(temp, 0o666 & ~mask)
+        write_yaml(_ledger_path(root), ledger)
+        os.replace(temp, stored)
+        temp = None
+    except OSError as exc:
+        raise KitError(f"cannot write {stored}: {exc.strerror or exc}") from exc
+    finally:
+        if temp is not None:
+            try:
+                temp.unlink()
+            except FileNotFoundError:
+                pass
     return source_id
 
 
@@ -623,6 +675,9 @@ def replay(root: Path, ledger: Path, artifacts_dir: Path) -> None:
         raise KitError("ledger invalid: " + "; ".join(problems))
     if not artifacts_dir.is_dir():
         raise KitError(f"{artifacts_dir}: not a directory")
+    for reserved in ("ledger.yaml", "approvals"):
+        if (artifacts_dir / reserved).exists() or (artifacts_dir / reserved).is_symlink():
+            raise KitError(f"{artifacts_dir}: must not contain {reserved}")
     copies = []
     for source in sorted(artifacts_dir.rglob("*")):
         relative = source.relative_to(artifacts_dir)
@@ -637,9 +692,6 @@ def replay(root: Path, ledger: Path, artifacts_dir: Path) -> None:
     for stage, info in coverage["stages"].items():
         if stage > LAST_REPLAY_STAGE:
             continue
-        reasons = stopping_rule(root, stage)
-        if reasons:
-            raise KitError(f"replay stopped at stage {stage}: " + "; ".join(reasons))
         try:
             approve(root, stage, [root / "program" / relative for relative in info["artifacts"]])
         except KitError as exc:
