@@ -116,8 +116,10 @@ def git(root: Path, *args: str) -> str:
     except OSError as exc:
         raise KitError(f"cannot run git: {exc.strerror or exc}") from exc
     if proc.returncode != 0:
-        detail = (proc.stderr.strip() or proc.stdout.strip()).splitlines()
-        raise KitError(f"git {' '.join(args)} failed: {detail[-1] if detail else 'exit ' + str(proc.returncode)}")
+        lines = [ln.strip() for ln in (proc.stderr or proc.stdout).splitlines() if ln.strip()]
+        reason = next((ln for ln in lines if ln.startswith(("fatal:", "error:"))),
+                      lines[0] if lines else f"exit {proc.returncode}")
+        raise KitError(f"git {' '.join(args)} failed: {reason}")
     return proc.stdout.strip()
 
 

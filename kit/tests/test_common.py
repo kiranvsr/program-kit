@@ -110,8 +110,11 @@ class CommonTests(unittest.TestCase):
 
     def test_git_raises_kiterror_with_stderr(self):
         common.git(self.tmp, "init", "-q")
-        with self.assertRaisesRegex(KitError, "nope"):
+        with self.assertRaises(KitError) as ctx:
             common.git(self.tmp, "rev-parse", "nope")
+        # "ambiguous argument" appears only in git's stderr, not in the echoed args
+        self.assertRegex(str(ctx.exception), r"fatal: .*(ambiguous argument|unknown revision)")
+        self.assertNotIn("\n", str(ctx.exception))
 
 
 if __name__ == "__main__":
