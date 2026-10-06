@@ -1,0 +1,29 @@
+# Commands the gate runs, as argv lists (never a shell). This is the python preset with the unit tests
+# pointed at src/. scan needs gitleaks on the PATH.
+build:
+  - - python3
+    - '-m'
+    - compileall
+    - '-q'
+    - .
+test:
+  - - python3
+    - '-m'
+    - unittest
+    - discover
+    - '-s'
+    - src
+scan:
+  - - python3
+    - '-m'
+    - pip
+    - check
+  - - gitleaks
+    - detect
+    - '--no-git'
+compile_check: []
+extra_gate: []
+guarded_files:
+  - pyproject.toml
+  - requirements.txt
+  - program/checks.yaml

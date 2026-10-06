@@ -1,0 +1,88 @@
+journeys:
+  J1:
+    title: Operator checks the service is alive
+    requirements:
+      - REQ-001
+      - REQ-004
+  J2:
+    title: Developer echoes a JSON message
+    requirements:
+      - REQ-002
+      - REQ-003
+      - REQ-004
+      - REQ-005
+requirements:
+  REQ-001:
+    title: GET /health answers 200 with status ok
+    journeys:
+      - J1
+    components:
+      - C1
+  REQ-002:
+    title: POST /echo returns the JSON it was sent
+    journeys:
+      - J2
+    components:
+      - C1
+  REQ-003:
+    title: POST /echo refuses a body that is not JSON
+    journeys:
+      - J2
+    components:
+      - C1
+  REQ-004:
+    title: Unknown path is 404, wrong method is 405
+    journeys:
+      - J1
+      - J2
+    components:
+      - C1
+  REQ-005:
+    title: A body over 1024 bytes is refused with 413
+    journeys:
+      - J2
+    components:
+      - C1
+  NFR-001:
+    title: Binds 127.0.0.1 by default and never stores or logs a body
+    nfr: true
+    components:
+      - C1
+  NFR-002:
+    title: One access log line per request, never the body
+    nfr: true
+    components:
+      - C1
+components:
+  C1:
+    title: Service in src/tiny_service.py
+    requirements:
+      - REQ-001
+      - REQ-002
+      - REQ-003
+      - REQ-004
+      - REQ-005
+      - NFR-001
+      - NFR-002
+gates:
+  G-P1:
+    claims:
+      - GET /health and POST /echo behave as REQ-001 to REQ-005 say in the dev environment
+      - The service binds the loopback address and never logs a request body (NFR-001, NFR-002)
+    records:
+      - program/evidence/P1-M01-S01-T01/results.json
+      - program/evidence/P1-M01-S01-T02/results.json
+tasks:
+  P1-M01-S01-T01:
+    closes:
+      - J1
+      - J2
+      - REQ-001
+      - REQ-002
+      - REQ-003
+      - REQ-004
+      - REQ-005
+      - NFR-001
+  P1-M01-S01-T02:
+    closes:
+      - NFR-002

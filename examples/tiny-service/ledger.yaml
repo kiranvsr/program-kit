@@ -1,0 +1,375 @@
+# Recorded interview for the tiny-service example (see README.md). Each topic of stages 1 to 4 and 6
+# that applies is closed by the entries below; T1.9 and T3.3 do not apply because no entry carries a
+# regulated, personal_data, payments, government, healthcare, external_customers or external_system tag.
+sources:
+  S1:
+    kind: document
+    ref: program/BRIEF.md
+    at: "2026-10-06"
+  S2:
+    kind: user
+    ref: message 2, answers to the discovery questions
+    at: "2026-10-06"
+  S3:
+    kind: user
+    ref: message 3, product choices
+    at: "2026-10-06"
+  S4:
+    kind: user
+    ref: message 4, specification and design choices
+    at: "2026-10-06"
+  S5:
+    kind: user
+    ref: message 5, plan and cadence
+    at: "2026-10-06"
+entries:
+  - id: F-1
+    kind: fact
+    topics:
+      - T1.1
+    tags:
+      - outcome
+      - beneficiary
+      - measures
+      - cost_of_not_building
+    text: "Outcome, in one sentence: an operator can tell that a service process is alive, and a developer can see exactly what their HTTP client sends. First beneficiary is the platform operator who checks services by hand. Measures have no target yet (owner is the service owner, review on 2026-12-01). Without it, every team keeps writing its own throwaway health script."
+    source: S1
+    at: "2026-10-06"
+  - id: F-2
+    kind: fact
+    topics:
+      - T1.2
+    tags:
+      - user_kinds
+      - dependent_systems
+      - decider_acceptor_payer
+      - conflict_priority
+    text: "User kinds are the operator (checks health) and the developer (echoes requests). No other system depends on the service. The service owner is the decider, the acceptor and the payer; there is no separate budget. If their needs ever conflict, the operator wins."
+    source: S2
+    at: "2026-10-06"
+  - id: F-3
+    kind: fact
+    topics:
+      - T1.3
+    tags:
+      - system_owners
+      - system_health
+      - must_stay_unchanged
+      - prior_documents
+    text: "Greenfield: no existing system, so there are no owners or health notes to record and nothing that must stay unchanged. No prior documents exist; this is declared absent."
+    source: S2
+    at: "2026-10-06"
+  - id: F-4
+    kind: fact
+    topics:
+      - T1.4
+    tags:
+      - exclusions
+      - reduced_first_release
+      - deferred_items
+    text: "Out of scope: authentication, TLS, any stored data, a metrics endpoint, containers or packaging. The reduced first release is the two endpoints on the loopback address. Deferred until the service leaves a developer machine (no date): authentication and TLS."
+    source: S2
+    at: "2026-10-06"
+  - id: F-5
+    kind: fact
+    topics:
+      - T1.5
+    tags:
+      - dates
+      - budget
+      - mandated_technology
+      - forbidden_technology
+      - organisational_constraints
+    text: "No date. No budget beyond one person's time. Mandated: Python 3.11 or later, standard library only. Forbidden: third-party packages. No organisational constraints."
+    source: S2
+    at: "2026-10-06"
+  - id: Q-1
+    kind: question
+    topics:
+      - T1.6
+    tags: []
+    text: "Does a staging environment exist, or is one planned?"
+    source: S2
+    at: "2026-10-06"
+    lens: delivery
+    blocking: true
+  - id: F-6
+    kind: fact
+    topics:
+      - T1.6
+    tags:
+      - environment_inventory
+      - environment_operators
+      - missing_environment_owner
+    text: "Two environments are named. dev is a developer machine, it exists and each developer runs their own. staging does not exist and none is planned; it is declared out, so it has no owner and nothing may be claimed for it."
+    source: S2
+    at: "2026-10-06"
+    answers:
+      - Q-1
+  - id: F-7
+    kind: fact
+    topics:
+      - T1.7
+    tags:
+      - team_and_split
+      - reviewer_merger
+      - on_call
+      - conventions
+      - response_time
+    text: "One implementer agent builds each task and a separate QA agent reviews it; the service owner merges. No on-call, because nothing runs outside developer machines. Conventions in force are the kit's rules and unittest. The owner answers within one working day."
+    source: S2
+    at: "2026-10-06"
+  - id: F-8
+    kind: fact
+    topics:
+      - T1.8
+    tags:
+      - top_risk
+      - prior_failures
+      - spike_decision
+    text: "Top risk: someone runs the service on a non-loopback address, where it has no authentication. No prior failures; nothing like this was built before. No spike: the work is well understood."
+    source: S2
+    at: "2026-10-06"
+  - id: A-1
+    kind: assumption
+    topics:
+      - T1.8
+    tags:
+      - unverified_assumptions
+    text: "Every developer machine has Python 3.11 or later. Verified by `pk doctor` on each machine, by the service owner, on 2026-10-06."
+    source: S2
+    at: "2026-10-06"
+    confirmed: true
+  - id: F-9
+    kind: fact
+    topics:
+      - T2.1
+    tags:
+      - persona_goals
+      - persona_frequency
+      - persona_expertise
+      - persona_context
+      - persona_frustration
+    text: "U1 operator: wants to know in seconds whether the process is up; checks a few times a day; knows the command line; works at a terminal; frustrated by having to read logs to find out. U2 developer: wants to see exactly what their client sends; daily while building; knows HTTP and JSON; works against a local port; frustrated by guessing what the client really sent."
+    source: S3
+    at: "2026-10-06"
+  - id: D-1
+    kind: decision
+    topics:
+      - T2.2
+    tags:
+      - journey_ids
+      - journey_flow
+      - failure_paths
+      - walking_skeleton_journey
+    text: "Two first-release journeys. J1, the operator checks the service is alive (trigger a request to /health, end state a 200 answer, failure path a refused connection). J2, the developer echoes a JSON message (trigger a post to /echo, end state the same JSON back, failure paths an invalid body and a body over the limit). The walking skeleton is J1."
+    source: S3
+    at: "2026-10-06"
+    ruling: null
+  - id: D-2
+    kind: decision
+    topics:
+      - T2.3
+    tags:
+      - surface_items_decided
+      - surface_later_releases_named
+      - surface_exclusion_reasons
+    text: "Every item of the product surface checklist is decided in product.md. Operations (deploy, monitoring) and documentation are in the first release; authentication and authorization is in the later release named secured; onboarding, administration, billing, backup and restore, data lifecycle and support are out, each with a reason."
+    source: S3
+    at: "2026-10-06"
+    ruling: null
+  - id: D-3
+    kind: decision
+    topics:
+      - T2.4
+    tags:
+      - release_mode
+      - pilot_users
+      - later_release_entry
+    text: "A single first release, then one later release named secured. The pilot user is the service owner. The secured release starts when the service is to run anywhere other than a developer machine."
+    source: S3
+    at: "2026-10-06"
+    ruling: null
+  - id: D-4
+    kind: decision
+    topics:
+      - T3.1
+    tags:
+      - journey_step_coverage
+      - requirement_ids
+      - rules
+      - inputs_outputs
+      - validation
+      - errors
+    text: "REQ-001 to REQ-005 cover every step of J1 and J2: each has a rule, input, output, validation and error, as written in SPEC.md."
+    source: S4
+    at: "2026-10-06"
+    ruling: null
+  - id: D-5
+    kind: decision
+    topics:
+      - T3.2
+    tags:
+      - entities_ownership
+      - volumes_growth
+      - sensitivity_class
+      - retention_residency
+      - source_of_truth
+    text: "The service stores nothing. It has no entities, no volume or growth, and no retention or residency. An echoed body is treated as untrusted and sensitive: it lives in memory for one request, is capped at 1024 bytes and is never logged. There is no source of truth."
+    source: S4
+    at: "2026-10-06"
+    ruling: null
+  - id: D-6
+    kind: decision
+    topics:
+      - T3.4
+    tags:
+      - scale_latency
+      - availability_recovery
+      - security_tenancy
+      - observability_cost
+      - accessibility
+    text: "Scale and latency: no target yet (owner is the service owner, 2026-12-01). Availability and recovery: none, an operator restarts the process by hand. Security: loopback only, no authentication, a single tenant. Observability: one access log line per request, no cost. Accessibility: not applicable, the service is an API for programs."
+    source: S4
+    at: "2026-10-06"
+    ruling: null
+  - id: D-7
+    kind: decision
+    topics:
+      - T3.5
+    tags:
+      - failure_modes
+      - user_visible_behaviour
+      - operator_action
+    text: "No stateful component or integration, so there is no slow, corrupt or data-loss case. A crashed process shows the caller a refused connection and the operator restarts it. A bad request shows the caller a 4xx answer with a JSON error and needs no operator action."
+    source: S4
+    at: "2026-10-06"
+    ruling: null
+  - id: D-8
+    kind: decision
+    topics:
+      - T4.1
+    tags:
+      - candidate_approaches
+      - recommendation
+      - user_choice
+    text: "Candidates were the standard library http.server, the standard library wsgiref and a third-party web framework. The recommendation was http.server and the user chose it (ADR 0001)."
+    source: S4
+    at: "2026-10-06"
+    ruling: null
+  - id: D-9
+    kind: decision
+    topics:
+      - T4.2
+    tags:
+      - component_ids
+      - responsibility_interface
+      - component_data
+      - owner_role
+      - build_buy_reuse
+    text: "One component, C1, in src/tiny_service.py. Its one responsibility is answering the two endpoints; its interface is HTTP and the function handle. It holds no data. The owner role is backend. It is built, not bought."
+    source: S4
+    at: "2026-10-06"
+    ruling: null
+  - id: D-10
+    kind: decision
+    topics:
+      - T4.3
+    tags:
+      - authn_authz
+      - tenancy_enforcement
+      - config_secrets
+      - observability_policy
+      - migration_versioning_errors
+    text: "No authentication or authorization, enforced by binding to the loopback address. Single tenant. Configuration is two command-line options (host and port) and there are no secrets. Observability is one access log line per request, never the body. No migrations and no versioning. Errors are a JSON object with an error field and a 4xx status."
+    source: S4
+    at: "2026-10-06"
+    ruling: null
+  - id: D-11
+    kind: decision
+    topics:
+      - T4.4
+    tags:
+      - runtime_per_environment
+      - merge_to_production_path
+      - rollback
+      - migration_ordering
+    text: "dev runs python3 src/tiny_service.py on the developer machine. There is no production, so the path ends at the merge to main. Rollback is reverting the commit and restarting the process. There are no migrations."
+    source: S4
+    at: "2026-10-06"
+    ruling: null
+  - id: D-12
+    kind: decision
+    topics:
+      - T4.5
+    tags:
+      - adr_options_decision
+      - consequences_reversibility
+      - licences_checked
+    text: "ADR 0001 records the options, the decision, the consequences and its reversibility. The standard library is the only dependency, so no licence has to be checked against the forbidden list."
+    source: S4
+    at: "2026-10-06"
+    ruling: null
+  - id: D-13
+    kind: decision
+    topics:
+      - T4.6
+    tags:
+      - gate_per_claim
+      - gate_evidence
+      - gate_environment
+      - blocked_gates
+    text: "One gate, G-P1, proves the first-release claims in the dev environment, with each task's results.json and acceptance.json as its records. No claim needs staging, so no gate is blocked."
+    source: S4
+    at: "2026-10-06"
+    ruling: null
+  - id: D-14
+    kind: decision
+    topics:
+      - T4.7
+    tags:
+      - repo_branching_review
+      - definition_of_done
+      - test_expectations
+      - merge_gating_checks
+      - agent_roles
+    text: "Source in src/, one branch per task, merged with --no-ff after independent QA. Done means the hand-back gate passed and QA accepted for development. Every requirement has a unit test and every planted bug is caught. The merge check runs build and unit tests on the trial merge. Roles: the backend role builds, a separate QA agent accepts."
+    source: S4
+    at: "2026-10-06"
+    ruling: null
+  - id: D-15
+    kind: decision
+    topics:
+      - T6.1
+    tags:
+      - walking_skeleton
+      - phase_order
+      - milestone_gates
+    text: "One phase. The walking skeleton is the service answering /health and /echo on the loopback address. Its milestone gate is G-P1."
+    source: S5
+    at: "2026-10-06"
+    ruling: null
+  - id: D-16
+    kind: decision
+    topics:
+      - T6.2
+    tags:
+      - implementer_count
+      - task_size
+      - consultation_frequency
+      - reporting
+    text: "One implementer at a time. Tasks are size S or M. The implementer consults the controller only for the cases the brief names. The controller reports after each merge."
+    source: S5
+    at: "2026-10-06"
+    ruling: null
+  - id: F-10
+    kind: fact
+    topics:
+      - T6.3
+    tags:
+      - parked_tasks
+      - parking_owner
+      - parking_date
+    text: "No task is parked: none needs a missing environment, a vendor or a user decision. Owner: the service owner. Date: not applicable."
+    source: S5
+    at: "2026-10-06"
