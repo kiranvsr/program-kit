@@ -1,0 +1,157 @@
+import _paths  # noqa: F401  (must come first: puts kit/scripts/ on sys.path)
+import contextlib
+import hashlib
+import io
+import json
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+
+import evidence
+import pk
+import stale
+
+
+def sh(cwd, *argv):
+    return subprocess.run(list(argv), cwd=str(cwd), check=True, capture_output=True, text=True).stdout
+
+
+def digest(text):
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+class Base(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name).resolve()
+        sh(self.root, "git", "init", "-q", "-b", "main")
+        sh(self.root, "git", "config", "user.name", "Test")
+        sh(self.root, "git", "config", "user.email", "test@example.com")
+        self.put("calc.py", "v1\n")
+        self.put("lib.py", "lib1\n")
+        self.record("T-1", {"calc.py": digest("v1\n"), "lib.py": digest("lib1\n")})
+        self.record("T-2", {"lib.py": digest("lib1\n")})
+        self.commit("init")
+
+    def put(self, name, text):
+        path = self.root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+
+    def record(self, task, inputs):
+        self.put(f"program/evidence/{task}/results.json", json.dumps({"task_id": task, "inputs": inputs}))
+
+    def commit(self, message):
+        sh(self.root, "git", "add", "-A")
+        sh(self.root, "git", "commit", "-q", "-m", message)
+
+
+class StaleRecords(Base):
+    def test_stale_lists_record_whose_input_changed_on_main(self):
+        self.put("calc.py", "v2\n")
+        self.commit("change calc")
+        report = stale.stale_records(self.root, "main")
+        self.assertEqual(report["main"], sh(self.root, "git", "rev-parse", "main").strip())
+        self.assertEqual(report["stale"], [{"path": "program/evidence/T-1/results.json",
+                                            "changed_inputs": ["calc.py"]}])
+        self.assertEqual(report["unreadable"], [])
+        self.assertEqual(report["checked"], 2)
+
+    def test_stale_ignores_untouched_records(self):
+        report = stale.stale_records(self.root, "main")
+        self.assertEqual(report["stale"], [])
+        self.assertEqual(report["checked"], 2)
+
+    def test_input_deleted_on_main_is_changed(self):
+        sh(self.root, "git", "rm", "-q", "lib.py")
+        self.commit("drop lib")
+        report = stale.stale_records(self.root, "main")
+        self.assertEqual([(r["path"], r["changed_inputs"]) for r in report["stale"]],
+                         [("program/evidence/T-1/results.json", ["lib.py"]),
+                          ("program/evidence/T-2/results.json", ["lib.py"])])
+
+    def test_working_copy_edits_do_not_count_only_main_does(self):
+        (self.root / "calc.py").write_text("dirty\n")
+        self.assertEqual(stale.stale_records(self.root, "main")["stale"], [])
+
+    def test_unreadable_records_are_reported_never_fresh_never_raised(self):
+        self.put("program/evidence/A-bad/results.json", "{not json")
+        self.put("program/evidence/B-list/results.json", "[]")
+        self.put("program/evidence/C-noinputs/results.json", json.dumps({"task_id": "x"}))
+        self.put("program/evidence/D-empty/results.json", json.dumps({"inputs": {}}))
+        self.commit("bad records")
+        report = stale.stale_records(self.root, "main")
+        self.assertEqual(report["stale"], [])
+        self.assertEqual([r["path"] for r in report["unreadable"]],
+                         [f"program/evidence/{n}/results.json" for n in ("A-bad", "B-list", "C-noinputs", "D-empty")])
+        for item in report["unreadable"]:
+            self.assertEqual(item["changed_inputs"], [])
+            self.assertEqual(len(item["error"].splitlines()), 1)
+        self.assertEqual(report["checked"], 6)
+
+    def test_input_hash_shared_between_records_is_computed_once(self):
+        calls = []
+        real = stale._blob_bytes
+
+        def spy(root, blob):
+            calls.append(blob)
+            return real(root, blob)
+
+        stale._blob_bytes = spy
+        self.addCleanup(setattr, stale, "_blob_bytes", real)
+        stale.stale_records(self.root, "main")
+        self.assertEqual(len(calls), 2)  # calc.py and lib.py, though lib.py is an input of both records
+
+    def test_unresolvable_main_is_a_kit_error(self):
+        with self.assertRaises(stale.KitError):
+            stale.stale_records(self.root, "nope")
+        with self.assertRaises(stale.KitError):
+            stale.stale_records(self.root, "--all")
+
+    def test_no_evidence_directory_checks_nothing(self):
+        sh(self.root, "git", "rm", "-rq", "program")
+        self.commit("no evidence")
+        report = stale.stale_records(self.root, "main")
+        self.assertEqual((report["stale"], report["unreadable"], report["checked"]), ([], [], 0))
+
+
+class Cli(Base):
+    def run_cli(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), \
+                contextlib.chdir(self.root):
+            code = pk.main(["stale", *argv])
+        return code, out.getvalue(), err.getvalue()
+
+    def test_prints_sorted_json_and_exits_zero_even_when_stale(self):
+        self.put("calc.py", "v2\n")
+        self.commit("change calc")
+        code, out, err = self.run_cli()
+        self.assertEqual((code, err), (0, ""))
+        data = json.loads(out)
+        self.assertEqual(data["stale"][0]["changed_inputs"], ["calc.py"])
+        self.assertEqual(out, json.dumps(data, indent=2, sort_keys=True) + "\n")
+
+    def test_main_option_and_unresolvable_main(self):
+        sh(self.root, "git", "branch", "other")
+        code, out, _ = self.run_cli("--main", "other")
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out)["main"], sh(self.root, "git", "rev-parse", "other").strip())
+        code, out, err = self.run_cli("--main", "nope")
+        self.assertEqual((code, out), (1, ""))
+        self.assertTrue(err.startswith("error: "))
+
+
+class EvidenceIntegration(Base):
+    def test_evidence_stale_uses_the_real_module(self):
+        self.put("calc.py", "v2\n")
+        self.commit("change calc")
+        got = evidence.Evidence(self.root, "T-9").stale()
+        self.assertEqual(got, {"checked": True, "records": [{"path": "program/evidence/T-1/results.json",
+                                                             "changed_inputs": ["calc.py"]}]})
+
+
+if __name__ == "__main__":
+    unittest.main()
