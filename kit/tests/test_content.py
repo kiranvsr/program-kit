@@ -35,7 +35,7 @@ MERGE_LINE = "`OK: <branch> merges into main at <sha>`"
 # does not itself contain a forbidden token.
 OTHER_NAMES = ["co" + "pilot", "ll" + "ama", "mist" + "ral", "deep" + "seek", "qw" + "en", "x" + "ai\\b"]
 FORBIDDEN_RE = re.compile("|".join([*map(re.escape, FORBIDDEN), *OTHER_NAMES]), re.I)
-URL = re.compile(r"https?://|ftp://|www\.", re.I)
+URL = re.compile(r"[a-z][a-z0-9+.-]*" + ":" + "//|www\\.", re.I)  # no URL written literally here
 PLAYBOOK_FILE = re.compile(r"\b\d\d_[a-z_]+\.md\b")
 
 

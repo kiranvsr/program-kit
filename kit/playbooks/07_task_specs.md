@@ -14,7 +14,7 @@ Give a task its SPEC and PLAN when it reaches the front of the queue, not before
 
 ## Steps
 
-1. Pick the next task: every `depends_on` task is `done` (`pk status list`) and it is not blocked or parked. Run `pk status show <ID>` to confirm it is `not_started`.
+1. Pick the next task: every `depends_on` task is `done` (`pk status list`) and it is not blocked or parked. A phase, milestone or step ID in `depends_on` has no status record: check every task under it. Run `pk status show <ID>` to confirm it is `not_started`.
 2. Write `program/tasks/<ID>/SPEC.md`: scope in and out, dependencies, the architecture contracts it consumes, security and tenancy, failure modes (one row each, each needing a test), observability, module placement, resolved questions, and the requirement IDs it closes.
 3. If the work must edit a guarded file (one listed under `guarded_files` in `program/checks.yaml`), ask the user first. Only when the user agrees, add a line `Guarded edit: <path>` to the SPEC. That line records the user's approval. Without it the hand-back gate fails the branch.
 4. Write `program/tasks/<ID>/PLAN.md`: the pull-request boundary, the work breakdown, the definition of done, gate evidence and rollback, and a section headed exactly `## Exact Commands`. Under it put one command per line.

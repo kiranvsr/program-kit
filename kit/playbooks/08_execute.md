@@ -18,7 +18,7 @@ Build the register's tasks one at a time with an implementer, independent QA and
 3. Dispatch. The gate reads the SPEC, the PLAN and `checks.yaml` from main, so they must be on main first.
    - `pk status set <ID> in_progress --role controller`.
    - Commit the SPEC, the PLAN and that status file to main together, as one commit.
-   - Then `pk worktree new <ID>` creates the worktree and the branch `task/<ID>`. From here on the status record changes only on the task branch.
+   - Then `pk worktree new <ID>` creates the worktree under `.worktrees/` and the branch `task/<ID>`. The project must git-ignore `.worktrees/`; add it to `.gitignore` before the first dispatch, or every worktree makes main look dirty. From here on the status record changes only on the task branch.
    - Give the implementer `kit/briefs/implementer.md`, the task brief, the SPEC, the PLAN, the rules, the full text of the rulings the SPEC cites, and the report path `program/evidence/<ID>/report.md` (written after the gate passes and committed with `results.json` in the evidence commit).
 4. Build (implementer). Test first, and build exactly the PLAN's boundary.
    - Decide anything with precedent and record it. Ask the controller only for a new dependency, a security boundary with no precedent, a change to user scope, or two conflicting rulings.
@@ -32,9 +32,9 @@ Build the register's tasks one at a time with an implementer, independent QA and
    - It fails a branch that changed its own PLAN.md, or a guarded file without its `Guarded edit:` line.
    - On success its last line is exactly `OK: <branch> passes the hand-back gate at <sha>`. Exit code 0 alone is never accepted: read the last line.
    - A failure returns to the implementer with no QA round.
-7. Evidence commit (implementer). The gate leaves `results.json` uncommitted. In the task worktree run `pk status set <ID> review --role implementer --evidence program/evidence/<ID>/results.json`. Commit `results.json` and the status file alone. That is the evidence commit, and it follows the gated commit.
+7. Evidence commit (implementer). The gate leaves `results.json` uncommitted. In the task worktree run `pk status set <ID> review --role implementer --evidence program/evidence/<ID>/results.json`. Commit the files of `program/evidence/<ID>/` that are new (`results.json` and `report.md`) and the status file, and nothing else. That is the evidence commit, and it follows the gated commit.
 8. Start QA only when the evidence reflects current main, one branch at a time.
-   - Run `pk stale`: it lists evidence records whose hashed inputs changed on main. This task's own record is listed whenever its branch changed one of its own inputs; ignore that. If main moved with code, the overlap check applies: `git merge-tree --write-tree main task/<ID>` is clean and none of the hashed inputs changed. Otherwise the branch merges main and re-produces.
+   - Run `pk stale` in the task worktree (it reads the checkout it runs in): it lists evidence records whose hashed inputs changed on main. This task's own record is listed whenever its branch changed one of its own inputs; ignore that. If main moved with code, the overlap check applies: `git merge-tree --write-tree main task/<ID>` is clean and none of the hashed inputs changed. Otherwise the branch merges main and re-produces.
    - Start `kit/briefs/qa.md`.
 9. QA decides.
    - It runs `pk gate binding <ID> --branch task/<ID>` (the commit recorded in `results.json` is an ancestor of the branch tip, and every later commit touches only this task's evidence directory and status file), re-runs the PLAN commands, plants its own bugs, and checks scope against the SPEC, closed requirement IDs against the traceability matrix, and claims against `CLAIM_BOUNDARIES.md`.

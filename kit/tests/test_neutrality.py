@@ -1,49 +1,48 @@
-"""The kit names no vendor, model or originating project, and ships no URL (apart from the FAQ's links).
+"""The kit names no vendor, model or originating project, and ships no URL (apart from a short exempt list).
 
-Scope: kit/, examples/ (when present), docs/ except docs/superpowers/ (the design history, which names the
-originating project), README.md and install.sh. A forbidden token is a case-sensitive whole word. A URL is
-http:// or https://; kit/tests/ is exempt from the URL rule (the fetch tests use loopback addresses) and docs/FAQ.md
-may carry links. Nothing is exempt from the token rule.
+Scope: every file under the repository root except the directories .git, .worktrees, .superpowers and
+__pycache__ (and *.pyc and .DS_Store files). Rules, with nothing exempt from the first:
+- no forbidden token (see _tokens.py), matched case-insensitively: distinctive names anywhere, short names unless
+  an ASCII letter is directly before or after;
+- no URL of any scheme in any case (a scheme name, a colon and two slashes) outside docs/FAQ.md and the test files listed in URL_EXEMPT_FILES;
+- every scanned file is valid UTF-8 and holds no zero-width character.
 """
 import _paths  # noqa: F401  (must come first: puts kit/scripts on sys.path)
+import os
 import re
 import tempfile
 import unittest
 from pathlib import Path
 
-from _tokens import FORBIDDEN
+from _tokens import DISTINCTIVE, FORBIDDEN, SHORT
 
 ROOT = Path(__file__).resolve().parent.parent.parent
-SCAN_DIRS = ("kit", "examples", "docs")
-SCAN_FILES = ("README.md", "install.sh")
-SKIP_DIRS = {"__pycache__", ".git"}
+SKIP_ROOT_DIRS = {".git", ".worktrees", ".superpowers"}  # only at the repository root
+SKIP_DIRS = {"__pycache__"}  # at any depth
 SKIP_NAMES = {".DS_Store"}
-SKIP_TREES = ("docs/superpowers",)
-URL_EXEMPT_FILES = ("docs/FAQ.md",)
-URL_EXEMPT_TREES = ("kit/tests",)
+SKIP_SUFFIXES = {".pyc"}
+URL_EXEMPT_FILES = (
+    "docs/FAQ.md",  # may carry links
+    "kit/tests/test_fetch.py",  # the fetch tests need loopback and example URLs
+)
+ZERO_WIDTH = "".join(chr(code) for code in (0x200B, 0x200C, 0x200D, 0x2060, 0xFEFF))  # none written literally
 
-TOKEN = re.compile(r"(?<!\w)(?:" + "|".join(re.escape(t) for t in FORBIDDEN) + r")(?!\w)")
-URL = re.compile(r"https?://")
-
-
-def under(rel: str, trees: tuple) -> bool:
-    return any(rel == tree or rel.startswith(tree + "/") for tree in trees)
+_SHORT = "|".join(re.escape(t) for t in SHORT)
+TOKEN = re.compile(
+    "|".join(re.escape(t) for t in DISTINCTIVE) + rf"|(?<![A-Za-z])(?:{_SHORT})(?![A-Za-z])", re.IGNORECASE)
+URL = re.compile(r"[a-z][a-z0-9+.-]*://", re.IGNORECASE)
+INVISIBLE = re.compile("[" + ZERO_WIDTH + "]")
 
 
 def scanned_files(root: Path) -> list:
-    found = [root / name for name in SCAN_FILES if (root / name).is_file()]
-    for name in SCAN_DIRS:
-        base = root / name
-        if not base.is_dir():
-            continue
-        for path in sorted(base.rglob("*")):
-            rel = path.relative_to(root).as_posix()
-            parts = set(path.relative_to(root).parts)
-            if not path.is_file() or parts & SKIP_DIRS or path.name in SKIP_NAMES or path.suffix == ".pyc":
-                continue
-            if under(rel, SKIP_TREES):
-                continue
-            found.append(path)
+    found = []
+    for current, dirs, names in os.walk(root):
+        base = Path(current)
+        at_root = base == root
+        dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS and not (at_root and d in SKIP_ROOT_DIRS))
+        for name in sorted(names):
+            if name not in SKIP_NAMES and Path(name).suffix not in SKIP_SUFFIXES:
+                found.append(base / name)
     return found
 
 
@@ -51,12 +50,18 @@ def problems(root: Path) -> list:
     out = []
     for path in scanned_files(root):
         rel = path.relative_to(root).as_posix()
-        text = path.read_text(encoding="utf-8", errors="replace")
+        try:
+            text = path.read_bytes().decode("utf-8")  # strict: no replacement characters
+        except UnicodeDecodeError as exc:
+            out.append(f"{rel}: not valid UTF-8 (byte {exc.start})")
+            continue
         for number, line in enumerate(text.splitlines(), 1):
             for match in TOKEN.finditer(line):
                 out.append(f"{rel}:{number}: forbidden token {match.group(0)!r}")
-            if URL.search(line) and rel not in URL_EXEMPT_FILES and not under(rel, URL_EXEMPT_TREES):
+            if URL.search(line) and rel not in URL_EXEMPT_FILES:
                 out.append(f"{rel}:{number}: URL")
+            if INVISIBLE.search(line):
+                out.append(f"{rel}:{number}: zero-width character")
     return out
 
 
@@ -65,13 +70,17 @@ class NeutralityTests(unittest.TestCase):
         found = problems(ROOT)
         self.assertEqual(found, [], "\n".join(found))
 
-    def test_the_scan_reaches_the_shipped_content(self):
+    def test_the_scan_reaches_the_whole_tree(self):
         rels = {p.relative_to(ROOT).as_posix() for p in scanned_files(ROOT)}
-        for expected in ("README.md", "install.sh", "kit/playbooks/00_START.md", "kit/tests/test_neutrality.py",
-                         "kit/templates/status.schema.json", "kit/scripts/pk.py"):
+        for expected in ("README.md", "LICENSE", "install.sh", "kit/playbooks/00_START.md",
+                         "kit/tests/test_neutrality.py", "kit/templates/status.schema.json", "kit/scripts/pk.py",
+                         "docs/DESIGN.md"):
             self.assertIn(expected, rels)
-        self.assertFalse([r for r in rels if r.startswith("docs/superpowers")])
-        self.assertFalse([r for r in rels if "__pycache__" in r])
+        self.assertFalse([r for r in rels if "__pycache__" in r or r.startswith((".git/", ".worktrees/"))])
+
+    def test_the_url_exempt_files_exist(self):
+        for rel in URL_EXEMPT_FILES:
+            self.assertTrue((ROOT / rel).is_file(), f"{rel} is listed in URL_EXEMPT_FILES but does not exist")
 
 
 class ScanBehaviourTests(unittest.TestCase):
@@ -82,15 +91,15 @@ class ScanBehaviourTests(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.root = Path(self._tmp.name)
 
-    def put(self, rel: str, text: str) -> None:
+    def put(self, rel: str, text) -> None:
         path = self.root / rel
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text, encoding="utf-8")
+        path.write_bytes(text if isinstance(text, bytes) else text.encode("utf-8"))
 
     def test_every_token_is_caught_in_every_scanned_place(self):
         for token in FORBIDDEN:
-            for rel in ("README.md", "install.sh", "kit/playbooks/a.md", "kit/tests/t.py", "examples/x/y.md",
-                        "docs/DESIGN.md", "docs/FAQ.md"):
+            for rel in ("README.md", "LICENSE", "install.sh", "kit/playbooks/a.md", "kit/tests/t.py",
+                        "examples/x/y.md", "docs/DESIGN.md", "docs/FAQ.md", "docs/superpowers/s.md"):
                 with self.subTest(token=token, rel=rel):
                     self.put(rel, f"a line\nuses {token} here\n")
                     found = problems(self.root)
@@ -98,32 +107,79 @@ class ScanBehaviourTests(unittest.TestCase):
                     self.assertIn(f"{rel}:2:", found[0])
                     (self.root / rel).unlink()
 
-    def test_tokens_are_case_sensitive_whole_words(self):
-        first = FORBIDDEN[0]
-        self.put("README.md", f"{first.lower()} and {first.upper()} and {first}s and x{first} and {first}-like\n")
-        self.assertEqual(len(problems(self.root)), 1)  # only "<first>-like": a hyphen ends the word
-        self.put("README.md", f"{first.lower()} {first.upper()} {first}s x{first} {first}x\n")
+    def test_tokens_match_in_any_case(self):
+        for token in FORBIDDEN:
+            for variant in (token.lower(), token.upper()):
+                with self.subTest(variant=variant):
+                    self.put("README.md", f"x {variant} y\n")
+                    self.assertEqual(len(problems(self.root)), 1)
+
+    def test_distinctive_names_match_inside_words_and_glued_forms(self):
+        for token in DISTINCTIVE:
+            for text in (f"x{token.lower()}y", f"{token}s", f"v_{token}", f"{token}2", f"1{token}"):
+                with self.subTest(text=text):
+                    self.put("README.md", text + "\n")
+                    self.assertEqual(len(problems(self.root)), 1)
+
+    def test_short_names_need_no_adjacent_letter_but_digits_and_underscores_count(self):
+        for token in SHORT:
+            for caught in (f"{token}", f"{token.lower()}-like", f"v{token}".replace("v", "9"), f"{token}_2",
+                           f"({token.upper()})", f"{token}2"):
+                with self.subTest(caught=caught):
+                    self.put("README.md", caught + "\n")
+                    self.assertEqual(len(problems(self.root)), 1)
+            for passed in (f"x{token}", f"{token}s", f"{token.lower()}y", f"a{token.upper()}b"):
+                with self.subTest(passed=passed):
+                    self.put("README.md", passed + "\n")
+                    self.assertEqual(problems(self.root), [])
+
+    def test_a_scheme_is_caught_in_any_case_except_in_the_exempt_files(self):
+        for scheme in ("https", "http", "HTTPS", "Ftp", "git+ssh", "s3"):
+            for rel in ("README.md", "install.sh", "kit/templates/a.json", "kit/scripts/a.py", "docs/DESIGN.md",
+                        "examples/e/a.md", "LICENSE"):
+                with self.subTest(scheme=scheme, rel=rel):
+                    self.put(rel, f"see {scheme}" + "://example.test/x\n")
+                    self.assertEqual(len(problems(self.root)), 1)
+                    (self.root / rel).unlink()
+        self.put("docs/FAQ.md", "see https" + "://example.test/x and HTTP" + "://example.test/y\n")
+        self.put("kit/tests/test_fetch.py", "url = 'http" + "://127.0.0.1:1/x'\n")
         self.assertEqual(problems(self.root), [])
 
-    def test_a_url_is_caught_except_in_the_faq_and_the_tests(self):
-        for rel in ("README.md", "install.sh", "kit/templates/a.json", "kit/scripts/a.py", "docs/DESIGN.md",
-                    "examples/e/a.md"):
-            with self.subTest(rel=rel):
-                self.put(rel, "see https://example.test/x\n")
-                self.assertEqual(len(problems(self.root)), 1)
-                (self.root / rel).unlink()
-        self.put("docs/FAQ.md", "see https://example.test/x and http://example.test/y\n")
-        self.put("kit/tests/t.py", "url = 'http://127.0.0.1:1/x'\n")
-        self.assertEqual(problems(self.root), [])
-
-    def test_the_design_history_and_caches_are_skipped(self):
-        first = FORBIDDEN[0]
-        self.put("docs/superpowers/specs/s.md", f"{first} https://example.test\n")
-        self.put("kit/scripts/__pycache__/a.txt", f"{first}\n")
-        self.put("kit/.DS_Store", f"{first}\n")
-        self.assertEqual(problems(self.root), [])
-        self.put("docs/superpowers.md", f"{first}\n")  # a sibling that merely shares the prefix is scanned
+    def test_a_url_in_a_test_file_that_is_not_listed_is_caught(self):
+        self.put("kit/tests/test_other.py", "url = 'http" + "://127.0.0.1:1/x'\n")
         self.assertEqual(len(problems(self.root)), 1)
+
+    def test_a_file_at_the_root_is_scanned(self):
+        self.put("NOTICE", f"by {DISTINCTIVE[0]}\n")
+        self.put(".gitignore", f"{DISTINCTIVE[1]}\n")
+        self.assertEqual(len(problems(self.root)), 2)
+
+    def test_a_file_that_is_not_utf8_is_a_problem_not_decoded_with_replacement(self):
+        self.put("kit/data.bin", b"\xff\xfe\x00 ok\n")
+        self.put("kit/almost.md", b"caf\xe9 \x80\n")
+        found = problems(self.root)
+        self.assertEqual(len(found), 2, found)
+        self.assertTrue(all("not valid UTF-8" in line for line in found), found)
+
+    def test_a_zero_width_character_is_a_problem(self):
+        for char in ZERO_WIDTH:
+            with self.subTest(char=hex(ord(char))):
+                self.put("docs/DESIGN.md", f"a{char}b\n")
+                found = problems(self.root)
+                self.assertEqual(len(found), 1, found)
+                self.assertIn("zero-width", found[0])
+        self.put("docs/DESIGN.md", "plain text\n")
+        self.assertEqual(problems(self.root), [])
+
+    def test_vcs_worktree_and_cache_directories_are_skipped_only_where_named(self):
+        token = DISTINCTIVE[0]
+        for rel in (".git/x", ".worktrees/t/a.md", ".superpowers/sdd/r.md", "kit/scripts/__pycache__/a.txt",
+                    "kit/.DS_Store", "kit/scripts/a.pyc"):
+            self.put(rel, f"{token}\n")
+        self.assertEqual(problems(self.root), [])
+        self.put("kit/.git/x", f"{token}\n")  # only the root-level ones are skipped
+        self.put("docs/superpowers/a.md", f"{token}\n")  # no longer a skipped tree
+        self.assertEqual(len(problems(self.root)), 2)
 
 
 if __name__ == "__main__":
