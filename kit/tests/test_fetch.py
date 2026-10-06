@@ -8,6 +8,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -32,6 +33,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.server.hits.append(self.path)
         if body is None:
             self.send_error(404)
+            return
+        if isinstance(body, tuple) and body[0] == "drip":  # ("drip", total bytes, seconds between bytes)
+            self.send_response(200)
+            self.send_header("Content-Length", str(body[1]))
+            self.end_headers()
+            try:
+                for _ in range(body[1]):
+                    self.wfile.write(b"x")
+                    self.wfile.flush()
+                    time.sleep(body[2])
+            except OSError:  # the client gave up: stop writing
+                pass
             return
         if isinstance(body, tuple):  # ("redirect", location)
             self.send_response(302)
@@ -379,6 +392,17 @@ class Fetch(Base):
         self.assertEqual((row["state"], row["reason"]), ("refused", "timed out"))
         self.assertTrue(response.closed)
         self.assertEqual(self.leftovers(b"x" * 100), [])
+
+    def test_real_slow_drip_server_is_cut_off_at_the_deadline(self):
+        data = b"x" * 40
+        server, base = self.serve({"/drip": ("drip", 40, 0.05)})
+        started = time.monotonic()
+        row = fetch.fetch(self.cache, [self.pin(base + "/drip", data=data)], timeout=0.3)[0]
+        elapsed = time.monotonic() - started
+        self.assertEqual((row["state"], row["reason"]), ("refused", "timed out"))
+        self.assertLess(elapsed, 1.5)
+        self.assertEqual(self.leftovers(data), [])
+        self.assertFalse(self.digest_dir(data).exists())
 
     @unittest.skipUnless(hasattr(os, "fchmod"), "POSIX only")
     def test_entry_mode_follows_umask_and_is_world_readable(self):

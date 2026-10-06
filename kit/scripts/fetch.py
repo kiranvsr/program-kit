@@ -34,6 +34,7 @@ from common import KitError, read_json
 
 ALLOW_HTTP = "PROGRAM_KIT_FETCH_ALLOW_HTTP"
 CHUNK = 1 << 20
+READ = 1 << 16  # network read size: small, so control returns often enough to check the deadline
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _DIGEST = re.compile(r"[0-9a-f]{64}")
 _PIN_KEYS = ("url", "sha256", "size", "filename")
@@ -174,7 +175,10 @@ def _download(root: Path, pin: dict, opener, timeout: int) -> Path:
                 if hasattr(os, "fchmod"):
                     os.fchmod(out.fileno(), 0o644 & ~_umask())  # mkstemp makes 0600; a shared cache must be readable
                 while True:
-                    chunk = response.read(CHUNK)
+                    if time.monotonic() > deadline:
+                        raise _Refused("timed out")
+                    # read1 returns after one recv; read(n) would wait for n bytes or EOF past the deadline
+                    chunk = getattr(response, "read1", response.read)(READ)
                     if time.monotonic() > deadline:
                         raise _Refused("timed out")
                     if not chunk:
