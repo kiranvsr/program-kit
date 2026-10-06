@@ -52,14 +52,14 @@ def _parse(data: bytes, name: str = "rulings.md") -> list[tuple[dict, int]]:
     starts = []
     for index, line in enumerate(lines):
         if line.startswith("## R"):
-            if not _HEADER.match(line):
+            if not _HEADER.match(line.rstrip()):
                 raise KitError(f"{name} line {index + 1}: malformed ruling header {line!r}; "
                                f"expected '## R<n> (<YYYY-MM-DD>, <role>)'")
             starts.append(index)
     found = []
     for position, start in enumerate(starts):
         end = starts[position + 1] if position + 1 < len(starts) else len(lines)
-        number, date, role = _HEADER.match(lines[start]).groups()
+        number, date, role = _HEADER.match(lines[start].rstrip()).groups()
         marks = []  # (field, line index) in the order they appear
         for index in range(start + 1, end):
             for field, marker in zip(_FIELDS, _MARKERS):
@@ -102,8 +102,8 @@ def _check_text(label: str, value: str, required: bool) -> str:
 def add(root: Path, role: str, question: str, decision: str, precedent: str = "") -> int:
     """Append the next ruling and return its number. Nothing is written on any refusal."""
     role = role.strip()
-    if not role or "\n" in role or "(" in role or ")" in role:
-        raise KitError(f"invalid role {role!r}: one line, no parentheses")
+    if len(role.splitlines()) != 1 or "(" in role or ")" in role:  # splitlines: \r, \x0b, \x85, \u2028 ... too
+        raise KitError(f"invalid role {role!r}: one non-empty line, no parentheses")
     question = _check_text("question", question, True)
     decision = _check_text("decision", decision, True)
     precedent = _check_text("precedent", precedent, False)
@@ -135,20 +135,23 @@ def validate(root: Path) -> list[str]:
         return [str(exc)]
     problems: list[str] = []
     seen: set[int] = set()
-    expected = 1
+    expected, previous = 1, 0
     for ruling, line in found:
         number = ruling["number"]
         if number in seen:
             problems.append(f"rulings.md line {line}: R{number} appears more than once")
-        elif number != expected:
-            problems.append(f"rulings.md line {line}: R{number} found where R{expected} expected "
-                            f"(numbers run 1, 2, 3 with no gaps)")
+        else:
+            if number < previous:
+                problems.append(f"rulings.md line {line}: R{number} is out of order after R{previous}")
+            elif number != expected:
+                problems.append(f"rulings.md line {line}: R{number} found where R{expected} expected "
+                                f"(numbers run 1, 2, 3 with no gaps)")
+            expected, previous = number + 1, number
         for target in ruling["supersedes"]:
             if target not in seen:
                 problems.append(f"rulings.md line {line}: R{number} supersedes R{target}, "
                                 f"which is not an earlier ruling")
         seen.add(number)
-        expected = max(expected, number + 1)
     return problems
 
 

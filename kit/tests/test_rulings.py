@@ -95,6 +95,37 @@ class RulingsTests(unittest.TestCase):
         self.seed(HEADER + self.block(2))
         self.assertRegex(rulings.validate(self.root)[0], r"R2.*R1 expected")
 
+    def test_validate_names_only_the_real_discontinuity(self):
+        self.seed(HEADER + self.block(1) + self.block(2) + self.block(3) + self.block(2) + self.block(4))
+        problems = rulings.validate(self.root)
+        self.assertEqual(len(problems), 1)
+        self.assertRegex(problems[0], r"R2.*more than once")
+        self.seed(HEADER + self.block(1) + self.block(3) + self.block(2))
+        problems = rulings.validate(self.root)
+        self.assertEqual(len(problems), 2)
+        self.assertRegex(problems[0], r"R3 found where R2 expected")
+        self.assertRegex(problems[1], r"R2 is out of order after R3")
+
+    def test_header_with_trailing_whitespace_is_accepted(self):
+        self.seed(HEADER + "\n## R1 (2026-01-02, controller) \t\n\n**Question.** Q?\n\n**Decision.** D.\n\n**Precedent.**\n")
+        self.assertEqual(rulings.read(self.root)[0]["role"], "controller")
+        self.assertEqual(rulings.validate(self.root), [])
+
+    def test_list_reads_a_crlf_file(self):
+        self.seed((HEADER + self.block(1) + self.block(2, "Then supersedes R1.")).replace("\n", "\r\n"))
+        code, out, err = self.run_cli("rulings", "list")
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(len(out.splitlines()), 2)
+        self.assertIn("supersedes R1", out)
+
+    def test_trailing_partial_block_without_final_newline(self):
+        self.seed(HEADER + self.block(1) + "\n## R2 (2026-01-02, controller)\n\n**Question.** Q?")
+        before = self.path.read_bytes()
+        self.assertRegex(rulings.validate(self.root)[0], r"line 13: R2 is missing .*Decision")
+        with self.assertRaisesRegex(KitError, "R2 is missing"):
+            rulings.add(self.root, "controller", "Q?", "D.")
+        self.assertEqual(self.path.read_bytes(), before)
+
     def test_supersedes_must_point_backwards(self):
         self.seed(HEADER + self.block(1, "Supersedes R2 later.") + self.block(2, "Self: supersedes R2."))
         problems = rulings.validate(self.root)
@@ -128,6 +159,10 @@ class RulingsTests(unittest.TestCase):
             ("", "Q?", "D.", ""), ("a)b", "Q?", "D.", ""), ("x\ny", "Q?", "D.", ""),
             ("controller", " ", "D.", ""), ("controller", "Q?", "", ""),
             ("controller", "Q?", "line\n## R9 (2026-01-01, x)", ""),
+            ("controller", "Q\n## heading", "D.", ""),
+            ("controller", "Q?", "D.", "p\r## sneaky"),
+            ("x\ry", "Q?", "D.", ""), ("x\x0by", "Q?", "D.", ""), ("x\x0cy", "Q?", "D.", ""),
+            ("x\x85y", "Q?", "D.", ""), ("x\u2028y", "Q?", "D.", ""), ("x\u2029y", "Q?", "D.", ""),
             ("controller", "Q?", "line\n**Decision.** twice", ""),
         ]:
             with self.assertRaises(KitError, msg=repr((role, question, decision))):
