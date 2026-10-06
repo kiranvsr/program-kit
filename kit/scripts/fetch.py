@@ -23,6 +23,7 @@ import re
 import stat
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -39,7 +40,12 @@ _PIN_KEYS = ("url", "sha256", "size", "filename")
 
 
 def cache_root() -> Path:
-    """The cache root: $PROGRAM_KIT_CACHE, else ~/.cache/program-kit/fetch."""
+    """The cache root: $PROGRAM_KIT_CACHE, else ~/.cache/program-kit/fetch.
+
+    The root itself may be a symlink (it is the user's own path) and is followed; only the digest
+    directory and the entry beneath it are never followed. Checks on them are made just before use,
+    a race this per-host cache accepts.
+    """
     override = os.environ.get("PROGRAM_KIT_CACHE")
     return Path(override) if override else Path.home() / ".cache" / "program-kit" / "fetch"
 
@@ -66,26 +72,26 @@ def _inspect(root: Path, sha256: str, name: str) -> tuple[Path | None, str]:
     """(path, "") for a good cache entry, else (None, why it is a miss)."""
     path = cache_path(root, sha256, name)
     if path.parent.is_symlink():
-        return None, "digest directory is a symlink"
+        return None, "symlink: digest directory is a link"
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)  # never block on a FIFO
     try:
         fd = os.open(path, flags)
     except FileNotFoundError:
         return None, "not in the cache"
     except OSError:  # includes ELOOP for a symlinked entry
-        return None, "entry is a symlink or unreadable"
+        return None, "symlink or unreadable entry"
     digest = hashlib.sha256()
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
-            return None, "entry is not a regular file"
+            return None, "not a regular file"
         while chunk := os.read(fd, CHUNK):
             digest.update(chunk)
     except OSError as error:
-        return None, f"entry cannot be read: {_one_line(error)}"
+        return None, f"unreadable: {_one_line(error)}"
     finally:
         os.close(fd)
     if digest.hexdigest() != sha256:
-        return None, "cached file does not match its digest"
+        return None, "digest mismatch"
     return path, ""
 
 
@@ -134,10 +140,24 @@ def _one_line(error: BaseException) -> str:
     return f"{type(error).__name__}: {text}" if text else type(error).__name__
 
 
+def _umask() -> int:
+    mask = os.umask(0)
+    os.umask(mask)
+    return mask
+
+
+def _scheme(url: str) -> str:
+    try:
+        return urllib.parse.urlsplit(url).scheme.lower()
+    except ValueError as error:
+        raise _Refused("malformed url") from error
+
+
 def _download(root: Path, pin: dict, opener, timeout: int) -> Path:
     url, size, sha256 = pin["url"], pin["size"], pin["sha256"]
-    if urllib.parse.urlsplit(url).scheme.lower() not in _allowed_schemes():
+    if _scheme(url) not in _allowed_schemes():
         raise _Refused("scheme not allowed")
+    deadline = time.monotonic() + timeout  # for the whole download; `timeout` alone is per socket operation
     path = cache_path(root, sha256, pin["filename"])
     directory = path.parent
     temporary, renamed = None, False
@@ -151,8 +171,12 @@ def _download(root: Path, pin: dict, opener, timeout: int) -> Path:
             fd, temporary = tempfile.mkstemp(dir=directory, prefix=f".{path.name}.", suffix=".part")
             digest, received = hashlib.sha256(), 0
             with os.fdopen(fd, "wb") as out:
+                if hasattr(os, "fchmod"):
+                    os.fchmod(out.fileno(), 0o644 & ~_umask())  # mkstemp makes 0600; a shared cache must be readable
                 while True:
                     chunk = response.read(CHUNK)
+                    if time.monotonic() > deadline:
+                        raise _Refused("timed out")
                     if not chunk:
                         break
                     received += len(chunk)
@@ -178,6 +202,11 @@ def _download(root: Path, pin: dict, opener, timeout: int) -> Path:
             try:
                 os.unlink(temporary)
             except FileNotFoundError:
+                pass
+        if not renamed:
+            try:
+                os.rmdir(directory)  # only if empty: a failed fetch leaves no digest directory behind
+            except OSError:
                 pass
 
 
@@ -231,17 +260,23 @@ def cmd_fetch(args: argparse.Namespace) -> int:
     pins = _load_pins(pins_file)
     if getattr(args, "fetch_action", None) == "verify":
         rows = verify(cache_root(), pins)
+        misses = [row for row in rows if row["state"] == "missing"]
+        if misses:  # nothing on stdout: a miss is a failure with the command to run
+            for row in misses:
+                print(f"error: {row['filename']} {row['reason']}; run: pk fetch --pins {pins_file}", file=sys.stderr)
+            return 1
         for row in rows:
-            if row["state"] == "missing":
-                print(f"error: {row['filename']} is not in the cache; run: pk fetch --pins {pins_file}",
-                      file=sys.stderr)
-            else:
-                print(f"{row['state']} {row['filename']} {row['reason']}")
-        return 1 if any(row["state"] == "missing" for row in rows) else 0
+            print(f"{row['state']} {row['filename']} {row['reason']}")
+        return 0
     rows = fetch(cache_root(), pins)
+    refused = False
     for row in rows:
-        print(f"{row['state']} {row['filename']} {row['reason']}")
-    return 1 if any(row["state"] == "refused" for row in rows) else 0
+        if row["state"] == "refused":
+            refused = True
+            print(f"error: {row['filename']}: {row['reason']}", file=sys.stderr)
+        else:
+            print(f"{row['state']} {row['filename']} {row['reason']}")
+    return 1 if refused else 0
 
 
 def _configure(parser: argparse.ArgumentParser) -> None:

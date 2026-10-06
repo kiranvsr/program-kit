@@ -395,7 +395,8 @@ class Evidence:
         except ImportError as exc:
             raise KitError(f"stale check unavailable: {exc}") from exc
         report = stale_module.stale_records(self.root, main or self.main)
-        self.stale_result = {"checked": True, "records": list(report.get("stale", []))}
+        self.stale_result = {"checked": True, "records": list(report.get("stale", [])),
+                             "unreadable": list(report.get("unreadable", []))}
         return self.stale_result
 
     # --- write -----------------------------------------------------------------

@@ -485,12 +485,14 @@ class Write(Base):
     def test_stale_delegates_to_stale_records(self):
         ev = evidence.Evidence(self.root, "T-1")
         fake = mock.Mock()
+        bad = {"path": "u", "changed_inputs": [], "error": "no inputs mapping"}
         fake.stale_records.return_value = {"main": "x" * 40, "stale": [{"path": "p", "changed_inputs": ["q"]}],
-                                           "checked": 1}
+                                           "unreadable": [bad], "checked": 2}
         with mock.patch.dict(sys.modules, {"stale": fake}):
             got = ev.stale("main")
         fake.stale_records.assert_called_once_with(self.root, "main")
-        self.assertEqual(got, {"checked": True, "records": [{"path": "p", "changed_inputs": ["q"]}]})
+        self.assertEqual(got, {"checked": True, "records": [{"path": "p", "changed_inputs": ["q"]}],
+                               "unreadable": [bad]})
         self.assertEqual(ev.stale_result, got)
 
 

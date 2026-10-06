@@ -167,7 +167,8 @@ class Verify(Base):
         pins.write_text(json.dumps([self.pin()]))
         code, out, err = run_cli("fetch", "verify", "--pins", str(pins))
         self.assertEqual(code, 1)
-        self.assertEqual(err, f"error: {NAME} is not in the cache; run: pk fetch --pins {pins}\n")
+        self.assertEqual(err, f"error: {NAME} not in the cache; run: pk fetch --pins {pins}\n")
+        self.assertEqual(out, "")
 
     def test_verify_treats_symlinked_entry_as_miss(self):
         outside = self.work / "outside.bin"
@@ -352,6 +353,74 @@ class Fetch(Base):
         self.assertEqual(len(seen), 1)
         self.assertEqual(Path(seen[0][1]["dir"]), self.digest_dir())
 
+    def test_malformed_url_is_refused_and_later_pins_still_run(self):
+        server, base = self.serve({"/a": PAYLOAD})
+        pins = self.work / "pins.json"
+        pins.write_text(json.dumps([self.pin("https://[bad", data=b"zz", name="b.bin"), self.pin(base + "/a")]))
+        for url in ("https://[bad", "http://[::1"):
+            row = fetch.fetch(self.cache, [self.pin(url, data=b"zz", name="b.bin")])[0]
+            self.assertEqual((row["state"], row["reason"]), ("refused", "malformed url"))
+        code, out, err = run_cli("fetch", "--pins", str(pins))
+        self.assertEqual(code, 1)
+        self.assertEqual(err, "error: b.bin: malformed url\n")
+        self.assertEqual(out.split()[:2], ["fetched", NAME])
+
+    def test_whole_download_deadline_refuses_a_slow_drip(self):
+        clock = [1000.0]
+
+        class Drip(FakeResponse):
+            def read(self, size=-1):
+                clock[0] += 400  # each chunk is within any per-operation timeout, the total is not
+                return b"x"
+
+        response = Drip([])
+        with mock.patch.object(fetch.time, "monotonic", lambda: clock[0]):
+            row = fetch.fetch(self.cache, [self.pin(data=b"x" * 100)], opener=FakeOpener(response), timeout=600)[0]
+        self.assertEqual((row["state"], row["reason"]), ("refused", "timed out"))
+        self.assertTrue(response.closed)
+        self.assertEqual(self.leftovers(b"x" * 100), [])
+
+    @unittest.skipUnless(hasattr(os, "fchmod"), "POSIX only")
+    def test_entry_mode_follows_umask_and_is_world_readable(self):
+        old = os.umask(0o022)
+        self.addCleanup(os.umask, old)
+        server, base = self.serve({"/a": PAYLOAD})
+        fetch.fetch(self.cache, [self.pin(base + "/a")])
+        self.assertEqual((self.digest_dir() / NAME).stat().st_mode & 0o777, 0o644)
+        self.assertEqual(os.umask(0o022), 0o022)  # the helper left the umask as it found it
+
+    def test_failed_fetch_removes_an_empty_digest_directory_but_not_a_populated_one(self):
+        server, base = self.serve({"/wrong": b"x" * len(PAYLOAD)})
+        self.assertEqual(fetch.fetch(self.cache, [self.pin(base + "/wrong")])[0]["state"], "refused")
+        self.assertFalse(self.digest_dir().exists())  # the directory this attempt created is gone again
+        self.assertTrue(self.cache.exists())
+        directory = self.digest_dir()
+        directory.mkdir()
+        (directory / "other").write_bytes(b"keep")
+        (directory / NAME).write_bytes(b"corrupt")
+        fetch.fetch(self.cache, [self.pin(base + "/wrong")])
+        self.assertEqual(sorted(p.name for p in directory.iterdir()), ["other", NAME])
+
+    def test_dangling_and_looping_symlink_entries_are_misses_and_replaced(self):
+        directory = self.digest_dir()
+        directory.mkdir(parents=True)
+        entry = directory / NAME
+        server, base = self.serve({"/a": PAYLOAD})
+        for kind in ("dangling", "loop"):
+            with self.subTest(kind=kind):
+                if entry.is_symlink() or entry.exists():
+                    entry.unlink()
+                if kind == "dangling":
+                    entry.symlink_to(self.work / "does-not-exist")
+                else:
+                    entry.symlink_to(entry.name)  # points at itself
+                self.assertIsNone(fetch.cached(self.cache, sha(PAYLOAD), NAME))
+                self.assertEqual(fetch.verify(self.cache, [self.pin()])[0]["state"], "missing")
+                self.assertEqual(fetch.fetch(self.cache, [self.pin(base + "/a")])[0]["state"], "fetched")
+                self.assertFalse(entry.is_symlink())
+                self.assertEqual(entry.read_bytes(), PAYLOAD)
+        self.assertFalse((self.work / "does-not-exist").exists())
+
     def test_one_refusal_does_not_stop_the_other_pins(self):
         server, base = self.serve({"/a": PAYLOAD})
         other = b"second"
@@ -391,8 +460,33 @@ class Cli(Base):
         pins = self.pins_file([self.pin(base + "/nope")])
         code, out, err = run_cli("fetch", "--pins", str(pins))
         self.assertEqual(code, 1)
-        self.assertEqual(out.split()[:2], ["refused", NAME])
+        self.assertEqual(out, "")
+        self.assertTrue(err.startswith(f"error: {NAME}: "), err)
+        self.assertEqual(len(err.splitlines()), 1)
         self.assertNotIn("Traceback", out + err)
+
+    def test_refusal_goes_to_stderr_and_other_pins_stay_on_stdout(self):
+        server, base = self.serve({"/a": PAYLOAD})
+        pins = self.pins_file([self.pin(base + "/nope", data=b"zz", name="b.bin"), self.pin(base + "/a")])
+        code, out, err = run_cli("fetch", "--pins", str(pins))
+        self.assertEqual(code, 1)
+        self.assertEqual(out.split()[:2], ["fetched", NAME])
+        self.assertTrue(err.startswith("error: b.bin: "), err)
+
+    def test_verify_with_a_miss_prints_real_reasons_and_nothing_on_stdout(self):
+        server, base = self.serve({"/a": PAYLOAD})
+        good = self.pin(base + "/a")
+        bad = self.pin(data=b"other", name="bad.bin")
+        absent = self.pin(data=b"absent", name="absent.bin")
+        fetch.fetch(self.cache, [good])
+        d = self.digest_dir(b"other")
+        d.mkdir(parents=True)
+        (d / "bad.bin").write_bytes(b"corrupt")
+        pins = self.pins_file([good, bad, absent])
+        code, out, err = run_cli("fetch", "verify", "--pins", str(pins))
+        self.assertEqual((code, out), (1, ""))
+        self.assertEqual(err.splitlines(), [f"error: bad.bin digest mismatch; run: pk fetch --pins {pins}",
+                                            f"error: absent.bin not in the cache; run: pk fetch --pins {pins}"])
 
     def test_missing_pins_and_bad_pins_file(self):
         self.assertEqual(run_cli("fetch")[0], 1)

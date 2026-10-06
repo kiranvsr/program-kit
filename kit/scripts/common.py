@@ -98,6 +98,8 @@ def read_json(path: Path):
         return json.loads(text)
     except ValueError as exc:
         raise KitError(f"{path}: invalid JSON: {exc}") from exc
+    except RecursionError as exc:
+        raise KitError(f"{path}: JSON nested too deeply") from exc
 
 
 def write_json(path: Path, data) -> None:

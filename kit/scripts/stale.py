@@ -45,12 +45,15 @@ def _one_line(text) -> str:
     return " ".join(str(text).split()) or "unreadable"
 
 
-def _inputs(path: Path):
-    """(inputs mapping, None) for a usable record, else (None, one-line reason)."""
+def _inputs(path: Path, rel: str):
+    """(inputs mapping, None) for a usable record, else (None, one-line reason).
+
+    The reason names the record by its root-relative path, so reports match across machines.
+    """
     try:
         data = read_json(path)
     except KitError as exc:
-        return None, _one_line(exc)
+        return None, _one_line(str(exc).replace(str(path), rel))
     if not isinstance(data, dict):
         return None, "results.json is not a JSON object"
     inputs = data.get("inputs")
@@ -86,7 +89,7 @@ def stale_records(root, main: str = "main") -> dict:
     records = sorted((root / "program" / "evidence").glob("*/results.json"))
     for record in records:
         rel = record.relative_to(root).as_posix()
-        inputs, error = _inputs(record)
+        inputs, error = _inputs(record, rel)
         if inputs is None:
             unreadable.append({"path": rel, "changed_inputs": [], "error": error})
             continue

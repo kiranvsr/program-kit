@@ -117,6 +117,36 @@ class StaleRecords(Base):
         self.assertEqual((report["stale"], report["unreadable"], report["checked"]), ([], [], 0))
 
 
+class Robustness(Base):
+    def test_deeply_nested_record_is_unreadable_and_the_rest_are_reported(self):
+        self.put("program/evidence/A-deep/results.json", "[" * 100000)
+        self.put("calc.py", "v2\n")
+        self.commit("deep record, changed calc")
+        report = stale.stale_records(self.root, "main")
+        self.assertEqual([r["path"] for r in report["unreadable"]], ["program/evidence/A-deep/results.json"])
+        self.assertIn("nested too deeply", report["unreadable"][0]["error"])
+        self.assertEqual([r["path"] for r in report["stale"]], ["program/evidence/T-1/results.json"])
+        self.assertEqual(report["checked"], 3)
+
+    def test_unreadable_errors_are_root_relative(self):
+        self.put("program/evidence/A-bad/results.json", "{not json")
+        self.put("program/evidence/B-deep/results.json", "[" * 100000)
+        self.commit("bad records")
+        report = stale.stale_records(self.root, "main")
+        self.assertEqual(len(report["unreadable"]), 2)
+        for item in report["unreadable"]:
+            self.assertNotIn(str(self.root), item["error"])
+            self.assertIn(item["path"], item["error"])
+
+    def test_non_string_input_hash_is_reported_stale_not_a_crash(self):
+        self.record("T-3", {"calc.py": 5, "lib.py": None, "sub/x": ["a"]})
+        self.commit("odd hashes")
+        report = stale.stale_records(self.root, "main")
+        row = [r for r in report["stale"] if r["path"].endswith("T-3/results.json")]
+        self.assertEqual(row[0]["changed_inputs"], ["calc.py", "lib.py", "sub/x"])
+        self.assertEqual(report["unreadable"], [])
+
+
 class Cli(Base):
     def run_cli(self, *argv):
         out, err = io.StringIO(), io.StringIO()
@@ -148,9 +178,15 @@ class EvidenceIntegration(Base):
     def test_evidence_stale_uses_the_real_module(self):
         self.put("calc.py", "v2\n")
         self.commit("change calc")
-        got = evidence.Evidence(self.root, "T-9").stale()
-        self.assertEqual(got, {"checked": True, "records": [{"path": "program/evidence/T-1/results.json",
-                                                             "changed_inputs": ["calc.py"]}]})
+        self.put("program/evidence/T-0/results.json", "{not json")
+        self.commit("unreadable record")
+        ev = evidence.Evidence(self.root, "T-9")
+        got = ev.stale()
+        self.assertEqual(got["checked"], True)
+        self.assertEqual(got["records"], [{"path": "program/evidence/T-1/results.json",
+                                           "changed_inputs": ["calc.py"]}])
+        self.assertEqual([r["path"] for r in got["unreadable"]], ["program/evidence/T-0/results.json"])
+        self.assertEqual(ev.stale_result, got)
 
 
 if __name__ == "__main__":
