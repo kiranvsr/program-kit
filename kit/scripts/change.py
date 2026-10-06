@@ -99,7 +99,10 @@ def _read(root: Path, cr_id: str) -> tuple[Path, str]:
 
 def _create_exclusive(path: Path, text: str) -> bool:
     """Create `path` with `text`; False when it already exists (another create won the number)."""
-    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)  # a file in the way is an error, not a lost race
+    except OSError as exc:
+        raise KitError(f"cannot create {path}: {exc.strerror or exc}") from exc
     try:
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
     except FileExistsError:

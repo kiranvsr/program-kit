@@ -312,6 +312,13 @@ class CliTests(ChangeBase):
                 self.assertEqual((code, out), (1, ""))
                 self.assertTrue(err.startswith("error: ") and err.count("\n") == 1, err)
 
+    def test_a_file_where_the_changes_directory_belongs_is_one_error_line(self):
+        (self.program / "changes").write_text("not a directory\n")
+        code, out, err = self.run_cli("change", "create", "--title", "t", "--why", "w", "--asked-by", "Ada")
+        self.assertEqual((code, out), (1, ""))
+        self.assertTrue(err.startswith("error: cannot create ") and err.count("\n") == 1, err)
+        self.assertEqual((self.program / "changes").read_text(), "not a directory\n")
+
 
 if __name__ == "__main__":
     unittest.main()

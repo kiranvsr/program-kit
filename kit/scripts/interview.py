@@ -6,11 +6,13 @@ lists the topics of each stage and the ledger tags each one needs; the ledger
 (`program/ledger.yaml`) records facts, assumptions, decisions and questions; `topic_states` and
 `stopping_rule` decide from those two whether a stage may be approved; `approve` records the
 artifact and ledger hashes in `program/approvals/stage-N.json`, and `next_stage`, `amend` and
-`replay` work from those records.
+`replay` work from those records. The freeze approval (stage 5) also records a digest of the entries that
+touch a topic of stages 1 to 5, so the stage 6 answers that follow it do not reopen the freeze.
 """
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import string
@@ -484,7 +486,8 @@ def stopping_rule(root: Path, stage: int) -> list[str]:
     """Reasons `stage` cannot be approved, each starting with a topic or entry ID or a file name.
 
     From the freeze (stage 5) on, the topic and blocking-question checks of every earlier stage run again, so a
-    topic reopened or a question raised after its own approval blocks the freeze; stage 6 also validates the register.
+    topic reopened or a question raised after its own approval blocks the freeze; stage 6 also validates the register
+    and, for a register that is valid, refuses a matrix whose copy of the tasks `pk trace sync` would change.
     """
     _refuse_per_task(stage)
     coverage = load_coverage(root)
@@ -508,7 +511,8 @@ def stopping_rule(root: Path, stage: int) -> list[str]:
 
         reasons.extend(trace_module.validate(root, stage))
     if stage == 6:
-        reasons.extend(_register_reasons(root))
+        invalid = _register_reasons(root)
+        reasons.extend(invalid or trace_module.unsynced(root))  # the requirement check above read that copy
     return reasons
 
 
@@ -522,8 +526,16 @@ def _template(name: str) -> string.Template:
         raise KitError(f"cannot read {path}: {exc.strerror or exc}") from exc
 
 
+def _make_parent(path: Path) -> None:
+    """Create the directory `path` goes in; a file in the way (at any level) is an error naming `path`."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise KitError(f"cannot write {path}: {exc.strerror or exc}") from exc
+
+
 def _write_text(path: Path, text: str, exclusive: bool = False) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _make_parent(path)
     try:
         with open(path, "x" if exclusive else "w", encoding="utf-8", newline="\n") as handle:
             handle.write(text)
@@ -612,6 +624,57 @@ def _ledger_hash(root: Path) -> str | None:
     return sha256_file(path) if path.exists() else None
 
 
+FROZEN_ENTRIES = "frozen_entries_sha256"  # in the stage 5 approval only
+
+
+def _frozen_entries_hash(root: Path) -> str:
+    """sha256 over the ledger entries that touch a topic of stages 1 to 5, with the sources they cite.
+
+    An entry is left out only when every topic it lists belongs to a stage after the freeze (stage 6), so the
+    answers recorded for stage 6 after approval 5 do not change the digest; an entry that also names an earlier
+    topic, or lists no topic the map knows, stays in. The digest is over a canonical form (JSON, sorted keys),
+    so the file's layout and comments do not count.
+    """
+    later = {topic for stage, info in load_coverage(root)["stages"].items() if stage > FREEZE_STAGE
+             for topic in info["topics"]}
+    ledger = _load_ledger(root)
+    kept = []
+    for item in ledger["entries"]:
+        topics = item.get("topics")
+        if not (isinstance(topics, list) and topics and all(isinstance(t, str) and t in later for t in topics)):
+            kept.append(item)
+    cited = {item["source"] for item in kept if isinstance(item.get("source"), str)}
+    sources = {key: record for key, record in ledger["sources"].items() if key in cited}
+    try:
+        text = json.dumps({"entries": kept, "sources": sources}, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError) as exc:
+        raise KitError(f"{_ledger_path(root)}: cannot be hashed: {exc}") from exc
+    return sha256_bytes(text.encode("utf-8"))
+
+
+def _ledger_record(root: Path, stage: int) -> dict:
+    """The ledger fields of an approval of `stage` written now; a missing ledger is an error."""
+    ledger_hash = _ledger_hash(root)
+    if ledger_hash is None:
+        raise KitError("program/ledger.yaml is missing")
+    record = {"ledger_sha256": ledger_hash}
+    if stage == FREEZE_STAGE:
+        record[FROZEN_ENTRIES] = _frozen_entries_hash(root)
+    return record
+
+
+def _ledger_changed(root: Path, stage: int, record: dict) -> bool:
+    """Whether the ledger no longer matches the approval `record` of `stage`; approve, amend and next all ask here.
+
+    The freeze approval compares its digest of the stage 1 to 5 entries, so entries for stage 6 topics may be
+    added, changed or removed after it. Every other approval, and a freeze approval written before that digest
+    existed, compares the whole file.
+    """
+    if stage == FREEZE_STAGE and isinstance(record.get(FROZEN_ENTRIES), str):
+        return record[FROZEN_ENTRIES] != _frozen_entries_hash(root)
+    return record.get("ledger_sha256") != _ledger_hash(root)
+
+
 ADR_STAGE = 4  # the stage whose approval also hashes the decision records in program/adr/ (playbook 04, step 11)
 
 
@@ -631,16 +694,13 @@ def approve(root: Path, stage: int, artifacts: list[Path]) -> Path:
     reasons = stopping_rule(root, stage)
     if reasons:
         raise KitError("; ".join(reasons))
-    ledger_hash = _ledger_hash(root)
-    if ledger_hash is None:
-        raise KitError("program/ledger.yaml is missing")
+    ledger = _ledger_record(root, stage)
     hashes = {}
     for artifact in artifacts:
         relative = _relpath(root, artifact)
         hashes[relative] = sha256_file(Path(root) / relative)
     path = _approval_path(root, stage)
-    write_json(path, {"stage": stage, "at": utc_now(), "artifacts": dict(sorted(hashes.items())),
-                      "ledger_sha256": ledger_hash})
+    write_json(path, {"stage": stage, "at": utc_now(), "artifacts": dict(sorted(hashes.items())), **ledger})
     return path
 
 
@@ -674,7 +734,7 @@ def _changes(root: Path, record, check_ledger: bool, stage: int) -> list[str]:
         except KitError:
             changed.append(relative)
     changed.extend(_unrecorded(root, stage, record["artifacts"]))  # a file added after the approval
-    if check_ledger and record.get("ledger_sha256") != _ledger_hash(root):
+    if check_ledger and _ledger_changed(root, stage, record):
         changed.append("program/ledger.yaml")
     return sorted(changed)
 
@@ -683,8 +743,9 @@ def _first_open(root: Path, last: int) -> tuple[int, list[str]] | None:
     """The first stage in 1..`last` that is unapproved (with no paths) or whose approval is stale (with them).
 
     The ledger grows while stages 1 to 4 are worked, so their approvals compare artifact hashes only. After the
-    freeze (stage 5 on) a ledger change is a change request: the ledger hash is compared for the highest approval
-    of stage 5 or later among the stages looked at.
+    freeze (stage 5 on) a ledger change is a change request: the ledger is compared for the highest approval
+    of stage 5 or later among the stages looked at (`_ledger_changed`: stage 5 by its digest of the entries that
+    touch stages 1 to 5, because stage 6 still adds its own answers; stage 6 by the whole file).
     """
     approved = [stage for stage in range(1, last + 1) if _approval_path(root, stage).exists()]
     frozen = [stage for stage in approved if stage >= FREEZE_STAGE]
@@ -727,8 +788,9 @@ def require_earlier(root: Path, stage: int) -> None:
 def amend(root: Path, stage: int) -> list[str]:
     """Re-hash an approval's artifacts and the ledger; rewrite it if any changed; return the changed paths.
 
-    The set re-hashed is the one approve and replay hash: a file added to it joins, and a decision record
-    (`program/adr/*.md`) that is gone leaves it. Any other recorded file that cannot be read is an error.
+    The ledger counts as changed when `_ledger_changed` says so, as for `next`. The set re-hashed is the one
+    approve and replay hash: a file added to it joins, and a decision record (`program/adr/*.md`) that is gone
+    leaves it. Any other recorded file that cannot be read is an error.
     """
     _check_stage(stage)
     _refuse_per_task(stage)
@@ -750,13 +812,11 @@ def amend(root: Path, stage: int) -> list[str]:
         hashes[relative] = sha256_file(Path(root) / relative)
         changed.append(relative)
     hashes = dict(sorted(hashes.items()))
-    ledger_hash = _ledger_hash(root)
-    if ledger_hash is None:
-        raise KitError("program/ledger.yaml is missing")
-    if ledger_hash != record.get("ledger_sha256"):
+    ledger = _ledger_record(root, stage)
+    if _ledger_changed(root, stage, record):
         changed.append("program/ledger.yaml")
     if changed:
-        write_json(path, {"stage": stage, "at": utc_now(), "artifacts": hashes, "ledger_sha256": ledger_hash})
+        write_json(path, {"stage": stage, "at": utc_now(), "artifacts": hashes, **ledger})
     return sorted(changed)
 
 
@@ -782,7 +842,7 @@ def ingest(root: Path, file: Path) -> str:
     numbers = [int(m.group(1)) for key in ledger["sources"] if (m := re.fullmatch(r"S(\d+)", str(key)))]
     source_id = f"S{max(numbers, default=0) + 1}"
     stored = Path(root) / "program" / "sources" / f"{sha256_bytes(data)[:12]}-{source.name}"
-    stored.parent.mkdir(parents=True, exist_ok=True)
+    _make_parent(stored)
     ledger["sources"][source_id] = {"kind": "document", "ref": stored.relative_to(Path(root)).as_posix(),
                                     "at": utc_now()}
     temp = None
@@ -846,7 +906,7 @@ def replay(root: Path, ledger: Path, artifacts_dir: Path) -> None:
 
 
 def _write_bytes(path: Path, data: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _make_parent(path)
     try:
         path.write_bytes(data)
     except OSError as exc:

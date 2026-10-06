@@ -997,6 +997,215 @@ class MalformedLedgerValueTests(InterviewBase):
                          ["F-\u0661: id must look like F-<n>, A-<n>, D-<n> or Q-<n>"])
 
 
+class StageSixAnswersTests(InterviewBase):
+    """Stage 6 is an interview stage: its answers reach the ledger after approval 5 and must not reopen the freeze.
+
+    Between approval 5 and approval 6 only an entry that touches a topic of stages 1 to 5 makes stage 5 modified.
+    """
+
+    FILES = {1: "discovery.md", 2: "product.md", 3: "SPEC.md", 4: "ARCHITECTURE.md", 5: "freeze/signoff.md",
+             6: "register.yaml"}
+    MORE_SOURCES = dict(SOURCES, S2={"kind": "user", "ref": "message 9", "at": "2026-10-02T10:00:00Z"})
+
+    def setUp(self):
+        super().setUp()
+
+        def topic(title):
+            return {"title": title, "owner": "project", "contributes": [], "required": True, "condition": None,
+                    "closes_when": "Stated.", "needs": []}
+
+        coverage = read_yaml(FIXTURE)
+        coverage["stages"].update({
+            "3": {"name": "specify", "budget": 3, "artifacts": [self.FILES[3]], "topics": {"T3.1": topic("Scope")}},
+            "4": {"name": "architect", "budget": 3, "artifacts": [self.FILES[4]], "topics": {}},
+            "5": {"name": "freeze review", "budget": 0, "artifacts": [self.FILES[5]], "topics": {}},
+            "6": {"name": "roadmap and register", "budget": 3, "artifacts": [self.FILES[6]],
+                  "topics": {"T6.1": topic("Phase shaping"), "T6.2": topic("Capacity")}}})
+        write_yaml(self.root / "kit" / "interview" / "coverage.yaml", coverage)
+        self.spec = CLOSING + [entry("F-3", topics=["T2.1"]), entry("F-4", topics=["T3.1"]), entry("F-5")]
+        self.put_ledger(self.spec)
+        for stage in range(1, 6):
+            self.write(f"program/{self.FILES[stage]}")
+        self.put_register()
+        for stage in range(2, 7):
+            self.challenge(stage)
+        patcher = mock.patch("trace.validate", return_value=[])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for stage in range(1, 6):
+            self.assertEqual(self.run_cli("interview", "approve", str(stage))[0], 0, stage)
+
+    def next(self):
+        code, out, err = self.run_cli("interview", "next")
+        self.assertEqual((code, err), (0, ""))
+        return out
+
+    def assert_freeze_reopened(self):
+        out = self.next()
+        self.assertEqual(out.splitlines()[0], "next stage: 5 (freeze review)")
+        self.assertIn("stage 5 was approved and its files changed: program/ledger.yaml; run pk interview amend 5", out)
+        code, out, err = self.run_cli("interview", "approve", "6")
+        self.assertEqual((code, out), (1, ""))
+        self.assertEqual(err, "error: stage 5 was approved and its files changed (program/ledger.yaml); "
+                              "run pk interview amend 5 or raise a change request before approving stage 6\n")
+        self.assertFalse((self.root / "program" / "approvals" / "stage-6.json").exists())
+
+    def test_a_stage_6_fact_after_approval_5_leaves_the_freeze_current_and_stage_6_approves(self):
+        self.assertEqual(self.next().splitlines()[0], "next stage: 6 (roadmap and register)")
+        self.put_ledger(self.spec + [entry("F-6", topics=["T6.1"], source="S2")], self.MORE_SOURCES)
+        out = self.next()
+        self.assertEqual(out.splitlines()[:2], ["next stage: 6 (roadmap and register)", "topics closed: 1 of 2"])
+        self.assertNotIn("was approved", out)
+        code, out, err = self.run_cli("interview", "approve", "6")  # refused by stage 6's own stopping rule only
+        self.assertEqual((code, out), (1, ""))
+        self.assertEqual(err, "error: T6.2: required topic open (missing: any fact, confirmed assumption or "
+                              "decision)\n")
+        self.put_ledger(self.spec + [entry("F-6", topics=["T6.1"], source="S2"),
+                                     entry("D-1", topics=["T6.2", "T6.1"], source="S2")], self.MORE_SOURCES)
+        code, out, err = self.run_cli("interview", "approve", "6")
+        self.assertEqual((code, out, err), (0, "approved stage 6: program/approvals/stage-6.json\n", ""))
+        self.assertEqual(self.next().splitlines()[0], "next stage: 7 (stage 7)")
+
+    def test_amend_agrees_that_a_stage_6_answer_changed_nothing_at_stage_5(self):
+        record = self.root / "program" / "approvals" / "stage-5.json"
+        before = record.read_bytes()
+        self.put_ledger(self.spec + [entry("F-6", topics=["T6.1"])])
+        self.assertEqual(self.run_cli("interview", "amend", "5"), (0, "no changes\n", ""))
+        self.assertEqual(record.read_bytes(), before)
+
+    def test_an_entry_on_a_stage_3_topic_after_approval_5_reopens_the_freeze_until_amended(self):
+        self.put_ledger(self.spec + [entry("F-6", topics=["T3.1"]), entry("F-7", topics=["T6.1"])])
+        self.assert_freeze_reopened()
+        self.assertEqual(self.run_cli("interview", "amend", "5"), (0, "program/ledger.yaml\n", ""))
+        self.assertEqual(self.next().splitlines()[0], "next stage: 6 (roadmap and register)")
+        self.put_ledger(self.spec + [entry("F-6", topics=["T3.1"]), entry("F-7", topics=["T6.1"]),
+                                     entry("F-8", topics=["T6.2"])])  # the amended record still lets stage 6 grow
+        self.assertEqual(self.run_cli("interview", "approve", "6")[0], 0)
+
+    def test_an_existing_stage_2_entry_edited_after_approval_5_reopens_the_freeze(self):
+        edited = [dict(item, text="another meaning") if item["id"] == "F-3" else item for item in self.spec]
+        self.put_ledger(edited + [entry("F-6", topics=["T6.1"]), entry("F-7", topics=["T6.2"])])
+        self.assert_freeze_reopened()
+
+    def test_an_earlier_entry_removed_or_its_source_changed_reopens_the_freeze(self):
+        self.put_ledger([item for item in self.spec if item["id"] != "F-5"])
+        self.assert_freeze_reopened()
+        self.put_ledger(self.spec, dict(SOURCES, S1=dict(SOURCES["S1"], ref="another message")))
+        self.assert_freeze_reopened()
+        self.put_ledger(self.spec)
+        self.assertEqual(self.next().splitlines()[0], "next stage: 6 (roadmap and register)")
+
+    def test_an_entry_with_a_stage_6_topic_and_an_earlier_one_counts_as_the_earlier_stage(self):
+        for topics in (["T6.1", "T2.1"], ["T1.1", "T6.2"]):
+            with self.subTest(topics=topics):
+                self.put_ledger(self.spec + [entry("F-6", topics=topics)])
+                self.assert_freeze_reopened()
+
+    def test_after_approval_6_a_stage_6_entry_change_makes_stage_6_modified(self):
+        answers = [entry("F-6", topics=["T6.1"]), entry("F-7", topics=["T6.2"])]
+        self.put_ledger(self.spec + answers)
+        self.assertEqual(self.run_cli("interview", "approve", "6")[0], 0)
+        self.put_ledger(self.spec + [dict(answers[0], text="another cadence"), answers[1]])
+        out = self.next()
+        self.assertEqual(out.splitlines()[0], "next stage: 6 (roadmap and register)")
+        self.assertIn("stage 6 was approved and its files changed: program/ledger.yaml; run pk interview amend 6", out)
+        self.assertEqual(self.run_cli("interview", "amend", "6"), (0, "program/ledger.yaml\n", ""))
+        self.assertEqual(self.next().splitlines()[0], "next stage: 7 (stage 7)")
+        self.put_ledger(self.spec + answers + [entry("F-8", topics=["T6.2"])])  # an added one, too
+        self.assertIn("stage 6 was approved and its files changed: program/ledger.yaml", self.next())
+
+    def test_an_approval_written_before_the_second_digest_falls_back_to_the_whole_file(self):
+        path = self.root / "program" / "approvals" / "stage-5.json"
+        record = read_json(path)
+        self.assertEqual(sorted(record), ["artifacts", "at", "frozen_entries_sha256", "ledger_sha256", "stage"])
+        del record["frozen_entries_sha256"]
+        path.write_text(json.dumps(record), encoding="utf-8")
+        self.assertEqual(self.next().splitlines()[0], "next stage: 6 (roadmap and register)")
+        self.put_ledger(self.spec + [entry("F-6", topics=["T6.1"])])
+        self.assert_freeze_reopened()  # as the record's writer behaved
+        self.assertEqual(self.run_cli("interview", "amend", "5"), (0, "program/ledger.yaml\n", ""))
+        self.assertIn("frozen_entries_sha256", read_json(path))
+        self.put_ledger(self.spec + [entry("F-6", topics=["T6.1"]), entry("F-7", topics=["T6.2"])])
+        self.assertEqual(self.next().splitlines()[0], "next stage: 6 (roadmap and register)")
+
+    def test_only_the_freeze_approval_carries_the_second_digest(self):
+        self.put_ledger(self.spec + [entry("F-6", topics=["T6.1"]), entry("F-7", topics=["T6.2"])])
+        self.assertEqual(self.run_cli("interview", "approve", "6")[0], 0)
+        for stage in (1, 4, 6):
+            record = read_json(self.root / "program" / "approvals" / f"stage-{stage}.json")
+            self.assertEqual(sorted(record), ["artifacts", "at", "ledger_sha256", "stage"], stage)
+        self.assertEqual(record["ledger_sha256"], sha256_file(self.root / "program" / "ledger.yaml"))
+
+
+class StaleTaskCopyTests(InterviewBase):
+    """Stage 6 reads the matrix's copy of each task's `closes`; a register edited since `pk trace sync` is refused."""
+
+    SYNC = "program/traceability.yaml: tasks section differs from the register; run pk trace sync"
+
+    def setUp(self):
+        import trace as trace_module
+        from test_trace import GATES, full_matrix
+
+        super().setUp()
+        self.trace = trace_module
+        self.put_ledger(CLOSING + [entry("F-3", topics=["T2.1"])])
+        self.challenge(6)
+        write_yaml(self.root / "program" / "traceability.yaml", full_matrix())
+        write_yaml(self.root / "program" / "gates.yaml", GATES)
+        self.closing = (task("P1-M01-S01-T01", closes=["REQ-001", "J1"]), task("P1-M01-S01-T02", closes=["NFR-001"]))
+        self.put_register(*self.closing)
+
+    def test_a_register_never_synced_is_refused_and_a_synced_one_passes(self):
+        self.assertIn(self.SYNC, interview.stopping_rule(self.root, 6))
+        self.trace.sync(self.root)
+        self.assertEqual(interview.stopping_rule(self.root, 6), [])
+        self.put_register(*reversed(self.closing))  # the order of the tasks is not a difference
+        self.assertEqual(interview.stopping_rule(self.root, 6), [])
+
+    def test_removing_the_only_task_that_closes_a_requirement_is_refused_before_and_after_sync(self):
+        self.trace.sync(self.root)
+        self.put_register(self.closing[0])
+        self.assertEqual(interview.ledger_validate(self.root), [])
+        with self.assertRaises(KitError) as caught:
+            interview.approve(self.root, 6, [self.root / "program" / "register.yaml"])
+        self.assertEqual(str(caught.exception), self.SYNC)
+        self.assertFalse((self.root / "program" / "approvals").exists())
+        self.trace.sync(self.root)
+        with self.assertRaises(KitError) as caught:
+            interview.approve(self.root, 6, [self.root / "program" / "register.yaml"])
+        self.assertEqual(str(caught.exception), "NFR-001: first-release requirement is not closed by any task")
+        self.assertFalse((self.root / "program" / "approvals").exists())
+
+    def test_an_empty_register_with_an_old_tasks_section_is_refused(self):
+        self.trace.sync(self.root)
+        write_yaml(self.root / "program" / "register.yaml", {"phases": []})
+        self.assertEqual(interview.stopping_rule(self.root, 6), [self.SYNC])
+
+    def test_a_changed_closes_list_is_refused_until_synced(self):
+        self.trace.sync(self.root)
+        self.put_register(task("P1-M01-S01-T01", closes=["REQ-001", "J1", "NFR-001"]),
+                          task("P1-M01-S01-T02", closes=[]))
+        self.assertEqual(interview.stopping_rule(self.root, 6), [self.SYNC])
+        self.trace.sync(self.root)
+        self.assertEqual(interview.stopping_rule(self.root, 6), [])
+
+    def test_a_missing_file_or_an_invalid_register_is_reported_once_by_its_own_check(self):
+        self.trace.sync(self.root)
+        write_yaml(self.root / "program" / "register.yaml", {"phases": [{"id": "P1", "title": "p", "milestones": 5}]})
+        reasons = interview.stopping_rule(self.root, 6)  # the validator names it; nothing is synced from it
+        self.assertIn("P1.milestones: must be a list", reasons)
+        self.assertNotIn(self.SYNC, reasons)
+        (self.root / "program" / "register.yaml").unlink()
+        self.assertEqual(interview.stopping_rule(self.root, 6), ["program/register.yaml is missing"])
+        self.put_register(*self.closing)
+        (self.root / "program" / "traceability.yaml").unlink()
+        self.assertEqual(interview.stopping_rule(self.root, 6), ["program/traceability.yaml is missing"])
+
+    def test_stage_5_does_not_look_at_the_register(self):
+        self.challenge(5)
+        self.assertEqual(interview.stopping_rule(self.root, 5), [])
+
+
 class CliTests(InterviewBase):
     def test_cli_round_trip(self):
         code, out, err = self.run_cli("interview", "next")
@@ -1057,6 +1266,25 @@ class CliTests(InterviewBase):
         self.assertEqual((code, out), (1, ""))
         code, out, err = self.run_cli("interview")
         self.assertEqual(code, 1)
+
+    def test_a_file_where_the_reports_or_sources_directory_belongs_is_one_error_line(self):
+        self.put_ledger(CLOSING)
+        self.write("program/reports", "not a directory\n")
+        for action in ("report", "challenge"):
+            code, out, err = self.run_cli("interview", action, "1")
+            self.assertEqual((code, out), (1, ""), action)
+            self.assertEqual(err.count("\n"), 1, err)
+            self.assertTrue(err.startswith("error: cannot write "), err)
+            self.assertIn("program/reports", err)
+        self.assertEqual((self.root / "program" / "reports").read_text(encoding="utf-8"), "not a directory\n")
+        self.write("program/sources", "not a directory\n")
+        ledger = (self.root / "program" / "ledger.yaml").read_bytes()
+        code, out, err = self.run_cli("interview", "ingest", str(self.write("incoming/notes.md")))
+        self.assertEqual((code, out), (1, ""))
+        self.assertEqual(err.count("\n"), 1, err)
+        self.assertTrue(err.startswith("error: cannot write "), err)
+        self.assertIn("program/sources", err)
+        self.assertEqual((self.root / "program" / "ledger.yaml").read_bytes(), ledger)
 
 
 if __name__ == "__main__":

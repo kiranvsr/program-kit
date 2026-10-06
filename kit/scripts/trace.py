@@ -4,7 +4,8 @@
 The matrix links journeys (J<n>) to requirements (REQ-<nnn>, NFR-<nnn>), requirements
 to components (C<n>), gates (G-<NAME>) to the records that prove them, and tasks to
 the IDs they close. `validate` applies the checks that belong to an interview stage,
-cumulatively; `sync` copies each task's `closes` from the register; `impact` answers
+cumulatively; `sync` copies each task's `closes` from the register and `unsynced` says when
+that copy is out of date; `impact` answers
 what a change to some IDs reaches (a gate whose claims name only a journey is not matched).
 Both files are optional until the stage that needs them.
 """
@@ -220,6 +221,25 @@ def _register_tasks(register: dict) -> list[tuple[str, list[str]]]:
     return found
 
 
+def _synced_tasks(register: dict) -> dict[str, dict]:
+    """The `tasks` section `sync` writes for `register`."""
+    return {task_id: {"closes": closes} for task_id, closes in _register_tasks(register)}
+
+
+def unsynced(root: Path) -> list[str]:
+    """One reason when the `tasks` section is not what `sync` would write from the register as it is now.
+
+    The stage 6 requirement check reads that section, so a register edited since the last sync must not be
+    judged by the old copy. Empty when either file is absent: that is reported by the check that needs it.
+    """
+    matrix = _load(root, "traceability.yaml", SECTIONS)
+    if matrix is None or not _path(root, "register.yaml").exists():
+        return []
+    if matrix["tasks"] != _synced_tasks(register_module.load(root)):
+        return ["program/traceability.yaml: tasks section differs from the register; run pk trace sync"]
+    return []
+
+
 def sync(root: Path) -> int:
     """Rewrite the `tasks` section from the register, leaving the other sections alone.
 
@@ -230,7 +250,7 @@ def sync(root: Path) -> int:
     data = read_yaml(path) if path.exists() else None
     _sections(data, "program/traceability.yaml", SECTIONS)  # refuses a file of the wrong shape
     matrix = dict(data) if data else {name: {} for name in SECTIONS}
-    tasks = {task_id: {"closes": closes} for task_id, closes in _register_tasks(register)}
+    tasks = _synced_tasks(register)
     matrix["tasks"] = tasks
     write_yaml(path, matrix)
     return len(tasks)
