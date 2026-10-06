@@ -542,6 +542,18 @@ def _ledger_hash(root: Path) -> str | None:
     return sha256_file(path) if path.exists() else None
 
 
+ADR_STAGE = 4  # the stage whose approval also hashes the decision records in program/adr/ (playbook 04, step 11)
+
+
+def stage_artifacts(root: Path, stage: int, info: dict) -> list[Path]:
+    """The files an approval of `stage` hashes by default: the coverage map's list, plus every ADR for stage 4."""
+    found = [Path(root) / "program" / item for item in info["artifacts"]]
+    if stage == ADR_STAGE:
+        adr = Path(root) / "program" / "adr"
+        found += sorted(path for path in adr.glob("*.md") if path.is_file()) if adr.is_dir() else []
+    return found
+
+
 def approve(root: Path, stage: int, artifacts: list[Path]) -> Path:
     """Write `program/approvals/stage-N.json`, or refuse with the stopping-rule reasons (writing nothing)."""
     _check_stage(stage)
@@ -669,7 +681,8 @@ def ingest(root: Path, file: Path) -> str:
 def replay(root: Path, ledger: Path, artifacts_dir: Path) -> None:
     """Install a recorded ledger and artifacts, then approve each mapped stage up to 6, stopping at the first gap.
 
-    Stage artifacts in the coverage map are paths relative to `program/`; stages the map does not list are skipped.
+    Stage artifacts in the coverage map are paths relative to `program/` (stage 4 adds the ADRs under `program/adr/`,
+    as a live approval does); stages the map does not list are skipped.
     """
     root, ledger, artifacts_dir = Path(root), Path(ledger), Path(artifacts_dir)
     coverage = load_coverage(root)
@@ -697,7 +710,7 @@ def replay(root: Path, ledger: Path, artifacts_dir: Path) -> None:
         if stage > LAST_REPLAY_STAGE:
             continue
         try:
-            approve(root, stage, [root / "program" / relative for relative in info["artifacts"]])
+            approve(root, stage, stage_artifacts(root, stage, info))
         except KitError as exc:
             raise KitError(f"replay stopped at stage {stage}: {exc}") from exc
 
@@ -745,8 +758,8 @@ def cmd_interview(args: argparse.Namespace) -> int:
         print(_show(root, challenge_init(root, args.stage)))
     elif action == "approve":
         _refuse_per_task(args.stage)
-        artifacts = [Path.cwd() / item for item in args.artifact] if args.artifact else [
-            root / "program" / item for item in _stage(load_coverage(root), args.stage)["artifacts"]]
+        artifacts = [Path.cwd() / item for item in args.artifact] if args.artifact else stage_artifacts(
+            root, args.stage, _stage(load_coverage(root), args.stage))
         if not artifacts:
             raise KitError(f"stage {args.stage} names no artifacts; pass --artifact")
         print(f"approved stage {args.stage}: {_show(root, approve(root, args.stage, artifacts))}")

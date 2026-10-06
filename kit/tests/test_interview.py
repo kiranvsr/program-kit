@@ -555,6 +555,51 @@ class ReplayTests(InterviewBase):
         self.assertIn("stage 1", str(ctx.exception))
 
 
+class AdrApprovalTests(InterviewBase):
+    """Stage 4 also hashes the ADRs (playbook 04, step 11), by default and in a replay."""
+
+    def setUp(self):
+        super().setUp()
+        (self.root / "kit" / "interview" / "coverage.yaml").write_text(
+            "stages:\n  4:\n    name: architect\n    budget: 0\n    artifacts:\n      - ARCHITECTURE.md\n    topics: {}\n",
+            encoding="utf-8")
+        self.challenge(4)
+        self.write("program/ARCHITECTURE.md", "a\n")
+
+    def test_default_approval_hashes_every_adr_in_name_order(self):
+        self.write("program/adr/0002-b.md", "b\n")
+        self.write("program/adr/0001-a.md", "a\n")
+        self.write("program/adr/notes.txt", "not a record\n")
+        code, _, err = self.run_cli("interview", "approve", "4")
+        self.assertEqual((code, err), (0, ""))
+        record = read_json(self.root / "program" / "approvals" / "stage-4.json")
+        self.assertEqual(list(record["artifacts"]),
+                         ["program/ARCHITECTURE.md", "program/adr/0001-a.md", "program/adr/0002-b.md"])
+        self.write("program/adr/0001-a.md", "changed\n")  # an edited ADR is now a change after approval
+        self.assertEqual(interview.amend(self.root, 4), ["program/adr/0001-a.md"])
+
+    def test_approval_without_an_adr_folder_hashes_only_the_listed_files(self):
+        interview.approve(self.root, 4, interview.stage_artifacts(
+            self.root, 4, interview.load_coverage(self.root)["stages"][4]))
+        record = read_json(self.root / "program" / "approvals" / "stage-4.json")
+        self.assertEqual(list(record["artifacts"]), ["program/ARCHITECTURE.md"])
+
+    def test_replay_hashes_the_adrs_it_installs(self):
+        recorded = self.root / "recorded.yaml"
+        write_yaml(recorded, {"sources": SOURCES, "entries": []})
+        artifacts = self.root / "artifacts"
+        (artifacts / "adr").mkdir(parents=True)
+        (artifacts / "reports").mkdir()
+        (artifacts / "ARCHITECTURE.md").write_text("a\n", encoding="utf-8")
+        (artifacts / "adr" / "0001-a.md").write_text("adr\n", encoding="utf-8")
+        (artifacts / "reports" / "stage-4-challenge.md").write_text(
+            "# challenge\n\n| # | Finding | Severity | Resolution |\n|---|---|---|---|\n", encoding="utf-8")
+        shutil.rmtree(self.root / "program" / "reports")  # the replay installs its own challenge report
+        interview.replay(self.root, recorded, artifacts)
+        record = read_json(self.root / "program" / "approvals" / "stage-4.json")
+        self.assertEqual(list(record["artifacts"]), ["program/ARCHITECTURE.md", "program/adr/0001-a.md"])
+
+
 class CliTests(InterviewBase):
     def test_cli_round_trip(self):
         code, out, err = self.run_cli("interview", "next")
