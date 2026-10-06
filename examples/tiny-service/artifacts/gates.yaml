@@ -1,0 +1,13 @@
+# Gates: the claims a phase makes and the records that prove them.
+gates:
+  G-P1:
+    title: Phase 1 exit, health and echo
+    claims:
+      - GET /health and POST /echo behave as REQ-001 to REQ-005 say in the dev environment
+      - The service binds the loopback address and never logs a request body (NFR-001, NFR-002)
+    environment: dev
+    records:
+      - path: program/evidence/P1-M01-S01-T01/results.json
+        acceptance: QA accepted for development, bound to this results.json
+      - path: program/evidence/P1-M01-S01-T02/results.json
+        acceptance: QA accepted for development, bound to this results.json

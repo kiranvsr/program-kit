@@ -1,0 +1,11 @@
+# Named environments a claim can depend on. One row per environment:
+#   <name>: {exists: bool, owner: str, notes: str}
+environments:
+  dev:
+    exists: true
+    owner: each developer
+    notes: A developer machine. The service runs there with python3 src/tiny_service.py on 127.0.0.1.
+  staging:
+    exists: false
+    owner: none
+    notes: Does not exist and none is planned. Declared out of this program, so nothing is claimed for it.
