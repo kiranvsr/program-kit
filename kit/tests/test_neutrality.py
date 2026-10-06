@@ -1,7 +1,6 @@
 """The kit names no vendor, model or originating project, and ships no URL (apart from a short exempt list).
 
-Scope: every file under the repository root except the directories .git, .worktrees, .superpowers and
-__pycache__ (and *.pyc and .DS_Store files). Rules, with nothing exempt from the first:
+Scope: every file under the repository root except the directories .git, .worktrees and __pycache__ (and *.pyc and .DS_Store files). Rules, with nothing exempt from the first:
 - no forbidden token (see _tokens.py), matched case-insensitively as a substring, in the text of every file and in
   every relative path (each directory and file name); a hyphen inside a name also matches a space, an underscore
   or nothing at all;
@@ -23,7 +22,7 @@ from pathlib import Path
 from _tokens import DISTINCTIVE, FORBIDDEN, ORIGIN, SHORT
 
 ROOT = Path(__file__).resolve().parent.parent.parent
-SKIP_ROOT_DIRS = {".git", ".worktrees", ".superpowers"}  # only at the repository root
+SKIP_ROOT_DIRS = {".git", ".worktrees"}  # only at the repository root
 SKIP_DIRS = {"__pycache__"}  # at any depth
 SKIP_NAMES = {".DS_Store"}
 SKIP_SUFFIXES = {".pyc"}
@@ -128,7 +127,7 @@ class ScanBehaviourTests(unittest.TestCase):
     def test_every_token_is_caught_in_every_scanned_place(self):
         for token in FORBIDDEN:
             for rel in ("README.md", "LICENSE", "install.sh", "kit/playbooks/a.md", "kit/tests/t.py",
-                        "examples/x/y.md", "docs/DESIGN.md", "docs/FAQ.md", "docs/superpowers/s.md"):
+                        "examples/x/y.md", "docs/DESIGN.md", "docs/FAQ.md", "docs/notes/s.md"):
                 with self.subTest(token=token, rel=rel):
                     self.put(rel, f"a line\nuses {token} here\n")
                     found = problems(self.root)
@@ -307,12 +306,12 @@ class ScanBehaviourTests(unittest.TestCase):
 
     def test_vcs_worktree_and_cache_directories_are_skipped_only_where_named(self):
         token = DISTINCTIVE[0]
-        for rel in (".git/x", ".worktrees/t/a.md", ".superpowers/sdd/r.md", "kit/scripts/__pycache__/a.txt",
+        for rel in (".git/x", ".worktrees/t/a.md", "kit/scripts/__pycache__/a.txt",
                     "kit/.DS_Store", "kit/scripts/a.pyc"):
             self.put(rel, f"{token}\n")
         self.assertEqual(problems(self.root), [])
         self.put("kit/.git/x", f"{token}\n")  # only the root-level ones are skipped
-        self.put("docs/superpowers/a.md", f"{token}\n")  # no longer a skipped tree
+        self.put("docs/notes/a.md", f"{token}\n")  # no tree under docs/ is skipped
         self.assertEqual(len(problems(self.root)), 2)
 
 
