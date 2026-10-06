@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 import interview
+from _tokens import FORBIDDEN
 import miniyaml
 
 KIT = Path(__file__).resolve().parent.parent
@@ -364,7 +365,7 @@ class SpecFidelityTest(unittest.TestCase):
 
 class ForbiddenTokensTest(unittest.TestCase):
     def test_no_provider_names_in_interview_content(self):
-        pattern = re.compile(r"claude|anthropic|openai|gpt|codex|gemini|grok|ent-harness|fable|opus|sonnet", re.I)
+        pattern = re.compile("|".join(map(re.escape, FORBIDDEN)), re.I)
         for path in [COVERAGE, SEEDS, *LENS_DIR.glob("*.md")]:
             self.assertIsNone(pattern.search(path.read_text(encoding="utf-8")), path.name)
 

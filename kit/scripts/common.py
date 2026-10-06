@@ -68,6 +68,15 @@ def _atomic_write(path: Path, text: str) -> None:
         raise
 
 
+def write_text(path: Path, text: str) -> None:
+    """Write `text` to `path` atomically: a temp file in the same directory, then os.replace.
+
+    Parent directories are created and an existing file keeps its permission bits. Either the old
+    content or the new content is on disk, never a mixture.
+    """
+    _atomic_write(path, text)
+
+
 def _read_text(path: Path) -> str:
     try:
         return Path(path).read_text(encoding="utf-8")

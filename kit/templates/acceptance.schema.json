@@ -1,5 +1,4 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "program/evidence/<ID>/acceptance.json",
   "description": "A QA acceptance bound to one evidence file and one source commit. Documents the shape for readers; the required keys are the ones the evidence kit lists.",
   "type": "object",

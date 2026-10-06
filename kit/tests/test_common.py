@@ -4,6 +4,7 @@ import re
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import common
 from common import KitError
@@ -45,6 +46,26 @@ class CommonTests(unittest.TestCase):
             common.write_yaml(target, {"bad": object()})
         self.assertEqual(common.read_yaml(target), {"ok": 1})
         self.assertEqual([p.name for p in self.tmp.iterdir()], ["f.yaml"])
+
+    def test_write_text_is_public_atomic_and_keeps_the_mode(self):
+        target = self.tmp / "deep" / "er" / "f.txt"
+        common.write_text(target, "one\nA\u00e9\n")  # creates the parents
+        self.assertEqual(target.read_bytes(), "one\nA\u00e9\n".encode("utf-8"))
+        target.chmod(0o640)
+        common.write_text(target, "two\n")
+        self.assertEqual(target.read_text(), "two\n")
+        self.assertEqual(target.stat().st_mode & 0o777, 0o640)
+        self.assertEqual([p.name for p in target.parent.iterdir()], ["f.txt"])  # no temp file left behind
+        with mock.patch("os.replace", side_effect=OSError("boom")):
+            with self.assertRaises(OSError):
+                common.write_text(target, "three\n")
+        self.assertEqual(target.read_text(), "two\n")  # the old content survives a failed write
+        self.assertEqual([p.name for p in target.parent.iterdir()], ["f.txt"])
+
+    def test_only_common_uses_the_private_atomic_writer(self):
+        for path in sorted(Path(common.__file__).parent.glob("*.py")):
+            if path.name != "common.py":
+                self.assertNotIn("_atomic_write", path.read_text(encoding="utf-8"), path.name)
 
     def test_read_yaml_errors_name_the_file(self):
         bad = self.tmp / "bad.yaml"

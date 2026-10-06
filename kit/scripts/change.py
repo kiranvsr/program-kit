@@ -22,7 +22,7 @@ from pathlib import Path
 
 import register as register_module
 import trace as trace_module
-from common import KitError, _atomic_write, find_root, utc_now
+from common import KitError, find_root, utc_now, write_text
 
 TEMPLATE = Path(__file__).resolve().parent.parent / "templates" / "change_request.md"
 HEADINGS = ("Change", "Why", "Asked by", "Impact", "Approval", "Applied")
@@ -170,7 +170,7 @@ def impact(root: Path, cr_id: str, ids: list[str]) -> dict:
         f"- In-flight tasks: {_listing(tasks['in_flight'])}",
         f"- Not-started tasks: {_listing(tasks['not_started'])}",
     ])
-    _atomic_write(path, _replace(text, "Impact", body, cr_id))
+    write_text(path, _replace(text, "Impact", body, cr_id))
     return reached
 
 
@@ -182,7 +182,7 @@ def approve(root: Path, cr_id: str, by: str) -> None:
         raise KitError(f"{cr_id} is already approved")
     if not section(text, "Impact", cr_id):
         raise KitError(f"{cr_id} has no impact yet; run: pk change impact {cr_id} ID...")
-    _atomic_write(path, _replace(text, "Approval", f"{utc_now()[:10]}: {by}", cr_id))
+    write_text(path, _replace(text, "Approval", f"{utc_now()[:10]}: {by}", cr_id))
 
 
 def apply(root: Path, cr_id: str, note: str) -> None:
@@ -204,7 +204,7 @@ def apply(root: Path, cr_id: str, note: str) -> None:
     if problems:
         raise KitError(f"{cr_id} not applied: traceability at stage 6 has {len(problems)} problem(s): "
                        + "; ".join(problems) + ". The register log entry stays (the log is append-only)")
-    _atomic_write(path, _replace(text, "Applied", f"{utc_now()[:10]}: {note}", cr_id))
+    write_text(path, _replace(text, "Applied", f"{utc_now()[:10]}: {note}", cr_id))
 
 
 def open_requests(root: Path) -> list[dict]:

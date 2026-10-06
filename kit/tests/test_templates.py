@@ -3,11 +3,12 @@ import re
 import unittest
 from pathlib import Path
 
+from _tokens import FORBIDDEN
+
 TEMPLATES = Path(__file__).resolve().parent.parent / "templates"
 NEW_TEMPLATES = ("discovery.md", "product.md", "SPEC.md", "ARCHITECTURE.md", "adr.md", "roadmap.md",
                  "task_SPEC.md", "task_PLAN.md", "freeze_review.md", "signoff.md")
-FORBIDDEN = re.compile(r"claude|anthropic|openai|gpt|codex|gemini|grok|ent-harness|fable|opus|sonnet|lorem ipsum|"
-                       r"https?://", re.I)
+BANNED = re.compile("|".join([*map(re.escape, FORBIDDEN), "lorem ipsum", "https?://"]), re.I)
 TASK_SPEC_HEADINGS = ["Summary", "Scope In", "Scope Out", "Dependencies", "Consumed Contracts",
                       "Security And Tenancy", "Failure Modes And Recovery", "Observability", "Module Placement",
                       "Resolved Questions", "Closes"]
@@ -29,7 +30,7 @@ class TemplateTests(unittest.TestCase):
         for name in NEW_TEMPLATES:
             text = (TEMPLATES / name).read_text(encoding="utf-8")
             self.assertTrue(text.strip(), name)
-            self.assertIsNone(FORBIDDEN.search(text), name)
+            self.assertIsNone(BANNED.search(text), name)
             self.assertTrue(text.startswith("# "), name)
             self.assertGreaterEqual(len(headings(name)), 3, name)
 

@@ -17,8 +17,8 @@ import sys
 from pathlib import Path
 from string import Template
 
-from common import KitError, _atomic_write, find_root, sha256_bytes
-from register import KINDS, _ID, load
+from common import KitError, find_root, sha256_bytes, write_text
+from register import ID_PATTERNS, KINDS, load
 
 KIT_DIR = Path(__file__).resolve().parent.parent
 TEMPLATES = KIT_DIR / "templates"
@@ -77,7 +77,7 @@ def _walk(register: dict):
             if not isinstance(node, dict):
                 raise KitError(f"{where} must be a mapping")
             ident = node.get("id")
-            if not isinstance(ident, str) or not _ID[KINDS[level]].match(ident):
+            if not isinstance(ident, str) or not ID_PATTERNS[KINDS[level]].match(ident):
                 raise KitError(f"{where}: id {ident!r} is not a valid {KINDS[level]} id; "
                                f"run `pk register assign-ids`")
             if ident in seen:
@@ -177,7 +177,7 @@ def generate(root: Path) -> list[Path]:
                     continue
             except OSError:
                 pass
-            _atomic_write(path, data.decode("utf-8"))
+            write_text(path, data.decode("utf-8"))
         for rel in _stale(root, files):
             (root / rel).unlink()
     except OSError as exc:
