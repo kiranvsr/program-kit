@@ -17,7 +17,9 @@ import tempfile
 from pathlib import Path
 from typing import Callable
 
-from common import KitError, find_root, read_yaml
+sys.dont_write_bytecode = True  # before any kit import: running pk must never leave bytecode in the project
+
+from common import KitError, ensure_gitignore, find_root, primary_branch_problem, read_yaml  # noqa: E402
 
 KIT_DIR = Path(__file__).resolve().parent.parent
 MIN_PYTHON = (3, 11)
@@ -114,8 +116,34 @@ def cmd_init(args: argparse.Namespace) -> int:
     finally:
         if staging is not None and staging.exists():  # still there only if the rename did not happen
             shutil.rmtree(staging, ignore_errors=True)
+    ensure_gitignore(target.parent)  # bytecode and worktrees must not make the first gate see a dirty tree
     print(f"created {target}")
     return 0
+
+
+def _checks_problems(data) -> list[str]:
+    """The problems the gate's own loader finds in a parsed checks.yaml, one line each.
+
+    The gate stops at its first problem, so each check key, guarded_files and the unknown keys are
+    handed to its loader separately; the rules are the gate's, not a copy of them.
+    """
+    import gate  # lazy: gate imports most of the kit
+
+    required = ("build", "test", "scan")
+    if data is not None and not isinstance(data, dict):
+        parts = [(data, ())]
+    else:
+        data = data or {}
+        parts = [({key: data.get(key)}, (key,) if key in required else ()) for key in gate.CHECK_KEYS]
+        parts.append(({"guarded_files": data.get("guarded_files")}, ()))
+        parts.append(({key: value for key, value in data.items() if key not in gate.ALL_KEYS}, ()))
+    problems = []
+    for part, require in parts:
+        try:
+            gate._parse_checks(part, require)
+        except KitError as exc:
+            problems.append(" ".join(str(exc).split()))
+    return problems
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
@@ -128,7 +156,14 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     program = root / "program"
     if not program.is_dir():
         raise KitError(f"program/ not found at {root}; run `pk init`")
-    read_yaml(program / "checks.yaml")  # raises KitError naming the file and line
+    problems = _checks_problems(read_yaml(program / "checks.yaml"))  # a file that does not read raises, naming the line
+    branch = primary_branch_problem(root)
+    if branch:
+        problems.append(branch)
+    for problem in problems:
+        print("error: " + problem, file=sys.stderr)
+    if problems:
+        return 1
     print("doctor: ok")
     return 0
 
