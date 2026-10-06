@@ -55,13 +55,13 @@ Stages 1 to 6 are approved one at a time with `pk interview approve N`, and from
 
 Each task is built by an implementer in its own worktree, accepted by a different agent, and merged by a controller (`08_execute.md` has every command).
 
-1. Dispatch commit: the controller sets the task `in_progress` and commits its SPEC, PLAN and status file to main together, because the gate reads them from main.
+1. Dispatch commit: the controller sets the task `in_progress` and commits its SPEC, PLAN, spec-QA `review.md` and status file to main together, because the gate reads them from main. A task whose review record is not on main fails both gates with `FAILED: review program/tasks/<ID>/review.md is missing on main`.
 2. `pk worktree new <ID>` creates the worktree and branch `task/<ID>`; the implementer builds test first.
 3. The implementer writes an evidence producer, then runs the hand-back gate: `pk gate handback <ID> --branch task/<ID>`.
 4. The gate's last line must be exactly `OK: <branch> passes the hand-back gate at <sha>`. Exit code 0 alone is never accepted; a failed gate returns the work with no QA round.
 5. Evidence commit: the implementer sets the task `review` and commits `results.json`, its report and the status file, and nothing else.
 6. Independent QA runs `pk gate binding <ID> --branch task/<ID>`, re-runs the commands, plants its own bugs and checks scope, then accepts (the only way a task becomes `done`) or rejects with numbered findings.
-7. Merge check: from main, `pk gate merge-check --branch task/<ID>` must end with `OK: <branch> merges into main at <sha>`. It is the controller's own run of the gate's checks: guarded files, the task's SPEC and PLAN unchanged, then the build, the tests and the scans on a trial merge.
+7. Merge check: from main, `pk gate merge-check --branch task/<ID>` must end with `OK: <branch> merges into main at <sha>`. It is the controller's own run of the gate's checks: guarded files, the task's SPEC, PLAN and spec-QA `review.md` on main and unchanged, then the build, the tests and the scans on a trial merge.
 8. Merge with `git merge --no-ff`, one accepted branch at a time.
 9. Hand-off update: `pk handoff update`, `pk handoff check`, and commit `program/`.
 
@@ -78,7 +78,7 @@ The rules are in `kit/rules/`: `HARD_RULES.md`, `EVIDENCE_HONESTY.md` and `THROU
 
 ## Upgrading
 
-Run `sh install.sh /path/to/your-repo --upgrade` from a newer copy of the kit. The installer first checks the new copy against its own manifest and the installed `kit/` against its `kit/MANIFEST.sha256`, and refuses if either does not match (for the installed one, if you changed anything under it, a file you added under `kit/tests` included), then replaces `kit/` wholesale; a `kit/tests` left by an older install goes with the old kit. It never reads, writes or lists `program/` and leaves `.gitignore` alone. Keep your own changes in `program/`, not in `kit/`.
+Run `sh install.sh /path/to/your-repo --upgrade` from a newer copy of the kit. The installer first checks the new copy against its own manifest and the installed `kit/` against its `kit/MANIFEST.sha256`, and refuses if either does not match (for the installed one, if you changed anything under it, a file you added under `kit/tests` included), then replaces `kit/` wholesale; a `kit/tests` left by an older install goes with the old kit. It also appends `__pycache__/`, `*.pyc` and `.worktrees/` to `.gitignore` if they are missing, exactly as a fresh install does (existing lines are left as they are), and it never reads, writes or lists `program/`. Keep your own changes in `program/`, not in `kit/`.
 
 ## Requirements
 

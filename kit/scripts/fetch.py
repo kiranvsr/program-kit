@@ -9,9 +9,15 @@ cache root (see `cache_root()`), not the project root.
 
 Guards: names are one plain path component; the URL scheme must be https (http only when
 PROGRAM_KIT_FETCH_ALLOW_HTTP=1, used by tests against a local server); a download is written
-to a temporary file created in the digest directory, bounded by the pinned size, checked for
-size and digest, then renamed into place; the temporary file is removed on every other path;
-a symlinked entry or digest directory is never followed (the link itself is unlinked).
+to a temporary file of its own in the cache root, bounded by the pinned size, checked for
+size and digest, then renamed into its digest directory; the temporary file is removed on every
+other path; a symlinked entry or digest directory is never followed (the link itself is unlinked).
+
+Two fetches of one digest may run at the same time, in one process or in two. Each writes its own
+temporary file, the final name only ever holds a complete, verified file (the rename is atomic), and
+no fetch removes a directory, so neither can take anything from the other. The temporary file is
+created with its mode (0644, narrowed by the umask as the system does for any new file): the
+process umask is never read or changed.
 """
 from __future__ import annotations
 
@@ -20,9 +26,9 @@ import hashlib
 import http.client
 import os
 import re
+import secrets
 import stat
 import sys
-import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -141,10 +147,24 @@ def _one_line(error: BaseException) -> str:
     return f"{type(error).__name__}: {text}" if text else type(error).__name__
 
 
-def _umask() -> int:
-    mask = os.umask(0)
-    os.umask(mask)
-    return mask
+def _temporary(root: Path, name: str) -> tuple[int, Path]:
+    """A new file for one download, in the cache root: (open descriptor, path).
+
+    Created exclusively, so an existing path (a link included) is never opened, and with mode 0644, which
+    the system narrows by the umask. The name is this download's alone: process id and a random part.
+    """
+    path = root / f".{name}.{os.getpid()}.{secrets.token_hex(8)}.part"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    return os.open(path, flags, 0o644), path
+
+
+def _unlink_link(path: Path) -> None:
+    """Remove `path` if it is a symbolic link: the link itself, never its target."""
+    if path.is_symlink():
+        try:
+            os.unlink(path)
+        except FileNotFoundError:  # another fetch of this digest removed it first
+            pass
 
 
 def _scheme(url: str) -> str:
@@ -166,14 +186,10 @@ def _download(root: Path, pin: dict, opener, timeout: int) -> Path:
         if opener is None:
             opener = urllib.request.build_opener(_SchemeRedirects)
         with closing(opener.open(urllib.request.Request(url), timeout=timeout)) as response:
-            if directory.is_symlink():
-                os.unlink(directory)  # the link itself, never its target
-            directory.mkdir(parents=True, exist_ok=True)
-            fd, temporary = tempfile.mkstemp(dir=directory, prefix=f".{path.name}.", suffix=".part")
+            Path(root).mkdir(parents=True, exist_ok=True)
+            fd, temporary = _temporary(Path(root), path.name)
             digest, received = hashlib.sha256(), 0
             with os.fdopen(fd, "wb") as out:
-                if hasattr(os, "fchmod"):
-                    os.fchmod(out.fileno(), 0o644 & ~_umask())  # mkstemp makes 0600; a shared cache must be readable
                 while True:
                     if time.monotonic() > deadline:
                         raise _Refused("timed out")
@@ -192,8 +208,11 @@ def _download(root: Path, pin: dict, opener, timeout: int) -> Path:
             raise _Refused(f"size mismatch: expected {size} bytes, received {received}")
         if digest.hexdigest() != sha256:
             raise _Refused(f"digest mismatch: expected {sha256}, received {digest.hexdigest()}")
-        if path.is_symlink():
-            os.unlink(path)  # the link itself, never its target
+        # Publish. The digest directory is made only now, for a file that is complete and verified, and
+        # the rename is atomic: a reader or another fetch sees no entry or a whole one, never a part.
+        _unlink_link(directory)
+        directory.mkdir(exist_ok=True)
+        _unlink_link(path)
         os.replace(temporary, path)
         renamed = True
         return path
@@ -207,11 +226,7 @@ def _download(root: Path, pin: dict, opener, timeout: int) -> Path:
                 os.unlink(temporary)
             except FileNotFoundError:
                 pass
-        if not renamed:
-            try:
-                os.rmdir(directory)  # only if empty: a failed fetch leaves no digest directory behind
-            except OSError:
-                pass
+        # No directory is removed here, empty or not: another fetch of this digest may be about to publish into it.
 
 
 def fetch(root: Path, pins: list[dict], opener=None, timeout: int = 600) -> list[dict]:

@@ -410,6 +410,53 @@ class ProjectPreparationTests(InstallCase):
         self.assert_ok(self.install(target))
         self.assertEqual((target / ".gitignore").read_text().splitlines(), self.LINES)
 
+    def upgraded(self, ignore):
+        """An installed project whose .gitignore is `ignore` (None: absent), upgraded; returns the target."""
+        target = self.repo()
+        self.assert_ok(self.install(target, "--preset", "python"))
+        if ignore is None:
+            (target / ".gitignore").unlink()
+        else:
+            (target / ".gitignore").write_bytes(ignore)
+        program = snapshot(target / "program")
+        self.assert_ok(self.install(target, "--upgrade"))
+        self.assertEqual(snapshot(target / "program"), program)  # program/ is still not touched
+        self.assertEqual(self.leftovers(target), [])
+        return target
+
+    def test_upgrade_appends_only_the_missing_lines_and_keeps_existing_bytes(self):
+        original = b"# mine\r\nnode_modules/\r\n*.pyc\r\n.env"  # CRLF and no final newline
+        data = (self.upgraded(original) / ".gitignore").read_bytes()
+        self.assertTrue(data.startswith(original))
+        self.assertEqual(data[len(original):], b"\n__pycache__/\n.worktrees/\n")  # exactly as a fresh install
+
+    def test_upgrade_creates_gitignore_with_the_three_lines_when_it_is_absent(self):
+        self.assertEqual((self.upgraded(None) / ".gitignore").read_text().splitlines(), self.LINES)
+
+    def test_upgrade_leaves_a_complete_gitignore_byte_identical(self):
+        text = b"dist/\n.worktrees/\n*.pyc\n__pycache__/\n"
+        self.assertEqual((self.upgraded(text) / ".gitignore").read_bytes(), text)
+
+    def test_upgrade_of_a_project_from_before_the_ignore_lines_gets_a_clean_first_gate(self):
+        target = self.upgraded(b"dist/\n")  # an install made before the installer wrote the lines
+        self.assertEqual((target / ".gitignore").read_bytes(), b"dist/\n__pycache__/\n*.pyc\n.worktrees/\n")
+        (target / ".worktrees" / "t1").mkdir(parents=True)
+        (target / ".worktrees" / "t1" / "x").write_text("x")
+        (target / "kit" / "scripts" / "__pycache__").mkdir()
+        (target / "kit" / "scripts" / "__pycache__" / "pk.cpython-311.pyc").write_bytes(b"x")
+        status = subprocess.run(["git", "-C", str(target), "status", "--porcelain", "--untracked-files=all"],
+                                capture_output=True, text=True, env=_env()).stdout
+        self.assertNotIn(".worktrees", status)
+        self.assertNotIn("__pycache__", status)
+
+    def test_a_refused_upgrade_leaves_gitignore_alone(self):
+        target = self.repo()
+        self.assert_ok(self.install(target))
+        (target / ".gitignore").write_bytes(b"dist/\n")
+        (target / "kit" / "scripts" / "pk.py").write_text("changed\n")
+        self.assert_refused(self.install(target, "--upgrade"), "does not match its manifest")
+        self.assertEqual((target / ".gitignore").read_bytes(), b"dist/\n")
+
     def test_a_failed_install_leaves_gitignore_alone(self):
         target = self.repo()
         self.assert_refused(self.install(target, "--preset", "cobol"), "preset")

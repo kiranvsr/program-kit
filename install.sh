@@ -5,8 +5,9 @@
 #
 # Fresh install copies kit/ (without kit/tests, which belong to the kit's own repository), makes sure the
 # project's .gitignore lists __pycache__/, *.pyc and .worktrees/, and, when program/ is absent, runs `pk init`.
-# --upgrade replaces kit/ wholesale after checking it has no local changes; program/ and .gitignore are never
-# read, written or listed. Either way the source kit is first checked against its own manifest.
+# --upgrade replaces kit/ wholesale after checking it has no local changes, and makes sure of the same three
+# .gitignore lines in the same way; program/ is never read, written or listed. Either way the source kit is
+# first checked against its own manifest.
 set -eu
 
 usage='usage: install.sh <target-repo> [--preset go|node|python] [--upgrade]'
@@ -190,22 +191,21 @@ else
 fi
 
 # Bytecode and task worktrees must never reach a commit: the first gate refuses a dirty tree. Append only the
-# lines the project's .gitignore lacks (a CRLF line ending is ignored when comparing); existing bytes stay as they are.
-if [ "$upgrade" = 0 ]; then
-    ignore_file="$target/.gitignore"
-    if [ -e "$ignore_file" ] && [ ! -f "$ignore_file" ]; then
-        fail "$ignore_file is not a regular file"
-    fi
-    for line in '__pycache__/' '*.pyc' '.worktrees/'; do
-        if [ -f "$ignore_file" ] && tr -d '\r' < "$ignore_file" | grep -qxF -- "$line"; then
-            continue
-        fi
-        if [ -s "$ignore_file" ] && [ -n "$(tail -c 1 "$ignore_file")" ]; then
-            printf '\n' >> "$ignore_file" || fail "cannot update $ignore_file"
-        fi
-        printf '%s\n' "$line" >> "$ignore_file" || fail "cannot update $ignore_file"
-    done
+# lines the project's .gitignore lacks (a CRLF line ending is ignored when comparing); existing bytes stay as they
+# are. An upgrade does the same: a project installed before these lines were written gets them now.
+ignore_file="$target/.gitignore"
+if [ -e "$ignore_file" ] && [ ! -f "$ignore_file" ]; then
+    fail "$ignore_file is not a regular file"
 fi
+for line in '__pycache__/' '*.pyc' '.worktrees/'; do
+    if [ -f "$ignore_file" ] && tr -d '\r' < "$ignore_file" | grep -qxF -- "$line"; then
+        continue
+    fi
+    if [ -s "$ignore_file" ] && [ -n "$(tail -c 1 "$ignore_file")" ]; then
+        printf '\n' >> "$ignore_file" || fail "cannot update $ignore_file"
+    fi
+    printf '%s\n' "$line" >> "$ignore_file" || fail "cannot update $ignore_file"
+done
 
 # program/ is the project's: the only thing asked of it is whether it exists.
 if [ -e "$target/program" ] || [ -L "$target/program" ]; then

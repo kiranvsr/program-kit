@@ -3,6 +3,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -108,17 +109,18 @@ class CommonTests(unittest.TestCase):
         self.assertEqual((code, out.strip()), (0, "$HOME"))
 
     def test_run_argv_combines_streams_and_reports_exit_code(self):
-        code, out = common.run_argv(["python3", "-c", "import sys; print('o'); print('e', file=sys.stderr); sys.exit(3)"], self.tmp)
+        code, out = common.run_argv([sys.executable, "-c",
+                                     "import sys; print('o'); print('e', file=sys.stderr); sys.exit(3)"], self.tmp)
         self.assertEqual(code, 3)
         self.assertIn("o", out)
         self.assertIn("e", out)
 
     def test_run_argv_env_cwd_and_timeout(self):
-        code, out = common.run_argv(["python3", "-c", "import os; print(os.getcwd()); print(os.environ['KIT_X'])"],
+        code, out = common.run_argv([sys.executable, "-c", "import os; print(os.getcwd()); print(os.environ['KIT_X'])"],
                                     self.tmp, env={"KIT_X": "yes", "PATH": __import__("os").environ["PATH"]})
         self.assertEqual(code, 0)
         self.assertEqual(out.split(), [str(self.tmp), "yes"])
-        code, out = common.run_argv(["python3", "-c", "import time; time.sleep(5)"], self.tmp, timeout=1)
+        code, out = common.run_argv([sys.executable, "-c", "import time; time.sleep(5)"], self.tmp, timeout=1)
         self.assertEqual(code, 124)
         self.assertIn("timed out", out)
 
@@ -144,6 +146,48 @@ class CommonTests(unittest.TestCase):
         # "ambiguous argument" appears only in git's stderr, not in the echoed args
         self.assertRegex(str(ctx.exception), r"fatal: .*(ambiguous argument|unknown revision)")
         self.assertNotIn("\n", str(ctx.exception))
+
+    def test_git_error_falls_back_to_stdout_and_then_to_the_exit_code(self):
+        def failing(stdout, stderr):
+            return mock.patch.object(common.subprocess, "run", return_value=subprocess.CompletedProcess(
+                ["git"], 3, stdout=stdout, stderr=stderr))
+
+        for stdout, stderr, reason in (("on stdout\n", "", "on stdout"),
+                                       ("on stdout\n", " \n\t\n", "on stdout"),  # blank stderr is no reason
+                                       ("on stdout\n", "warning: w\nfatal: on stderr\n", "fatal: on stderr"),
+                                       ("", "", "exit 3"),
+                                       (" \n", "\n \n", "exit 3")):
+            with self.subTest(stdout=stdout, stderr=stderr), failing(stdout, stderr):
+                with self.assertRaises(KitError) as ctx:
+                    common.git(self.tmp, "merge", "x")
+                self.assertEqual(str(ctx.exception), f"git merge x failed: {reason}")
+
+    def test_no_test_of_this_module_starts_a_bare_python3(self):
+        # A child interpreter is the one running the suite: `python3` on PATH may be another version or absent.
+        self.assertNotIn('["python' + '3"', Path(__file__).read_text(encoding="utf-8"))
+
+    def test_nested_lists_round_trip_through_the_yaml_writer_and_reader(self):
+        data = {"build": [["make"], ["go", "build", "./..."]],
+                "deep": [[["a", "b"], ["c"]], [["d"]], "e"],
+                "rows": [{"argv": [["x", "y"], ["z"]], "n": 1}, [{"k": ["v", ["w"]]}]],
+                "empty": [[], [[]]]}
+        target = self.tmp / "nested.yaml"
+        common.write_yaml(target, data)
+        text = target.read_text(encoding="utf-8")
+        self.assertNotRegex(text, r"\[[^\]]")  # block style: no flow sequence with anything in it
+        self.assertEqual(common.read_yaml(target), data)
+        common.write_yaml(target, common.read_yaml(target))
+        self.assertEqual(target.read_text(encoding="utf-8"), text)  # a second trip changes nothing
+
+    def test_nested_lists_read_with_the_sequence_at_its_keys_indent(self):
+        target = self.tmp / "flush.yaml"
+        target.write_text("build:\n- - make\n- - go\n  - build\ndeep:\n- - - a\n    - b\n  - - c\n- e\n"
+                          "outer:\n  inner:\n  - - x\n    - y\n  - z\n", encoding="utf-8")
+        expected = {"build": [["make"], ["go", "build"]], "deep": [[["a", "b"], ["c"]], "e"],
+                    "outer": {"inner": [["x", "y"], "z"]}}
+        self.assertEqual(common.read_yaml(target), expected)
+        common.write_yaml(target, expected)  # the writer's own layout reads back the same
+        self.assertEqual(common.read_yaml(target), expected)
 
 
 class WriteFailureTests(unittest.TestCase):
@@ -226,6 +270,34 @@ class MalformedInputTests(unittest.TestCase):
         json_path.write_bytes(b"\xef\xbb\xbf{\"a\": 1}\n")
         self.assertEqual(common.read_yaml(yaml_path), {"build": [["make"]]})
         self.assertEqual(common.read_json(json_path), {"a": 1})
+
+    def test_read_text_is_the_shared_reader_and_drops_only_a_leading_byte_order_mark(self):
+        path = self.tmp / "t.md"
+        path.write_bytes(b"\xef\xbb\xbf# Title\r\nbody \xef\xbb\xbf kept\n")
+        self.assertEqual(common.read_text(path), "# Title\nbody \ufeff kept\n")
+        self.assertEqual(common.read_text(path, newline=""), "# Title\r\nbody \ufeff kept\n")  # bytes as they are
+        path.write_bytes(b"plain\n")
+        self.assertEqual(common.read_text(path), "plain\n")
+        self.assertEqual(common.read_text(str(path)), "plain\n")
+
+    def test_read_text_failures_are_one_line_kit_errors_naming_the_file(self):
+        bad = self.tmp / "bad.md"
+        bad.write_bytes(b"caf\xe9\n")
+        for path, why in ((self.tmp / "absent.md", "No such file"), (self.tmp, "directory"), (bad, "utf-8")):
+            with self.subTest(path=path.name), self.assertRaises(KitError) as ctx:
+                common.read_text(path)
+            message = str(ctx.exception)
+            self.assertTrue(message.startswith(f"cannot read {path}: "), message)
+            self.assertIn(why, message)
+            self.assertNotIn("\n", message)
+
+    def test_no_script_of_mine_decodes_a_file_without_the_shared_reader(self):
+        # Blobs read from git go through drop_bom; nothing reads a file as text behind the reader's back.
+        scripts = Path(common.__file__).parent
+        for name in ("gate.py", "status.py", "evidence.py", "stale.py", "fetch.py", "pk.py", "manifest.py",
+                     "handoff.py", "worktree.py"):
+            text = (scripts / name).read_text(encoding="utf-8")
+            self.assertIsNone(re.search(r"\.read_text\(|read_bytes\(\)\.decode\(", text), name)
 
 
 class GitignoreTests(unittest.TestCase):

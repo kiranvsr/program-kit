@@ -24,7 +24,10 @@ class PkTests(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.tmp = Path(self._tmp.name).resolve()
-        (self.tmp / ".git").mkdir()  # pin the project root to the temp dir
+        subprocess.run(["git", "init", "-q", "-b", "main", str(self.tmp)], check=True)  # init needs a repository
+        ceiling = mock.patch.dict(os.environ, {"GIT_CEILING_DIRECTORIES": str(self.tmp.parent)})
+        ceiling.start()  # a repository above the temp directory is never this test's
+        self.addCleanup(ceiling.stop)
         old = os.getcwd()
         os.chdir(self.tmp)
         self.addCleanup(os.chdir, old)
@@ -87,12 +90,79 @@ class PkTests(unittest.TestCase):
         self.assertEqual((self.tmp / "program" / "checks.yaml").read_bytes(), preset.read_bytes())
 
     def test_init_with_missing_preset_file_writes_nothing(self):
-        with mock.patch.object(pk, "KIT_DIR", self.tmp / "fakekit"):
-            (self.tmp / "fakekit").mkdir()
-            rc, out, err = self.run_pk("init", "--preset", "go")
-        self.assertEqual(rc, 1)
-        self.assertTrue(err.startswith("error: "), err)
+        # A preset the real kit does not ship, let past the argument check: every template is there, the preset is not.
+        with mock.patch.object(pk, "PRESETS", (*pk.PRESETS, "fortran")):
+            rc, out, err = self.run_pk("init", "--preset", "fortran")
+        self.assertEqual((rc, out), (1, ""))
+        missing = KIT / "presets" / "checks.fortran.yaml"
+        self.assertEqual(err, f"error: cannot read {missing}: No such file or directory\n")
+        self.assertEqual(sorted(p.name for p in self.tmp.iterdir()), [".git"])  # no program/, no .gitignore
+
+    def outside(self):
+        """A directory that is in no git repository, made the current one."""
+        place = self.tmp.parent / f"{self.tmp.name}-plain"
+        place.mkdir()
+        self.addCleanup(shutil.rmtree, place, ignore_errors=True)
+        os.chdir(place)
+        return place
+
+    def test_init_outside_any_git_repository_is_one_error_line_and_creates_nothing(self):
+        place = self.outside()
+        for argv in (("init",), ("init", "--preset", "python")):
+            rc, out, err = self.run_pk(*argv)
+            self.assertEqual((rc, out), (1, ""))
+            self.assertEqual(err, f"error: {place} is not inside a git repository; run `git init -b main` there, "
+                                  "then pk init\n")
+            self.assertEqual(list(place.iterdir()), [])
+
+    def test_init_in_a_subdirectory_refuses_and_names_the_root(self):
+        deep = self.tmp / "services" / "api"
+        deep.mkdir(parents=True)
+        for where in (deep, deep.parent):
+            with self.subTest(where=where.name):
+                os.chdir(where)
+                rc, out, err = self.run_pk("init", "--preset", "python")
+                self.assertEqual((rc, out), (1, ""))
+                self.assertEqual(err, f"error: {where} is not the root of its repository; run pk init in {self.tmp}\n")
+        self.assertEqual(sorted(p.name for p in self.tmp.iterdir()), [".git", "services"])  # nothing in the ancestor
+        self.assertEqual(sorted(p.name for p in deep.parent.iterdir()), ["api"])
+        self.assertEqual(list(deep.iterdir()), [])
+
+    def test_init_in_a_subdirectory_does_not_report_the_ancestors_program_directory(self):
+        self.assertEqual(self.run_pk("init")[0], 0)
+        before = sorted(p.name for p in (self.tmp / "program").iterdir())
+        (self.tmp / "sub").mkdir()
+        os.chdir(self.tmp / "sub")
+        rc, out, err = self.run_pk("init")
+        self.assertEqual((rc, out), (1, ""))
+        self.assertIn("is not the root of its repository", err)
+        self.assertEqual(err.count("\n"), 1)
+        self.assertEqual(sorted(p.name for p in (self.tmp / "program").iterdir()), before)
+
+    def test_init_at_the_root_reached_through_a_symlink_works(self):
+        link = self.tmp.parent / f"{self.tmp.name}-link"
+        link.symlink_to(self.tmp, target_is_directory=True)
+        self.addCleanup(link.unlink)
+        os.chdir(link)
+        rc, out, err = self.run_pk("init")
+        self.assertEqual((rc, err), (0, ""))
+        self.assertTrue((self.tmp / "program" / "BRIEF.md").is_file())
+
+    def test_init_in_a_task_worktree_acts_on_that_worktree(self):
+        self.git_repo(commit=True)
+        wt = self.tmp / ".worktrees" / "t1"
+        subprocess.run(["git", "-C", str(self.tmp), "worktree", "add", "-q", "-b", "side", str(wt)], check=True)
+        os.chdir(wt)
+        rc, out, err = self.run_pk("init")
+        self.assertEqual((rc, err), (0, ""))
+        self.assertTrue((wt / "program").is_dir())
         self.assertFalse((self.tmp / "program").exists())
+
+    def test_init_without_git_on_path_says_so(self):
+        with mock.patch.dict(os.environ, {"PATH": str(self.tmp / "no-such-bin")}):
+            rc, out, err = self.run_pk("init")
+        self.assertEqual((rc, out, err), (1, "", "error: git was not found on PATH\n"))
+        self.assertEqual(sorted(p.name for p in self.tmp.iterdir()), [".git"])
 
     def test_init_rejects_unknown_preset(self):
         rc, _, err = self.run_pk("init", "--preset", "cobol")

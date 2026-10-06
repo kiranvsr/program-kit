@@ -226,7 +226,26 @@ class UpdateTests(HandoffBase):
         self.file.unlink()
         with self.assertRaises(KitError) as caught:
             handoff.update(self.root)
-        self.assertIn("HANDOFF.md", str(caught.exception))
+        self.assertEqual(str(caught.exception), "program/HANDOFF.md not found; run: pk init")
+
+    def test_a_leading_byte_order_mark_does_not_hide_a_marker_on_the_first_line(self):
+        self.write_handoff(f"\ufeff{START}\r\n{END}\r\n{TAIL}")
+        self.assertIs(handoff.check(self.root), False)  # read, not "marker not found"
+        self.assertIs(handoff.update(self.root), True)
+        text = self.text()
+        self.assertTrue(text.startswith(f"{START}\r\n"), repr(text[:60]))  # written back without the mark
+        self.assertTrue(text.endswith(f"{END}\r\n{TAIL}"), repr(text[-60:]))  # the hand-written bytes are kept
+        self.assertIs(handoff.check(self.root), True)
+        self.assertIs(handoff.update(self.root), False)
+
+    def test_a_handoff_that_is_not_utf8_is_one_error_line(self):
+        self.file.write_bytes(b"caf\xe9\n")
+        for action in (handoff.update, handoff.check):
+            with self.assertRaises(KitError) as caught:
+                action(self.root)
+            self.assertTrue(str(caught.exception).startswith(f"cannot read {self.file}: "), caught.exception)
+            self.assertNotIn("\n", str(caught.exception))
+        self.assertEqual(self.file.read_bytes(), b"caf\xe9\n")
 
     def test_template_has_the_markers(self):
         template = (KIT / "templates" / "HANDOFF.md").read_text()

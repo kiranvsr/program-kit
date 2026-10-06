@@ -19,7 +19,7 @@ from typing import Callable
 
 sys.dont_write_bytecode = True  # before any kit import: running pk must never leave bytecode in the project
 
-from common import KitError, ensure_gitignore, find_root, primary_branch_problem, read_yaml  # noqa: E402
+from common import KitError, ensure_gitignore, find_root, git, primary_branch_problem, read_yaml  # noqa: E402
 
 KIT_DIR = Path(__file__).resolve().parent.parent
 MIN_PYTHON = (3, 11)
@@ -78,11 +78,22 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
 
-def _project_root() -> Path:
+def _init_root() -> Path:
+    """Where `pk init` creates program/: the current directory, which must be the root of a git repository.
+
+    Outside a repository, and in a subdirectory of one, init refuses: it never creates program/ in an
+    ancestor the user did not name, and never in a directory no gate could work in.
+    """
+    here = Path.cwd().resolve()
+    if shutil.which("git") is None:
+        raise KitError("git was not found on PATH")
     try:
-        return find_root()
+        top = Path(git(here, "rev-parse", "--show-toplevel")).resolve()
     except KitError:
-        return Path.cwd().resolve()  # a fresh directory: init creates program/ here
+        raise KitError(f"{here} is not inside a git repository; run `git init -b main` there, then pk init") from None
+    if top != here:
+        raise KitError(f"{here} is not the root of its repository; run pk init in {top}")
+    return here
 
 
 def _umask() -> int:
@@ -92,7 +103,7 @@ def _umask() -> int:
 
 
 def cmd_init(args: argparse.Namespace) -> int:
-    target = _project_root() / "program"
+    target = _init_root() / "program"
     if target.exists():
         raise KitError(f"{target} already exists; refusing to overwrite")
     sources = {name: KIT_DIR / "templates" / name for name in TEMPLATE_FILES}

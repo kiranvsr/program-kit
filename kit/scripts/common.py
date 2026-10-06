@@ -90,20 +90,30 @@ def write_text(path: Path, text: str) -> None:
     _atomic_write(path, text)
 
 
-def _read_text(path: Path) -> str:
-    """The file's text; a leading UTF-8 byte-order mark (common in files saved by other tools) is dropped."""
+def drop_bom(text: str) -> str:
+    """`text` without a leading UTF-8 byte-order mark (common in files saved by other tools)."""
+    return text[1:] if text.startswith("\ufeff") else text
+
+
+def read_text(path: Path, *, newline: str | None = None) -> str:
+    """The file's text, UTF-8, without a leading byte-order mark: the one reader for every file the kit reads as text.
+
+    A file that cannot be read or is not UTF-8 is a KitError naming the path. Line endings are translated to
+    `\\n` as `open` does; pass `newline=""` to get them as they are on disk.
+    """
     try:
-        text = Path(path).read_text(encoding="utf-8")
+        with open(path, encoding="utf-8", newline=newline) as handle:
+            text = handle.read()
     except (OSError, UnicodeDecodeError) as exc:
         reason = exc.strerror if isinstance(exc, OSError) and exc.strerror else exc
         raise KitError(f"cannot read {path}: {reason}") from exc
-    return text[1:] if text.startswith("\ufeff") else text
+    return drop_bom(text)
 
 
 def read_yaml(path: Path):
     import miniyaml  # lazy: miniyaml imports KitError from this module
 
-    text = _read_text(path)
+    text = read_text(path)
     try:
         return miniyaml.loads(text)
     except miniyaml.YAMLError as exc:
@@ -123,7 +133,7 @@ def write_yaml(path: Path, data) -> None:
 
 
 def read_json(path: Path):
-    text = _read_text(path)
+    text = read_text(path)
     try:
         return json.loads(text)
     except ValueError as exc:
@@ -141,7 +151,11 @@ def write_json(path: Path, data) -> None:
 
 
 def git(root: Path, *args: str) -> str:
-    """Run git in `root`; return stripped stdout, raise KitError with stderr on failure."""
+    """Run git in `root`; return stripped stdout, raise KitError on failure.
+
+    The error names git's own `fatal:` or `error:` line, else its first line: from stderr, from stdout when
+    stderr is blank, and `exit N` when both are.
+    """
     try:
         proc = subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True,
                               encoding="utf-8", errors="replace")
@@ -150,7 +164,8 @@ def git(root: Path, *args: str) -> str:
     except ValueError as exc:  # an argument git cannot be given, such as one with a NUL byte
         raise KitError("git: invalid argument") from exc
     if proc.returncode != 0:
-        lines = [ln.strip() for ln in (proc.stderr or proc.stdout).splitlines() if ln.strip()]
+        said = proc.stderr if proc.stderr.strip() else proc.stdout  # some failures are reported on stdout only
+        lines = [ln.strip() for ln in said.splitlines() if ln.strip()]
         reason = next((ln for ln in lines if ln.startswith(("fatal:", "error:"))),
                       lines[0] if lines else f"exit {proc.returncode}")
         raise KitError(f"git {' '.join(args)} failed: {reason}")

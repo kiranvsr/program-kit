@@ -6,6 +6,9 @@ import http.server
 import io
 import json
 import os
+import re
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -45,6 +48,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     time.sleep(body[2])
             except OSError:  # the client gave up: stop writing
                 pass
+            return
+        if isinstance(body, tuple) and body[0] == "held":  # ("held", bytes, barrier, seconds to wait after it)
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body[1])))
+            self.end_headers()
+            half = len(body[1]) // 2
+            self.wfile.write(body[1][:half])
+            self.wfile.flush()
+            body[2].wait(timeout=20)  # every download of the test is now part-way through
+            time.sleep(body[3])
+            self.wfile.write(body[1][half:])
             return
         if isinstance(body, tuple):  # ("redirect", location)
             self.send_response(302)
@@ -113,6 +127,15 @@ class Base(unittest.TestCase):
         self.addCleanup(stop)
         return server, f"http://127.0.0.1:{server.server_address[1]}"
 
+    def parts(self, expected):
+        """The names of the download files in the cache root, once `expected` of them are there."""
+        deadline = time.monotonic() + 20
+        while True:  # the server reaches its barrier before a client has opened its file
+            found = sorted(p.name for p in self.cache.glob(".*.part")) if self.cache.is_dir() else []
+            if len(found) >= expected or time.monotonic() > deadline:
+                return found
+            time.sleep(0.01)
+
     def pin(self, url="http://127.0.0.1:1/x", data=PAYLOAD, name=NAME, **over):
         return {"url": url, "sha256": sha(data), "size": len(data), "filename": name, **over}
 
@@ -120,8 +143,10 @@ class Base(unittest.TestCase):
         return self.cache / sha(data)
 
     def leftovers(self, data=PAYLOAD):
+        """What a fetch left behind: the entries of the digest directory and any file in the cache root."""
         directory = self.digest_dir(data)
-        return sorted(p.name for p in directory.iterdir()) if directory.is_dir() else []
+        inside = sorted(p.name for p in directory.iterdir()) if directory.is_dir() else []
+        return inside + (sorted(p.name for p in self.cache.iterdir() if not p.is_dir()) if self.cache.is_dir() else [])
 
 
 class Names(Base):
@@ -352,19 +377,33 @@ class Fetch(Base):
         self.assertFalse(self.digest_dir().is_symlink())
         self.assertEqual((self.digest_dir() / NAME).read_bytes(), PAYLOAD)
 
-    def test_temp_file_is_created_in_digest_directory(self):
-        seen = []
-        real = tempfile.mkstemp
+    def test_a_download_in_flight_is_a_file_of_its_own_in_the_cache_root(self):
+        seen = {}
 
-        def spy(*args, **kwargs):
-            seen.append((args, kwargs))
-            return real(*args, **kwargs)
+        def look():
+            seen["parts"] = self.parts(1)
+            seen["root"] = sorted(p.name for p in self.cache.iterdir())
+            seen["modes"] = [p.stat().st_mode & 0o777 for p in self.cache.iterdir()]
+            seen["digest directory"] = self.digest_dir().exists()
 
-        server, base = self.serve({"/a": PAYLOAD})
-        with mock.patch.object(fetch.tempfile, "mkstemp", spy):
-            fetch.fetch(self.cache, [self.pin(base + "/a")])
-        self.assertEqual(len(seen), 1)
-        self.assertEqual(Path(seen[0][1]["dir"]), self.digest_dir())
+        old = os.umask(0o027)
+        self.addCleanup(os.umask, old)
+        server, base = self.serve({"/a": ("held", PAYLOAD, threading.Barrier(1, action=look), 0)})
+        self.assertEqual(fetch.fetch(self.cache, [self.pin(base + "/a")])[0]["state"], "fetched")
+        self.assertEqual(seen["root"], seen["parts"], seen)
+        self.assertEqual(len(seen["root"]), 1, seen)
+        self.assertRegex(seen["root"][0], rf"\A\.{re.escape(NAME)}\.\d+\.[0-9a-f]+\.part\Z")
+        self.assertFalse(seen["digest directory"])  # nothing carries the final name until it is complete
+        if hasattr(os, "fchmod"):
+            self.assertEqual(seen["modes"], [0o640])  # created with its mode: 0644 narrowed by the umask
+        self.assertEqual(self.leftovers(), [NAME])
+
+    def test_the_umask_is_never_read_or_changed_by_a_fetch(self):
+        server, base = self.serve({"/a": PAYLOAD, "/wrong": b"x" * len(PAYLOAD)})
+        with mock.patch.object(os, "umask", side_effect=AssertionError("umask touched")) as umask:
+            rows = fetch.fetch(self.cache, [self.pin(base + "/wrong", name="w.bin"), self.pin(base + "/a")])
+        self.assertEqual([row["state"] for row in rows], ["refused", "fetched"], rows)
+        self.assertEqual(umask.call_count, 0)
 
     def test_malformed_url_is_refused_and_later_pins_still_run(self):
         server, base = self.serve({"/a": PAYLOAD})
@@ -413,17 +452,22 @@ class Fetch(Base):
         self.assertEqual((self.digest_dir() / NAME).stat().st_mode & 0o777, 0o644)
         self.assertEqual(os.umask(0o022), 0o022)  # the helper left the umask as it found it
 
-    def test_failed_fetch_removes_an_empty_digest_directory_but_not_a_populated_one(self):
+    def test_failed_fetch_creates_no_digest_directory_and_removes_none(self):
         server, base = self.serve({"/wrong": b"x" * len(PAYLOAD)})
         self.assertEqual(fetch.fetch(self.cache, [self.pin(base + "/wrong")])[0]["state"], "refused")
-        self.assertFalse(self.digest_dir().exists())  # the directory this attempt created is gone again
+        self.assertFalse(self.digest_dir().exists())  # a failed attempt never creates the directory
         self.assertTrue(self.cache.exists())
         directory = self.digest_dir()
-        directory.mkdir()
+        directory.mkdir()  # as another fetch of this digest leaves it just before it publishes
+        with mock.patch.object(os, "rmdir", side_effect=AssertionError("rmdir called")) as rmdir:
+            fetch.fetch(self.cache, [self.pin(base + "/wrong")])
+        self.assertEqual(rmdir.call_count, 0)
+        self.assertTrue(directory.is_dir())
         (directory / "other").write_bytes(b"keep")
         (directory / NAME).write_bytes(b"corrupt")
         fetch.fetch(self.cache, [self.pin(base + "/wrong")])
         self.assertEqual(sorted(p.name for p in directory.iterdir()), ["other", NAME])
+        self.assertEqual((directory / NAME).read_bytes(), b"corrupt")  # a mismatching entry is left in place
 
     def test_dangling_and_looping_symlink_entries_are_misses_and_replaced(self):
         directory = self.digest_dir()
@@ -451,6 +495,85 @@ class Fetch(Base):
         rows = fetch.fetch(self.cache, [self.pin(base + "/nope", data=other, name="b.bin"),
                                         self.pin(base + "/a")])
         self.assertEqual([r["state"] for r in rows], ["refused", "fetched"])
+
+
+class Concurrent(Base):
+    """Two fetches of one digest at the same time: both succeed, or one fails cleanly."""
+
+    def in_threads(self, *pins):
+        rows = [None] * len(pins)
+
+        def work(index, pin):
+            rows[index] = fetch.fetch(self.cache, [pin])[0]
+
+        threads = [threading.Thread(target=work, args=item) for item in enumerate(pins)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        return rows
+
+    def test_two_fetches_of_one_digest_at_once_both_succeed(self):
+        seen = {}
+
+        def look():  # runs once, while both downloads are half-way
+            seen["parts"] = self.parts(2)
+            seen["final name"] = (self.digest_dir() / NAME).exists()
+            seen["digest directory"] = self.digest_dir().exists()
+
+        both = threading.Barrier(2, action=look)
+        server, base = self.serve({"/a": ("held", PAYLOAD, both, 0)})
+        with mock.patch.object(os, "rmdir", side_effect=AssertionError("rmdir called")) as rmdir, \
+                mock.patch.object(os, "umask", side_effect=AssertionError("umask touched")) as umask:
+            rows = self.in_threads(self.pin(base + "/a"), self.pin(base + "/a"))
+        self.assertEqual([row["state"] for row in rows], ["fetched", "fetched"], rows)
+        self.assertEqual(server.hits, ["/a", "/a"])
+        self.assertEqual((rmdir.call_count, umask.call_count), (0, 0))
+        self.assertFalse(seen["final name"])  # no partial file is ever visible under the final name
+        self.assertEqual(len(set(seen["parts"])), 2, seen)  # each download has a file of its own
+        self.assertFalse(seen["digest directory"])
+        self.assertEqual((self.digest_dir() / NAME).read_bytes(), PAYLOAD)
+        self.assertEqual(self.leftovers(), [NAME])
+        self.assertEqual(fetch.verify(self.cache, [self.pin()])[0]["state"], "cached")
+
+    def test_a_fetch_that_fails_beside_one_that_succeeds_takes_nothing_from_it(self):
+        wrong = b"x" * len(PAYLOAD)
+        for first_done in ("the failing one", "the good one"):
+            with self.subTest(first_done=first_done):
+                if self.cache.exists():
+                    (self.digest_dir() / NAME).unlink()
+                    self.digest_dir().rmdir()
+                both = threading.Barrier(2)
+                slow = 0.3
+                server, base = self.serve({
+                    "/good": ("held", PAYLOAD, both, slow if first_done == "the failing one" else 0),
+                    "/bad": ("held", wrong, both, slow if first_done == "the good one" else 0)})
+                with mock.patch.object(os, "rmdir", side_effect=AssertionError("rmdir called")) as rmdir:
+                    good, bad = self.in_threads(self.pin(base + "/good"), self.pin(base + "/bad"))
+                self.assertEqual(rmdir.call_count, 0)  # never a directory another fetch is using
+                self.assertEqual(good["state"], "fetched", good)
+                self.assertEqual(bad["state"], "refused", bad)
+                self.assertIn("digest mismatch", bad["reason"])
+                self.assertEqual(len(bad["reason"].splitlines()), 1)
+                self.assertEqual((self.digest_dir() / NAME).read_bytes(), PAYLOAD)
+                self.assertEqual(self.leftovers(), [NAME])
+
+    def test_two_processes_fetching_one_digest_at_once_both_exit_zero(self):
+        both = threading.Barrier(2)
+        server, base = self.serve({"/a": ("held", PAYLOAD, both, 0)})
+        pins = self.work / "pins.json"
+        pins.write_text(json.dumps([self.pin(base + "/a")]))
+        script = Path(fetch.__file__).with_name("pk.py")
+        children = [subprocess.Popen([sys.executable, str(script), "fetch", "--pins", str(pins)],
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=dict(os.environ))
+                    for _ in range(2)]
+        results = [(child.wait(timeout=60), *child.communicate()) for child in children]
+        entry = self.digest_dir() / NAME
+        self.assertEqual(results, [(0, f"fetched {NAME} {entry}\n", "")] * 2)
+        self.assertEqual(server.hits, ["/a", "/a"])
+        self.assertEqual(entry.read_bytes(), PAYLOAD)
+        self.assertEqual(self.leftovers(), [NAME])
 
 
 def run_cli(*argv):

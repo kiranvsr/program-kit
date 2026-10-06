@@ -244,6 +244,106 @@ class PlantedBugs(Base):
         with self.assertRaises(KitError):  # the self-test cannot fail "not passing" through a missing program
             ev.planted_bugs([row("flip")], None, ["no-such-program-pk"])
 
+    HANGS_ON_A_BROKEN_FILE = ("import sys, time\ntext = open('calc.py').read()\n"
+                              "if 'def (:' in text:\n    time.sleep(60)\n"
+                              "sys.exit(1 if 'a - b' in text else 0)\n")
+
+    def test_build_none_self_test_that_times_out_names_the_timeout(self):
+        ev = evidence.Evidence(self.root, "T-1")
+        with self.assertRaises(KitError) as ctx:
+            ev.planted_bugs([row("flip", test_args=[])], None, [PY, "-c", self.HANGS_ON_A_BROKEN_FILE], timeout=2)
+        message = str(ctx.exception)
+        self.assertTrue(message.startswith("self-test cannot be trusted: the test timed out after 2s"), message)
+        self.assertIn("calc.py", message)
+        self.assertIn("pass a build command", message)
+        self.assertNotIn("\n", message)
+        self.assertEqual(ev.planted_bug_rows, [])  # nothing was recorded as "build failed"
+        self.assertEqual(len(worktrees(self.root)), 1)
+
+    def test_with_a_build_step_a_test_that_times_out_is_still_only_a_row_that_does_not_build(self):
+        ev = evidence.Evidence(self.root, "T-1")
+        hang = row("hang", find="return a + b", replace="while True: pass")
+        rows = ev.planted_bugs([hang], BUILD, TEST, timeout=3)
+        self.assertEqual([(r["id"], r["builds"], r["kill_reason"]) for r in rows],
+                         [("hang", False, "build failed"), (SELF_TEST, False, "build failed")])
+
+    def failing_restore(self, ev, fail_from=1):
+        """Make the restore step of `ev` fail from its `fail_from`-th call on; returns the list of calls."""
+        calls, real = [], ev._restore
+
+        def restore(mirror):
+            calls.append(mirror)
+            if len(calls) >= fail_from:
+                raise KitError("git clean -fdxq failed: disk is full")
+            real(mirror)
+
+        patcher = mock.patch.object(ev, "_restore", restore)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return calls
+
+    def test_a_restore_failure_does_not_replace_the_error_of_the_row(self):
+        ev = evidence.Evidence(self.root, "T-1")
+        self.failing_restore(ev)
+        with self.assertRaises(KitError) as ctx:
+            ev.planted_bugs([row("flip")], BUILD, [PY, "-c", "raise SystemExit(1)"])
+        message = str(ctx.exception)
+        first, second = "unmutated mirror fails its own test (exit 1)", "the mirror could not be restored: git clean"
+        self.assertIn(first, message)
+        self.assertIn(second, message)
+        self.assertLess(message.index(first), message.index(second))  # the row's own error comes first
+        self.assertNotIn("\n", message)
+        self.assertEqual(len(worktrees(self.root)), 1)
+
+    def test_a_restore_failure_does_not_hide_the_result_of_the_row(self):
+        ev = evidence.Evidence(self.root, "T-1")
+        calls = self.failing_restore(ev, fail_from=2)  # the baseline restores; the first planted bug cannot
+        with self.assertRaises(KitError) as ctx:
+            ev.planted_bugs([row("flip"), row("again", replace="a * b")], BUILD, TEST)
+        self.assertEqual(len(calls), 2)  # nothing more ran on a mirror that is no longer HEAD
+        message = str(ctx.exception)
+        self.assertRegex(message, r"\Aplanted bug flip gave builds: true, test exit: 1; "
+                                  r"the mirror could not be restored: git clean -fdxq failed: disk is full\Z")
+        self.assertEqual(ev.planted_bug_rows, [])
+
+    def test_a_restore_failure_is_added_to_an_error_that_is_not_the_kits(self):
+        ev = evidence.Evidence(self.root, "T-1")
+        self.failing_restore(ev)
+        real_run = evidence.run_argv
+
+        def exploding(argv, cwd, *a, **kw):
+            if "unittest" in argv:
+                raise RuntimeError("runner exploded")
+            return real_run(argv, cwd, *a, **kw)
+
+        with mock.patch.object(evidence, "run_argv", exploding):
+            with self.assertRaises(RuntimeError) as ctx:
+                ev.planted_bugs([row("flip")], BUILD, TEST)
+        self.assertEqual(str(ctx.exception), "runner exploded")  # the row's own exception, unchanged
+        self.assertEqual(ctx.exception.__notes__,
+                         ["the mirror could not be restored: git clean -fdxq failed: disk is full"])
+
+    def test_a_mirror_removal_failure_does_not_replace_the_error_of_the_row(self):
+        ev = evidence.Evidence(self.root, "T-1")
+        real_git = evidence.git
+
+        def failing_git(root, *args):
+            if args[:2] == ("worktree", "remove"):
+                raise KitError("git worktree remove failed: locked")
+            return real_git(root, *args)
+
+        with spy_mkdtemp() as made:
+            try:
+                with mock.patch.object(evidence, "git", failing_git):
+                    with self.assertRaises(KitError) as ctx:
+                        ev.planted_bugs([row("flip")], BUILD, [PY, "-c", "raise SystemExit(1)"])
+            finally:  # the test, not the code under test, cleans up what it forced to leak
+                sh(self.root, "git", "worktree", "remove", "--force", made[0])
+        message = str(ctx.exception)
+        self.assertIn("unmutated mirror fails its own test (exit 1)", message)
+        self.assertIn(f"cannot remove mirror {made[0]}", message)
+        self.assertLess(message.index("unmutated mirror"), message.index("cannot remove mirror"))
+
     def test_find_occurring_zero_or_twice_is_a_table_error_before_anything_runs(self):
         (self.root / "dup.py").write_text("x = 1\nx = 1\n")
         sh(self.root, "git", "add", "dup.py")
@@ -627,7 +727,7 @@ class Validate(Base):
                 with self.subTest(index=index, key=key):
                     stripped = copy.deepcopy(data)
                     del stripped["planted_bugs"][index][key]
-                    self.assertEqual(evidence.validate_results(stripped), [])  # the schema keeps them optional
+                    self.assertEqual(evidence.validate_results(stripped), [])  # validate alone: types when present
                     self.assertEqual(evidence.gate_problems(stripped, "T-1"),
                                      [f"planted_bugs[{index}]: does not record {key} (what was planted and the "
                                       "commands that ran)"])
@@ -641,15 +741,14 @@ class Validate(Base):
                          ["commands: is empty (evidence must record the commands that were run)"])
         self.assertEqual(evidence.gate_problems([], "T-1"), ["results must be a JSON object"])
 
-    def test_schema_lists_the_planted_fields_as_optional_properties(self):
+    def test_schema_requires_the_fields_every_written_row_carries(self):
         schema = json.loads((Path(evidence.__file__).resolve().parent.parent / "templates"
                              / "results.schema.json").read_text())
         items = schema["properties"]["planted_bugs"]["items"]
-        self.assertEqual(items["required"], ["id", "builds", "killed", "kill_reason", "test_output_sha256"])
+        self.assertEqual(items["required"], [*evidence.ROW_KEYS, *evidence.PLANTED_KEYS])
         for row_written in read_json(self.written())["planted_bugs"]:
+            self.assertEqual(list(row_written), [*evidence.ROW_KEYS, *evidence.PLANTED_KEYS])
             self.assertEqual(set(row_written), set(items["properties"]))
-        for key in evidence.PLANTED_KEYS:
-            self.assertNotIn(key, items["required"])
 
     def test_validate_all_killed_recomputed_excluding_self_test_row(self):
         out = self.written()

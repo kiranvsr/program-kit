@@ -1,6 +1,6 @@
 {
   "title": "program/evidence/<ID>/results.json",
-  "description": "Written by pk's evidence kit (Evidence.write) and checked by `pk evidence validate`. The checker enforces the same shape in code; its list of required keys is read from this file.",
+  "description": "Written by pk's evidence kit (Evidence.write) and checked by `pk evidence validate`. The checker enforces the same shape in code; its list of required keys is read from this file. This is the record the hand-back gate, the binding check and `pk status set ... done` accept: they refuse a planted-bug row without path, find, replace, build_argv or test_argv, where `pk evidence validate` alone checks those five only when a row carries them.",
   "type": "object",
   "required": ["task_id", "head", "main", "merge_base", "produced_at", "inputs", "commands", "planted_bugs",
                "planted_bugs_all_killed", "all_commands_as_expected", "tree_unchanged_by_run", "stale",
@@ -38,7 +38,8 @@
       "description": "one row per planted bug, then exactly one self-test row (id self-test-noncompiling, builds false, killed false)",
       "items": {
         "type": "object",
-        "required": ["id", "builds", "killed", "kill_reason", "test_output_sha256"],
+        "required": ["id", "builds", "killed", "kill_reason", "test_output_sha256",
+                     "path", "find", "replace", "build_argv", "test_argv"],
         "properties": {
           "id": {"type": "string"},
           "builds": {"type": "boolean"},
