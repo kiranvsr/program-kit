@@ -1,0 +1,23 @@
+# Commands the gate runs, as argv lists (never a shell). build, test and scan must each list a command.
+build:
+  - - pnpm
+    - install
+    - '--frozen-lockfile'
+    - '--offline'
+  - - pnpm
+    - build
+test:
+  - - pnpm
+    - test
+scan:
+  - - pnpm
+    - audit
+  - - gitleaks
+    - detect
+    - '--no-git'
+compile_check: []
+extra_gate: []
+guarded_files:
+  - package.json
+  - pnpm-lock.yaml
+  - program/checks.yaml

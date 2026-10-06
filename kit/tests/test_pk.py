@@ -78,8 +78,6 @@ class PkTests(unittest.TestCase):
         self.assertEqual(sorted(p.name for p in self.tmp.iterdir()), [".git", "program"])
 
     def test_init_with_preset_copies_checks(self):
-        if not (KIT / "presets").is_dir():
-            self.skipTest("kit/presets not created yet (Task 12)")
         preset = KIT / "presets" / "checks.python.yaml"
         rc, _, err = self.run_pk("init", "--preset", "python")
         self.assertEqual((rc, err), (0, ""))
