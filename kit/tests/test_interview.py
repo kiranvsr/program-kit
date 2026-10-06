@@ -243,12 +243,16 @@ class StoppingRuleTests(InterviewBase):
             validate.assert_called_once_with(self.root, 5)
             self.assertEqual(interview.stopping_rule(self.root, 4), ["stage-4-challenge.md: missing"])
 
-    def test_stage_7_includes_register_problems_when_register_exists(self):
-        self.challenge(7)
-        self.assertEqual(interview.stopping_rule(self.root, 7), ["program/register.yaml: missing"])
-        write_yaml(self.root / "program" / "register.yaml", {"phases": [{"id": "P1", "title": "a", "milestones": []}]})
-        with mock.patch("register.validate", return_value=["P1: has no milestones"]):
-            self.assertEqual(interview.stopping_rule(self.root, 7), ["P1: has no milestones"])
+    def test_stage_7_is_per_task_and_never_approved(self):
+        message = ("stage 7 is per task: run playbooks 07 and 08 for each task; there is nothing to approve")
+        for call in (lambda: interview.stopping_rule(self.root, 7), lambda: interview.approve(self.root, 7, []),
+                     lambda: interview.challenge_init(self.root, 7), lambda: interview.amend(self.root, 7),
+                     lambda: interview.report(self.root, 7)):
+            with self.assertRaises(KitError) as caught:
+                call()
+            self.assertEqual(str(caught.exception), message)
+        self.assertFalse((self.root / "program" / "approvals" / "stage-7.json").exists())
+        self.assertFalse((self.root / "program" / "reports" / "stage-7-challenge.md").exists())
 
 
 class ApprovalTests(InterviewBase):
@@ -327,17 +331,14 @@ class ApprovalTests(InterviewBase):
             self.put_ledger(stage2 + [entry("F-11"), entry("F-12")])
             self.challenge(6)
             interview.approve(self.root, 6, [product])
-            self.challenge(7)
-            write_yaml(self.root / "program" / "register.yaml", {"phases": []})
-            with mock.patch("register.validate", return_value=[]):
-                interview.approve(self.root, 7, [product])
-        self.assertEqual(interview.next_stage(self.root), 8)
-        # a ledger change after the freeze makes the highest frozen approval stale, and only that one
-        self.put_ledger(stage2 + [entry("F-11"), entry("F-12"), entry("F-13")])
+        # stage 7 is never approved: once stages 1 to 6 are current, 7 is the final value
         self.assertEqual(interview.next_stage(self.root), 7)
+        # a ledger change after the freeze makes the highest frozen approval (stage 6) stale, and only that one
+        self.put_ledger(stage2 + [entry("F-11"), entry("F-12"), entry("F-13")])
+        self.assertEqual(interview.next_stage(self.root), 6)
         # an artifact change is caught at any stage
         self.put_ledger(stage2 + [entry("F-11"), entry("F-12")])
-        self.assertEqual(interview.next_stage(self.root), 8)
+        self.assertEqual(interview.next_stage(self.root), 7)
         artifact.write_text("changed\n", encoding="utf-8")
         self.assertEqual(interview.next_stage(self.root), 1)
 
@@ -582,6 +583,19 @@ class CliTests(InterviewBase):
         code, out, _ = self.run_cli("interview", "ingest", str(doc))
         self.assertEqual(code, 0)
         self.assertTrue(out.startswith("S2 program/sources/"))
+
+    def test_cli_stage_7_is_per_task(self):
+        with mock.patch("interview.next_stage", return_value=7):
+            code, out, err = self.run_cli("interview", "next")
+        self.assertEqual((code, err), (0, ""))
+        lines = out.splitlines()
+        self.assertTrue(lines[0].startswith("next stage: 7 ("), lines[0])
+        self.assertEqual(lines[1:], ["discovery is complete: run playbooks 07 and 08 for each task"])
+        for action in ("report", "challenge", "approve", "amend"):
+            code, out, err = self.run_cli("interview", action, "7")
+            self.assertEqual((code, out), (1, ""), action)
+            self.assertEqual(err, "error: stage 7 is per task: run playbooks 07 and 08 for each task; "
+                                  "there is nothing to approve\n", action)
 
     def test_cli_errors_are_one_line(self):
         self.put_ledger([entry("F-1", source="S9")])

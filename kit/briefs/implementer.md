@@ -6,22 +6,22 @@ You own one task. You work in its own git worktree on branch `task/<ID>`, test f
 
 ## Read first
 
-1. The hand-off's hard rules, evidence rules and throughput rules (the sections in `program/HANDOFF.md`), and `kit/rules/HARD_RULES.md`, `kit/rules/EVIDENCE_HONESTY.md` and `kit/rules/THROUGHPUT.md`.
+1. The rules: `kit/rules/HARD_RULES.md`, `kit/rules/EVIDENCE_HONESTY.md` and `kit/rules/THROUGHPUT.md`, and the project's `program/rulings.md`.
 2. Your task brief in `program/briefs/` (immutable), then `program/tasks/<ID>/SPEC.md` and `PLAN.md`.
 3. The full text of each ruling the SPEC or your dispatch cites, and nothing more. Look up other rulings by heading in `program/rulings.md` and `kit/rules/RULINGS_SEED.md` only when a question comes up.
 
 ## What you do
 
-1. Confirm you are in the task worktree, on `task/<ID>`, with a clean tree and the status `in_progress` (`pk status show <ID>`). If not, stop and report.
+1. Confirm you are in the task worktree, on `task/<ID>`, with a clean tree and the status `in_progress` (`pk status show <ID>`). The controller committed that status to main at dispatch. If anything differs, stop and report.
 2. Write the failing tests first. Show them failing (RED). Every failure-mode row in the SPEC needs a test that passes at the end.
 3. Build exactly the PLAN's boundary. Apply every ruling the SPEC cites. Anything with precedent you decide yourself and record as a deviation that cites the precedent.
-4. Write the evidence producer `program/evidence/<ID>/produce.py` with `kit/scripts/evidence.py`: literal PLAN commands, parsed derived fields, complete input hashes, and one planted bug for each guard you added or edited, plus the non-building self-test row. Commit it with the work.
+4. Write the evidence producer `program/evidence/<ID>/produce.py` with `kit/scripts/evidence.py`: literal PLAN commands, parsed derived fields, complete input hashes, and one planted bug for each guard you added or edited, plus the non-building self-test row. The results file must match `kit/templates/results.schema.json`; check it with `pk evidence validate program/evidence/<ID>/results.json`. Commit the producer with the work.
 5. Merge current main into your branch with a merge commit (`git merge main`). Never rebase.
 6. Make sure the tree is clean and the project's ignore file covers the bytecode and build output your commands write.
-7. From the main checkout, run the gate and wait for it in the background: `pk gate handback <ID> --branch task/<ID>`. It runs the build and compile checks on a trial merge, the project's tests and scans, your PLAN commands, your producer, and the stale check.
+7. From the main checkout, run the gate and wait for it in the background: `pk gate handback <ID> --branch task/<ID>`. It runs the guarded-file check, a trial merge with the build and compile checks, the project's tests, scans and extra gate commands, your PLAN commands, your producer, and the stale check. A failed gate can leave `results.json` behind: restore or delete it by its exact path before you run the gate again.
 8. If the last line is not exactly `OK: <branch> passes the hand-back gate at <sha>`, read the failing step and its tail, fix it, commit, and run the gate again. Exit code 0 alone is never a pass.
-9. After the gate passes, move the task to review and commit the evidence alone: `pk status set <ID> review --role implementer --evidence program/evidence/<ID>/results.json`, then one commit containing `results.json` and the status file and nothing else. That is the evidence commit.
-10. Write your report and stop. Fix rounds come back to you; answer them with the finding-to-fix table.
+9. After the gate passes, in your worktree run `pk status set <ID> review --role implementer --evidence program/evidence/<ID>/results.json`, then make one commit containing `results.json` and the status file and nothing else. That is the evidence commit. From now on the status record changes only on this branch.
+10. Write your report to `program/tasks/<ID>/report.md` in the main checkout (the directory that holds `.worktrees/`), never in your worktree: the gate and the binding check allow no other change on your branch. Then stop. Fix rounds come back to you; answer them with the finding-to-fix table.
 
 ## Needs context
 
@@ -29,7 +29,7 @@ Stop with NEEDS_CONTEXT only for: a new dependency; a security boundary with no 
 
 ## Report shape
 
-Write the report to the path your dispatch names. Fixed headings, under 25 lines:
+Write the report to `program/tasks/<ID>/report.md` in the main checkout, as step 10 says. Fixed headings, under 25 lines:
 
 ```
 # Report: <ID>

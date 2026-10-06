@@ -21,7 +21,7 @@ Architect owns the whole stage: functional requirements, data, integrations, non
 4. Write non-functional requirements `NFR-001` and so on for scale, availability, latency, security, compliance, tenancy, data retention and residency. Each has a measurable target or an explicit "no target yet" with an owner.
 5. Write the domain objects and interfaces, the data (entities, owners, volumes, sensitivity, retention, source of truth), each integration (direction, protocol, authentication, limits, owner, what happens when it is down), security and tenancy boundaries, failure modes and recovery, and observability.
 6. Close every open question by an answer or a ruling (`pk rulings add --role interviewer --question Q --decision D`). Write `program/SPEC.md`.
-7. Add the requirements to `program/traceability.yaml` (`requirements:` with `journeys`, and `nfr: true` where it applies). Run `pk trace validate --stage 3`.
+7. Add the requirements to `program/traceability.yaml` (`requirements:` with `journeys`, and `nfr: true` where it applies). A requirement has a `release` field (default `first`). Give a requirement for a later release `release: <name>`; otherwise the stage 6 check demands a task for it. Run `pk trace validate --stage 3`.
 8. Write back and have the user correct it. Run `pk interview report 3`.
 9. Challenge round: `pk interview challenge 3`, each lens in its own session, every row resolved or deferred with an owner and date.
 10. Run `pk interview validate`, get the user's approval, then run `pk interview approve 3`.

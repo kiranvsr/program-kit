@@ -33,8 +33,8 @@ Project owns phase shaping, capacity and parking. Architect, program, delivery a
 
 ## Done when
 
-`pk interview approve 6` succeeds, `pk register validate` and `pk trace validate --stage 6` pass, and `pk briefs check` reports nothing. Later register edits go only through `pk register change --note TEXT`, which logs the change and regenerates the briefs. After one, run `pk interview next`. If it names an approved stage whose files changed, follow what it says.
+`pk interview approve 6` succeeds, `pk register validate` and `pk trace validate --stage 6` pass, and `pk briefs check` reports nothing. Later register edits go only through `pk register change --note TEXT`, which logs the change and regenerates the briefs. After one, run `pk interview next`. If it names an approved stage whose files changed, follow what it says. Stage 7 is never approved, so `next` naming stage 7 is normal and means discovery is complete; act on discovery only when it names stage 6 or lower.
 
 ## Next playbook
 
-`07_task_specs.md`. Confirm with `pk interview next`.
+`07_task_specs.md`. Confirm with `pk interview next`, which now prints stage 7.

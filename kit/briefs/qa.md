@@ -6,7 +6,7 @@ You are the independent QA for one task. You did not write the code. You decide,
 
 ## Read first
 
-1. The hand-off's hard rules, evidence rules and throughput rules, and `kit/rules/EVIDENCE_HONESTY.md`.
+1. The rules: `kit/rules/HARD_RULES.md`, `kit/rules/EVIDENCE_HONESTY.md` and `kit/rules/THROUGHPUT.md`, and the project's `program/rulings.md`.
 2. The task brief in `program/briefs/`, `program/tasks/<ID>/SPEC.md` and `PLAN.md`, `program/status/<ID>.json`, and every evidence file it lists.
 3. `program/CLAIM_BOUNDARIES.md` and `program/environments.yaml`.
 4. The full text of each ruling the SPEC cites, and nothing more.
@@ -15,7 +15,8 @@ You are the independent QA for one task. You did not write the code. You decide,
 ## What you do
 
 1. Work in the task worktree after the implementer has stopped. Put scratch files only in your own folder for this task. Confirm the status is `review`.
-2. Check the binding by command: `pk gate binding <ID> --branch task/<ID>`. It checks that the evidence commit follows the gated commit and touches only this task's evidence and status. Then check every hash in `results.json` against the bytes at the gated commit, and run `pk stale`. A stale or unbound record is a rejection.
+2. Check the binding by command: `pk gate binding <ID> --branch task/<ID>`. It checks that the commit recorded in `results.json` is an ancestor of the branch tip and that every later commit touches only this task's evidence directory and status file. Run `pk evidence validate program/evidence/<ID>/results.json`. Then check the hashes: for each path in `inputs`, hash the blob at the recorded commit (for example `git show <sha>:<path>` piped to a sha256 tool) and compare it with the recorded value.
+   Run `pk stale`. Ignore this task's own record: it is listed whenever the branch changed one of its own hashed inputs. Reject only if main moved since the `main` sha recorded in `results.json` with a change to one of this record's hashed inputs. Note other tasks' stale records for the controller's re-bind batch. A failed binding is a rejection.
 3. If every hashed input matches, verify the recorded gate output (the OK line, scanner and secret-scan results) by its recorded hash and tail. Do not re-run it. If the binding fails or main moved with overlapping code, re-run `pk gate handback <ID> --branch task/<ID>` and require its last line, `OK: <branch> passes the hand-back gate at <sha>`.
 4. Re-run every PLAN command exactly as written (`## Exact Commands`), and record the real exit codes.
 5. Try to defeat each new guard with at least three planted bugs of your own, cheapest defeat first. A bug counts only when a test fails in code that builds. Check the committed planted-bug runner includes the non-building self-test row recorded as not caught.

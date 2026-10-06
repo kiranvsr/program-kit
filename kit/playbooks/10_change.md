@@ -18,9 +18,9 @@ A correction that does not change meaning (a typo, a clarified sentence) is not 
 3. Show the user the CR and the impact. The user approves with that impact in view. Only after the user has said so, run `pk change approve CR-NNN --by NAME` with the user's name. Never approve for the user.
 4. Amend the affected artifacts and put the CR number in each one's change log. Run `pk trace validate --stage 6`. It must pass again.
 5. For each affected done task, add a follow-up task to `program/register.yaml` that carries the new meaning. Then run `pk register assign-ids`, `pk register validate` and `pk trace sync`, record it with `pk register change --note "CR-NNN: ..."` (this regenerates the briefs), and run `pk briefs check`.
-6. For each affected in-flight task, record a ruling with `pk rulings add --role controller --question Q --decision D --precedent CR-NNN` and deliver it to that task's implementer. The SPEC or PLAN of a not-started task is simply written with the new meaning at stage 7.
+6. For each affected in-flight task, record a ruling with `pk rulings add --role controller --question Q --decision D --precedent CR-NNN` and deliver it to that task's implementer. The SPEC or PLAN of a not-started task is simply written with the new meaning when its SPEC is written (`07_task_specs.md`).
 7. Run `pk change apply CR-NNN --note TEXT` to record that the change has been applied. It refuses without the approval record.
-8. Run `pk interview next`. If it names an approved stage whose files changed, run `pk interview amend N` for it. Then run `pk handoff update` and `pk handoff check`, and commit `program/`.
+8. Run `pk interview next`. If it names an approved stage whose files changed, run `pk interview amend N` for it. Stage 7 is never approved, so `next` naming stage 7 is normal and means discovery is complete; act on discovery only when it names stage 6 or lower. Then run `pk handoff update` and `pk handoff check`, and commit `program/`.
 
 ## Outputs
 

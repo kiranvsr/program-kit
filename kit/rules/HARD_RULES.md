@@ -26,7 +26,7 @@ These rules hold for every agent in every role, in every stage. If a rule seems 
 14. Never push, deploy or apply infrastructure unless the user explicitly tells you to.
 15. Every destructive command uses a literal path. No variables, no globs, no recursive prune of shared resources. Clean up only what you created, by its exact name.
 16. Commit messages end with your own attribution line, not one copied from a brief or an earlier commit.
-17. Never commit `.DS_Store`, `__pycache__`, build output or scratch files.
+17. Never commit editor, operating-system or build leftovers, or scratch files.
 
 ## Permissions and scope
 

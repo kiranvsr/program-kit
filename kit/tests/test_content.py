@@ -19,7 +19,11 @@ BRIEFS = ["controller.md", "implementer.md", "qa.md", "spec_qa.md"]
 RULES = ["HARD_RULES.md", "EVIDENCE_HONESTY.md", "THROUGHPUT.md", "RULINGS_SEED.md"]
 
 PLAYBOOK_SECTIONS = ["Purpose", "Inputs", "Steps", "Outputs", "Done when", "Next playbook"]
-BRIEF_SECTIONS = ["Role", "Read first", "Report shape", "Never"]
+BRIEF_SECTIONS = ["Role", "Read first", "What you do", "Needs context", "Report shape", "Never"]
+# The first playbook file each playbook's "Next playbook" section names (00 lists them all, 01 first).
+EXPECTED_NEXT = {name: PLAYBOOKS[i + 1] for i, name in enumerate(PLAYBOOKS[:9])}
+EXPECTED_NEXT["09_handoff.md"] = "08_execute.md"
+EXPECTED_NEXT["10_change.md"] = "08_execute.md"
 NEEDS_CONTEXT = ["a new dependency", "a security boundary with no precedent", "a change to user scope",
                  "two conflicting rulings"]
 HANDBACK_LINE = "`OK: <branch> passes the hand-back gate at <sha>`"
@@ -105,6 +109,7 @@ class PlaybookTests(unittest.TestCase):
             self.assertTrue(links, f"{name}: Next playbook names no playbook file")
             for link in links:
                 self.assertTrue((PLAYBOOK_DIR / link).is_file(), f"{name}: Next playbook {link} does not exist")
+            self.assertEqual(links[0], EXPECTED_NEXT[name], f"{name}: Next playbook should name {EXPECTED_NEXT[name]} first")
 
     def test_start_playbook_names_every_other_playbook(self):
         text = read(PLAYBOOK_DIR / PLAYBOOKS[0])
@@ -136,9 +141,9 @@ class BriefTests(unittest.TestCase):
             path = BRIEF_DIR / name
             self.assertTrue(path.is_file(), f"{name} is missing")
             text = read(path)
-            for case in NEEDS_CONTEXT:
-                self.assertIn(case, text, f"{name}: missing NEEDS_CONTEXT case '{case}'")
             found = sections(text)
+            for case in NEEDS_CONTEXT:
+                self.assertIn(case, found.get("Needs context", ""), f"{name}: Needs context lacks '{case}'")
             for heading in BRIEF_SECTIONS:
                 self.assertIn(heading, found, f"{name}: missing section '{heading}'")
             self.assertLessEqual(len(text.splitlines()), 100, f"{name}: over 100 lines")
@@ -161,8 +166,15 @@ class RulesTests(unittest.TestCase):
         for number, block in zip(numbers, blocks):
             for label in ("**Rule.**", "**Why.**", "**How to apply.**"):
                 self.assertIn(label, block, f"K{number}: missing {label}")
-        self.assertIn("controller documents", blocks[-2], "K(n-1) is the closure-exclusion lesson")
-        self.assertRegex(blocks[-1], r"(?i)quiet main", "K(n) is the quiet-main lesson")
+        titles = {int(m.group(1)): m.group(2) for m in re.finditer(r"^## K(\d+)\. (.+)$", text, re.M)}
+
+        def block_titled(fragment: str) -> str:
+            hits = [n for n, title in titles.items() if fragment in title.lower()]
+            self.assertEqual(len(hits), 1, f"expected exactly one ruling titled with '{fragment}'")
+            return blocks[hits[0] - 1]
+
+        self.assertIn("program/HANDOFF.md", block_titled("controller documents"))
+        self.assertRegex(block_titled("nothing else merges"), r"(?i)quiet main")
 
     def test_evidence_honesty_has_ten_rules(self):
         text = read(RULES_DIR / "EVIDENCE_HONESTY.md")
@@ -173,6 +185,38 @@ class RulesTests(unittest.TestCase):
         for topic in ("merge queue", "hand-back gate", "decide, don't ask", "finding-to-fix", "tier 1", "tier 2",
                       "escalate", "three implementers", "four agents", "polling", "interrupt", "quiet main"):
             self.assertIn(topic, text, f"THROUGHPUT.md does not cover '{topic}'")
+
+
+class StageSevenTests(unittest.TestCase):
+    def test_stage_7_is_per_task_and_never_approved(self):
+        for path in all_files():
+            text = read(path)
+            self.assertNotIn("all stages approved", text, f"{path.name}: stage 7 is never approved")
+            self.assertNotIn("stage-7.json", text, f"{path.name}: there is no stage 7 approval")
+            self.assertNotRegex(text, r"interview (approve|challenge|report|amend) 7", path.name)
+        start = read(PLAYBOOK_DIR / "00_START.md")
+        self.assertRegex(start, r"(?i)stage 7 is never approved")
+        self.assertRegex(read(PLAYBOOK_DIR / "07_task_specs.md"), r"(?i)once per task")
+
+
+class LedgerExampleTests(unittest.TestCase):
+    def test_discover_playbook_ledger_example_is_valid(self):
+        import interview
+        import miniyaml
+        import tempfile
+        import shutil
+
+        text = read(PLAYBOOK_DIR / "01_discover.md")
+        block = re.search(r"```\n(sources:\n.*?)```", text, re.S)
+        self.assertIsNotNone(block, "01_discover.md has no ledger example")
+        root = Path(tempfile.mkdtemp())
+        try:
+            (root / "program").mkdir()
+            (root / "program" / "ledger.yaml").write_text(block.group(1), encoding="utf-8")
+            miniyaml.loads(block.group(1))
+            self.assertEqual(interview.ledger_validate(root), [])
+        finally:
+            shutil.rmtree(root)
 
 
 class CommandTests(unittest.TestCase):

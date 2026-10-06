@@ -4,7 +4,7 @@ Rework and token cost, not coding, are what slow a program down. These rules exi
 
 ## Merge queue
 
-- QA starts only on a branch that has merged current main and produced its evidence on that merge.
+- QA starts once the branch's evidence reflects current main.
 - When QA accepts, the controller merges that branch next. No other code merge to main happens in between. Documentation-only hand-off commits are fine.
 - Accepted branches merge one at a time, in the order they were accepted.
 - If main moved without touching a branch's hashed inputs and `git merge-tree --write-tree main <branch>` is clean, the branch does not re-merge or re-produce its evidence. Any overlap means merge main, re-produce, then QA.
@@ -40,7 +40,7 @@ Rework and token cost, not coding, are what slow a program down. These rules exi
 - Each agent has its own scratch folder named for its task and role.
 - No polling. Run long commands in the background with output redirected to a file, and wait for completion. Never use sleep loops and never `tail -f`.
 - Reports are short and use the fixed headings in the role's brief.
-- Read the hand-off's rule sections and the rulings your SPEC cites, not the whole ruling log.
+- Read the three rule files in `kit/rules/` and the rulings your SPEC cites, not the whole ruling log.
 - Run the kit's `pk fetch` step in the background once per host at session setup, so no gate step ever waits on a download.
 
 ## Interruptions
@@ -56,5 +56,5 @@ Rework and token cost, not coding, are what slow a program down. These rules exi
 
 - A gate that reads every record (a phase gate, a re-bind batch) is voided by any merge. While one runs, merge nothing else.
 - Merge the feature tasks first. Then run the gates back to back on a quiet main, merging each result before the next gate starts.
-- The controller commits `program/` hand-off files only after a merge, a ruling or at session end, and evidence closures exclude them.
+- The controller commits hand-off and controller-state updates only after a merge, a ruling or at session end, and evidence closures exclude them. The one exception is the dispatch commit: a task's SPEC, PLAN and `in_progress` status go to main together, as one commit, before its worktree is created, because the gate reads them from main. After that the status record changes only on the task branch.
 - A successor verifies that the repo-wide suite passes on main before it dispatches anything.

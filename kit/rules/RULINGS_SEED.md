@@ -4,13 +4,13 @@ These are the starting rulings of a program, numbered K1 to K33. They come from 
 
 Your own program records its rulings in `program/rulings.md` with `pk rulings add`, numbered R1 onward. A ruling never contradicts an earlier one silently: it supersedes it by name. A K ruling can be superseded the same way.
 
-## K1. Merge queue: QA only on current main, merge right after acceptance
+## K1. Merge queue: QA only on evidence that reflects current main, merge right after acceptance
 
-**Rule.** QA starts only after the branch has merged current main and produced its evidence on that merge. Once QA accepts, the controller merges that branch next. No other code merge to main happens between the start of QA and that merge. Accepted branches merge one at a time, in acceptance order. Documentation-only hand-off commits are fine.
+**Rule.** QA starts once the branch's evidence reflects current main. Once QA accepts, the controller merges that branch next. No other code merge to main happens between the start of QA and that merge. Accepted branches merge one at a time, in acceptance order. Documentation-only hand-off commits are fine.
 
 **Why.** Every merge to main makes every waiting branch re-merge, re-produce evidence and re-run QA. Rework, not coding, was the bottleneck.
 
-**How to apply.** The controller keeps a queue ordered by acceptance. It starts QA on one branch whose evidence reflects current main, merges it on acceptance, and only then starts QA on the next.
+**How to apply.** The controller keeps a queue ordered by acceptance. It starts QA on one branch whose evidence reflects current main (`pk stale`, and K16 when main moved), merges it on acceptance, and only then starts QA on the next.
 
 ## K2. Hand-back gate before any QA round
 
@@ -84,21 +84,21 @@ Your own program records its rulings in `program/rulings.md` with `pk rulings ad
 
 **How to apply.** Write edits that stay valid code (`&& false`, `|| true`, assign to an unused name). If a row shows `build failed`, rewrite the edit.
 
-## K11. Cross-boundary tests for every tenancy or access policy
+## K11. Cross-boundary tests for every access policy
 
-**Rule.** Every new tenancy or access policy gets a test that acts as another tenant or principal and shows reads see nothing, writes of foreign rows fail and updates change nothing. It also gets a committed planted bug that replaces the policy with an allow-everything one, and the test must catch it.
+**Rule.** Every new access policy (tenancy, roles, permissions, row filters) gets an eligible-record positive control, a cross-boundary negative test that acts as another principal (reads see nothing, writes of foreign records fail, updates change nothing), and a committed planted bug that replaces the policy with an allow-everything one, which the test must catch.
 
 **Why.** A policy nobody tried to cross can be wrong in both directions without any test noticing.
 
-**How to apply.** One test per new table or policy. Use K12 for the update case.
+**How to apply.** One test per new policy. Use K12 for the update case.
 
-## K12. Update checks need a positive eligible-row control
+## K12. Update checks need a positive eligible-record control
 
-**Rule.** Before a cross-boundary update assertion, the test must prove that the owner has at least one row matching the exact update predicate and that the intended change is legal for it. Then show the other principal's update changes zero rows. Do not reuse a fixture that earlier steps made ineligible.
+**Rule.** Before a cross-boundary update assertion, the test must prove that the owner has at least one record matching the exact update predicate and that the intended change is legal for it. Then show the other principal's update changes nothing. Do not reuse a fixture that earlier steps made ineligible.
 
-**Why.** An update that matches no owner row proves nothing about isolation. It would pass with the policy removed.
+**Why.** An update that matches no owner record proves nothing about isolation. It would pass with the policy removed.
 
-**How to apply.** Order the test: owner updates its row and succeeds, restore it, other principal updates and affects zero rows, owner row unchanged.
+**How to apply.** Order the test: owner updates its record and succeeds, restore it, other principal updates and nothing changes, owner record unchanged.
 
 ## K13. QA scopes its re-runs when the evidence binds at HEAD
 
@@ -110,7 +110,7 @@ Your own program records its rulings in `program/rulings.md` with `pk rulings ad
 
 ## K14. Read only the rules and the rulings your SPEC cites
 
-**Rule.** Read the hand-off's hard rules, evidence rules and throughput rules, plus the full text of each ruling your SPEC, PLAN or dispatch prompt cites. Do not read the whole ruling log.
+**Rule.** Read `kit/rules/HARD_RULES.md`, `EVIDENCE_HONESTY.md` and `THROUGHPUT.md`, plus the full text of each ruling your SPEC, PLAN or dispatch prompt cites. Do not read the whole ruling log.
 
 **Why.** The log grows without limit, and reading all of it costs more than the rest of the task.
 
@@ -204,9 +204,9 @@ Your own program records its rulings in `program/rulings.md` with `pk rulings ad
 
 **How to apply.** Have the collector derive the list deterministically, sorted and deduplicated, and require every path to exist at HEAD. Commit the collector, then produce once from a clean tree.
 
-## K26. Test-only fixture modes are explicit and default off
+## K26. A tool's test-only fixture mode is explicit and default off
 
-**Rule.** A collector may read archive fixtures without version control only in an explicit test mode that is off by default. Ordinary collection requires git and committed blobs, and a git failure never silently falls back to reading the filesystem. Test both the default rejection and the explicit success, and add a planted bug that flips the default.
+**Rule.** A tool's test-only fixture mode (for example a collector reading a fixture tree that has no version control) is enabled only by an explicit test flag, never by a silent fallback. Ordinary use requires the real source (committed blobs), and a failure to reach it never falls back to reading whatever is on disk. Test both the default rejection and the explicit success, and add a planted bug that flips the default.
 
 **Why.** A silent fallback turns a git failure into evidence about whatever happens to be on disk.
 
