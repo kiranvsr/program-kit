@@ -2,6 +2,7 @@ import _paths  # noqa: F401  (must come first: puts kit/scripts/ on sys.path)
 import contextlib
 import copy
 import io
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -133,6 +134,17 @@ class RegisterTests(unittest.TestCase):
         self.assertEqual(register.validate(reg(task(tid, role="wizard")), None, None), [])
 
     # beyond the five named tests
+    def test_id_patterns_accept_only_ascii_digits(self):
+        arabic = "\u0661"  # ARABIC-INDIC DIGIT ONE, which str.isdigit and \d (without ASCII) accept
+        for text in (f"P{arabic}-M01-S01-T01", f"P1-M0{arabic}-S01-T01", f"P1-M01-S01-T0{arabic}"):
+            self.assertIsNone(register.TASK_ID.match(text), text)
+        self.assertIsNotNone(register.TASK_ID.match("P1-M01-S01-T01"))
+        self.assertIsNone(register.CLOSES_ID.match(f"REQ-00{arabic}"))
+        self.assertIsNone(register.CLOSES_ID.match(f"J{arabic}"))
+        self.assertIsNotNone(register.CLOSES_ID.match("J1"))
+        for kind, shape in register._ID.items():
+            self.assertTrue(shape.flags & re.ASCII, kind)
+
     def test_validate_checks_ids_gates_and_closes(self):
         a = "P1-M01-S01-T01"
         problems = self.messages(reg(task(a, closes=["REQ-001", "NFR-012", "J3", "REQ-1", "X-001"], gate="BETA"),

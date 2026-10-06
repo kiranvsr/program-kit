@@ -117,6 +117,8 @@ def git(root: Path, *args: str) -> str:
                               encoding="utf-8", errors="replace")
     except OSError as exc:
         raise KitError(f"cannot run git: {exc.strerror or exc}") from exc
+    except ValueError as exc:  # an argument git cannot be given, such as one with a NUL byte
+        raise KitError("git: invalid argument") from exc
     if proc.returncode != 0:
         lines = [ln.strip() for ln in (proc.stderr or proc.stdout).splitlines() if ln.strip()]
         reason = next((ln for ln in lines if ln.startswith(("fatal:", "error:"))),

@@ -24,14 +24,14 @@ KINDS = ("phase", "milestone", "step", "task")
 _CHILD = ("milestones", "steps", "tasks")  # the list each of the first three kinds holds
 _LETTER = ("", "M", "S", "T")
 _ID = {
-    "phase": re.compile(r"P\d+\Z"),
-    "milestone": re.compile(r"P\d+-M\d+\Z"),
-    "step": re.compile(r"P\d+-M\d+-S\d+\Z"),
-    "task": re.compile(r"P\d+-M\d+-S\d+-T\d+\Z"),
+    "phase": re.compile(r"P\d+\Z", re.ASCII),
+    "milestone": re.compile(r"P\d+-M\d+\Z", re.ASCII),
+    "step": re.compile(r"P\d+-M\d+-S\d+\Z", re.ASCII),
+    "task": re.compile(r"P\d+-M\d+-S\d+-T\d+\Z", re.ASCII),
 }
 _SHAPE = {"phase": "P<n>", "milestone": "P<n>-M<n>", "step": "P<n>-M<n>-S<n>", "task": "P<n>-M<n>-S<n>-T<n>"}
 _GATE = re.compile(r"G-[A-Z0-9][A-Z0-9_]*\Z")
-_CLOSES = re.compile(r"(?:REQ-\d{3}|NFR-\d{3}|J\d+)\Z")
+_CLOSES = re.compile(r"(?:REQ-\d{3}|NFR-\d{3}|J\d+)\Z", re.ASCII)
 GATE_ID, CLOSES_ID, TASK_ID = _GATE, _CLOSES, _ID["task"]  # public aliases for trace.py
 
 
