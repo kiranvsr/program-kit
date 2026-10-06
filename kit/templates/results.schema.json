@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "program/evidence/<ID>/results.json",
+  "description": "Written by pk's evidence kit (Evidence.write) and checked by `pk evidence validate`. The checker enforces the same shape in code; its list of required keys is read from this file.",
+  "type": "object",
+  "required": ["task_id", "head", "main", "merge_base", "produced_at", "inputs", "commands", "planted_bugs",
+               "planted_bugs_all_killed", "all_commands_as_expected", "tree_unchanged_by_run", "stale",
+               "blocked_by", "deviations"],
+  "properties": {
+    "task_id": {"type": "string"},
+    "head": {"type": "string", "pattern": "^[0-9a-f]{40}$", "description": "the one commit the evidence binds to"},
+    "main": {"type": "string", "pattern": "^[0-9a-f]{40}$", "description": "SHA of the main branch when produced"},
+    "merge_base": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "produced_at": {"type": "string", "description": "UTC, YYYY-MM-DDTHH:MM:SSZ"},
+    "inputs": {
+      "type": "object", "minProperties": 1,
+      "description": "root-relative path -> sha256 of the blob committed at head",
+      "additionalProperties": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+    },
+    "commands": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["label", "argv", "exit", "expected_exit", "as_expected", "derived", "output_sha256", "output_tail"],
+        "properties": {
+          "label": {"type": "string"},
+          "argv": {"type": "array", "items": {"type": "string"}, "description": "the literal command, never a shell string"},
+          "exit": {"type": "integer"},
+          "expected_exit": {"type": "integer"},
+          "as_expected": {"type": "boolean", "description": "exit equals expected_exit and any parse succeeded"},
+          "derived": {"type": "object", "description": "fields parsed from the real output"},
+          "output_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$", "description": "over the full combined stdout and stderr"},
+          "output_tail": {"type": "string", "description": "last 2000 characters of that output"}
+        }
+      }
+    },
+    "planted_bugs": {
+      "type": "array",
+      "description": "one row per planted bug, then exactly one self-test row (id self-test-noncompiling, builds false, killed false)",
+      "items": {
+        "type": "object",
+        "required": ["id", "builds", "killed"],
+        "properties": {
+          "id": {"type": "string"},
+          "builds": {"type": "boolean"},
+          "killed": {"type": "boolean", "description": "true only when the code built and the test failed"},
+          "kill_reason": {"enum": ["test failed", "build failed", "not killed"]},
+          "test_output_sha256": {"type": "string", "description": "empty when no test ran"}
+        }
+      }
+    },
+    "planted_bugs_all_killed": {"type": "boolean", "description": "over the rows except the self-test row"},
+    "all_commands_as_expected": {"type": "boolean"},
+    "tree_unchanged_by_run": {"type": "boolean", "description": "clean at the start, clean at the end, same HEAD"},
+    "stale": {
+      "type": "object",
+      "required": ["checked", "records"],
+      "properties": {"checked": {"type": "boolean"}, "records": {"type": "array"}}
+    },
+    "blocked_by": {"type": "array", "items": {"type": "string"}},
+    "deviations": {"type": "array", "items": {"type": "string"}}
+  }
+}
