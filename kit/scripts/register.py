@@ -14,7 +14,7 @@ import re
 import sys
 from pathlib import Path
 
-from common import KitError, find_root, read_yaml, write_yaml
+from common import KitError, find_root, read_yaml, utc_now, write_yaml
 
 KIT_DIR = Path(__file__).resolve().parent.parent
 MAX_FAN_IN = 6
@@ -239,13 +239,54 @@ def validate(register: dict, environments: dict | None, roles: dict | None) -> l
     return problems
 
 
+# --- change log --------------------------------------------------------------
+
+_LOG_TITLE = "# Register change log\n"
+
+
+def change(root: Path, note: str) -> None:
+    """Append `- <date>: <note>` to program/changes/register-log.md, then regenerate the briefs.
+
+    The log is append-only. A note that is empty or spans several lines, or a register
+    the briefs cannot be built from, is refused before anything is written.
+    """
+    import briefs  # lazy: briefs imports this module
+
+    note = note.strip()
+    if not note or len(note.splitlines()) != 1:  # splitlines: \r, \x0b, \x85, \u2028 ... too
+        raise KitError("a register change note must be one non-empty line")
+    briefs.render(root)  # raises if the register cannot be rendered; nothing written yet
+    path = Path(root) / "program" / "changes" / "register-log.md"
+    try:
+        data = path.read_bytes()
+    except FileNotFoundError:
+        data = b""
+    except OSError as exc:
+        raise KitError(f"cannot read {path}: {exc.strerror or exc}") from exc
+    prefix = _LOG_TITLE + "\n" if not data else ("" if data.endswith(b"\n") else "\n")
+    entry = f"- {utc_now()[:10]}: {note}\n"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "ab") as handle:
+            handle.write((prefix + entry).encode("utf-8"))
+    except OSError as exc:
+        raise KitError(f"cannot write {path}: {exc.strerror or exc}") from exc
+    briefs.generate(root)
+
+
 # --- command -----------------------------------------------------------------
 
 def cmd_register(args: argparse.Namespace) -> int:
     action = getattr(args, "register_action", None)
-    if action not in ("validate", "assign-ids"):
-        raise KitError("register needs an action: validate or assign-ids")
+    if action not in ("validate", "assign-ids", "change"):
+        raise KitError("register needs an action: validate, assign-ids or change")
     root = find_root()
+    if action == "change":
+        import briefs
+
+        change(root, args.note)
+        print(f"recorded register change; generated {briefs.brief_count(briefs.generate(root))} briefs")
+        return 0
     register = load(root)
     if action == "assign-ids":
         assigned = assign_ids(register)
@@ -267,7 +308,9 @@ def _configure(parser: argparse.ArgumentParser) -> None:
     actions = parser.add_subparsers(dest="register_action", metavar="action", parser_class=type(parser))
     actions.add_parser("validate", help="check program/register.yaml")
     actions.add_parser("assign-ids", help="fill missing IDs in program/register.yaml from position")
+    changer = actions.add_parser("change", help="log a register change and regenerate the briefs")
+    changer.add_argument("--note", required=True, help="one line saying what changed and why")
 
 
 def register(add_command) -> None:
-    add_command("register", cmd_register, help="task register: validate and assign IDs", configure=_configure)
+    add_command("register", cmd_register, help="task register: validate, assign IDs, log changes", configure=_configure)
