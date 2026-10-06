@@ -1,0 +1,43 @@
+# Minimal coverage map for the interview tests: two stages, three topics, one conditional.
+stages:
+  1:
+    name: discover
+    budget: 4
+    artifacts:
+      - discovery.md
+    topics:
+      T1.1:
+        title: Outcome
+        owner: program
+        contributes:
+          - delivery
+        required: true
+        condition: null
+        closes_when: One sentence outcome, a named beneficiary and a measure.
+        needs:
+          - measure
+          - beneficiary
+      T1.9:
+        title: Regulatory and contractual
+        owner: program
+        contributes:
+          - architect
+        required: true
+        condition: has:regulated or has:payments
+        closes_when: Applicable regulations are named.
+        needs:
+          - regulation
+  2:
+    name: define the product
+    budget: 3
+    artifacts:
+      - product.md
+    topics:
+      T2.1:
+        title: Personas
+        owner: program
+        contributes: []
+        required: true
+        condition: null
+        closes_when: Each user kind is described.
+        needs: []
