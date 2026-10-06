@@ -2,8 +2,12 @@
 """Status state machine (spec 4.3). The only writer of program/status/<ID>.json.
 
 A task with no record is `not_started`. Every transition is checked in full
-before anything is written, so a refusal leaves no file behind. `done` is
-terminal and needs an acceptance file bound to the task's current results.json.
+before anything is written, so a refusal leaves no file behind, and only a task
+the register lists can be given a status. `done` is terminal and needs an
+acceptance file that accepts (`decision: accepted_development`), names this
+task, and is bound by hash to a current results.json the hand-back gate would
+pass. The role is a flag the caller passes: the machine checks which role may
+make a move, not who is typing.
 """
 from __future__ import annotations
 
@@ -12,6 +16,8 @@ import json
 import re
 from pathlib import Path
 
+import evidence as evidence_module
+import register as register_module
 from common import KitError, find_root, read_json, sha256_file, utc_now, write_json
 
 STATUSES = ("not_started", "in_progress", "review", "done", "blocked", "parked")
@@ -31,8 +37,12 @@ TRANSITIONS: dict[tuple[str, str], set[str]] = {
     ("parked", "not_started"): {"controller"},
 }
 
+ACCEPTED = "accepted_development"  # the accepting value of `decision` in acceptance.schema.json
+
 _TASK_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 _FIELDS = ("task_id", "status", "role", "updated_at", "note", "evidence", "blocked_by", "history")
+_TEXT_FIELDS = ("task_id", "role", "updated_at", "note")
+_ENTRY_FIELDS = ("status", "role", "at")
 
 
 def _check_id(task_id: str) -> str:
@@ -74,11 +84,20 @@ def _shape_problem(record) -> str | None:
     missing = [field for field in _FIELDS if field not in record]
     if missing:
         return f"missing field(s) {', '.join(missing)}"
-    if record["status"] not in STATUSES:
+    if not isinstance(record["status"], str) or record["status"] not in STATUSES:
         return f"unknown status {record['status']!r}"
+    for field in _TEXT_FIELDS:
+        if not isinstance(record[field], str):
+            return f"{field} must be text, not {record[field]!r}"
     for field in ("evidence", "blocked_by", "history"):
         if not isinstance(record[field], list):
             return f"{field} must be a list"
+    for field in ("evidence", "blocked_by"):
+        if not all(isinstance(item, str) for item in record[field]):
+            return f"{field} must be a list of text items"
+    for number, entry in enumerate(record["history"], 1):
+        if not isinstance(entry, dict) or not all(isinstance(entry.get(key), str) for key in _ENTRY_FIELDS):
+            return f"history entry {number} must be an object with text {', '.join(_ENTRY_FIELDS)}"
     return None
 
 
@@ -100,20 +119,56 @@ def list_all(root: Path) -> list[dict]:
     return [read(root, path.stem) for path in sorted(folder.glob("*.json"))]
 
 
+def _registered(root: Path) -> set[str]:
+    """Every task ID in `program/register.yaml`; entries of the wrong shape are skipped, not followed."""
+    def children(node, key: str) -> list:
+        items = node.get(key) if isinstance(node, dict) else None
+        return items if isinstance(items, list) else []
+
+    path = Path(root) / "program" / "register.yaml"
+    if not path.is_file():
+        raise KitError("program/register.yaml does not exist; a status belongs to a task the register lists")
+    found = set()
+    for phase in register_module.load(root)["phases"]:
+        for milestone in children(phase, "milestones"):
+            for step in children(milestone, "steps"):
+                found.update(task["id"] for task in children(step, "tasks")
+                             if isinstance(task, dict) and isinstance(task.get("id"), str))
+    return found
+
+
 def _acceptance_problem(root: Path, task_id: str, evidence: list[str]) -> str | None:
-    """Why `evidence` does not accept `task_id`, or None when the acceptance binds the current results."""
+    """Why `evidence` does not accept `task_id`, or None.
+
+    None only when the acceptance file is listed, has every key acceptance.schema.json requires, accepts
+    (`decision` is `accepted_development`), is QA's and this task's, binds the current results.json by hash,
+    and that results.json passes the checks of the hand-back gate (`evidence.gate_problems`).
+    """
     acceptance = f"program/evidence/{task_id}/acceptance.json"
     results = f"program/evidence/{task_id}/results.json"
     if acceptance not in [_norm(root, item) for item in evidence]:
         return f"{task_id}: done needs {acceptance} among the evidence paths"
     bound = read_json(Path(root) / acceptance)
-    claimed = bound.get("evidence_sha256") if isinstance(bound, dict) else None
+    missing = [key for key in evidence_module.required_keys("acceptance")
+               if not isinstance(bound, dict) or key not in bound]
+    if missing:
+        return f"{task_id}: {acceptance}: missing {', '.join(missing)}"
+    if bound["decision"] != ACCEPTED:
+        return f"{task_id}: {acceptance}: decision is {bound['decision']!r}, not {ACCEPTED!r}"
+    for key, expected in (("task_id", task_id), ("role", "qa")):
+        if bound[key] != expected:
+            return f"{task_id}: {acceptance}: {key} is {bound[key]!r}, not {expected!r}"
+    claimed = bound["evidence_sha256"]
     if not isinstance(claimed, str) or not claimed:
         return f"{task_id}: {acceptance} has no evidence_sha256"
     actual = sha256_file(Path(root) / results)
     if claimed != actual:
         return (f"{task_id}: {acceptance} binds evidence_sha256 {claimed} but {results} hashes to {actual}; "
                 f"acceptance is stale")
+    problems = evidence_module.gate_problems(read_json(Path(root) / results), task_id)
+    if problems:
+        more = f" (and {len(problems) - 1} more; run pk evidence validate)" if len(problems) > 1 else ""
+        return f"{task_id}: {results}: {problems[0]}{more}"
     return None
 
 
@@ -125,6 +180,8 @@ def transition(root: Path, task_id: str, to: str, role: str, note: str = "",
         raise KitError(f"unknown status {to!r}; statuses are {', '.join(STATUSES)}")
     if role not in ROLES:
         raise KitError(f"unknown role {role!r}; roles are {', '.join(ROLES)}")
+    if task_id not in _registered(root):
+        raise KitError(f"{task_id}: not a task in program/register.yaml")
     record = read(root, task_id)
     current = record["status"]
     if current == "done":

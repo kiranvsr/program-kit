@@ -1,5 +1,6 @@
 import _paths  # noqa: F401  (must come first: puts kit/scripts/ on sys.path)
 import contextlib
+import copy
 import hashlib
 import io
 import json
@@ -184,6 +185,31 @@ class PlantedBugs(Base):
         self.assertEqual((by_id["noop"]["builds"], by_id["noop"]["killed"], by_id["noop"]["kill_reason"]),
                          (True, False, "not killed"))
         self.assertEqual(len(by_id["flip"]["test_output_sha256"]), 64)
+
+    def test_rows_record_what_was_planted_and_the_commands_that_ran(self):
+        ev = evidence.Evidence(self.root, "T-1")
+        flip, noop, self_test = ev.planted_bugs(
+            [row("flip"), row("noop", find="return a + b", replace="return b + a", test_args=())], BUILD, TEST)
+        self.assertEqual({key: flip[key] for key in evidence.PLANTED_KEYS},
+                         {"path": "calc.py", "find": "a + b", "replace": "a - b", "build_argv": BUILD,
+                          "test_argv": TEST + ["test_calc"]})
+        self.assertEqual((noop["find"], noop["replace"], noop["test_argv"]), ("return a + b", "return b + a", TEST))
+        # the self-test row: nothing is replaced, the unparseable line is appended to the first row's file
+        self.assertEqual({key: self_test[key] for key in evidence.PLANTED_KEYS},
+                         {"path": "calc.py", "find": "", "replace": evidence.BROKEN_LINE, "build_argv": BUILD,
+                          "test_argv": TEST + ["test_calc"]})
+        for item in (flip, noop, self_test):
+            self.assertIsNot(item["test_argv"], TEST)
+            self.assertIsNot(item["build_argv"], BUILD)
+
+    def test_a_test_that_is_not_a_test_shows_in_the_row(self):
+        ev = evidence.Evidence(self.root, "T-1")
+        comment = row("comment-only", find="def add(a, b):", replace="def add(a, b):  # same code", test_args=())
+        rows = ev.planted_bugs([comment], BUILD, ["git", "diff", "--quiet"])
+        # still counted as killed: the runner cannot know the command is not a test, so the row has to say what ran
+        self.assertEqual((rows[0]["killed"], rows[0]["kill_reason"]), (True, "test failed"))
+        self.assertEqual(rows[0]["test_argv"], ["git", "diff", "--quiet"])
+        self.assertEqual((rows[0]["path"], rows[0]["replace"]), ("calc.py", "def add(a, b):  # same code"))
 
     def test_self_test_row_always_present_and_not_killed(self):
         ev = evidence.Evidence(self.root, "T-1")
@@ -574,6 +600,56 @@ class Validate(Base):
         good["planted_bugs_all_killed"] = False
         out.write_text(json.dumps(good))
         self.assertEqual(self.run_cli(str(out))[0], 0)
+
+    def test_validate_checks_the_planted_fields_when_present(self):
+        out = self.written()
+        original = out.read_text()
+        cases = [("path", 5), ("path", ""), ("find", 5), ("replace", None), ("build_argv", "make"),
+                 ("build_argv", []), ("build_argv", [1]), ("test_argv", None), ("test_argv", []),
+                 ("test_argv", "make test"), ("test_argv", ["make", 2])]
+        for key, value in cases:
+            with self.subTest(key=key, value=value):
+                out.write_text(original)
+                self.tamper(out, lambda d: d["planted_bugs"][0].update({key: value}))
+                code, _, stderr = self.run_cli(str(out))
+                self.assertEqual(code, 1)
+                self.assertEqual(stderr.count("\n"), 1, stderr)
+                self.assertTrue(stderr.startswith(f"error: planted_bugs[0]: {key} "), stderr)
+        out.write_text(original)
+        self.tamper(out, lambda d: d["planted_bugs"][0].update(build_argv=None))  # no build step was given
+        self.assertEqual(self.run_cli(str(out))[0], 0)
+
+    def test_the_gate_needs_every_row_to_say_what_was_planted_and_what_ran(self):
+        data = read_json(self.written())
+        self.assertEqual(evidence.gate_problems(data, "T-1"), [])
+        for index in (0, 1):
+            for key in evidence.PLANTED_KEYS:
+                with self.subTest(index=index, key=key):
+                    stripped = copy.deepcopy(data)
+                    del stripped["planted_bugs"][index][key]
+                    self.assertEqual(evidence.validate_results(stripped), [])  # the schema keeps them optional
+                    self.assertEqual(evidence.gate_problems(stripped, "T-1"),
+                                     [f"planted_bugs[{index}]: does not record {key} (what was planted and the "
+                                      "commands that ran)"])
+
+    def test_gate_problems_cover_task_head_commands_and_survivors(self):
+        data = read_json(self.written())
+        self.assertEqual(evidence.gate_problems(data, "T-1", data["head"]), [])
+        self.assertEqual(evidence.gate_problems(data, "T-2"), ["task_id: is T-1, expected T-2"])
+        self.assertTrue(evidence.gate_problems(data, "T-1", "0" * 40)[0].startswith("head: is "))
+        self.assertEqual(evidence.gate_problems(dict(data, commands=[]), "T-1"),
+                         ["commands: is empty (evidence must record the commands that were run)"])
+        self.assertEqual(evidence.gate_problems([], "T-1"), ["results must be a JSON object"])
+
+    def test_schema_lists_the_planted_fields_as_optional_properties(self):
+        schema = json.loads((Path(evidence.__file__).resolve().parent.parent / "templates"
+                             / "results.schema.json").read_text())
+        items = schema["properties"]["planted_bugs"]["items"]
+        self.assertEqual(items["required"], ["id", "builds", "killed", "kill_reason", "test_output_sha256"])
+        for row_written in read_json(self.written())["planted_bugs"]:
+            self.assertEqual(set(row_written), set(items["properties"]))
+        for key in evidence.PLANTED_KEYS:
+            self.assertNotIn(key, items["required"])
 
     def test_validate_all_killed_recomputed_excluding_self_test_row(self):
         out = self.written()

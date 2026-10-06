@@ -2,6 +2,7 @@ import _paths  # noqa: F401  (must come first: puts kit/scripts/ on sys.path)
 import ast
 import contextlib
 import hashlib
+import inspect
 import io
 import json
 import os
@@ -24,7 +25,7 @@ GIT = shutil.which("git")
 SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
 PRESETS = Path(__file__).resolve().parent.parent / "presets"
 TASK = "P0-M01-S01-T01"
-BRANCH = "task/p0-m01-s01-t01"
+BRANCH = f"task/{TASK}"  # the name `pk worktree new` gives the branch
 TAIL = "    | "
 OK_LINE = re.compile(r"OK: (\S+) passes the hand-back gate at ([0-9a-f]{40})\Z")
 CALC = "def add(a, b):\n    return a + b\n\n\ndef sub(a, b):\n    return a - b\n"
@@ -65,6 +66,30 @@ if os.environ.get("PK_STRAY"):
 if os.environ.get("PK_TOUCH"):
     (root / os.environ["PK_TOUCH"]).write_text("changed by produce\\n")
 '''
+HAND_MADE = '''import hashlib
+import json
+import subprocess
+from pathlib import Path
+
+head = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+empty = hashlib.sha256(b"").hexdigest()
+row = {"builds": True, "killed": True, "kill_reason": "test failed", "test_output_sha256": empty,
+       "path": "calc.py", "find": "a + b", "replace": "a - b", "build_argv": ["python3", "-c", "pass"],
+       "test_argv": ["python3", "-c", "raise SystemExit(1)"]}
+record = {"task_id": "P0-M01-S01-T01", "head": head, "main": head, "merge_base": head,
+          "produced_at": "2026-01-01T00:00:00Z", "inputs": {"calc.py": empty},
+          "commands": [{"label": "unit", "argv": ["python3", "-c", "pass"], "exit": 0, "expected_exit": 0,
+                        "as_expected": True, "derived": {}, "output_sha256": empty, "output_tail": ""}],
+          "planted_bugs": [dict(row, id="made-up"),
+                           dict(row, id="self-test-noncompiling", builds=False, killed=False,
+                                kill_reason="build failed", test_output_sha256="")],
+          "planted_bugs_all_killed": True, "all_commands_as_expected": True, "tree_unchanged_by_run": True,
+          "stale": {"checked": False, "records": []}, "blocked_by": [], "deviations": []}
+Path("program/evidence/P0-M01-S01-T01/results.json").write_text(json.dumps(record))
+'''
+FAILING_TESTS = ("import unittest\n\n\nclass T(unittest.TestCase):\n"
+                 "    def test_one(self):\n        self.fail('one')\n\n"
+                 "    def test_two(self):\n        self.fail('two')\n")
 
 
 def sh(cwd, *argv):
@@ -230,7 +255,7 @@ class PresetTests(unittest.TestCase):
                "guarded": ["go.mod", "go.sum", "program/checks.yaml"]},
         "node": {"build": [["pnpm", "install", "--frozen-lockfile", "--offline"], ["pnpm", "build"]],
                  "compile_check": [], "test": [["pnpm", "test"]],
-                 "scan": [["pnpm", "audit"], ["gitleaks", "detect", "--no-git"]],
+                 "scan": [["gitleaks", "detect", "--no-git"]],
                  "guarded": ["package.json", "pnpm-lock.yaml", "program/checks.yaml"]},
         "python": {"build": [["python3", "-m", "compileall", "-q", "."]], "compile_check": [],
                    "test": [["python3", "-m", "unittest", "discover"]],
@@ -251,6 +276,18 @@ class PresetTests(unittest.TestCase):
                 self.assertEqual(data["scan"], expect["scan"])
                 self.assertEqual(data["build"], expect["build"])
                 self.assertEqual(data["compile_check"], expect["compile_check"])
+
+    def test_no_preset_gate_step_needs_the_network(self):
+        for name in self.EXPECT:
+            with self.subTest(preset=name):
+                data = read_yaml(PRESETS / f"checks.{name}.yaml")
+                commands = [argv for key in ("build", "test", "scan", "compile_check", "extra_gate")
+                            for argv in data[key]]
+                self.assertEqual([argv for argv in commands if "audit" in argv], [])
+        text = (PRESETS / "checks.node.yaml").read_text()
+        notes = [ln for ln in text.splitlines() if ln.startswith("#") and "audit" in ln]
+        self.assertEqual(len(notes), 1, text)
+        self.assertIn("outside the gate", notes[0])
 
     def test_presets_load_through_load_checks(self):
         for name in self.EXPECT:
@@ -505,6 +542,60 @@ class HandbackTests(HandbackBase):
         rc, out = self.handback()
         self.assertEqual(rc, 0, out)
 
+    def test_branch_editing_its_own_spec_fails_and_identical_spec_passes(self):
+        path = self.wt / "program" / "tasks" / TASK / "SPEC.md"
+        path.write_text("# Spec\n\nREQ-004 (the body size limit) is out of scope for this task.\n")
+        commit(self.wt, "narrow the spec")
+        rc, out = self.handback()
+        self.assertEqual((rc, out.splitlines()[-1]),
+                         (1, f"FAILED: spec program/tasks/{TASK}/SPEC.md differs from main"))
+        self.assertEqual([ln for ln in out.splitlines() if ln.startswith("step ")], [])  # refused before anything runs
+        self.assert_no_trial_left()
+        path.write_text("# Spec\n")
+        commit(self.wt, "back to the spec on main")
+        rc, out = self.handback()
+        self.assertEqual(rc, 0, out)
+
+    def test_spec_missing_on_the_branch_or_on_main_fails(self):
+        (self.wt / "program" / "tasks" / TASK / "SPEC.md").unlink()
+        commit(self.wt, "drop spec")
+        expect = (1, f"FAILED: spec program/tasks/{TASK}/SPEC.md differs from main")
+        rc, out = self.handback()
+        self.assertEqual((rc, out.splitlines()[-1]), expect)
+        (self.root / "program" / "tasks" / TASK / "SPEC.md").unlink()
+        commit(self.root, "drop spec on main")
+        rc, out = self.handback()
+        self.assertEqual((rc, out.splitlines()[-1]), expect)
+
+    def test_spec_changed_on_main_alone_fails_until_the_branch_merges_main(self):
+        put(self.root, f"program/tasks/{TASK}/SPEC.md", "# Spec\n\nA clarification.\n")
+        commit(self.root, "amend the spec")
+        rc, out = self.handback()
+        self.assertEqual((rc, out.splitlines()[-1]),
+                         (1, f"FAILED: spec program/tasks/{TASK}/SPEC.md differs from main"))
+        sh(self.wt, "git", "merge", "-q", "main")
+        rc, out = self.handback()
+        self.assertEqual(rc, 0, out)
+
+    def test_handback_from_inside_the_task_worktree_says_to_use_the_main_checkout(self):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(gate, "find_root", return_value=self.wt), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = pk.main(["gate", "handback", TASK, "--branch", BRANCH])
+        self.assertEqual((rc, out.getvalue()), (1, ""))
+        self.assertEqual(err.getvalue().count("\n"), 1, err.getvalue())
+        self.assertTrue(err.getvalue().startswith("error: "), err.getvalue())
+        self.assertIn("from the main checkout", err.getvalue())
+        self.assertNotIn("task worktree not found", err.getvalue())
+
+    def test_task_id_and_branch_must_name_the_same_task(self):
+        put(self.root, "program/tasks/P0-M01-S01-T02/SPEC.md", "Guarded edit: pyproject.toml\n")
+        commit(self.root, "another task whose spec allows more")
+        for function in (gate.handback, gate.binding):
+            with self.subTest(function=function.__name__), self.assertRaises(KitError) as ctx:
+                run_quiet(function, self.root, "P0-M01-S01-T02", BRANCH)
+            self.assertIn("task/P0-M01-S01-T02", str(ctx.exception))
+
     def test_plan_missing_on_the_branch_fails(self):
         (self.wt / "program" / "tasks" / TASK / "PLAN.md").unlink()
         commit(self.wt, "drop plan")
@@ -570,6 +661,7 @@ class HandbackTests(HandbackBase):
         self.assert_no_trial_left()
         put(self.root, f"program/tasks/{TASK}/SPEC.md", "# Spec\n\nGuarded edit: pyproject.toml\n")
         commit(self.root, "spec allows it")
+        sh(self.wt, "git", "merge", "-q", "main")  # the branch's SPEC must be main's
         rc, out = self.handback()
         self.assertEqual(rc, 0, out)
         self.assertTrue(OK_LINE.match(out.splitlines()[-1]))
@@ -712,6 +804,7 @@ class HandbackTests(HandbackBase):
         self.assertEqual((rc, out.strip()), (1, "FAILED: guarded files changed: deps/sub/x.txt, pyproject.toml"))
         put(self.root, f"program/tasks/{TASK}/SPEC.md", "Guarded edit: ./pyproject.toml\nGuarded edit: deps/sub/x.txt\n")
         commit(self.root, "allow both")
+        sh(self.wt, "git", "merge", "-q", "main")
         rc, out = self.handback()
         self.assertEqual(rc, 0, out)
 
@@ -726,6 +819,7 @@ class HandbackTests(HandbackBase):
         self.assertEqual((rc, out.strip()), (1, "FAILED: guarded files changed: deps/a.txt, deps/b.txt"))
         put(self.root, f"program/tasks/{TASK}/SPEC.md", "Guarded edit: deps/\n")
         commit(self.root, "allow the directory")
+        sh(self.wt, "git", "merge", "-q", "main")
         rc, out = self.handback()
         self.assertEqual(rc, 0, out)
 
@@ -762,7 +856,7 @@ class MergeCheckTests(HandbackBase):
         self.assertEqual(rc, 0, out)
         self.assertEqual(out.splitlines()[-1], f"OK: {BRANCH} merges into main at {self.sha}")
         self.assertEqual([ln for ln in out.splitlines() if ln.startswith("OK: ")], [out.splitlines()[-1]])
-        self.assertFalse(self.fake_log.exists(), "merge-check does not scan")
+        self.assertTrue(self.fake_log.exists(), "merge-check runs the scan from main's checks.yaml")
         self.assert_no_trial_left()
         self.assertEqual(sh(self.root, "git", "status", "--porcelain").strip(), "")
 
@@ -785,11 +879,151 @@ class MergeCheckTests(HandbackBase):
         self.assertNotIn("OK: ", out)
         self.assert_no_trial_left()
 
-    def test_merge_check_does_not_need_scan_commands(self):
+    def test_merge_check_needs_scan_commands(self):
         self.write_checks(scan=[])
         commit(self.root, "no scan")
+        with self.assertRaises(KitError) as ctx:
+            self.merge_check()
+        self.assertEqual(str(ctx.exception), "checks.yaml: scan must list at least one command")
+
+    def produce_without_the_gate(self):
+        """What an implementer who never ran the gate leaves: a record produced directly and a typed OK line."""
+        subprocess.run([PY, f"program/evidence/{TASK}/produce.py"], cwd=str(self.wt), check=True,
+                       capture_output=True)
+        put(self.wt, f"program/evidence/{TASK}/report.md",
+            f"## Gate\n\nOK: {BRANCH} passes the hand-back gate at {self.sha}\n")
+        return commit(self.wt, "evidence nobody gated")
+
+    def test_gate_skipped_with_an_unapproved_guarded_file_is_refused(self):
+        put(self.wt, "pyproject.toml", "[project]\nname = 'x'\n")
+        commit(self.wt, "touch guarded")
+        self.produce_without_the_gate()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(gate.binding(self.root, TASK, BRANCH), [])  # everything QA runs still passes
+        rc, out = self.merge_check()
+        self.assertEqual((rc, out.strip()), (1, "FAILED: guarded files changed: pyproject.toml"))
+        self.assert_no_trial_left()
+        put(self.root, f"program/tasks/{TASK}/SPEC.md", "# Spec\n\nGuarded edit: pyproject.toml\n")
+        commit(self.root, "the user approves the guarded edit")
         rc, out = self.merge_check()
         self.assertEqual(rc, 0, out)
+
+    def test_gate_skipped_with_a_failing_test_is_refused(self):
+        put(self.wt, "test_more.py", FAILING_TESTS)
+        put(self.wt, f"program/evidence/{TASK}/produce.py", HAND_MADE)
+        commit(self.wt, "failing tests and a producer that runs nothing")
+        self.produce_without_the_gate()
+        rc, out = self.merge_check()
+        self.assertEqual(rc, 1)
+        self.assertIn(f"FAILED: test {PY} -m unittest -q (exit 1)", out.splitlines())
+        self.assertFalse(self.fake_log.exists(), "scan ran after test failed")
+        self.assert_no_trial_left()
+
+    def test_gate_skipped_with_a_scan_finding_or_no_scanner_is_refused(self):
+        self.produce_without_the_gate()
+        self.wrapper("gitleaks", 'echo "leak found"\nexit 1')
+        rc, out = self.merge_check()
+        self.assertEqual(rc, 1)
+        self.assertEqual(out.splitlines()[-2:], ["FAILED: scan gitleaks detect --no-git (exit 1)", TAIL + "leak found"])
+        (self.bin / "gitleaks").unlink()
+        rc, out = self.merge_check()
+        self.assertEqual((rc, out.splitlines()[-1]), (1, "FAILED: scan missing tool: gitleaks"))
+        self.assert_no_trial_left()
+
+    def test_merge_check_runs_every_step_in_order_on_the_trial_merge(self):
+        marker = self.root.parent / "order.log"
+        script = "import os, sys; open(%r, 'a').write(sys.argv[1] + ' ' + os.path.basename(os.getcwd()) + '\\n')" \
+            % str(marker)
+        self.write_checks(**{step: [[PY, "-c", script, step]] for step in
+                             ("build", "compile_check", "test", "scan", "extra_gate")})
+        commit(self.root, "ordered commands")
+        rc, out = self.merge_check()
+        self.assertEqual(rc, 0, out)
+        ran = [line.split() for line in marker.read_text().splitlines()]
+        self.assertEqual([step for step, _ in ran], ["build", "compile_check", "test", "scan", "extra_gate"])
+        self.assertTrue(all(where.startswith("pk-trial-") for _, where in ran), ran)
+        self.assertEqual(len({where for _, where in ran}), 1)
+
+    def test_merge_check_refuses_a_branch_that_rewrote_its_spec_or_plan(self):
+        for name, label in (("SPEC.md", "spec"), ("PLAN.md", "plan")):
+            with self.subTest(name=name):
+                sh(self.wt, "git", "reset", "-q", "--hard", self.sha)
+                put(self.wt, f"program/tasks/{TASK}/{name}", "# Easier\n\n## Exact Commands\n\n$ python3 -c pass\n")
+                commit(self.wt, f"rewrite {name}")
+                rc, out = self.merge_check()
+                self.assertEqual((rc, out.splitlines()[-1]),
+                                 (1, f"FAILED: {label} program/tasks/{TASK}/{name} differs from main"))
+                self.assertEqual([ln for ln in out.splitlines() if ln.startswith("step ")], [])
+                self.assert_no_trial_left()
+
+    def test_merge_check_needs_a_task_branch(self):
+        sh(self.root, "git", "branch", "feature", BRANCH)
+        for branch in ("feature", "main", "task/a/b", "task/"):
+            with self.subTest(branch=branch), self.assertRaises(KitError) as ctx:
+                run_quiet(gate.merge_check, self.root, branch)
+            self.assertIn("task/<ID>", str(ctx.exception))
+        self.assert_no_trial_left()
+
+    def test_merge_check_fails_when_the_branch_moves_during_the_check(self):
+        script = ("import subprocess, sys; subprocess.run(['git', '-C', sys.argv[1], 'commit', '-q', '--allow-empty', "
+                  "'-m', 'moved'], check=True)")
+        self.write_checks(extra_gate=[[PY, "-c", script, str(self.wt)]])
+        commit(self.root, "a step that moves the branch")
+        rc, out = self.merge_check()
+        self.assertEqual((rc, out.splitlines()[-1]), (1, f"FAILED: {BRANCH} moved during the merge check"))
+
+
+class FixedMainTests(HandbackBase):
+    """The rules are always read from `main`: no argument can make a branch the judge of itself."""
+
+    def rig_the_branch(self):
+        """Two failing tests, every check and the PLAN rewritten to pass, and a hand-made record."""
+        put(self.wt, "test_more.py", FAILING_TESTS)
+        easy = [[PY, "-c", "pass"]]
+        write_yaml(self.wt / "program" / "checks.yaml", checks_data(build=easy, test=easy, scan=easy))
+        put(self.wt, f"program/tasks/{TASK}/PLAN.md", "## Exact Commands\n\n$ python3 -c pass\n")
+        put(self.wt, f"program/evidence/{TASK}/produce.py", HAND_MADE)
+        return commit(self.wt, "rigged")
+
+    def gate_actions(self):
+        import argparse
+
+        top = pk.build_parser()
+        commands = next(a for a in top._actions if isinstance(a, argparse._SubParsersAction)).choices
+        return next(a for a in commands["gate"]._actions if isinstance(a, argparse._SubParsersAction)).choices
+
+    def test_no_gate_function_or_subcommand_takes_a_main_branch(self):
+        for function in (gate.handback, gate.merge_check, gate.binding):
+            self.assertNotIn("main", inspect.signature(function).parameters, function.__name__)
+        actions = self.gate_actions()
+        self.assertEqual(sorted(actions), ["binding", "claims", "handback", "merge-check", "validate"])
+        for name, parser in actions.items():
+            options = {option for action in parser._actions for option in action.option_strings}
+            self.assertEqual([o for o in options if o.startswith("--m")], [], name)
+
+    def test_a_rigged_branch_gets_no_ok_line_by_any_argument(self):
+        self.rig_the_branch()
+        bases = [("handback", TASK, "--branch", BRANCH), ("merge-check", "--branch", BRANCH)]
+        extras = [(), ("--main", BRANCH), (f"--main={BRANCH}",), ("--mai", BRANCH), ("--main", "main"),
+                  ("--main", f"refs/heads/{BRANCH}")]
+        attempts = [base + extra for base in bases for extra in extras]
+        attempts += [bases[0] + ("--worktree", str(self.wt)), bases[0] + ("--worktree", str(self.wt), "--main", BRANCH)]
+        for argv in attempts:
+            with self.subTest(argv=argv):
+                rc, out, err = self.run_cli(*argv)
+                self.assertEqual(rc, 1, out)
+                self.assert_no_forged_ok(out, err)
+                sh(self.wt, "git", "clean", "-fdq")  # a record a wrongly passing run would leave behind
+        for base in bases:
+            with self.subTest(honest=base):
+                rc, out, err = self.run_cli(*base)
+                self.assertEqual((rc, out.strip(), err), (1, "FAILED: guarded files changed: program/checks.yaml", ""))
+        self.assert_no_trial_left()
+
+    def test_binding_takes_no_main_branch_either(self):
+        rc, out, err = self.run_cli("binding", TASK, "--branch", BRANCH, "--main", BRANCH)
+        self.assertEqual((rc, out), (1, ""))
+        self.assertEqual(err, f"error: unrecognized arguments: --main {BRANCH}\n")
 
 
 class TrialMergeTests(HandbackBase):
@@ -944,15 +1178,45 @@ class ClaimsTests(ClaimsBase):
             gate.claims(self.root, "G-X")
         self.assertIn("qa", str(ctx.exception))
 
-    def test_gate_with_no_records_writes_nothing_and_clears_the_directory(self):
+    def test_gate_with_no_records_is_refused_and_nothing_is_touched(self):
         self.set_gates({"G-EMPTY": {"title": "t", "claims": [], "environment": "dev", "records": []}})
-        self.assertEqual(gate.claims(self.root, "G-EMPTY"), [])
-        self.assertEqual(gate.validate_claims(self.root, "G-EMPTY"), [])
         directory = self.root / "program" / "claims" / "G-EMPTY"
         directory.mkdir(parents=True)
         (directory / "old.json").write_text("{}")
-        self.assertEqual(gate.claims(self.root, "G-EMPTY"), [])
-        self.assertEqual(list(directory.iterdir()), [])
+        for function in (gate.claims, gate.validate_claims):
+            with self.subTest(function=function.__name__), self.assertRaises(KitError) as ctx:
+                function(self.root, "G-EMPTY")
+            self.assertEqual(str(ctx.exception),
+                             "gate G-EMPTY: records is empty; a gate with no records claims nothing")
+        self.assertEqual([p.name for p in directory.iterdir()], ["old.json"])
+
+    def test_claims_leave_a_file_alone_when_only_the_commit_would_change(self):
+        self.accept()
+        first = commit(self.root, "acceptance")
+        written = gate.claims(self.root, "G-P0")
+        before = {path: path.read_bytes() for path in written}
+        self.assertEqual(len(before), 2)
+        commit(self.root, "claims")
+        self.assertEqual(gate.claims(self.root, "G-P0"), written)  # HEAD moved, nothing else did
+        self.assertEqual({path: path.read_bytes() for path in written}, before)
+        self.assertEqual(sh(self.root, "git", "status", "--porcelain").strip(), "")
+        self.assertEqual(gate.validate_claims(self.root, "G-P0"), [])
+        self.accept(findings=[{"n": 1, "severity": "minor", "location": "x", "fix": "y"}])
+        second = commit(self.root, "the acceptance changes")
+        gate.claims(self.root, "G-P0")
+        self.assertEqual(self.claim("G-P0", REC_DEV)["generated_from_commit"], second)  # a real change is written
+        self.assertEqual(self.claim("G-P0", REC_TWO)["generated_from_commit"], first)
+        self.assertEqual(sh(self.root, "git", "status", "--porcelain").split(),
+                         ["M", "program/claims/G-P0/program__evidence__P0-M01-S01-T01__results.json"])
+
+    def test_claims_rewrite_a_file_that_is_not_a_usable_claim_document(self):
+        written = gate.claims(self.root, "G-P0")
+        commit(self.root, "claims")
+        head = sh(self.root, "git", "rev-parse", "HEAD").strip()
+        written[0].write_text("{ nope")
+        written[1].write_text("[]")
+        gate.claims(self.root, "G-P0")
+        self.assertEqual([read_json(path)["generated_from_commit"] for path in written], [head, head])
 
     def test_symlinked_claims_directory_is_refused(self):
         elsewhere = self.root.parent / "elsewhere"
@@ -1029,8 +1293,17 @@ class CommandTests(ClaimsBase):
             rc = pk.main(["gate", *argv])
         return rc, out.getvalue(), err.getvalue()
 
+    def test_empty_gate_is_one_error_line_and_never_consistent(self):
+        self.set_gates({"G-EMPTY": {"title": "t", "claims": [], "environment": "dev", "records": []}})
+        for action in ("claims", "validate"):
+            with self.subTest(action=action):
+                rc, out, err = self.run_pk(action, "G-EMPTY")
+                self.assertEqual((rc, out), (1, ""))
+                self.assertEqual(err, "error: gate G-EMPTY: records is empty; a gate with no records claims nothing\n")
+
     def test_claims_and_validate_commands(self):
         self.assertEqual(self.run_pk("claims", "G-P0"), (0, "wrote 2 claim documents\n", ""))
+        self.assertEqual(self.run_pk("claims", "G-P0"), (0, "wrote 0 claim documents, 2 unchanged\n", ""))
         self.assertEqual(self.run_pk("validate", "G-P0"), (0, "claims consistent for G-P0\n", ""))
         (self.root / "program" / "claims" / "G-P0" / "extra.json").write_text("{}")
         rc, out, err = self.run_pk("validate", "G-P0")
@@ -1178,6 +1451,69 @@ class BindingTests(HandbackBase):
         problems, out = self.bind()
         self.assertEqual(len(problems), 1, problems)
         self.assertIn("not an ancestor", problems[0])
+
+    def test_binding_fails_for_a_head_edited_to_a_later_commit(self):
+        self.produce_and_commit()
+        put(self.wt, "calc.py", CALC.replace("a + b", "a - b") + "\n\ndef mul(a, b):\n    return a * b\n")
+        broken = commit(self.wt, "break add after the evidence")
+        problems, _ = self.bind()
+        self.assertTrue(problems[0].startswith(f"calc.py: changed in commit {broken} after {self.sha}"), problems)
+        data = read_json(self.wt / self.RESULTS)
+        recorded = data["inputs"]["calc.py"]
+        data["head"] = broken
+        (self.wt / self.RESULTS).write_text(json.dumps(data))
+        commit(self.wt, "move the recorded head past the edit")
+        problems, out = self.bind()
+        self.assertEqual(out, "")
+        actual = hashlib.sha256((self.wt / "calc.py").read_bytes()).hexdigest()
+        self.assertEqual(problems, [f"{self.RESULTS}: inputs: calc.py is recorded as {recorded} but its blob at the "
+                                    f"recorded head {broken} hashes to {actual}"])
+
+    def test_binding_fails_for_an_edited_or_made_up_input_hash(self):
+        rc, out = self.handback()
+        self.assertEqual(rc, 0, out)
+        honest = read_json(self.wt / self.RESULTS)
+        for name, edit in (("edited", {"calc.py": "0" * 64}), ("made up", {"gone.py": "1" * 64})):
+            with self.subTest(case=name):
+                data = dict(honest, inputs={**honest["inputs"], **edit})
+                (self.wt / self.RESULTS).write_text(json.dumps(data))
+                sh(self.wt, "git", "reset", "-q", "--soft", self.sha)
+                commit(self.wt, "evidence with a hand-edited hash")
+                problems, out = self.bind()
+                self.assertEqual(out, "")
+                self.assertEqual(len(problems), 1, problems)
+                path = next(iter(edit))
+                self.assertTrue(problems[0].startswith(f"{self.RESULTS}: inputs: {path} is recorded as "), problems)
+                self.assertIn(f"the recorded head {self.sha}", problems[0])
+
+    def test_binding_fails_when_the_record_was_not_committed_on_its_recorded_head(self):
+        evidence_commit = self.produce_and_commit()
+        put(self.wt, f"program/status/{TASK}.json", "{}\n")
+        status_commit = commit(self.wt, "status")
+        data = read_json(self.wt / self.RESULTS)
+        data["head"] = evidence_commit  # every hashed input is the same there, so only the position gives it away
+        (self.wt / self.RESULTS).write_text(json.dumps(data))
+        edit = commit(self.wt, "edit the recorded head")
+        problems, out = self.bind()
+        self.assertEqual(out, "")
+        self.assertEqual(problems, [f"{self.RESULTS}: committed in {edit} on top of {status_commit}, not on its "
+                                    f"recorded head {evidence_commit}; the evidence commit directly follows the "
+                                    "gated commit"])
+
+    def test_binding_holds_again_after_a_fix_round_regates(self):
+        self.produce_and_commit()
+        put(self.wt, f"program/status/{TASK}.json", '{"rejected": true}\n')
+        commit(self.wt, "QA rejects")
+        put(self.wt, "calc.py", CALC + "\n\ndef mul(a, b):\n    return b * a\n")
+        fixed = commit(self.wt, "fix the finding")
+        problems, _ = self.bind()
+        self.assertTrue(problems[0].startswith(f"calc.py: changed in commit {fixed} after {self.sha}"), problems)
+        rc, out = self.handback()
+        self.assertEqual(rc, 0, out)
+        commit(self.wt, "evidence for the fix")
+        problems, out = self.bind()
+        self.assertEqual((problems, out), ([], f"binding holds: results.json at {fixed} bound, 1 later commit(s) "
+                                               "touch only evidence and status\n"))
 
     def test_binding_fails_when_results_are_absent(self):
         problems, out = self.bind()

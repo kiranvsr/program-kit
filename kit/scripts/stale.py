@@ -6,6 +6,8 @@ the committed blob on `main`, or when that path no longer exists there. Hashing 
 git (`ls-tree` once for path -> blob id, then `cat-file blob` once per distinct blob), so the
 working copy never matters and a large evidence set does not spawn a process per input.
 `pk stale` always exits 0 and prints the report; only an unresolvable `--main` is an error.
+`changed_inputs` is the same comparison against any one commit; `pk gate binding` uses it to
+recompute a record's hashes at the commit the record names.
 """
 from __future__ import annotations
 
@@ -27,7 +29,7 @@ def _blob_bytes(root: Path, blob: str) -> bytes:
     return proc.stdout
 
 
-def _main_tree(root: Path, sha: str) -> dict[str, str]:
+def _tree(root: Path, sha: str) -> dict[str, str]:
     """path -> blob id for every file on the commit `sha` (submodule entries are not files)."""
     listing = git(root, "ls-tree", "-r", "-z", "--full-tree", sha)
     files = {}
@@ -64,6 +66,29 @@ def _inputs(path: Path, rel: str):
     return inputs, None
 
 
+def _hasher(root: Path, sha: str):
+    """A function path -> sha256 of the blob at commit `sha`, or None when it is not a file there."""
+    tree = _tree(root, sha)
+    hashes: dict[str, str] = {}  # blob id -> sha256, one read per distinct blob
+
+    def current(path: str) -> str | None:
+        blob = tree.get(path)
+        if blob is None:
+            return None
+        if blob not in hashes:
+            hashes[blob] = sha256_bytes(_blob_bytes(root, blob))
+        return hashes[blob]
+
+    return current
+
+
+def changed_inputs(root, sha: str, inputs: dict) -> dict[str, str | None]:
+    """The recorded inputs that do not match commit `sha`: path -> the blob's real sha256, or None when the
+    path is not a file there. Sorted by path; empty when every recorded hash is the committed one."""
+    current = _hasher(Path(root), sha)
+    return {path: current(path) for path, digest in sorted(inputs.items()) if current(path) != digest}
+
+
 def stale_records(root, main: str = "main") -> dict:
     """Compare every record's inputs with `main`; return {main, stale, unreadable, checked}.
 
@@ -74,16 +99,7 @@ def stale_records(root, main: str = "main") -> dict:
     if not isinstance(main, str) or not main or main.startswith("-"):
         raise KitError(f"not a usable branch name: {main}")
     sha = git(root, "rev-parse", "--verify", main + "^{commit}")
-    tree = _main_tree(root, sha)
-    hashes: dict[str, str] = {}  # blob id -> sha256, one read per distinct blob per run
-
-    def current(path: str) -> str | None:
-        blob = tree.get(path)
-        if blob is None:
-            return None
-        if blob not in hashes:
-            hashes[blob] = sha256_bytes(_blob_bytes(root, blob))
-        return hashes[blob]
+    current = _hasher(root, sha)  # shared by every record of this run
 
     stale_rows, unreadable = [], []
     records = sorted((root / "program" / "evidence").glob("*/results.json"))

@@ -2,19 +2,27 @@
 """The gate runner: hand-back gate, merge check and gate claim documents (standard library only).
 
 `handback` is the gate an implementer passes before independent QA; `merge_check` is the
-controller's check from main; `claims` and `validate_claims` keep `program/claims/<GATE>/*.json`
-equal to a recomputation from `gates.yaml`, each record's `acceptance.json` and `environments.yaml`.
+controller's independent run before every merge: the guarded-file check, the SPEC and PLAN identity
+check, then the build, the tests and the scans on the trial merge, so a branch whose implementer
+skipped the hand-back gate still cannot reach main. `claims` and `validate_claims` keep
+`program/claims/<GATE>/*.json` equal to a recomputation from `gates.yaml`, each record's
+`acceptance.json` and `environments.yaml`.
 
 Run it from the main checkout: the task worktree defaults to `<root>/.worktrees/<id lowercased>`.
 `checks.yaml` (with its guarded files), the `Guarded edit:` lines in the task's SPEC and the PLAN commands
-are all read from the main branch (`git show <main>:...`), so a task branch or a dirty main checkout
-cannot change the rules it is judged by; the task's PLAN.md must be byte-identical to main's.
+are all read from the primary branch, which is always `main` (`git show main:...`): no option names
+another branch, so a task branch or a dirty main checkout cannot change the rules it is judged by. The
+task's SPEC.md and PLAN.md must be byte-identical to main's, and a task's branch is `task/<ID>`.
 The trial merge happens in a temporary worktree of main and never commits or touches the main checkout.
-`binding` is QA's check that a record's `head` still binds the branch tip, read from git objects only.
+`binding` is QA's check that a record's `head` still binds the branch tip, read from git objects only:
+the record was committed directly on `head`, every later commit touches only the task's evidence and
+status, and every recorded input hash is the hash of the blob at `head`.
 
 Limits:
 - A produce.py that hand-writes a well-formed results.json is not detectable by the gate; QA re-runs the
   evidence independently and uses `pk gate binding`.
+- `binding` refuses an edited `head` or an edited input hash, but not a record rewritten consistently and
+  committed on the commit it names; the merge check runs the tests and scans again whatever the record says.
 - Files written to git-ignored paths are invisible to the clean-tree checks.
 - Projects must git-ignore the bytecode and build output their commands write: the evidence step
   needs a clean tree, and a leftover untracked file fails it.
@@ -40,6 +48,7 @@ import miniyaml
 from common import KitError, find_root, git, read_json, read_yaml, run_argv, sha256_file, write_json
 from register import GATE_ID
 
+MAIN = "main"  # the primary branch; fixed, so no caller can choose where the rules are read from
 CHECK_KEYS = ("build", "test", "scan", "compile_check", "extra_gate")
 ALL_KEYS = CHECK_KEYS + ("guarded_files",)
 STEP_TIMEOUT = 3600  # seconds per command
@@ -218,7 +227,7 @@ def _remove_trial(root: Path, trial: Path) -> str | None:
     return None
 
 
-def trial_merge(root, branch: str, main: str = "main") -> Path:
+def trial_merge(root, branch: str, main: str = MAIN) -> Path:
     """Merge `branch` into a temporary detached worktree of `main` without committing; return its path.
 
     The caller removes the worktree. A conflict aborts the merge, removes the worktree and raises
@@ -304,7 +313,34 @@ def _with_trial(root: Path, trial: Path, body) -> int:
 
 # --- hand-back gate ----------------------------------------------------------------
 
+def _task_branch(task_id, branch) -> str:
+    """`task_id`, checked, when `branch` is its branch `task/<ID>` (the name `pk worktree new` gives it).
+
+    A task is judged by its own SPEC and PLAN on main, so the ID and the branch may not name different tasks.
+    """
+    if not isinstance(task_id, str) or not _TASK.match(task_id):
+        raise KitError(f"not a usable task id: {_show(task_id)}")
+    if branch != f"task/{task_id}":
+        raise KitError(f"the branch of task {task_id} is task/{task_id}, not {_show(branch)}")
+    return task_id
+
+
+def _branch_task(branch) -> str:
+    """The task ID a task branch `task/<ID>` belongs to; KitError for any other branch name."""
+    task_id = branch[len("task/"):] if isinstance(branch, str) and branch.startswith("task/") else ""
+    if not _TASK.match(task_id):
+        raise KitError(f"merge-check needs a task branch named task/<ID>, not {_show(branch)}")
+    return task_id
+
+
 def _task_worktree(root: Path, task_id: str, branch: str, override) -> Path:
+    try:
+        here = git(root, "symbolic-ref", "HEAD").removeprefix("refs/heads/")
+    except KitError:
+        here = None
+    if here == branch:  # the command was started inside the task worktree, where `root` is that worktree
+        raise KitError(f"run pk gate handback from the main checkout: {_show(root)} is the worktree of "
+                       f"{_show(branch)}")
     wt = Path(override) if override is not None else root / ".worktrees" / task_id.lower()
     if not wt.is_dir():
         raise KitError(f"task worktree not found: {_show(wt)}")
@@ -363,21 +399,12 @@ def _guarded_changes(root: Path, task_id: str, branch: str, main: str, guarded: 
 
 
 def _results_problems(data, task_id: str, head: str | None) -> list[str]:
-    """Why a results.json does not pass the hand-back gate (empty when it does); `head` None skips the head check."""
-    problems = evidence_module.validate_results(data)
-    if problems:
-        return problems
-    if data["task_id"] != task_id:
-        problems.append(f"task_id: is {_show(data['task_id'])}, expected {_show(task_id)}")
-    if head is not None and data["head"] != head:
-        problems.append(f"head: is {_show(data['head'])}, expected the worktree HEAD {_show(head)}")
-    if data["all_commands_as_expected"] is not True:
-        problems.append("all_commands_as_expected: is not true")
-    if data["planted_bugs_all_killed"] is not True:
-        problems.append("planted_bugs_all_killed: is not true (a planted bug survived)")
-    if not data["commands"]:
-        problems.append("commands: is empty (evidence must record the commands that were run)")
-    return problems
+    """Why a results.json does not pass the hand-back gate (empty when it does); `head` None skips the head check.
+
+    The rules live in `evidence.gate_problems` (the status machine applies them too); here every problem is
+    escaped, because it quotes values the record controls.
+    """
+    return [_show(problem) for problem in evidence_module.gate_problems(data, task_id, head)]
 
 
 def _changes(wt: Path) -> list[str]:
@@ -429,8 +456,8 @@ def _evidence_step(wt: Path, task_id: str) -> bool:
     return not extra
 
 
-def _stale_step(wt: Path, main: str) -> bool:
-    report = stale_module.stale_records(wt, main)
+def _stale_step(wt: Path) -> bool:
+    report = stale_module.stale_records(wt, MAIN)
     _out(f"stale: {len(report['stale'])} record(s)")
     for row in report["stale"]:
         _out(row["path"])
@@ -439,22 +466,33 @@ def _stale_step(wt: Path, main: str) -> bool:
     return not report["unreadable"]
 
 
-def _run_steps(root: Path, checks: dict, task_id: str, wt: Path, trial: Path, main: str) -> int:
+def _frozen_plan(root: Path, tree: Path, task_id: str) -> bytes | None:
+    """Main's PLAN.md for the task, when the task's SPEC.md and PLAN.md in `tree` are byte-identical to main's.
+
+    Otherwise prints the failure line of the first file that differs (or is missing on either side) and
+    returns None: a branch may not narrow the SPEC it is reviewed against or ease the PLAN it is run by.
+    """
+    authoritative = None
+    for step, name in (("spec", "SPEC.md"), ("plan", "PLAN.md")):  # the PLAN last: its bytes are returned
+        rel = f"program/tasks/{task_id}/{name}"
+        try:
+            authoritative = _git_bytes(root, "show", f"{MAIN}:{rel}")
+        except KitError:
+            authoritative = None
+        own = tree / rel
+        if authoritative is None or not own.is_file() or own.read_bytes() != authoritative:
+            _out(f"FAILED: {step} {rel} differs from {MAIN}")
+            return None
+    return authoritative
+
+
+def _run_steps(checks: dict, task_id: str, wt: Path, trial: Path, authoritative: bytes) -> int:
     for step in ("build", "compile_check"):
         if not _run_commands(step, _commands(checks[step]), trial):
             return 1
     for step in ("test", "scan", "extra_gate"):
         if not _run_commands(step, _commands(checks[step]), wt):
             return 1
-    plan_rel = f"program/tasks/{task_id}/PLAN.md"
-    try:
-        authoritative = _git_bytes(root, "show", f"{main}:{plan_rel}")
-    except KitError:
-        authoritative = None
-    own = wt / plan_rel
-    if authoritative is None or not own.is_file() or own.read_bytes() != authoritative:
-        _out(f"FAILED: plan {plan_rel} differs from {main}")
-        return 1
     try:
         plan = parse_plan(authoritative.decode("utf-8", "replace"))
     except KitError as exc:
@@ -467,24 +505,25 @@ def _run_steps(root: Path, checks: dict, task_id: str, wt: Path, trial: Path, ma
         return 1
     if not _evidence_step(wt, task_id):
         return 1
-    return 0 if _stale_step(wt, main) else 1
+    return 0 if _stale_step(wt) else 1
 
 
-def handback(root, task_id: str, branch: str, worktree=None, main: str = "main") -> int:
+def handback(root, task_id: str, branch: str, worktree=None) -> int:
     """The hand-back gate; 0 and a final `OK:` line only when every step passed."""
     root = Path(root).resolve()
-    if not isinstance(task_id, str) or not _TASK.match(task_id):
-        raise KitError(f"not a usable task id: {_show(task_id)}")
-    _check_ref(main, "main branch")
+    _task_branch(task_id, branch)
     sha = _branch_head(root, branch)
     wt = _task_worktree(root, task_id, branch, worktree)
-    checks = load_checks_at(root, main, require=("build", "test", "scan"))
-    guarded = _guarded_changes(root, task_id, branch, main, checks["guarded_files"])
+    checks = load_checks_at(root, MAIN, require=("build", "test", "scan"))
+    guarded = _guarded_changes(root, task_id, branch, MAIN, checks["guarded_files"])
     if guarded:
         _out(f"FAILED: guarded files changed: {', '.join(guarded)}")
         return 1
-    trial = trial_merge(root, branch, main)
-    code = _with_trial(root, trial, lambda: _run_steps(root, checks, task_id, wt, trial, main))
+    authoritative = _frozen_plan(root, wt, task_id)
+    if authoritative is None:
+        return 1
+    trial = trial_merge(root, branch)
+    code = _with_trial(root, trial, lambda: _run_steps(checks, task_id, wt, trial, authoritative))
     if code:
         return code
     if git(wt, "rev-parse", "HEAD") != sha or _branch_head(root, branch) != sha:
@@ -494,16 +533,27 @@ def handback(root, task_id: str, branch: str, worktree=None, main: str = "main")
     return 0
 
 
-def merge_check(root, branch: str, main: str = "main") -> int:
-    """The controller's check from main: trial merge, build, compile_check, test; 0 and an `OK:` line."""
+def merge_check(root, branch: str) -> int:
+    """The controller's independent gate run before a merge; 0 and a final `OK:` line only when all of it passed.
+
+    It does not rely on the hand-back gate having been run: the guarded-file check, then on the trial merge the
+    SPEC and PLAN identity check and every build, compile_check, test, scan and extra_gate command of main's
+    `checks.yaml`. The task is the one the branch `task/<ID>` names; any other branch is refused.
+    """
     root = Path(root).resolve()
-    _check_ref(main, "main branch")
+    task_id = _branch_task(branch)
     sha = _branch_head(root, branch)
-    checks = load_checks_at(root, main, require=("build", "test"))
-    trial = trial_merge(root, branch, main)
+    checks = load_checks_at(root, MAIN, require=("build", "test", "scan"))
+    guarded = _guarded_changes(root, task_id, branch, MAIN, checks["guarded_files"])
+    if guarded:
+        _out(f"FAILED: guarded files changed: {', '.join(guarded)}")
+        return 1
+    trial = trial_merge(root, branch)
 
     def steps() -> int:
-        for step in ("build", "compile_check", "test"):
+        if _frozen_plan(root, trial, task_id) is None:
+            return 1
+        for step in ("build", "compile_check", "test", "scan", "extra_gate"):
             if not _run_commands(step, _commands(checks[step]), trial):
                 return 1
         return 0
@@ -511,6 +561,9 @@ def merge_check(root, branch: str, main: str = "main") -> int:
     code = _with_trial(root, trial, steps)
     if code:
         return code
+    if _branch_head(root, branch) != sha:
+        _out(f"FAILED: {branch} moved during the merge check")
+        return 1
     _print_ok("merge", branch, sha)
     return 0
 
@@ -561,6 +614,8 @@ def _gate(root: Path, gate_id: str) -> tuple[str, list[str]]:
     records = entry.get("records")
     if not isinstance(records, list) or not all(isinstance(item, dict) for item in records):
         raise KitError(f"gate {_show(gate_id)}: records must be a list of {{path, acceptance}} mappings")
+    if not records:  # nothing to evidence: never "0 documents written" and never "consistent"
+        raise KitError(f"gate {_show(gate_id)}: records is empty; a gate with no records claims nothing")
     return entry["environment"], [_record_path(item.get("path"), gate_id) for item in records]
 
 
@@ -623,21 +678,50 @@ def _refuse_symlink(directory: Path) -> None:
         raise KitError(f"{_show(directory)} is a symlink; refusing to use the claims directory through it")
 
 
-def claims(root, gate_id: str) -> list[Path]:
-    """Write `program/claims/<GATE>/<record-name>.json` per record and drop files of records no longer in the gate."""
-    root = Path(root).resolve()
+def _differing(doc: dict, actual: dict) -> list[str]:
+    """The keys in which a claim document on disk differs from its recomputation, the commit excluded."""
+    return sorted(key for key in set(doc) | set(actual) if key != "generated_from_commit"
+                  and doc.get(key, _MISSING) != actual.get(key, _MISSING))
+
+
+def _current(path: Path, doc: dict) -> bool:
+    """Whether the claim file at `path` already says what `doc` says, whatever commit it was generated from."""
+    if not path.is_file() or path.is_symlink():
+        return False
+    try:
+        actual = read_json(path)
+    except KitError:
+        return False
+    return (isinstance(actual, dict) and isinstance(actual.get("generated_from_commit"), str)
+            and not _differing(doc, actual))
+
+
+def _write_claims(root: Path, gate_id: str) -> tuple[list[Path], int]:
+    """(every claim path of the gate, how many of them were written)."""
     docs = _expected_claims(root, gate_id)
     directory = _claims_dir(root, gate_id)
     _refuse_symlink(directory)
-    written = []
+    paths, written = [], 0
     for name, doc in docs.items():
-        write_json(directory / name, doc)
-        written.append(directory / name)
+        paths.append(directory / name)
+        if not _current(directory / name, doc):
+            write_json(directory / name, doc)
+            written += 1
     if directory.is_dir():
         for entry in sorted(directory.iterdir()):
             if entry.name not in docs and (entry.is_file() or entry.is_symlink()):
                 entry.unlink()
-    return written
+    return paths, written
+
+
+def claims(root, gate_id: str) -> list[Path]:
+    """Bring `program/claims/<GATE>/<record-name>.json` up to date, one per record; return every claim path.
+
+    A file is rewritten only when something other than `generated_from_commit` would change, so committing
+    the claims (which moves HEAD) does not make them dirty again on the next run: the commit a file names is
+    HEAD as of its last real change. Files of records no longer in the gate are dropped.
+    """
+    return _write_claims(Path(root).resolve(), gate_id)[0]
 
 
 def validate_claims(root, gate_id: str) -> list[str]:
@@ -661,8 +745,7 @@ def validate_claims(root, gate_id: str) -> list[str]:
         if not isinstance(actual, dict):
             problems.append(f"{_show(rel)}: not a JSON object")
             continue
-        differing = sorted(key for key in set(doc) | set(actual) if key != "generated_from_commit"
-                           and doc.get(key, _MISSING) != actual.get(key, _MISSING))
+        differing = _differing(doc, actual)
         if differing:
             problems.append(f"{_show(rel)}: differs in {_show(', '.join(differing))}")
     if directory.is_dir():
@@ -675,19 +758,20 @@ def validate_claims(root, gate_id: str) -> list[str]:
 
 # --- binding ----------------------------------------------------------------------
 
-def binding(root, task_id: str, branch: str, main: str = "main") -> list[str]:
+def binding(root, task_id: str, branch: str) -> list[str]:
     """Problems that stop a branch's results.json from binding its tip (empty, with a printed line, when it holds).
 
-    Holds only when `program/evidence/<ID>/results.json` on the branch tip validates, its `head` is an
-    ancestor of the tip, and every commit after `head` up to the tip (merge commits against each parent)
-    changes only paths under `program/evidence/<ID>/` or exactly `program/status/<ID>.json`. A commit that
-    edits other paths and a later one that reverts them therefore still fails. Everything is read from git
-    objects, never from a working tree. At most one problem is reported for the commits: the first offender.
+    Holds only when `program/evidence/<ID>/results.json` on the branch tip validates and all of these are true:
+    its `head` is an ancestor of the tip; the commit that last wrote the record is the direct child of `head`
+    (the evidence commit follows the gated commit, so a `head` edited afterwards does not pass); every commit
+    after `head` up to the tip (merge commits against each parent) changes only paths under
+    `program/evidence/<ID>/` or exactly `program/status/<ID>.json`; and every recorded input hash is the sha256
+    of that path's blob at `head`. A commit that edits other paths and a later one that reverts them therefore
+    still fails. Everything is read from git objects, never from a working tree. At most one problem is
+    reported for the commits and one for the inputs: the first offender.
     """
     root = Path(root).resolve()
-    if not isinstance(task_id, str) or not _TASK.match(task_id):
-        raise KitError(f"not a usable task id: {_show(task_id)}")
-    _check_ref(main, "main branch")
+    _task_branch(task_id, branch)
     tip = _branch_head(root, branch)
     rel = f"program/evidence/{task_id}/results.json"
     try:
@@ -704,6 +788,11 @@ def binding(root, task_id: str, branch: str, main: str = "main") -> list[str]:
     code, _ = run_argv(["git", "-C", str(root), "merge-base", "--is-ancestor", head, tip], root)
     if code != 0:
         return [f"{_show(rel)}: head {_show(head)} is not an ancestor of {_show(branch)} ({tip})"]
+    wrote = git(root, "log", "-1", "--format=%H %P", tip, "--", rel).split()  # the commit, then its parents
+    if wrote[1:] != [head]:
+        return [f"{_show(rel)}: committed in {wrote[0] if wrote else 'no commit'} on top of "
+                f"{' and '.join(wrote[1:]) or 'no commit'}, not on its recorded head {head}; the evidence commit "
+                "directly follows the gated commit"]
     prefix, status = f"program/evidence/{task_id}/", f"program/status/{task_id}.json"
     commits = git(root, "rev-list", "--topo-order", "--reverse", f"{head}..{tip}").split()
     for commit in commits:
@@ -712,6 +801,12 @@ def binding(root, task_id: str, branch: str, main: str = "main") -> list[str]:
             if not path.startswith(prefix) and path != status:
                 return [f"{_show(path)}: changed in commit {commit} after {head}, outside {_show(prefix)} "
                         f"and {_show(status)}"]
+    changed = stale_module.changed_inputs(root, head, data["inputs"])
+    if changed:
+        path, actual = next(iter(changed.items()))
+        found = (f"its blob at the recorded head {head} hashes to {actual}" if actual is not None
+                 else f"it is not a file at the recorded head {head}")
+        return [f"{_show(rel)}: inputs: {_show(path)} is recorded as {data['inputs'][path]} but {found}"]
     _out(f"binding holds: results.json at {head} bound, {len(commits)} later commit(s) touch only evidence "
          "and status")
     return []
@@ -731,14 +826,16 @@ def cmd_gate(args: argparse.Namespace) -> int:
         raise KitError("gate needs an action: handback, merge-check, binding, claims or validate")
     root = find_root()
     if action == "handback":
-        return handback(root, args.task_id, args.branch, worktree=args.worktree, main=args.main)
+        return handback(root, args.task_id, args.branch, worktree=args.worktree)
     if action == "merge-check":
-        return merge_check(root, args.branch, main=args.main)
+        return merge_check(root, args.branch)
     if action == "binding":
-        problems = binding(root, args.task_id, args.branch, main=args.main)
+        problems = binding(root, args.task_id, args.branch)
         return _report(problems) if problems else 0
     if action == "claims":
-        _out(f"wrote {len(claims(root, args.gate))} claim documents")
+        paths, written = _write_claims(Path(root).resolve(), args.gate)
+        unchanged = len(paths) - written
+        _out(f"wrote {written} claim documents" + (f", {unchanged} unchanged" if unchanged else ""))
         return 0
     problems = validate_claims(root, args.gate)
     if problems:
@@ -753,14 +850,13 @@ def _configure(parser: argparse.ArgumentParser) -> None:
     hand.add_argument("task_id", metavar="ID", help="task ID, for example P0-M01-S01-T01")
     hand.add_argument("--branch", required=True, help="the task branch")
     hand.add_argument("--worktree", help="the task worktree (default: <root>/.worktrees/<id lowercased>)")
-    hand.add_argument("--main", default="main", help="main branch name (default: main)")
-    merge = actions.add_parser("merge-check", help="the controller's trial merge, build and test")
-    merge.add_argument("--branch", required=True, help="the branch to merge")
-    merge.add_argument("--main", default="main", help="main branch name (default: main)")
+    # No subcommand takes a main-branch option: the rules are always read from `main`.
+    merge = actions.add_parser("merge-check", help="the controller's gate run before a merge: guarded files, "
+                                                   "SPEC and PLAN, then build, test and scan on a trial merge")
+    merge.add_argument("--branch", required=True, help="the task branch to merge, task/<ID>")
     bind = actions.add_parser("binding", help="QA check: the branch's results.json still binds its tip")
     bind.add_argument("task_id", metavar="ID", help="task ID, for example P0-M01-S01-T01")
     bind.add_argument("--branch", required=True, help="the task branch")
-    bind.add_argument("--main", default="main", help="main branch name (default: main)")
     make = actions.add_parser("claims", help="write the claim documents of a gate")
     make.add_argument("gate", metavar="GATE", help="gate ID, for example G-P0")
     check = actions.add_parser("validate", help="fail on drift between claim documents and a recomputation")
