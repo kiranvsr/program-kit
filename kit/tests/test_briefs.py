@@ -167,6 +167,41 @@ class BriefsTests(BriefsBase):
         self.assertFalse((self.out / "tasks" / "junk.txt").exists())
         self.assertEqual(briefs.check(self.root), [])
 
+    def test_a_symlinked_brief_directory_is_one_problem_line_and_is_never_followed(self):
+        briefs.generate(self.root)
+        elsewhere = self.root / "elsewhere"
+        (self.out / "tasks").rename(elsewhere)
+        (elsewhere / "junk.md").write_text("x\n")
+        (self.out / "tasks").symlink_to(elsewhere, target_is_directory=True)
+        problems = briefs.check(self.root)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertTrue(problems[0].startswith("program/briefs/tasks: ") and "symbolic link" in problems[0], problems)
+        with self.assertRaises(KitError) as caught:
+            briefs.generate(self.root)
+        self.assertIn("program/briefs/tasks", str(caught.exception))
+        self.assertTrue((elsewhere / "junk.md").exists())  # nothing under the link was removed or written
+        self.assertEqual(sorted(p.name for p in elsewhere.iterdir()),
+                         ["P1-M01-S01-T01.md", "P1-M01-S01-T02.md", "P2-M01-S01-T01.md", "junk.md"])
+        code, out, err = self.run_cli("briefs", "check")
+        self.assertEqual((code, out, len(err.splitlines())), (1, "", 1))
+
+    def test_a_symlinked_brief_root_or_nested_directory_is_one_problem_line(self):
+        briefs.generate(self.root)
+        elsewhere = self.root / "elsewhere"
+        (elsewhere / "inner").mkdir(parents=True)
+        (self.out / "steps" / "nested").symlink_to(elsewhere, target_is_directory=True)
+        problems = briefs.check(self.root)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertTrue(problems[0].startswith("program/briefs/steps/nested"), problems)
+        (self.out / "steps" / "nested").unlink()
+        self.assertEqual(briefs.check(self.root), [])
+        moved = self.root / "moved"
+        self.out.rename(moved)
+        self.out.symlink_to(moved, target_is_directory=True)
+        problems = briefs.check(self.root)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertTrue(problems[0].startswith("program/briefs: "), problems)
+
     def test_unknown_placeholder_is_a_kit_error_naming_the_template(self):
         bad = Path(tempfile.mkdtemp())
         self.addCleanup(lambda: __import__("shutil").rmtree(bad, ignore_errors=True))
@@ -179,6 +214,19 @@ class BriefsTests(BriefsBase):
         self.assertIn("task_brief.md", str(caught.exception))
         self.assertIn("nonsense", str(caught.exception))
         self.assertFalse(self.out.exists(), "nothing is written when a template fails")
+
+    def test_a_template_with_a_byte_order_mark_does_not_put_one_in_the_briefs(self):
+        marked = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(marked, ignore_errors=True))
+        for name in briefs.TEMPLATE_NAMES.values():
+            (marked / name).write_bytes(b"\xef\xbb\xbf" + (briefs.TEMPLATES / name).read_bytes())
+        plain = briefs.render(self.root)
+        with mock.patch("briefs.TEMPLATES", marked):
+            self.assertEqual(briefs.render(self.root), plain)
+        (marked / "task_brief.md").write_bytes(b"\xff\xfe")
+        with mock.patch("briefs.TEMPLATES", marked), self.assertRaises(KitError) as caught:
+            briefs.render(self.root)
+        self.assertTrue(str(caught.exception).startswith("cannot read "), str(caught.exception))
 
     def test_bad_register_writes_nothing(self):
         data = two_phase()
@@ -256,6 +304,43 @@ class ChangeTests(BriefsBase):
         with self.assertRaises(KitError):
             register.change(self.root, "x")
         self.assertFalse(self.log.exists())
+
+    def failing_second_write(self):
+        """A write_text that lets the first file through and then fails, as a full disk would."""
+        real, calls = briefs.write_text, []
+
+        def write(path, text):
+            calls.append(path)
+            if len(calls) == 2:
+                raise KitError(f"cannot write {path}: No space left on device")
+            real(path, text)
+
+        return mock.patch("briefs.write_text", side_effect=write)
+
+    def test_a_failed_change_leaves_the_log_and_the_briefs_as_they_were(self):
+        with self.failing_second_write(), self.assertRaises(KitError):
+            register.change(self.root, "first")
+        self.assertFalse(self.log.exists())  # no log line, no partial brief tree
+        self.assertFalse(self.out.exists())
+        register.change(self.root, "baseline")
+        log, snap = self.log.read_bytes(), self.snapshot()
+        data = two_phase()
+        data["phases"][0]["milestones"][0]["steps"][0]["tasks"][1]["title"] = "renamed"
+        data["phases"][1]["id"] = "P3"
+        data["phases"][1]["milestones"][0]["id"] = "P3-M01"
+        data["phases"][1]["milestones"][0]["steps"][0]["id"] = "P3-M01-S01"
+        data["phases"][1]["milestones"][0]["steps"][0]["tasks"][0]["id"] = "P3-M01-S01-T01"
+        write_yaml(self.path, data)
+        with self.failing_second_write(), self.assertRaises(KitError):
+            register.change(self.root, "second")
+        self.assertEqual(self.log.read_bytes(), log)
+        self.assertEqual(self.snapshot(), snap)  # changed, added and removed briefs are all back
+        with self.failing_second_write():
+            code, out, err = self.run_cli("register", "change", "--note", "third")
+        self.assertEqual((code, out), (1, ""))
+        self.assertTrue(err.startswith("error: ") and err.count("\n") == 1, err)
+        self.assertEqual(self.log.read_bytes(), log)
+        self.assertEqual(self.snapshot(), snap)
 
     def test_cli_change(self):
         code, out, err = self.run_cli("register", "change", "--note", "add T03")

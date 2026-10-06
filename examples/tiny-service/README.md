@@ -25,8 +25,8 @@ The environment matrix has `dev` (exists) and `staging` (does not exist). So `CL
 ## The loop, command by command
 
 1. `sh install.sh <repo> --preset python`, then put `BRIEF.md`, `checks.yaml`, `HANDOFF.md` and `.gitignore` in place.
-2. `pk interview replay ledger.yaml artifacts` installs the ledger and artifacts and approves stages 1 to 6. `pk interview next` then prints stage 7: discovery is complete.
-3. `pk trace validate --stage 6`, `pk register validate`, `pk briefs generate`, `pk briefs check`.
+2. `pk interview replay ledger.yaml artifacts` installs the ledger and artifacts (the generated `briefs/` among them, which approval 6 needs to be current) and approves stages 1 to 6. `pk interview next` then prints stage 7: discovery is complete.
+3. `pk trace validate --stage 6`, `pk register validate`, `pk briefs check`.
 4. Dispatch: copy the task's SPEC and PLAN, `pk status set P1-M01-S01-T01 in_progress --role controller`, commit the three together to main, `pk worktree new P1-M01-S01-T01`.
 5. The implementer puts `src/` and `produce.py` in the worktree and commits. The controller answers a question with `pk rulings add`.
 6. `pk gate handback P1-M01-S01-T01 --branch task/P1-M01-S01-T01` from main. Its last line is `OK: task/P1-M01-S01-T01 passes the hand-back gate at <sha>`. It needs `gitleaks` on the PATH. The test puts a stand-in `gitleaks` that always succeeds there: it proves the gate calls the scanner and fails without it, not that secrets are found.

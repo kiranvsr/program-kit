@@ -269,6 +269,20 @@ def _strings(value) -> list[str]:
     return found
 
 
+def _gate_texts(gate, entry, file: str) -> list[str]:
+    """The claim and record strings of one gate entry; an entry or field of the wrong shape raises, naming it."""
+    if entry is None:
+        return []
+    if not isinstance(entry, dict):
+        raise KitError(f"{file}: {gate} must be a mapping")
+    claims, records = entry.get("claims"), entry.get("records")
+    if claims is not None and not (isinstance(claims, list) and all(isinstance(item, str) for item in claims)):
+        raise KitError(f"{file}: {gate}: claims must be a list of strings")
+    if records is not None and not (isinstance(records, list) and all(isinstance(item, (str, dict)) for item in records)):
+        raise KitError(f"{file}: {gate}: records must be a list of strings or mappings")
+    return _strings(claims) + _strings(records)
+
+
 def _mentions(text: str, ident: str) -> bool:
     return re.search(r"(?<![A-Za-z0-9_])" + re.escape(ident) + r"(?![A-Za-z0-9_])", text) is not None
 
@@ -314,12 +328,9 @@ def impact(root: Path, ids: list[str]) -> dict:
         reached_comps |= listed(requirements, req, "components") | holders(components, req, "requirements")
 
     texts: dict[str, list[str]] = {}
-    for table in (matrix["gates"], gate_file["gates"]):
+    for table, file in ((matrix["gates"], "program/traceability.yaml"), (gate_file["gates"], "program/gates.yaml")):
         for gate, entry in table.items():
-            if isinstance(entry, dict):
-                texts.setdefault(gate, []).extend(_strings(entry.get("claims")) + _strings(entry.get("records")))
-            else:
-                texts.setdefault(gate, [])
+            texts.setdefault(gate, []).extend(_gate_texts(gate, entry, file))
     reached_gates = {i for i in ids if i in gate_ids}
     for gate, strings in texts.items():
         if any(_mentions(text, ident) for text in strings for ident in reached_reqs | reached_comps):
