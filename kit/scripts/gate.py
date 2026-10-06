@@ -52,7 +52,40 @@ _TASK = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 _REF = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._/-]*\Z")
 _EXPECT = re.compile(r"\s+#\s+expect\s+(\d+)\s*\Z")
 _GUARDED = re.compile(r"Guarded edit:\s*(\S.*?)\s*\Z")
+_HEX40 = re.compile(r"[0-9a-f]{40}\Z")
+_CONTROL = re.compile("[\x00-\x1f\x7f-\x9f\u2028\u2029]")  # every line break and terminal control character
 _MISSING = object()
+
+
+def _escape(match) -> str:
+    code = ord(match.group())
+    return f"\\x{code:02x}" if code < 0x100 else f"\\u{code:04x}"
+
+
+def _show(value) -> str:
+    """`value` as text with every control character (any line break included) rendered as a visible escape.
+
+    Every value the gate interpolates into output or an error message passes through here, so nothing a branch,
+    a file name or a command controls can start a new line.
+    """
+    return _CONTROL.sub(_escape, str(value))
+
+
+def _out(text, stream=None) -> None:
+    """The only way the gate writes a line: control characters are escaped and a line that would read
+    as an `OK:` line is prefixed with `| `. The two real `OK:` lines come from `_print_ok` alone."""
+    line = _show(text)
+    if line.startswith("OK: "):
+        line = "| " + line
+    print(line, file=stream if stream is not None else sys.stdout)
+
+
+def _print_ok(kind: str, branch, sha) -> None:
+    """Print the final `OK:` line: nothing but a validated branch name and a 40-hex sha."""
+    ending = {"handback": "passes the hand-back gate", "merge": "merges into main"}[kind]
+    if not (isinstance(branch, str) and _REF.match(branch) and isinstance(sha, str) and _HEX40.match(sha)):
+        raise KitError("refusing to print an OK line for an unvalidated branch or sha")
+    print(f"OK: {branch} {ending} at {sha}")
 
 
 # --- checks.yaml -------------------------------------------------------------------
@@ -61,11 +94,11 @@ def _argv_lists(value, key: str) -> list[list[str]]:
     if value is None:
         return []
     if not isinstance(value, list):
-        raise KitError(f"checks.yaml: {key} must be a list of argv lists")
+        raise KitError(f"checks.yaml: {_show(key)} must be a list of argv lists")
     commands = []
     for item in value:
         if not isinstance(item, list) or not item or not all(isinstance(part, str) and part for part in item):
-            raise KitError(f"checks.yaml: every {key} command must be a non-empty argv list of strings, "
+            raise KitError(f"checks.yaml: every {_show(key)} command must be a non-empty argv list of strings, "
                            "not a shell string")
         commands.append(list(item))
     return commands
@@ -78,7 +111,7 @@ def _parse_checks(data, require: tuple[str, ...]) -> dict:
         raise KitError("checks.yaml: expected a mapping")
     unknown = sorted(str(key) for key in data if key not in ALL_KEYS)
     if unknown:
-        raise KitError(f"checks.yaml: unknown key {', '.join(unknown)} (expected {', '.join(ALL_KEYS)})")
+        raise KitError(f"checks.yaml: unknown key {_show(', '.join(unknown))} (expected {', '.join(ALL_KEYS)})")
     checks: dict = {key: _argv_lists(data.get(key), key) for key in CHECK_KEYS}
     guarded = data.get("guarded_files")
     if guarded is None:
@@ -106,7 +139,7 @@ def load_checks_at(root, ref: str, require: tuple[str, ...] = ()) -> dict:
     try:
         text = _git_bytes(Path(root), "show", f"{ref}:program/checks.yaml").decode("utf-8")
     except (KitError, UnicodeDecodeError) as exc:
-        raise KitError(f"program/checks.yaml cannot be read on {ref}: {exc}") from exc
+        raise KitError(f"program/checks.yaml cannot be read on {_show(ref)}: {_show(exc)}") from exc
     try:
         data = miniyaml.loads(text)
     except miniyaml.YAMLError as exc:
@@ -136,9 +169,9 @@ def parse_plan(text: str) -> list[tuple[list[str], int]]:
         try:
             argv = shlex.split(body)
         except ValueError as exc:
-            raise KitError(f"cannot parse PLAN command {line!r}: {exc}") from exc
+            raise KitError(f"cannot parse PLAN command {_show(repr(line))}: {_show(exc)}") from exc
         if not argv:
-            raise KitError(f"empty PLAN command: {line!r}")
+            raise KitError(f"empty PLAN command: {_show(repr(line))}")
         found.append((argv, expect))
     return found
 
@@ -148,10 +181,11 @@ def _git_bytes(root: Path, *args: str) -> bytes:
     try:
         proc = subprocess.run(["git", "-C", str(root), *args], capture_output=True)
     except OSError as exc:
-        raise KitError(f"cannot run git: {exc.strerror or exc}") from exc
+        raise KitError(f"cannot run git: {_show(exc.strerror or exc)}") from exc
     if proc.returncode != 0:
         lines = [ln.strip() for ln in proc.stderr.decode("utf-8", "replace").splitlines() if ln.strip()]
-        raise KitError(f"git {' '.join(args)} failed: {lines[0] if lines else f'exit {proc.returncode}'}")
+        raise KitError(f"git {_show(' '.join(args))} failed: "
+                       f"{_show(lines[0]) if lines else f'exit {proc.returncode}'}")
     return proc.stdout
 
 
@@ -164,7 +198,7 @@ def _git_fields(root: Path, *args: str) -> list[str]:
 
 def _check_ref(name, what: str) -> str:
     if not isinstance(name, str) or not _REF.match(name):
-        raise KitError(f"not a usable {what} name: {name}")
+        raise KitError(f"not a usable {what} name: {_show(name)}")
     return name
 
 
@@ -211,15 +245,17 @@ def trial_merge(root, branch: str, main: str = "main") -> Path:
             conflicted = []
         run_argv(["git", "-C", str(trial), "merge", "--abort"], trial)
         if conflicted:
-            raise KitError(f"merge of {branch} into {main} conflicts in: {', '.join(conflicted)}")
+            raise KitError(f"merge of {_show(branch)} into {_show(main)} conflicts in: "
+                           f"{_show(', '.join(conflicted))}")
         lines = [ln.strip() for ln in output.splitlines() if ln.strip()]
-        raise KitError(f"merge of {branch} into {main} failed: {lines[-1] if lines else f'exit {code}'}")
+        raise KitError(f"merge of {_show(branch)} into {_show(main)} failed: "
+                       f"{_show(lines[-1]) if lines else f'exit {code}'}")
     except BaseException as exc:  # nothing may leave the trial worktree behind
         problem = _remove_trial(root, trial)
         if problem and isinstance(exc, KitError):
-            raise KitError(f"{exc} ({problem})") from None
+            raise KitError(f"{_show(exc)} ({_show(problem)})") from None
         if problem:
-            print(f"warning: {problem}", file=sys.stderr)
+            _out(f"warning: {problem}", sys.stderr)
         raise
 
 
@@ -238,13 +274,13 @@ def _run_commands(step: str, commands: list[tuple[list[str], int]], cwd: Path) -
         if code == expect:
             continue
         if code == 127:
-            print(f"FAILED: {step} missing tool: {argv[0]}")
+            _out(f"FAILED: {step} missing tool: {argv[0]}")
             return False
-        print(f"FAILED: {step} {' '.join(argv)} (exit {code})")
+        _out(f"FAILED: {step} {' '.join(argv)} (exit {code})")
         for line in output.splitlines()[-TAIL_LINES:]:
-            print(TAIL_PREFIX + line)
+            _out(TAIL_PREFIX + line)
         return False
-    print(f"step {step}: ok")
+    _out(f"step {step}: ok")
     return True
 
 
@@ -259,10 +295,10 @@ def _with_trial(root: Path, trial: Path, body) -> int:
     finally:
         problem = _remove_trial(root, trial)
         if problem and sys.exc_info()[0] is not None:
-            print(f"warning: {problem}", file=sys.stderr)
+            _out(f"warning: {problem}", sys.stderr)
             problem = None
     if problem:
-        raise KitError(problem)
+        raise KitError(_show(problem))
     return code
 
 
@@ -271,24 +307,24 @@ def _with_trial(root: Path, trial: Path, body) -> int:
 def _task_worktree(root: Path, task_id: str, branch: str, override) -> Path:
     wt = Path(override) if override is not None else root / ".worktrees" / task_id.lower()
     if not wt.is_dir():
-        raise KitError(f"task worktree not found: {wt}")
+        raise KitError(f"task worktree not found: {_show(wt)}")
     wt = wt.resolve()
     if wt == root:
-        raise KitError(f"task worktree must not be the main checkout: {wt}")
+        raise KitError(f"task worktree must not be the main checkout: {_show(wt)}")
     if Path(git(wt, "rev-parse", "--show-toplevel")).resolve() != wt:
-        raise KitError(f"task worktree {wt} is not the top level of a git worktree")
+        raise KitError(f"task worktree {_show(wt)} is not the top level of a git worktree")
     common = Path(wt, git(wt, "rev-parse", "--git-common-dir")).resolve()
     if common != Path(root, git(root, "rev-parse", "--git-common-dir")).resolve():
-        raise KitError(f"task worktree {wt} belongs to a different repository")
+        raise KitError(f"task worktree {_show(wt)} belongs to a different repository")
     try:  # the full ref: `--short` turns into `heads/<name>` when a tag has the same name
         current = git(wt, "symbolic-ref", "HEAD").removeprefix("refs/heads/")
     except KitError:
         current = "a detached HEAD"
     if current != branch:
-        raise KitError(f"task worktree {wt} is on {current}, not on {branch}")
+        raise KitError(f"task worktree {_show(wt)} is on {_show(current)}, not on {_show(branch)}")
     dirty = _changes(wt)
     if dirty:
-        raise KitError(f"task worktree {wt} is not clean: {', '.join(dirty)}")
+        raise KitError(f"task worktree {_show(wt)} is not clean: {_show(', '.join(dirty))}")
     return wt
 
 
@@ -332,9 +368,9 @@ def _results_problems(data, task_id: str, head: str | None) -> list[str]:
     if problems:
         return problems
     if data["task_id"] != task_id:
-        problems.append(f"task_id: is {data['task_id']}, expected {task_id}")
+        problems.append(f"task_id: is {_show(data['task_id'])}, expected {_show(task_id)}")
     if head is not None and data["head"] != head:
-        problems.append(f"head: is {data['head']}, expected the worktree HEAD {head}")
+        problems.append(f"head: is {_show(data['head'])}, expected the worktree HEAD {_show(head)}")
     if data["all_commands_as_expected"] is not True:
         problems.append("all_commands_as_expected: is not true")
     if data["planted_bugs_all_killed"] is not True:
@@ -372,34 +408,34 @@ def _evidence_step(wt: Path, task_id: str) -> bool:
     base = f"program/evidence/{task_id}"
     produce, results_rel = f"{base}/produce.py", f"{base}/results.json"
     if not (wt / produce).is_file():
-        print(f"FAILED: evidence {produce} is missing")
+        _out(f"FAILED: evidence {produce} is missing")
         return False
     if not _run_commands("evidence", [(["python3", produce], 0)], wt):
         return False
     try:
         data = read_json(wt / results_rel)
     except KitError as exc:
-        print("FAILED: evidence " + " ".join(str(exc).replace(str(wt) + "/", "").split()))
+        _out("FAILED: evidence " + " ".join(str(exc).replace(str(wt) + "/", "").split()))
         return False
     problems = _results_problems(data, task_id, git(wt, "rev-parse", "HEAD"))
     if problems:
-        print("FAILED: evidence")
+        _out("FAILED: evidence")
         for problem in problems:
-            print(problem)
+            _out(problem)
         return False
     extra = _unexpected_changes(wt, results_rel)
     for path in extra:
-        print(f"FAILED: evidence unexpected change: {path}")
+        _out(f"FAILED: evidence unexpected change: {path}")
     return not extra
 
 
 def _stale_step(wt: Path, main: str) -> bool:
     report = stale_module.stale_records(wt, main)
-    print(f"stale: {len(report['stale'])} record(s)")
+    _out(f"stale: {len(report['stale'])} record(s)")
     for row in report["stale"]:
-        print(row["path"])
+        _out(row["path"])
     for row in report["unreadable"]:
-        print(f"FAILED: stale unreadable record {row['path']}: {row['error']}")
+        _out(f"FAILED: stale unreadable record {row['path']}: {row['error']}")
     return not report["unreadable"]
 
 
@@ -417,15 +453,15 @@ def _run_steps(root: Path, checks: dict, task_id: str, wt: Path, trial: Path, ma
         authoritative = None
     own = wt / plan_rel
     if authoritative is None or not own.is_file() or own.read_bytes() != authoritative:
-        print(f"FAILED: plan {plan_rel} differs from {main}")
+        _out(f"FAILED: plan {plan_rel} differs from {main}")
         return 1
     try:
         plan = parse_plan(authoritative.decode("utf-8", "replace"))
     except KitError as exc:
-        print(f"FAILED: plan {exc}")
+        _out(f"FAILED: plan {exc}")
         return 1
     if not plan:
-        print(f'FAILED: plan no commands under "{PLAN_SECTION}"')
+        _out(f'FAILED: plan no commands under "{PLAN_SECTION}"')
         return 1
     if not _run_commands("plan", plan, wt):
         return 1
@@ -438,23 +474,23 @@ def handback(root, task_id: str, branch: str, worktree=None, main: str = "main")
     """The hand-back gate; 0 and a final `OK:` line only when every step passed."""
     root = Path(root).resolve()
     if not isinstance(task_id, str) or not _TASK.match(task_id):
-        raise KitError(f"not a usable task id: {task_id}")
+        raise KitError(f"not a usable task id: {_show(task_id)}")
     _check_ref(main, "main branch")
     sha = _branch_head(root, branch)
     wt = _task_worktree(root, task_id, branch, worktree)
     checks = load_checks_at(root, main, require=("build", "test", "scan"))
     guarded = _guarded_changes(root, task_id, branch, main, checks["guarded_files"])
     if guarded:
-        print(f"FAILED: guarded files changed: {', '.join(guarded)}")
+        _out(f"FAILED: guarded files changed: {', '.join(guarded)}")
         return 1
     trial = trial_merge(root, branch, main)
     code = _with_trial(root, trial, lambda: _run_steps(root, checks, task_id, wt, trial, main))
     if code:
         return code
     if git(wt, "rev-parse", "HEAD") != sha or _branch_head(root, branch) != sha:
-        print(f"FAILED: {branch} moved during the gate")
+        _out(f"FAILED: {branch} moved during the gate")
         return 1
-    print(f"OK: {branch} passes the hand-back gate at {sha}")
+    _print_ok("handback", branch, sha)
     return 0
 
 
@@ -475,7 +511,7 @@ def merge_check(root, branch: str, main: str = "main") -> int:
     code = _with_trial(root, trial, steps)
     if code:
         return code
-    print(f"OK: {branch} merges into main at {sha}")
+    _print_ok("merge", branch, sha)
     return 0
 
 
@@ -484,10 +520,10 @@ def merge_check(root, branch: str, main: str = "main") -> int:
 def _mapping(data, label: str, key: str) -> dict:
     """The mapping under top-level `key` of a loaded file; absent or empty gives {}."""
     if data is not None and not isinstance(data, dict):
-        raise KitError(f"{label}: expected a mapping")
+        raise KitError(f"{_show(label)}: expected a mapping")
     value = {} if data is None or data.get(key) is None else data[key]
     if not isinstance(value, dict):
-        raise KitError(f"{label}: '{key}' must be a mapping")
+        raise KitError(f"{_show(label)}: '{_show(key)}' must be a mapping")
     return value
 
 
@@ -496,33 +532,35 @@ def _environments(root: Path) -> dict[str, bool]:
     found = {}
     for name, info in _mapping(read_yaml(path), "program/environments.yaml", "environments").items():
         if not isinstance(info, dict) or not isinstance(info.get("exists"), bool):
-            raise KitError(f"program/environments.yaml: {name}.exists must be true or false")
+            raise KitError(f"program/environments.yaml: {_show(name)}.exists must be true or false")
         found[str(name)] = info["exists"]
     return found
 
 
 def _record_path(value, gate_id: str) -> str:
-    if not isinstance(value, str) or not value or "\\" in value or value.startswith("/"):
-        raise KitError(f"gate {gate_id}: record path must be a relative posix path: {value!r}")
+    if (not isinstance(value, str) or not value or "\\" in value or value.startswith("/")
+            or _CONTROL.search(value)):
+        raise KitError(f"gate {_show(gate_id)}: record path must be a relative posix path without control "
+                       f"characters: {_show(repr(value))}")
     pure = PurePosixPath(value)
     if ".." in pure.parts or not pure.parts:
-        raise KitError(f"gate {gate_id}: record path must stay inside the project: {value}")
+        raise KitError(f"gate {_show(gate_id)}: record path must stay inside the project: {_show(value)}")
     return pure.as_posix()
 
 
 def _gate(root: Path, gate_id: str) -> tuple[str, list[str]]:
     """(environment, record paths) of a gate; KitError when it is unknown or malformed."""
     if not isinstance(gate_id, str) or not GATE_ID.match(gate_id):
-        raise KitError(f"not a valid gate id (expected G-<NAME>): {gate_id}")
+        raise KitError(f"not a valid gate id (expected G-<NAME>): {_show(gate_id)}")
     gates = _mapping(read_yaml(root / "program" / "gates.yaml"), "program/gates.yaml", "gates")
     entry = gates.get(gate_id)
     if entry is None:
-        raise KitError(f"unknown gate: {gate_id}")
+        raise KitError(f"unknown gate: {_show(gate_id)}")
     if not isinstance(entry, dict) or not isinstance(entry.get("environment"), str):
-        raise KitError(f"gate {gate_id}: environment must name an entry of environments.yaml")
+        raise KitError(f"gate {_show(gate_id)}: environment must name an entry of environments.yaml")
     records = entry.get("records")
     if not isinstance(records, list) or not all(isinstance(item, dict) for item in records):
-        raise KitError(f"gate {gate_id}: records must be a list of {{path, acceptance}} mappings")
+        raise KitError(f"gate {_show(gate_id)}: records must be a list of {{path, acceptance}} mappings")
     return entry["environment"], [_record_path(item.get("path"), gate_id) for item in records]
 
 
@@ -563,13 +601,13 @@ def _expected_claims(root: Path, gate_id: str) -> dict[str, dict]:
     own, records = _gate(root, gate_id)
     environments = _environments(root)
     if own not in environments:
-        raise KitError(f"gate {gate_id}: environment {own} is not named in program/environments.yaml")
+        raise KitError(f"gate {_show(gate_id)}: environment {_show(own)} is not named in program/environments.yaml")
     commit = git(root, "rev-parse", "HEAD")
     docs: dict[str, dict] = {}
     for record in records:
         name = _claim_name(record)
         if name in docs:
-            raise KitError(f"gate {gate_id}: records collide on the claim file {name}")
+            raise KitError(f"gate {_show(gate_id)}: records collide on the claim file {_show(name)}")
         states, acceptance_sha = _states(root, record, own, environments)
         docs[name] = {"gate": gate_id, "record": record, "environment": states,
                       "acceptance_sha256": acceptance_sha, "generated_from_commit": commit}
@@ -582,7 +620,7 @@ def _claims_dir(root: Path, gate_id: str) -> Path:
 
 def _refuse_symlink(directory: Path) -> None:
     if directory.is_symlink():
-        raise KitError(f"{directory} is a symlink; refusing to use the claims directory through it")
+        raise KitError(f"{_show(directory)} is a symlink; refusing to use the claims directory through it")
 
 
 def claims(root, gate_id: str) -> list[Path]:
@@ -613,24 +651,25 @@ def validate_claims(root, gate_id: str) -> list[str]:
         path = directory / name
         rel = path.relative_to(root).as_posix()
         if not path.is_file():
-            problems.append(f"{rel}: missing")
+            problems.append(f"{_show(rel)}: missing")
             continue
         try:
             actual = read_json(path)
         except KitError as exc:
-            problems.append(f"{rel}: unreadable: {' '.join(str(exc).replace(str(path), rel).split())}")
+            problems.append(f"{_show(rel)}: unreadable: {_show(' '.join(str(exc).replace(str(path), rel).split()))}")
             continue
         if not isinstance(actual, dict):
-            problems.append(f"{rel}: not a JSON object")
+            problems.append(f"{_show(rel)}: not a JSON object")
             continue
         differing = sorted(key for key in set(doc) | set(actual) if key != "generated_from_commit"
                            and doc.get(key, _MISSING) != actual.get(key, _MISSING))
         if differing:
-            problems.append(f"{rel}: differs in {', '.join(differing)}")
+            problems.append(f"{_show(rel)}: differs in {_show(', '.join(differing))}")
     if directory.is_dir():
         for entry in sorted(directory.iterdir()):
             if entry.name not in docs:
-                problems.append(f"{entry.relative_to(root).as_posix()}: extra file (no such record in {gate_id})")
+                problems.append(f"{_show(entry.relative_to(root).as_posix())}: extra file "
+                                f"(no such record in {_show(gate_id)})")
     return problems
 
 
@@ -640,12 +679,14 @@ def binding(root, task_id: str, branch: str, main: str = "main") -> list[str]:
     """Problems that stop a branch's results.json from binding its tip (empty, with a printed line, when it holds).
 
     Holds only when `program/evidence/<ID>/results.json` on the branch tip validates, its `head` is an
-    ancestor of the tip, and the net change from `head` to the tip touches only `program/evidence/<ID>/`
-    and `program/status/<ID>.json`. Everything is read from git objects, never from a working tree.
+    ancestor of the tip, and every commit after `head` up to the tip (merge commits against each parent)
+    changes only paths under `program/evidence/<ID>/` or exactly `program/status/<ID>.json`. A commit that
+    edits other paths and a later one that reverts them therefore still fails. Everything is read from git
+    objects, never from a working tree. At most one problem is reported for the commits: the first offender.
     """
     root = Path(root).resolve()
     if not isinstance(task_id, str) or not _TASK.match(task_id):
-        raise KitError(f"not a usable task id: {task_id}")
+        raise KitError(f"not a usable task id: {_show(task_id)}")
     _check_ref(main, "main branch")
     tip = _branch_head(root, branch)
     rel = f"program/evidence/{task_id}/results.json"
@@ -653,28 +694,36 @@ def binding(root, task_id: str, branch: str, main: str = "main") -> list[str]:
         text = _git_bytes(root, "show", f"{tip}:{rel}").decode("utf-8")
         data = json.loads(text)
     except KitError:
-        return [f"{rel} is absent on {branch}"]
+        return [f"{_show(rel)} is absent on {_show(branch)}"]
     except (UnicodeDecodeError, ValueError, RecursionError) as exc:
-        return [f"{rel} on {branch} is not valid JSON: {exc}"]
+        return [f"{_show(rel)} on {_show(branch)} is not valid JSON: {_show(exc)}"]
     problems = _results_problems(data, task_id, None)
     if problems:
-        return [f"{rel}: {problem}" for problem in problems]
+        return [f"{_show(rel)}: {problem}" for problem in problems]
     head = data["head"]
     code, _ = run_argv(["git", "-C", str(root), "merge-base", "--is-ancestor", head, tip], root)
     if code != 0:
-        return [f"{rel}: head {head} is not an ancestor of {branch} ({tip})"]
+        return [f"{_show(rel)}: head {_show(head)} is not an ancestor of {_show(branch)} ({tip})"]
     prefix, status = f"program/evidence/{task_id}/", f"program/status/{task_id}.json"
-    outside = [path for path in sorted(_git_fields(root, "diff", "--name-only", "--no-renames", "-z",
-                                                   f"{head}..{tip}"))
-               if not path.startswith(prefix) and path != status]
-    if outside:
-        return [f"{path}: changed after {head} but is not under {prefix} or {status}" for path in outside]
-    later = int(git(root, "rev-list", "--count", f"{head}..{tip}"))
-    print(f"binding holds: results.json at {head} bound, {later} later commit(s) touch only evidence and status")
+    commits = git(root, "rev-list", "--topo-order", "--reverse", f"{head}..{tip}").split()
+    for commit in commits:
+        for path in _git_fields(root, "diff-tree", "--no-commit-id", "--name-only", "-r", "-m", "--root",
+                                "--no-renames", "-z", commit):
+            if not path.startswith(prefix) and path != status:
+                return [f"{_show(path)}: changed in commit {commit} after {head}, outside {_show(prefix)} "
+                        f"and {_show(status)}"]
+    _out(f"binding holds: results.json at {head} bound, {len(commits)} later commit(s) touch only evidence "
+         "and status")
     return []
 
 
 # --- command -----------------------------------------------------------------------
+
+def _report(problems: list[str]) -> int:
+    for problem in problems:
+        _out("error: " + problem, sys.stderr)
+    return 1
+
 
 def cmd_gate(args: argparse.Namespace) -> int:
     action = getattr(args, "gate_action", None)
@@ -687,18 +736,14 @@ def cmd_gate(args: argparse.Namespace) -> int:
         return merge_check(root, args.branch, main=args.main)
     if action == "binding":
         problems = binding(root, args.task_id, args.branch, main=args.main)
-        if problems:
-            print("\n".join("error: " + problem for problem in problems), file=sys.stderr)
-            return 1
-        return 0
+        return _report(problems) if problems else 0
     if action == "claims":
-        print(f"wrote {len(claims(root, args.gate))} claim documents")
+        _out(f"wrote {len(claims(root, args.gate))} claim documents")
         return 0
     problems = validate_claims(root, args.gate)
     if problems:
-        print("\n".join("error: " + problem for problem in problems), file=sys.stderr)
-        return 1
-    print(f"claims consistent for {args.gate}")
+        return _report(problems)
+    _out(f"claims consistent for {args.gate}")
     return 0
 
 
