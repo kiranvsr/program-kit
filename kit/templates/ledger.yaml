@@ -1,0 +1,2 @@
+# Evidence ledger: one entry per recorded piece of evidence. Empty until you add some.
+entries: []

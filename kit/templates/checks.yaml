@@ -1,0 +1,2 @@
+# Checks the program runs (commands with expected outcomes). Empty until you add some.
+checks: []

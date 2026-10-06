@@ -1,0 +1,2 @@
+# Named environments a claim can depend on (for example staging, production-like). Empty until you add some.
+environments: []
