@@ -489,7 +489,7 @@ class KitTestsStayInTheKitRepositoryTests(InstallCase):
         target = self.repo()
         self.assert_ok(self.install(target))
         self.assertEqual(sorted(p.name for p in (target / "kit").iterdir()),
-                         sorted(p.name for p in KIT.iterdir() if p.name not in ("tests", "__pycache__")))
+                         sorted(p.name for p in KIT.iterdir() if p.name not in ("tests", "__pycache__", ".DS_Store")))
 
     def test_upgrade_from_an_install_that_has_kit_tests_works_and_removes_them(self):
         target = self.repo()

@@ -7,3 +7,7 @@ Blocking questions unanswered: $blocking
 questions asked: $questions_asked of budget $budget
 
 $table
+
+## Unconfirmed assumptions
+
+$assumptions

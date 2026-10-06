@@ -16,7 +16,7 @@ import re
 import string
 import sys
 import tempfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from common import (KitError, find_root, read_json, read_yaml, sha256_bytes, sha256_file, utc_now, write_json,
                     write_yaml)
@@ -32,7 +32,7 @@ STATES = ("closed", "open", "deferred", "not_applicable")
 
 SOURCE_KINDS = ("user", "document", "inference")
 _KIND_PREFIX = {"fact": "F", "assumption": "A", "decision": "D", "question": "Q"}
-_ENTRY_ID = re.compile(r"([FADQ])-(\d+)\Z")
+_ENTRY_ID = re.compile(r"([FADQ])-(\d+)\Z", re.ASCII)
 _SOURCE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 _CONDITION_TOKEN = re.compile(r"\s*(\(|\)|has:[A-Za-z0-9_.-]+|(?:and|or|not)(?![A-Za-z0-9_.:-]))")
 
@@ -165,7 +165,7 @@ def load_coverage(root: Path, path: Path | None = None) -> dict:
     stages: dict[int, dict] = {}
     seen: set[str] = set()
     for key, stage in data["stages"].items():
-        if not re.fullmatch(r"\d+", str(key)):
+        if not re.fullmatch(r"\d+", str(key), re.ASCII):
             raise KitError(f"{where}: stage key {key!r} must be a number")
         if not isinstance(stage, dict):
             raise KitError(f"{where}: stage {key} must be a mapping")
@@ -280,7 +280,7 @@ def _problems(coverage: dict, ledger: dict) -> list[str]:
         elif who in seen:
             problems.append(f"{who}: duplicate id")
         seen.add(who)
-        if kind not in _KIND_PREFIX:
+        if not isinstance(kind, str) or kind not in _KIND_PREFIX:
             problems.append(f"{who}: kind must be fact, assumption, decision or question")
         elif match and match.group(1) != _KIND_PREFIX[kind]:
             problems.append(f"{who}: id prefix does not match kind {kind}")
@@ -305,6 +305,8 @@ def _problems(coverage: dict, ledger: dict) -> list[str]:
             problems.append(f"{who}: answered must be true or false")
         if "source" not in item or item["source"] in (None, ""):
             problems.append(f"{who}: source is missing")
+        elif not isinstance(item["source"], str):
+            problems.append(f"{who}: source must be a string naming an entry of sources")
         elif item["source"] not in sources:
             problems.append(f"{who}: source {item['source']} is not in sources")
         if not _nonempty_string(item.get("at")):
@@ -396,47 +398,106 @@ def _challenge_path(root: Path, stage: int) -> Path:
     return Path(root) / "program" / "reports" / f"stage-{stage}-challenge.md"
 
 
-def _unresolved_findings(path: Path) -> int:
-    """Rows of the findings tables whose Resolution cell (the last one) is empty."""
+def _read_challenge(path: Path) -> str:
     try:
-        text = path.read_text(encoding="utf-8")
+        return path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         raise KitError(f"cannot read {path}: {getattr(exc, 'strerror', None) or exc}") from exc
+
+
+def _row_cells(line: str) -> list[str] | None:
+    """The cells of a findings-table data row, or None for any other line (header, separator, blank row, text)."""
+    line = line.strip()
+    if not line.startswith("|"):
+        return None
+    cells = [cell.strip() for cell in (line[1:-1] if line.endswith("|") and len(line) > 1 else line[1:]).split("|")]
+    if cells[0] == "#" or all(re.fullmatch(r":?-+:?", cell) for cell in cells) or not any(cells):
+        return None
+    return cells
+
+
+def _unresolved_findings(text: str) -> int:
+    """Rows of the findings tables whose Resolution cell (the last one) is empty."""
     count = 0
     for line in text.splitlines():
-        line = line.strip()
-        if not line.startswith("|"):
-            continue
-        cells = [cell.strip() for cell in (line[1:-1] if line.endswith("|") and len(line) > 1 else line[1:]).split("|")]
-        if cells[0] == "#" or all(re.fullmatch(r":?-+:?", cell) for cell in cells) or not any(cells):
-            continue  # header, separator, blank row
-        if len(cells) < 4 or not cells[-1]:
+        cells = _row_cells(line)
+        if cells is not None and (len(cells) < 4 or not cells[-1]):
             count += 1
     return count
 
 
-def stopping_rule(root: Path, stage: int) -> list[str]:
-    """Reasons `stage` cannot be approved, each starting with a topic or entry ID or a file name."""
-    _refuse_per_task(stage)
-    coverage = load_coverage(root)
+def _answered_lenses(text: str) -> set[str]:
+    """Lenses whose section holds a finding row or a `No findings.` line."""
+    answered: set[str] = set()
+    lens = None
+    for line in text.splitlines():
+        if line.startswith("## "):
+            lens = line[3:].strip().lower()
+        elif lens is not None and (_row_cells(line) is not None or line.strip().lower() == "no findings."):
+            answered.add(lens)
+    return answered
+
+
+def _challenge_reasons(root: Path, stage: int, path: Path) -> list[str]:
+    """Why the challenge report is not a finished round: untouched skeleton, an empty lens, unresolved rows."""
+    text = _read_challenge(path)
+    name = f"stage-{stage}-challenge.md"
+    if text.strip() == _challenge_skeleton(root, stage).strip():
+        return [f"{name}: still the untouched skeleton; each lens needs a finding row or a No findings. line"]
+    reasons = [f"{name}: section {lens} is empty; add a finding row or a No findings. line"
+               for lens in LENSES if lens not in _answered_lenses(text)]
+    findings = _unresolved_findings(text)
+    if findings:
+        noun = "finding" if findings == 1 else "findings"
+        reasons.append(f"{name}: {findings} {noun} unresolved")
+    return reasons
+
+
+def _open_reasons(root: Path, coverage: dict, entries: list[dict], stage: int, where: str = "") -> list[str]:
+    """Open required topics and unanswered blocking questions of `stage`; `where` says which stage when not this one."""
     topics = _stage(coverage, stage)["topics"]
-    ledger = _load_ledger(root)
-    entries = ledger["entries"]
-    reasons: list[str] = _problems(coverage, ledger)
+    reasons: list[str] = []
     for topic_id, state in topic_states(root, stage).items():
         if state["state"] == "open" and topics[topic_id]["required"]:
             missing = ", ".join(state["missing"]) or "any fact, confirmed assumption or decision"
-            reasons.append(f"{topic_id}: required topic open (missing: {missing})")
+            reasons.append(f"{topic_id}: required topic open{where} (missing: {missing})")
     unanswered = _unanswered(entries)
     for item in _stage_questions(entries, topics):
         if item.get("blocking") is True and str(item.get("id")) in unanswered:
-            reasons.append(f"{item.get('id')}: blocking question unanswered")
+            reasons.append(f"{item.get('id')}: blocking question unanswered{where}")
+    return reasons
+
+
+def _register_reasons(root: Path) -> list[str]:
+    """The problems `pk register validate` reports for `program/register.yaml`; a missing register is one."""
+    import register as register_module  # lazy, and not the module-level `register` command hook
+
+    path = Path(root) / "program" / "register.yaml"
+    if not path.exists():
+        return ["program/register.yaml is missing"]
+    environments = Path(root) / "program" / "environments.yaml"
+    return register_module.validate(register_module.load(root), read_yaml(environments) if environments.exists() else None,
+                                    read_yaml(register_module.KIT_DIR / "interview" / "roles.yaml"))
+
+
+def stopping_rule(root: Path, stage: int) -> list[str]:
+    """Reasons `stage` cannot be approved, each starting with a topic or entry ID or a file name.
+
+    From the freeze (stage 5) on, the topic and blocking-question checks of every earlier stage run again, so a
+    topic reopened or a question raised after its own approval blocks the freeze; stage 6 also validates the register.
+    """
+    _refuse_per_task(stage)
+    coverage = load_coverage(root)
+    ledger = _load_ledger(root)
+    entries = ledger["entries"]
+    reasons: list[str] = _problems(coverage, ledger)
+    reasons.extend(_open_reasons(root, coverage, entries, stage))
+    if stage >= FREEZE_STAGE:
+        for earlier in range(1, stage):
+            reasons.extend(_open_reasons(root, coverage, entries, earlier, f" at stage {earlier}"))
     challenge = _challenge_path(root, stage)
     if challenge.exists():
-        findings = _unresolved_findings(challenge)
-        if findings:
-            noun = "finding" if findings == 1 else "findings"
-            reasons.append(f"stage-{stage}-challenge.md: {findings} {noun} unresolved")
+        reasons.extend(_challenge_reasons(root, stage, challenge))
     elif stage >= 2:  # stage 1 has no challenge round; every later stage needs its report
         reasons.append(f"stage-{stage}-challenge.md: missing")
     if stage >= 5:
@@ -446,6 +507,8 @@ def stopping_rule(root: Path, stage: int) -> list[str]:
         import trace as trace_module  # lazy: trace imports register and status
 
         reasons.extend(trace_module.validate(root, stage))
+    if stage == 6:
+        reasons.extend(_register_reasons(root))
     return reasons
 
 
@@ -490,12 +553,15 @@ def report(root: Path, stage: int) -> Path:
     questions = _stage_questions(entries, info["topics"])
     unanswered = _unanswered(entries)
     counts = {name: sum(1 for state in states.values() if state["state"] == name) for name in STATES}
+    assumptions = [f"- {item.get('id')} ({', '.join(_strings(item.get('topics')))}): "
+                   + " ".join(str(item.get("text")).split())
+                   for item in entries if item.get("kind") == "assumption" and item.get("confirmed") is not True]
     text = _template("stage_report.md").substitute(
         stage=stage, name=info["name"], closed=counts["closed"], open=counts["open"], deferred=counts["deferred"],
         not_applicable=counts["not_applicable"], questions_asked=len(questions),
         budget="none" if info["budget"] is None else info["budget"],
         blocking=sum(1 for q in questions if q.get("blocking") is True and str(q.get("id")) in unanswered),
-        table="\n".join(rows))
+        table="\n".join(rows), assumptions="\n".join(assumptions) or "none")
     path = Path(root) / "program" / "reports" / f"stage-{stage}.md"
     _write_text(path, text)
     return path
@@ -507,14 +573,18 @@ def questions_line(root: Path, stage: int) -> str:
     return f"questions asked: {asked} of budget {'none' if info['budget'] is None else info['budget']}"
 
 
-def challenge_init(root: Path, stage: int) -> Path:
-    """Write the challenge report skeleton, one section per lens; never overwrites an existing report."""
-    _refuse_per_task(stage)
+def _challenge_skeleton(root: Path, stage: int) -> str:
     info = _stage(load_coverage(root), stage)
     sections = "\n\n".join(f"## {lens}\n\n{CHALLENGE_HEADER}\n|---|---|---|---|" for lens in LENSES)
     text = _template("challenge_report.md").substitute(stage=stage, name=info["name"], sections=sections)
+    return text.rstrip("\n") + "\n"
+
+
+def challenge_init(root: Path, stage: int) -> Path:
+    """Write the challenge report skeleton, one section per lens; never overwrites an existing report."""
+    _refuse_per_task(stage)
     path = _challenge_path(root, stage)
-    _write_text(path, text.rstrip("\n") + "\n", exclusive=True)
+    _write_text(path, _challenge_skeleton(root, stage), exclusive=True)
     return path
 
 
@@ -585,41 +655,81 @@ def _unrecorded(root: Path, stage: int, recorded) -> list[str]:
     return found
 
 
-def _stale(root: Path, record, check_ledger: bool, stage: int) -> bool:
+def _is_adr(stage: int, relative: str) -> bool:
+    """Whether `relative` is a decision record of the stage's default file set (`program/adr/*.md`)."""
+    parts = PurePosixPath(relative)
+    return stage == ADR_STAGE and parts.parent == PurePosixPath("program/adr") and parts.suffix == ".md"
+
+
+def _changes(root: Path, record, check_ledger: bool, stage: int) -> list[str]:
+    """Paths that no longer match an approval: a recorded file changed or gone, a file added to the stage's set
+    (such as a new ADR), the ledger when `check_ledger`; a record of the wrong shape names its own file."""
     if not isinstance(record, dict) or not isinstance(record.get("artifacts"), dict):
-        return True
-    if _unrecorded(root, stage, record["artifacts"]):  # a file added after the approval, such as a new ADR
-        return True
+        return [f"program/approvals/stage-{stage}.json"]
+    changed = []
     for relative, recorded in record["artifacts"].items():
         try:
             if sha256_file(Path(root) / relative) != recorded:
-                return True
+                changed.append(relative)
         except KitError:
-            return True
-    return check_ledger and record.get("ledger_sha256") != _ledger_hash(root)
+            changed.append(relative)
+    changed.extend(_unrecorded(root, stage, record["artifacts"]))  # a file added after the approval
+    if check_ledger and record.get("ledger_sha256") != _ledger_hash(root):
+        changed.append("program/ledger.yaml")
+    return sorted(changed)
+
+
+def _first_open(root: Path, last: int) -> tuple[int, list[str]] | None:
+    """The first stage in 1..`last` that is unapproved (with no paths) or whose approval is stale (with them).
+
+    The ledger grows while stages 1 to 4 are worked, so their approvals compare artifact hashes only. After the
+    freeze (stage 5 on) a ledger change is a change request: the ledger hash is compared for the highest approval
+    of stage 5 or later among the stages looked at.
+    """
+    approved = [stage for stage in range(1, last + 1) if _approval_path(root, stage).exists()]
+    frozen = [stage for stage in approved if stage >= FREEZE_STAGE]
+    for stage in range(1, last + 1):
+        if stage not in approved:
+            return stage, []
+        changed = _changes(root, read_json(_approval_path(root, stage)), bool(frozen) and stage == frozen[-1], stage)
+        if changed:
+            return stage, changed
+    return None
 
 
 def next_stage(root: Path) -> int:
     """First stage 1..6 that is unapproved or whose approved files changed; 7 once all six are current.
 
-    Stage 7 (task specs) is never approved: it names the per-task loop, so 7 is the final value. The ledger
-    grows while stages 1 to 4 are worked, so their approvals compare artifact hashes only. After the freeze
-    (stage 5 on) a ledger change is a change request: the ledger hash is compared for the highest approval
-    of stage 5 or later.
+    Stage 7 (task specs) is never approved: it names the per-task loop, so 7 is the final value.
     """
-    last = PER_TASK_STAGE - 1
-    approved = [stage for stage in range(1, last + 1) if _approval_path(root, stage).exists()]
-    frozen = [stage for stage in approved if stage >= FREEZE_STAGE]
-    for stage in range(1, last + 1):
-        if stage not in approved:
-            return stage
-        if _stale(root, read_json(_approval_path(root, stage)), bool(frozen) and stage == frozen[-1], stage):
-            return stage
-    return PER_TASK_STAGE
+    found = _first_open(root, PER_TASK_STAGE - 1)
+    return found[0] if found else PER_TASK_STAGE
+
+
+def _changed_since_approval(root: Path, stage: int) -> list[str]:
+    """What changed in `stage`'s approval when `next_stage` names it for that reason; empty when never approved."""
+    found = _first_open(root, PER_TASK_STAGE - 1)
+    return found[1] if found and found[0] == stage else []
+
+
+def require_earlier(root: Path, stage: int) -> None:
+    """Refuse unless every stage below `stage` is approved and current, naming the lowest one that is not."""
+    found = _first_open(root, stage - 1)
+    if found is None:
+        return
+    lowest, changed = found
+    if not changed:
+        raise KitError(f"stage {lowest} is not approved yet; approve it before stage {stage}")
+    raise KitError(f"stage {lowest} was approved and its files changed ({', '.join(changed)}); "
+                   f"run pk interview amend {lowest} or raise a change request before approving stage {stage}")
 
 
 def amend(root: Path, stage: int) -> list[str]:
-    """Re-hash an approval's artifacts and the ledger; rewrite it if any changed; return the changed paths."""
+    """Re-hash an approval's artifacts and the ledger; rewrite it if any changed; return the changed paths.
+
+    The set re-hashed is the one approve and replay hash: a file added to it joins, and a decision record
+    (`program/adr/*.md`) that is gone leaves it. Any other recorded file that cannot be read is an error.
+    """
     _check_stage(stage)
     _refuse_per_task(stage)
     path = _approval_path(root, stage)
@@ -630,6 +740,9 @@ def amend(root: Path, stage: int) -> list[str]:
         raise KitError(f"{path}: not a valid approval record")
     changed, hashes = [], {}
     for relative, recorded in record["artifacts"].items():
+        if _is_adr(stage, relative) and not (Path(root) / relative).exists():
+            changed.append(relative)  # removed or renamed: it leaves the set
+            continue
         hashes[relative] = sha256_file(Path(root) / relative)
         if hashes[relative] != recorded:
             changed.append(relative)
@@ -768,6 +881,10 @@ def cmd_interview(args: argparse.Namespace) -> int:
         applicable = [s for s in states.values() if s["state"] != "not_applicable"]
         done = sum(1 for s in applicable if s["state"] in ("closed", "deferred"))
         print(f"next stage: {stage} ({info['name']})\ntopics closed: {done} of {len(applicable)}")
+        changed = _changed_since_approval(root, stage)
+        if changed:
+            print(f"stage {stage} was approved and its files changed: {', '.join(changed)}; run pk interview amend "
+                  f"{stage} for a correction, or raise a change request")
     elif action == "report":
         path = report(root, args.stage)
         print(f"{_show(root, path)}\n{questions_line(root, args.stage)}")
@@ -775,6 +892,8 @@ def cmd_interview(args: argparse.Namespace) -> int:
         print(_show(root, challenge_init(root, args.stage)))
     elif action == "approve":
         _refuse_per_task(args.stage)
+        _check_stage(args.stage)
+        require_earlier(root, args.stage)
         artifacts = [Path.cwd() / item for item in args.artifact] if args.artifact else stage_artifacts(
             root, args.stage, _stage(load_coverage(root), args.stage))
         if not artifacts:

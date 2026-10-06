@@ -12,9 +12,9 @@ This is the entry point. You are an agent that has just opened this project. In 
 
 ## Steps
 
-1. Set up the command. `pk` in every playbook means `python3 kit/scripts/pk.py`. Make it a shell alias or type it in full. Run `pk doctor`. It checks Python 3.11 or later, git, and that `program/checks.yaml` reads. If `program/` does not exist, ask the user for a brief of a few lines, then run `pk init` (add `--preset go`, `--preset node` or `--preset python` to start `checks.yaml` from a preset) and put the brief in `program/BRIEF.md`.
+1. Set up the command. `pk` in every playbook means `python3 kit/scripts/pk.py`. Make it a shell alias or type it in full. Run `pk doctor`. It checks Python 3.11 or later, git, and that `program/checks.yaml` reads. It also checks that the primary branch is named `main` (`git branch -m main` renames it) and that `program/checks.yaml` lists a build, a test and a scan command; run it again after you fill `checks.yaml`. If `program/` does not exist, ask the user for a brief of a few lines, then run `pk init` (add `--preset go`, `--preset node` or `--preset python` to start `checks.yaml` from a preset) and put the brief in `program/BRIEF.md`.
 2. Check the hand-off is current: run `pk handoff check`. If it exits 1, run `pk handoff update`, then commit the result.
-3. Find the stage: run `pk interview next`. It prints `next stage: N (name)` and how many topics are closed. Stage 7 is never approved: once stages 1 to 6 are approved and current, `next` prints stage 7 and stays there. Seeing 7 is normal and means discovery is complete. Act on discovery only when it names stage 6 or lower.
+3. Find the stage: run `pk interview next`. It prints `next stage: N (name)` and how many topics are closed, and when the stage was approved and then modified it lists the changed files. Stage 7 is never approved: once stages 1 to 6 are approved and current, `next` prints stage 7 and stays there. Seeing 7 is normal and means discovery is complete. Act on discovery only when it names stage 6 or lower.
 4. Open the playbook for that result from the table below. Playbooks 01 to 06 are the interviewer's brief: stages 1 to 6 are an interview with the user. Playbooks 07 and 08 are the build loop and run once per task.
 5. Open the brief for your role in `kit/briefs/` (controller, implementer, qa or spec_qa) and read it. Read `kit/rules/HARD_RULES.md`. They bind you in every playbook.
 6. If you are taking over from another agent, read `program/HANDOFF.md` top to bottom and follow `09_handoff.md` before you do anything else.
@@ -30,7 +30,7 @@ This is the entry point. You are an agent that has just opened this project. In 
 | stage 6 (roadmap and register) | `06_register.md` |
 | stage 7 (task specs) | `07_task_specs.md`, then `08_execute.md`, once per task. Discovery is complete. |
 
-A stage that was approved and then modified is named again by `pk interview next`. Its message says whether to run `pk interview amend N` (a correction that does not change meaning) or to raise a change request.
+A stage that was approved and then modified is named again by `pk interview next`. Its message lists the changed files and says to run `pk interview amend N` (a correction that does not change meaning) or to raise a change request. `pk interview approve N` also needs every stage below N approved and current, and names the lowest one that is not.
 
 ## Outputs
 
