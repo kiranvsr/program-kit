@@ -90,6 +90,16 @@ class ServerTests(unittest.TestCase):
 
     def test_other_methods_get_a_json_answer(self):
         self.assertEqual(self.call("PUT", "/health")[0], 405)
+        self.assertEqual(self.call("PATCH", "/echo", b"{}"), (405, "application/json", {"error": "method not allowed"}))
+
+    def test_head_gets_405_with_headers_only(self):
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=5)
+        try:
+            connection.request("HEAD", "/health")
+            response = connection.getresponse()
+            self.assertEqual((response.status, response.read()), (405, b""))
+        finally:
+            connection.close()
 
 
 if __name__ == "__main__":

@@ -600,6 +600,57 @@ class AdrApprovalTests(InterviewBase):
         self.assertEqual(list(record["artifacts"]), ["program/ARCHITECTURE.md", "program/adr/0001-a.md"])
 
 
+class AdrAddedAfterApprovalTests(InterviewBase):
+    """approve, next_stage, amend and replay agree on one file set: an ADR added later is part of it."""
+
+    def setUp(self):
+        super().setUp()
+        (self.root / "kit" / "interview" / "coverage.yaml").write_text(
+            "stages:\n  4:\n    name: architect\n    budget: 0\n    artifacts:\n      - ARCHITECTURE.md\n    topics: {}\n",
+            encoding="utf-8")
+        self.challenge(4)
+        self.write("program/ARCHITECTURE.md", "a\n")
+        self.write("program/adr/0001-a.md", "first\n")
+        ledger = sha256_file(self.root / "program" / "ledger.yaml")
+        approvals = self.root / "program" / "approvals"
+        approvals.mkdir()
+        for stage in (1, 2, 3, 5, 6):  # stages the one-stage coverage map does not list: empty, current records
+            (approvals / f"stage-{stage}.json").write_text(
+                json.dumps({"stage": stage, "at": "x", "artifacts": {}, "ledger_sha256": ledger}), encoding="utf-8")
+        interview.approve(self.root, 4, interview.stage_artifacts(
+            self.root, 4, interview.load_coverage(self.root)["stages"][4]))
+
+    def test_an_adr_added_after_the_approval_is_stale_until_amended(self):
+        self.assertEqual(interview.next_stage(self.root), 7)
+        self.write("program/adr/0002-b.md", "second\n")
+        self.assertEqual(interview.next_stage(self.root), 4)  # a new file in the approved set
+        self.assertEqual(interview.amend(self.root, 4), ["program/adr/0002-b.md"])
+        record = read_json(self.root / "program" / "approvals" / "stage-4.json")
+        self.assertEqual(list(record["artifacts"]),
+                         ["program/ARCHITECTURE.md", "program/adr/0001-a.md", "program/adr/0002-b.md"])
+        self.assertEqual(interview.next_stage(self.root), 7)
+        self.assertEqual(interview.amend(self.root, 4), [])
+
+    def test_replay_of_the_same_files_records_the_set_amend_would(self):
+        self.write("program/adr/0002-b.md", "second\n")
+        interview.amend(self.root, 4)
+        amended = read_json(self.root / "program" / "approvals" / "stage-4.json")["artifacts"]
+        recorded = self.root / "recorded.yaml"
+        write_yaml(recorded, {"sources": SOURCES, "entries": []})
+        artifacts = self.root / "artifacts"
+        for relative in ("ARCHITECTURE.md", "adr/0001-a.md", "adr/0002-b.md"):
+            (artifacts / relative).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(self.root / "program" / relative, artifacts / relative)
+        (artifacts / "reports").mkdir()
+        shutil.copyfile(self.root / "program" / "reports" / "stage-4-challenge.md",
+                        artifacts / "reports" / "stage-4-challenge.md")
+        shutil.rmtree(self.root / "program" / "reports")
+        interview.replay(self.root, recorded, artifacts)
+        replayed = read_json(self.root / "program" / "approvals" / "stage-4.json")["artifacts"]
+        self.assertEqual(replayed, amended)
+        self.assertEqual(interview.amend(self.root, 4), [])
+
+
 class CliTests(InterviewBase):
     def test_cli_round_trip(self):
         code, out, err = self.run_cli("interview", "next")

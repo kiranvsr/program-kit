@@ -40,6 +40,20 @@ QA_BUGS = [  # planted by QA, not by the implementer's producer
 ]
 
 
+def _pip_available() -> bool:
+    try:
+        return subprocess.run(["python3", "-m", "pip", "--version"], capture_output=True).returncode == 0
+    except OSError:
+        return False
+
+
+# The only two things this test needs that a machine may lack: a POSIX sh (install.sh and the tool wrappers are
+# shell scripts) and pip (the python preset's scan step runs `python3 -m pip check`).
+NEEDS_SH = unittest.skipUnless(os.name == "posix" and shutil.which("sh") is not None,
+                               "needs a POSIX sh: install.sh and the tool wrappers are shell scripts")
+NEEDS_PIP = unittest.skipUnless(_pip_available(), "needs pip: the scan step runs `python3 -m pip check`")
+
+
 def _wrapper(directory: Path, name: str, target: str) -> None:
     path = directory / name
     path.write_text(f'#!/bin/sh\nexec "{target}" "$@"\n', encoding="utf-8")
@@ -59,7 +73,9 @@ class Project:
         tools = base / "tools"
         tools.mkdir()
         path = os.environ.get("PATH", "")
-        _wrapper(tools, "gitleaks", "true")  # a stand-in scanner: the python preset runs `gitleaks detect --no-git`
+        # A stand-in scanner that execs `true`. The python preset's scan step runs `gitleaks detect --no-git`; this
+        # test proves the gate calls the scanner and fails without it, not that the scanner finds any secret.
+        _wrapper(tools, "gitleaks", "true")
         self.env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
         self.env.update(PATH=os.pathsep.join([str(tools), path]) if with_gitleaks else path,
                         TMPDIR=str(self.scratch), PROGRAM_KIT_CACHE=str(self.cache),
@@ -104,9 +120,25 @@ class Project:
     def worktree(self) -> Path:
         return self.repo / ".worktrees" / TASK.lower()
 
+    def commit_in_worktree(self, message, *paths):
+        return self.commit(message, *paths, cwd=self.worktree)
+
+    def edit_in_worktree(self, relative, old, new):
+        path = self.worktree / relative
+        text = path.read_text(encoding="utf-8")
+        assert text.count(old) == 1, (relative, old)
+        path.write_text(text.replace(old, new), encoding="utf-8")
+
+    def handback_fails(self):
+        """Run the hand-back gate expecting a refusal; returns its output lines, none of which may be an OK line."""
+        gate = self.pk("gate", "handback", TASK, "--branch", BRANCH, expect=1, env=self.gate_env)
+        lines = gate.stdout.splitlines()
+        assert [ln for ln in lines if ln.startswith("OK: ")] == [], lines
+        return lines
+
     # --- set up: everything up to the point where the implementer hands back ------------
 
-    def prepare(self) -> None:
+    def prepare(self, plan_edit=None) -> None:
         repo = self.repo
         repo.mkdir()
         self.git("init", "-q", "-b", "main")
@@ -115,7 +147,7 @@ class Project:
 
         installed = self.run(["sh", ROOT / "install.sh", repo, "--preset", "python"])
         assert "created" in installed.stdout, installed.stdout  # the installer ran `pk init --preset python` itself
-        self.invoked.add("init")
+        # the installer ran `pk init --preset python` itself; the recorded `pk init` call is the refused one at the end
         self.put(EXAMPLE / "BRIEF.md", repo / "program" / "BRIEF.md")
         self.put(EXAMPLE / "checks.yaml", repo / "program" / "checks.yaml")
         self.put(EXAMPLE / "HANDOFF.md", repo / "program" / "HANDOFF.md")
@@ -139,6 +171,9 @@ class Project:
         # Dispatch: SPEC, PLAN, review and the in_progress status go to main as one commit, then the worktree.
         for name in ("SPEC.md", "PLAN.md", "review.md"):
             self.put(EXAMPLE / "tasks" / TASK / name, repo / "program" / "tasks" / TASK / name)
+        if plan_edit is not None:  # a PLAN the branch cannot fix: the gate reads it from main
+            plan = repo / "program" / "tasks" / TASK / "PLAN.md"
+            plan.write_text(plan_edit(plan.read_text(encoding="utf-8")), encoding="utf-8")
         self.pk("status", "set", TASK, "in_progress", "--role", "controller")
         self.commit(f"dispatch {TASK}")
         files = set(self.git("show", "--name-only", "--format=", "HEAD").splitlines())
@@ -169,6 +204,8 @@ class EndToEndTests(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.base = Path(self._tmp.name).resolve()
 
+    @NEEDS_SH
+    @NEEDS_PIP
     def test_tiny_service_runs_the_whole_loop(self):
         started = time.monotonic()
         project = Project(self.base, with_gitleaks=True)
@@ -320,16 +357,65 @@ class EndToEndTests(unittest.TestCase):
         project.pk("manifest", "check")
         project.pk("init", expect=1)  # program/ exists: init refuses to overwrite it
 
-        pk.build_parser()
+        pk.build_parser()  # fills pk.COMMANDS: only init and doctor register at import, the rest when it is built
         self.assertEqual(sorted(project.invoked), sorted(pk.COMMANDS))
         self.assertTrue(time.monotonic() - started < 120, "the end-to-end test took two minutes or more")
 
+    @NEEDS_SH
+    @NEEDS_PIP
     def test_gate_fails_with_missing_tool_without_gitleaks(self):
         project = Project(self.base, with_gitleaks=False)
         project.prepare()
         gate = project.pk("gate", "handback", TASK, "--branch", BRANCH, expect=1, env=project.gate_env)
         self.assertIn("FAILED: scan missing tool: gitleaks", gate.stdout)
         self.assertEqual([ln for ln in gate.stdout.splitlines() if ln.startswith("OK: ")], [])
+        self.assertFalse((project.worktree / RESULTS).exists())
+
+    @NEEDS_SH
+    @NEEDS_PIP
+    def test_gate_refuses_a_branch_whose_unit_test_fails(self):
+        project = Project(self.base, with_gitleaks=True)
+        project.prepare()
+        project.edit_in_worktree("src/tiny_service.py", 'return 200, {"status": "ok"}', 'return 200, {"status": "down"}')
+        project.commit_in_worktree("break the health answer")
+        lines = project.handback_fails()
+        self.assertIn("FAILED: test python3 -m unittest discover -s src (exit 1)", lines)
+        self.assertFalse((project.worktree / RESULTS).exists())  # nothing was produced past the failed step
+        self.assertEqual([ln for ln in lines if ln.startswith("step ")], ["step build: ok"])
+
+    @NEEDS_SH
+    @NEEDS_PIP
+    def test_a_planted_bug_no_test_catches_is_recorded_not_killed_and_refused(self):
+        project = Project(self.base, with_gitleaks=True)
+        project.prepare()
+        producer = Path(EVIDENCE) / "produce.py"
+        survivor = '    {"id": "comment-only", "path": SERVICE, "find": "a larger request body is refused",\n' \
+                   '     "replace": "bigger bodies are refused"},\n'
+        project.edit_in_worktree(producer.as_posix(), "PLANTED_BUGS = [\n", "PLANTED_BUGS = [\n" + survivor)
+        project.commit_in_worktree("plant a bug the tests cannot see")
+        lines = project.handback_fails()  # the producer writes results.json; the gate then refuses it
+        self.assertIn("FAILED: evidence", lines)
+        self.assertIn("planted_bugs_all_killed: is not true (a planted bug survived)", lines)
+        results_file = project.worktree / RESULTS
+        project.pk("evidence", "validate", results_file, cwd=project.worktree)  # the record itself is well formed
+        results = read_json(results_file)
+        rows = {row["id"]: row for row in results["planted_bugs"]}
+        self.assertEqual((rows["comment-only"]["builds"], rows["comment-only"]["killed"],
+                          rows["comment-only"]["kill_reason"]), (True, False, "not killed"))
+        self.assertFalse(results["planted_bugs_all_killed"])
+        # QA's binding check refuses the same record when it is committed to the branch.
+        project.commit_in_worktree("commit the record anyway", RESULTS)
+        binding = project.pk("gate", "binding", TASK, "--branch", BRANCH, expect=1)
+        self.assertIn(f"error: {RESULTS}: planted_bugs_all_killed: is not true (a planted bug survived)",
+                      binding.stderr)
+
+    @NEEDS_SH
+    @NEEDS_PIP
+    def test_a_plan_command_whose_real_exit_differs_from_the_plan_is_refused(self):
+        project = Project(self.base, with_gitleaks=True)
+        project.prepare(plan_edit=lambda text: text.replace(" # expect 2\n", "\n"))  # real exit is 2, plan says 0
+        lines = project.handback_fails()
+        self.assertIn("FAILED: plan python3 src/tiny_service.py --port abc (exit 2)", lines)
         self.assertFalse((project.worktree / RESULTS).exists())
 
     def test_example_ledger_validates_and_closes_all_required_topics(self):

@@ -36,7 +36,7 @@ Single tenant. The request body is untrusted: at most 1025 bytes are read, it is
 | Body is not JSON, not UTF-8, or empty (400) | `test_echo_refuses_a_body_that_is_not_json`, `..._not_utf8`, `..._an_empty_body` |
 | Body over 1024 bytes (413), exactly 1024 accepted | `test_echo_refuses_a_body_over_the_limit`, `test_echo_takes_a_body_of_exactly_the_limit`, `test_oversized_body_over_http` |
 | Bad Content-Length (400) | `test_bad_content_length_over_http` |
-| Unknown path (404) or wrong method (405) | `test_unknown_path_is_not_found`, `test_health_refuses_other_methods`, `test_echo_refuses_other_methods`, `test_other_methods_get_a_json_answer` |
+| Unknown path (404) or wrong method (405) | `test_unknown_path_is_not_found`, `test_health_refuses_other_methods`, `test_echo_refuses_other_methods`, `test_other_methods_get_a_json_answer`, `test_head_gets_405_with_headers_only` |
 | Process down | not testable in a unit test; the operator restarts it (SPEC.md, Failure Modes) |
 
 ## Observability

@@ -44,9 +44,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
-        self.wfile.write(data)
+        if self.command != "HEAD":  # a HEAD answer has the headers only
+            self.wfile.write(data)
 
-    do_GET = do_POST = do_PUT = do_DELETE = _answer
+    do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = do_HEAD = _answer
 
     def log_message(self, format, *args):
         pass  # no access log yet: that is the next task

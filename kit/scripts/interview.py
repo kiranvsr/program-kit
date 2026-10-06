@@ -574,8 +574,21 @@ def approve(root: Path, stage: int, artifacts: list[Path]) -> Path:
     return path
 
 
-def _stale(root: Path, record, check_ledger: bool) -> bool:
+def _unrecorded(root: Path, stage: int, recorded) -> list[str]:
+    """Files of the stage's current artifact set (`stage_artifacts`) that exist but the approval does not hold."""
+    info = _stage(load_coverage(root), stage)
+    found = []
+    for path in stage_artifacts(root, stage, info):
+        relative = path.resolve().relative_to(Path(root).resolve()).as_posix()
+        if path.is_file() and relative not in recorded:
+            found.append(relative)
+    return found
+
+
+def _stale(root: Path, record, check_ledger: bool, stage: int) -> bool:
     if not isinstance(record, dict) or not isinstance(record.get("artifacts"), dict):
+        return True
+    if _unrecorded(root, stage, record["artifacts"]):  # a file added after the approval, such as a new ADR
         return True
     for relative, recorded in record["artifacts"].items():
         try:
@@ -600,7 +613,7 @@ def next_stage(root: Path) -> int:
     for stage in range(1, last + 1):
         if stage not in approved:
             return stage
-        if _stale(root, read_json(_approval_path(root, stage)), check_ledger=bool(frozen) and stage == frozen[-1]):
+        if _stale(root, read_json(_approval_path(root, stage)), bool(frozen) and stage == frozen[-1], stage):
             return stage
     return PER_TASK_STAGE
 
@@ -620,6 +633,10 @@ def amend(root: Path, stage: int) -> list[str]:
         hashes[relative] = sha256_file(Path(root) / relative)
         if hashes[relative] != recorded:
             changed.append(relative)
+    for relative in _unrecorded(root, stage, record["artifacts"]):  # the same file set approve and replay hash
+        hashes[relative] = sha256_file(Path(root) / relative)
+        changed.append(relative)
+    hashes = dict(sorted(hashes.items()))
     ledger_hash = _ledger_hash(root)
     if ledger_hash is None:
         raise KitError("program/ledger.yaml is missing")
