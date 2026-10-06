@@ -184,6 +184,10 @@ class BriefsTests(BriefsBase):
                          ["P1-M01-S01-T01.md", "P1-M01-S01-T02.md", "P2-M01-S01-T01.md", "junk.md"])
         code, out, err = self.run_cli("briefs", "check")
         self.assertEqual((code, out, len(err.splitlines())), (1, "", 1))
+        approvals = self.root / "program" / "approvals"  # under an approved register it is still one line:
+        approvals.mkdir(parents=True, exist_ok=True)     # a link is not drift, so no freeze hint follows it
+        (approvals / "stage-6.json").write_text("{}\n")
+        self.assertEqual(briefs.check(self.root), problems)
 
     def test_a_symlinked_brief_root_or_nested_directory_is_one_problem_line(self):
         briefs.generate(self.root)

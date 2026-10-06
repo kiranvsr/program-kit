@@ -252,9 +252,14 @@ def check(root: Path) -> list[str]:
             raise KitError(f"cannot read {root / rel}: {exc.strerror or exc}") from exc
         if current != data:
             problems.append(f"{rel}: differs from the register")
-    problems += [f"{rel}: is a symbolic link; generated briefs are never links" if rel in links
-                 else f"{rel}: not generated from the register" for rel in _stale(root, files)]
-    if problems:
+    drift = len(problems)
+    for rel in _stale(root, files):
+        if rel in links:
+            problems.append(f"{rel}: is a symbolic link; generated briefs are never links")
+        else:
+            problems.append(f"{rel}: not generated from the register")
+            drift += 1
+    if drift:  # a link is not drift from the register: it gets its own line and no freeze hint
         approval = root / "program" / "approvals" / "stage-6.json"
         log = root / "program" / "changes" / "register-log.md"
         if approval.exists() and not (log.exists() and log.stat().st_mtime_ns > approval.stat().st_mtime_ns):
