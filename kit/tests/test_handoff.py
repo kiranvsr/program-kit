@@ -182,6 +182,14 @@ class RenderTests(HandoffBase):
         self.assertIn("- not in register: P1-M01-S01-T02, P9-M01-S01-T01", handoff.render(self.root))
 
 
+    def test_a_malformed_register_is_one_error_not_a_traceback(self):
+        write_yaml(self.root / "program" / "register.yaml",
+                   {"phases": [{"id": "P1", "title": "p", "gate": None, "milestones": 7}]})
+        with self.assertRaises(KitError) as caught:
+            handoff.render(self.root)
+        self.assertIn("program/register.yaml is malformed", str(caught.exception))
+
+
 class UpdateTests(HandoffBase):
     def test_update_touches_only_marked_block(self):
         self.put_status(T1, "in_progress")

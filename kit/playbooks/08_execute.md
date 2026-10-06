@@ -17,7 +17,7 @@ Build the register's tasks one at a time with an implementer, independent QA and
 2. Choose the next task in dependency order. Its SPEC and PLAN are accepted. Count running agents: at most three implementers and four agents in all.
 3. Dispatch. The gate reads the SPEC, the PLAN and `checks.yaml` from main, so they must be on main first.
    - `pk status set <ID> in_progress --role controller`.
-   - Commit the SPEC, the PLAN and that status file to main together, as one commit.
+   - Commit the SPEC, the PLAN, the spec-QA `review.md` and that status file to main together, as one commit.
    - Then `pk worktree new <ID>` creates the worktree and the branch `task/<ID>`. From here on the status record changes only on the task branch.
    - Give the implementer `kit/briefs/implementer.md`, the task brief, the SPEC, the PLAN, the rules, the full text of the rulings the SPEC cites, and the report path `program/evidence/<ID>/report.md` (written after the gate passes and committed with `results.json` in the evidence commit).
 4. Build (implementer). Test first, and build exactly the PLAN's boundary.

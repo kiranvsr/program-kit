@@ -20,8 +20,8 @@ You own one task. You work in its own git worktree on branch `task/<ID>`, test f
 6. Make sure the tree is clean and the project's ignore file covers the bytecode and build output your commands write.
 7. From the main checkout, run the gate and wait for it in the background: `pk gate handback <ID> --branch task/<ID>`. It runs the guarded-file check, a trial merge with the build and compile checks, the project's tests, scans and extra gate commands, your PLAN commands, your producer, and the stale check. A failed gate can leave `results.json` behind: restore or delete it by its exact path before you run the gate again.
 8. If the last line is not exactly `OK: <branch> passes the hand-back gate at <sha>`, read the failing step and its tail, fix it, commit, and run the gate again. Exit code 0 alone is never a pass.
-9. After the gate passes, in your worktree run `pk status set <ID> review --role implementer --evidence program/evidence/<ID>/results.json`, then make one commit containing `results.json` and the status file and nothing else. That is the evidence commit. From now on the status record changes only on this branch.
-10. After the gate has passed, write your report to `program/evidence/<ID>/report.md` and commit it together with `results.json` as the evidence commit: the binding check allows later commits to touch only your evidence directory and status file, so the report lives there and nowhere else on your branch. Then stop. Fix rounds come back to you; answer them with the finding-to-fix table.
+9. After the gate passes, write your report to `program/evidence/<ID>/report.md`. Then, in your worktree, run `pk status set <ID> review --role implementer --evidence program/evidence/<ID>/results.json` and make one commit containing `results.json`, `report.md` and the status file and nothing else. That is the evidence commit. From now on the status record changes only on this branch.
+10. Stop. The binding check allows commits after the gated one to touch only your evidence directory and your status file, which is why the report lives in the evidence directory and nowhere else on your branch. Fix rounds come back to you; answer them with the finding-to-fix table.
 
 ## Needs context
 
@@ -29,12 +29,12 @@ Stop with NEEDS_CONTEXT only for: a new dependency; a security boundary with no 
 
 ## Report shape
 
-Write the report to `program/evidence/<ID>/report.md`, as step 10 says. Fixed headings, under 25 lines:
+Write the report to `program/evidence/<ID>/report.md`, as step 9 says. Fixed headings, under 25 lines:
 
 ```
 # Report: <ID>
 ## Status        DONE, DONE_WITH_CONCERNS, NEEDS_CONTEXT or BLOCKED
-## Commits       gated commit sha; evidence commit sha
+## Commits       gated commit sha (the evidence commit is the one holding this report)
 ## Gate          the last line of the hand-back gate, verbatim
 ## Commands      each PLAN command with its exit code
 ## Failure modes SPEC row -> test name, one line each

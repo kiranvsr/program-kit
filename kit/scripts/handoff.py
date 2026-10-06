@@ -94,7 +94,11 @@ def render(root: Path, main: str = "main") -> str:
         counts[record["status"]] = counts.get(record["status"], 0) + 1
     unregistered: list[str] = []
     if (root / "program" / "register.yaml").exists():
-        in_register = {task_id for task_id, _ in trace_module._register_tasks(register_module.load(root))}
+        try:  # a hand-edited register of the wrong shape must be one error line, never a traceback
+            in_register = {task_id for task_id, _ in trace_module._register_tasks(register_module.load(root))}
+        except (TypeError, AttributeError, KeyError) as error:
+            raise KitError(f"program/register.yaml is malformed ({type(error).__name__}); "
+                           "run: pk register validate") from None
         recorded = {record["task_id"] for record in records}
         counts["not_started"] += len(in_register - recorded)  # no status record yet means not started
         unregistered = sorted(recorded - in_register)
