@@ -2,6 +2,9 @@ import _paths  # noqa: F401  (must come first: puts kit/scripts on sys.path)
 import contextlib
 import io
 import os
+import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -75,7 +78,7 @@ class PkTests(unittest.TestCase):
 
     def test_init_leaves_no_staging_directory(self):
         self.run_pk("init")
-        self.assertEqual(sorted(p.name for p in self.tmp.iterdir()), [".git", "program"])
+        self.assertEqual(sorted(p.name for p in self.tmp.iterdir()), [".git", ".gitignore", "program"])
 
     def test_init_with_preset_copies_checks(self):
         preset = KIT / "presets" / "checks.python.yaml"
@@ -97,8 +100,18 @@ class PkTests(unittest.TestCase):
         self.assertTrue(err.startswith("error: ") and err.count("\n") == 1, err)
         self.assertFalse((self.tmp / "program").exists())
 
+    def git_repo(self, branch="main", commit=False):
+        """Replace the fake .git directory with a real repository whose HEAD is `branch`."""
+        shutil.rmtree(self.tmp / ".git")
+        subprocess.run(["git", "init", "-q", str(self.tmp)], check=True)
+        subprocess.run(["git", "-C", str(self.tmp), "symbolic-ref", "HEAD", f"refs/heads/{branch}"], check=True)
+        if commit:
+            subprocess.run(["git", "-C", str(self.tmp), "-c", "user.name=T", "-c", "user.email=t@e.x",
+                            "commit", "-q", "--allow-empty", "-m", "c"], check=True)
+
     def test_doctor_ok_after_init(self):
-        self.run_pk("init")
+        self.git_repo()
+        self.run_pk("init", "--preset", "python")
         rc, out, err = self.run_pk("doctor")
         self.assertEqual((rc, out, err), (0, "doctor: ok\n", ""))
 
@@ -114,6 +127,67 @@ class PkTests(unittest.TestCase):
         self.assertEqual((rc, out), (1, ""))
         self.assertTrue(err.startswith("error: ") and "checks.yaml" in err and err.count("\n") == 1, err)
 
+    def test_doctor_refuses_a_repository_without_a_main_branch(self):
+        self.git_repo("master", commit=True)
+        self.run_pk("init", "--preset", "python")
+        rc, out, err = self.run_pk("doctor")
+        self.assertEqual((rc, out), (1, ""))
+        self.assertTrue(err.startswith("error: ") and err.count("\n") == 1, err)
+        self.assertIn("main", err)
+        self.assertIn("git branch -m main", err)
+
+    def test_doctor_accepts_main_before_and_after_the_first_commit(self):
+        self.git_repo("main")
+        self.run_pk("init", "--preset", "go")
+        self.assertEqual(self.run_pk("doctor"), (0, "doctor: ok\n", ""))
+        self.git_repo("main", commit=True)
+        self.assertEqual(self.run_pk("doctor"), (0, "doctor: ok\n", ""))
+
+    def checks_doctor(self, text):
+        self.git_repo()
+        self.run_pk("init", "--preset", "python")
+        (self.tmp / "program" / "checks.yaml").write_text(text)
+        return self.run_pk("doctor")
+
+    def test_doctor_validates_checks_yaml_like_the_gate(self):
+        rc, out, err = self.checks_doctor("build: go build\ntest:\n  - - go\n    - test\nscan:\n  - - gitleaks\n")
+        self.assertEqual((rc, out), (1, ""))
+        self.assertEqual(err.count("\n"), 1, err)
+        self.assertRegex(err, r"^error: checks\.yaml: .*build.*argv")
+
+    def test_doctor_reports_every_problem_on_its_own_line(self):
+        rc, out, err = self.checks_doctor("build: go build\ntest:\n  - [go]\nscan: []\n")
+        self.assertEqual((rc, out), (1, ""))  # a flow list is already a reader error: one line naming the line
+        self.assertEqual(err.count("\n"), 1, err)
+        rc, out, err = self.checks_doctor(
+            "build: go build\ntest:\n  - a b\nscan: []\ncompile_check:\n  - - ''\nguarded_files: x\nextra: 1\n")
+        self.assertEqual((rc, out), (1, ""))
+        lines = err.splitlines()
+        self.assertTrue(all(line.startswith("error: checks.yaml: ") for line in lines), err)
+        self.assertEqual(len(lines), 6, err)
+        for line, pattern in zip(lines, (r"build.*list of argv lists", r"every test command", r"scan must list",
+                                         r"every compile_check command", r"guarded_files must be a list",
+                                         r"unknown key extra")):
+            self.assertRegex(line, pattern)
+
+    def test_doctor_requires_a_command_in_build_test_and_scan(self):
+        self.git_repo()
+        self.run_pk("init")  # the unfilled template lists none
+        rc, out, err = self.run_pk("doctor")
+        self.assertEqual((rc, out), (1, ""))
+        lines = err.splitlines()
+        self.assertEqual(len(lines), 3, err)
+        for line, step in zip(lines, ("build", "test", "scan")):
+            self.assertEqual(line, f"error: checks.yaml: {step} must list at least one command")
+
+    def test_doctor_reports_checks_problems_together_with_the_branch_problem(self):
+        self.git_repo("master")
+        self.run_pk("init")
+        rc, out, err = self.run_pk("doctor")
+        self.assertEqual(rc, 1)
+        self.assertEqual(len(err.splitlines()), 4, err)
+        self.assertIn("git branch -m main", err.splitlines()[-1])
+
     def test_doctor_reports_old_python(self):
         self.run_pk("init")
         with mock.patch.object(pk.sys, "version_info", (3, 10, 9, "final", 0)):
@@ -127,6 +201,30 @@ class PkTests(unittest.TestCase):
             rc, out, err = self.run_pk("doctor")
         self.assertEqual((rc, out), (1, ""))
         self.assertTrue(err.startswith("error: ") and "git" in err, err)
+
+    def test_init_adds_the_ignore_lines_and_keeps_existing_ones(self):
+        (self.tmp / ".gitignore").write_bytes(b"dist/\n*.pyc")
+        rc, out, err = self.run_pk("init")
+        self.assertEqual((rc, err), (0, ""))
+        self.assertEqual((self.tmp / ".gitignore").read_bytes(), b"dist/\n*.pyc\n__pycache__/\n.worktrees/\n")
+
+    def test_init_creates_gitignore_with_the_three_lines(self):
+        self.run_pk("init")
+        self.assertEqual((self.tmp / ".gitignore").read_text(), "__pycache__/\n*.pyc\n.worktrees/\n")
+
+    def test_running_pk_never_writes_bytecode(self):
+        scripts = self.tmp / "scripts"
+        shutil.copytree(KIT / "scripts", scripts, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        env = {k: v for k, v in os.environ.items() if k != "PYTHONDONTWRITEBYTECODE"}
+        run = lambda *argv: subprocess.run([sys.executable, *argv], cwd=self.tmp, env=env,  # noqa: E731
+                                           capture_output=True, text=True)
+        run(str(scripts / "pk.py"), "doctor")
+        run(str(scripts / "pk.py"), "manifest", "check")
+        self.assertEqual(sorted(p.relative_to(scripts).as_posix() for p in scripts.rglob("*.pyc")), [])
+        self.assertFalse((scripts / "__pycache__").exists())
+        # the control: the same modules imported without pk's flag do leave bytecode behind
+        run("-c", f"import sys; sys.path.insert(0, {str(scripts)!r}); import common")
+        self.assertTrue(any(scripts.rglob("*.pyc")))
 
     def test_unknown_command_exits_1(self):
         rc, out, err = self.run_pk("frobnicate")

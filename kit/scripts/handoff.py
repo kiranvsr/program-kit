@@ -26,7 +26,7 @@ import status as status_module
 import trace as trace_module
 import worktree as worktree_module
 import register as register_module
-from common import KitError, find_root, git, read_json, write_text
+from common import KitError, find_root, git, primary_branch_problem, read_json, write_text
 
 START, END = "<!-- generated:start -->", "<!-- generated:end -->"
 COMMIT_PREFIX = "Commit: "
@@ -105,6 +105,9 @@ def render(root: Path, main: str = "main") -> str:
     flying = [f"{_line(r['task_id'])} ({r['status']}): "
               f"{_line(state['stage'].get(r['task_id'], '')) or '(no stage text)'}"
               for r in records if r["status"] in IN_FLIGHT]
+    problem = primary_branch_problem(root, main, need_commit=True)
+    if problem:
+        raise KitError(problem)
     branches = [_line(ref[len("refs/heads/"):]) for ref in git(
         root, "for-each-ref", "--format=%(refname)", f"--no-merged={main}", "refs/heads/").splitlines()]
     trees = [line for item in worktree_module.list_all(root) if (line := _worktree_line(root, item))]

@@ -1,4 +1,5 @@
 import _paths  # noqa: F401  (must come first: puts kit/scripts/ on sys.path)
+import shutil
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -267,6 +268,37 @@ class CheckTests(HandoffBase):
         self.assertNotEqual(edited, lines)
         self.write_handoff("".join(edited))
         self.assertTrue(handoff.check(self.root))
+
+
+class PrimaryBranchTests(HandoffBase):
+    """Finding 9 and lesser 12: no main is one clear line; a fresh project counts no placeholder task."""
+
+    def test_a_repository_without_main_gets_the_rename_line_not_a_git_failure(self):
+        sh(self.root, "git", "branch", "-m", "master")
+        for action in ("update", "check"):
+            code, out, err = run_cli("handoff", self.root, "handoff", action)
+            self.assertEqual((code, out), (1, ""), action)
+            self.assertTrue(err.startswith("error: ") and err.count("\n") == 1, err)
+            self.assertIn("git branch -m main", err)
+            self.assertNotIn("malformed object name", err)
+        with self.assertRaises(KitError) as caught:
+            handoff.render(self.root)
+        self.assertIn("git branch -m main", str(caught.exception))
+
+    def test_main_before_the_first_commit_says_so(self):
+        sh(self.root, "git", "update-ref", "-d", "refs/heads/main")
+        code, out, err = run_cli("handoff", self.root, "handoff", "update")
+        self.assertEqual((code, out), (1, ""))
+        self.assertTrue(err.startswith("error: ") and err.count("\n") == 1, err)
+        self.assertIn("no commits", err)
+
+    def test_a_fresh_projects_handoff_counts_no_tasks(self):
+        shutil.copy(KIT / "templates" / "register.yaml", self.root / "program" / "register.yaml")
+        shutil.copy(KIT / "templates" / "HANDOFF.md", self.file)
+        handoff.update(self.root)
+        text = self.text()
+        self.assertIn("- not_started: 0", text)
+        self.assertNotIn("not in register", text)
 
 
 if __name__ == "__main__":

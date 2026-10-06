@@ -251,5 +251,34 @@ class NeutralityTests(unittest.TestCase):
                 self.assertIn(f"`{line}`", (HANDBACK_LINE, MERGE_LINE), f"{path.name}: unexpected OK line")
 
 
+YAML_FENCE = re.compile(r"^```ya?ml\n(.*?)^```", re.M | re.S)
+CODE_SPAN = re.compile(r"`([^`\n]+)`")
+FLOW_IN_TEXT = re.compile(r"(?:^|[\s:(])[\[{](?![\]}])")
+OWNED_PLAYBOOKS = ("06_register.md", "07_task_specs.md", "09_handoff.md")
+
+
+class TaughtYamlTests(unittest.TestCase):
+    """Finding 10: nothing the kit teaches is YAML its own reader rejects."""
+
+    def test_yaml_fences_in_owned_playbooks_parse_with_the_kit_reader(self):
+        import miniyaml
+        for name in OWNED_PLAYBOOKS:
+            for block in YAML_FENCE.findall(read(PLAYBOOK_DIR / name)):
+                with self.subTest(name, block=block[:40]):
+                    miniyaml.loads(block)
+
+    def test_no_inline_example_teaches_a_flow_collection(self):
+        files = [PLAYBOOK_DIR / name for name in OWNED_PLAYBOOKS]
+        files += [KIT.parent / "README.md", KIT.parent / "docs" / "FAQ.md"]
+        for path in files:
+            for span in CODE_SPAN.findall(read(path)):
+                self.assertIsNone(FLOW_IN_TEXT.search(span), f"{path.name}: `{span}`")
+
+    def test_the_register_playbook_teaches_blocked_by_as_a_block_list(self):
+        step = [line for line in read(PLAYBOOK_DIR / "06_register.md").splitlines() if "blocked_by" in line][0]
+        self.assertNotIn("[", step)
+        self.assertIn("- <environment>", step)
+
+
 if __name__ == "__main__":
     unittest.main()

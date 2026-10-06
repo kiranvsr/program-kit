@@ -155,6 +155,28 @@ class RegisterTests(unittest.TestCase):
             self.assertIn(f"${field}", brief, field)  # and the brief template really uses the field
             self.assertNotRegex(text, rf"(?m)^\s*{field}:", field)
 
+    def test_environment_hint_teaches_block_style_the_reader_accepts(self):
+        tid = "P1-M01-S01-T01"
+        message = self.messages(reg(task(tid, environments=["staging"])), ENVS)[0]
+        self.assertNotRegex(message, r"[\[{]")  # no flow collection anywhere in the advice
+        self.assertIn("blocked_by:", message)
+        self.assertIn("- staging", message)
+        with tempfile.TemporaryDirectory() as tmp:  # and the advice, followed literally, validates
+            path = Path(tmp) / "register.yaml"
+            path.write_text(
+                "phases:\n  - id: P1\n    title: p\n    milestones:\n      - id: P1-M01\n        title: m\n"
+                "        steps:\n          - id: P1-M01-S01\n            title: s\n            tasks:\n"
+                f"              - id: {tid}\n                title: t\n                text: x\n"
+                "                role: backend\n                size: S\n                environments:\n"
+                "                  - staging\n                blocked_by:\n                  - staging\n",
+                encoding="utf-8")
+            self.assertEqual(self.messages(read_yaml(path), ENVS), [])
+            # the same list written at the key's indent (the default of common YAML writers) reads the same
+            path.write_text(path.read_text(encoding="utf-8").replace("                  - staging",
+                                                                       "                - staging"),
+                            encoding="utf-8")
+            self.assertEqual(self.messages(read_yaml(path), ENVS), [])
+
     def test_validate_checks_ids_gates_and_closes(self):
         a = "P1-M01-S01-T01"
         problems = self.messages(reg(task(a, closes=["REQ-001", "NFR-012", "J3", "REQ-1", "X-001"], gate="BETA"),
@@ -201,9 +223,9 @@ class RegisterTests(unittest.TestCase):
         template = read_yaml(KIT / "templates" / "register.yaml")
         self.assertEqual(register.validate(template, read_yaml(KIT / "templates" / "environments.yaml"), roles), [])
         self.assertEqual(register.assign_ids(template), template)
-        only = template["phases"][0]["milestones"][0]["steps"][0]["tasks"][0]
-        self.assertEqual((only["role"], only["size"], only["environments"], only["depends_on"], only["closes"]),
-                         ("backend", "S", [], [], []))
+        # No placeholder task: hand-off and status would count it as a real task that has not started.
+        self.assertEqual(template, {"phases": []})
+        self.assertEqual(register.task_count(template), 0)
 
 
 class RegisterCliTests(unittest.TestCase):

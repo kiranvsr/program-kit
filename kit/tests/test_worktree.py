@@ -140,5 +140,32 @@ class WorktreeTests(unittest.TestCase):
         self.assertTrue(err.startswith("error: "))
 
 
+class PrimaryBranchTests(unittest.TestCase):
+    """Finding 9: the primary branch is main; anything else is one clear line, not a git failure."""
+
+    def test_new_on_a_repository_without_main_says_how_to_rename(self):
+        root = make_repo(self)
+        sh(root, "git", "branch", "-m", "master")
+        with self.assertRaises(KitError) as caught:
+            worktree.new(root, T1)
+        self.assertIn("git branch -m main", str(caught.exception))
+        self.assertNotIn("resolve", str(caught.exception))
+        code, out, err = run_cli("worktree", root, "worktree", "new", T1)
+        self.assertEqual((code, out), (1, ""))
+        self.assertTrue(err.startswith("error: ") and err.count("\n") == 1, err)
+        self.assertIn("git branch -m main", err)
+        self.assertFalse((root / ".worktrees").exists())
+
+    def test_new_before_the_first_commit_says_so(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name).resolve()
+        sh(root, "git", "init", "-q", "-b", "main")
+        with self.assertRaises(KitError) as caught:
+            worktree.new(root, T1)
+        self.assertIn("no commits", str(caught.exception))
+        self.assertNotIn("\n", str(caught.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

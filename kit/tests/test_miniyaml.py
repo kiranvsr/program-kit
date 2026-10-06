@@ -99,5 +99,53 @@ class MiniYamlTests(unittest.TestCase):
         self.assertEqual(miniyaml.loads("a: 1\r\nb:\r\n  - x\r\n"), {"a": 1, "b": ["x"]})
 
 
+class SameIndentSequenceTests(unittest.TestCase):
+    """A block sequence may sit at the same indent as its key (the default output of common YAML writers)."""
+
+    def test_sequence_at_the_key_indent(self):
+        self.assertEqual(miniyaml.loads("a:\n- 1\n- two\nb: x\n"), {"a": [1, "two"], "b": "x"})
+        self.assertEqual(miniyaml.loads("a:\n- 1\n"), {"a": [1]})
+
+    def test_nesting(self):
+        text = ("items:\n- name: a\n  tags:\n  - x\n  - y\n  other: 1\n- name: b\n  tags: []\n"
+                "deep:\n  inner:\n  - 1\n  - - 2\n    - 3\n  after: z\nlast:\n")
+        self.assertEqual(miniyaml.loads(text), {
+            "items": [{"name": "a", "tags": ["x", "y"], "other": 1}, {"name": "b", "tags": []}],
+            "deep": {"inner": [1, [2, 3]], "after": "z"}, "last": None})
+        self.assertEqual(miniyaml.loads("a:\n- b:\n  - c\n- d\n"), {"a": [{"b": ["c"]}, "d"]})
+
+    def test_ambiguous_cases_keep_their_yaml_meaning(self):
+        # A key inside a list item is indented past the dash, so a dash at the dash column is the next item.
+        self.assertEqual(miniyaml.loads("- a:\n- b\n"), [{"a": None}, "b"])
+        self.assertEqual(miniyaml.loads("k:\n- a:\n- b\n"), {"k": [{"a": None}, "b"]})
+        # A key with nothing under it and a dash only deeper than the key is the old form.
+        self.assertEqual(miniyaml.loads("a:\n  - 1\nb:\n  - 2\n"), {"a": [1], "b": [2]})
+        # Null key followed by another key at the same indent stays null.
+        self.assertEqual(miniyaml.loads("a:\nb:\n- 1\n"), {"a": None, "b": [1]})
+
+    def test_nothing_else_is_newly_accepted(self):
+        for text, line in (("a: 1\n- b\n", "line 2"),            # a dash after a scalar value
+                           ("a:\n- 1\nx\n", "line 3"),           # a non-key line after the list
+                           ("a:\n- 1\n  - 2\n", "line 3"),       # a deeper dash after a scalar item
+                           ("a:\n- 1\n b: 2\n", "line 3"),       # off-column key
+                           ("a:\n  - 1\n- 2\n", "line 3"),       # dash back at the key indent after a deeper list
+                           ("- a\nb:\n- c\n", "line 2")):
+            with self.assertRaisesRegex(miniyaml.YAMLError, line, msg=repr(text)):
+                miniyaml.loads(text)
+
+    def test_duplicate_key_after_a_same_indent_list_is_still_rejected(self):
+        with self.assertRaisesRegex(miniyaml.YAMLError, "line 4"):
+            miniyaml.loads("a:\n- 1\nb: 2\na: 3\n")
+
+
+class ByteOrderMarkTests(unittest.TestCase):
+    def test_a_leading_bom_is_ignored(self):
+        self.assertEqual(miniyaml.loads("\ufeffa: 1\nb:\n  - x\n"), {"a": 1, "b": ["x"]})
+        self.assertIsNone(miniyaml.loads("\ufeff# only a comment\n"))
+
+    def test_a_bom_anywhere_else_is_not_stripped(self):
+        self.assertEqual(miniyaml.loads("a: \ufeffx\n"), {"a": "\ufeffx"})
+
+
 if __name__ == "__main__":
     unittest.main()

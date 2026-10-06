@@ -1,6 +1,8 @@
 import _paths  # noqa: F401  (must come first: puts kit/scripts on sys.path)
 import json
+import os
 import re
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -57,7 +59,7 @@ class CommonTests(unittest.TestCase):
         self.assertEqual(target.stat().st_mode & 0o777, 0o640)
         self.assertEqual([p.name for p in target.parent.iterdir()], ["f.txt"])  # no temp file left behind
         with mock.patch("os.replace", side_effect=OSError("boom")):
-            with self.assertRaises(OSError):
+            with self.assertRaisesRegex(KitError, r"cannot write .*f\.txt: boom"):
                 common.write_text(target, "three\n")
         self.assertEqual(target.read_text(), "two\n")  # the old content survives a failed write
         self.assertEqual([p.name for p in target.parent.iterdir()], ["f.txt"])
@@ -142,6 +144,162 @@ class CommonTests(unittest.TestCase):
         # "ambiguous argument" appears only in git's stderr, not in the echoed args
         self.assertRegex(str(ctx.exception), r"fatal: .*(ambiguous argument|unknown revision)")
         self.assertNotIn("\n", str(ctx.exception))
+
+
+class WriteFailureTests(unittest.TestCase):
+    """Finding 12: a write that fails is one KitError line, never an OSError traceback."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(self._tmp.name).resolve()
+
+    def writers(self, target):
+        return (lambda: common.write_text(target, "x\n"), lambda: common.write_json(target, {"a": 1}),
+                lambda: common.write_yaml(target, {"a": 1}))
+
+    def test_a_parent_that_is_a_file_is_a_kit_error(self):
+        (self.tmp / "blocker").write_text("a file, not a directory\n")
+        for write in self.writers(self.tmp / "blocker" / "sub" / "f.txt"):
+            with self.assertRaisesRegex(KitError, r"cannot write .*f\.txt"):
+                write()
+
+    def test_a_target_that_is_a_directory_is_a_kit_error(self):
+        (self.tmp / "dir").mkdir()
+        for write in self.writers(self.tmp / "dir"):
+            with self.assertRaisesRegex(KitError, r"cannot write .*dir"):
+                write()
+        self.assertEqual([p.name for p in self.tmp.iterdir()], ["dir"])  # no temp file left behind
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root ignores directory permissions")
+    def test_a_read_only_directory_is_a_kit_error(self):
+        locked = self.tmp / "locked"
+        locked.mkdir()
+        locked.chmod(0o555)
+        self.addCleanup(locked.chmod, 0o755)
+        for write in self.writers(locked / "f.txt"):
+            with self.assertRaises(KitError) as caught:
+                write()
+            self.assertNotIn("\n", str(caught.exception))
+            self.assertIn("f.txt", str(caught.exception))
+
+    def test_text_that_cannot_be_encoded_is_a_kit_error(self):
+        with self.assertRaisesRegex(KitError, r"cannot write .*f\.txt"):
+            common.write_text(self.tmp / "f.txt", "bad \ud800 surrogate")
+        self.assertEqual(list(self.tmp.iterdir()), [])
+
+    def test_a_failure_while_writing_the_temp_file_is_a_kit_error(self):
+        with mock.patch("os.fsync", side_effect=OSError(28, "No space left on device")):
+            with self.assertRaisesRegex(KitError, "No space left on device"):
+                common.write_text(self.tmp / "f.txt", "x\n")
+        self.assertEqual(list(self.tmp.iterdir()), [])
+
+
+class MalformedInputTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(self._tmp.name).resolve()
+
+    def test_deeply_nested_yaml_is_a_kit_error(self):
+        path = self.tmp / "deep.yaml"
+        path.write_text("".join(" " * i + "k:\n" for i in range(3000)) + " " * 3000 + "v: 1\n")
+        with self.assertRaisesRegex(KitError, r"deep\.yaml.*nested too deeply"):
+            common.read_yaml(path)
+        nest: object = 1
+        for _ in range(3000):
+            nest = [nest]
+        with self.assertRaisesRegex(KitError, "nested too deeply"):
+            common.write_yaml(self.tmp / "out.yaml", nest)
+        self.assertEqual(list(self.tmp.glob("out*")), [])
+
+    def test_non_utf8_and_binary_files_are_kit_errors(self):
+        path = self.tmp / "bin.yaml"
+        path.write_bytes(b"a: \xff\xfe\n")
+        for read in (common.read_yaml, common.read_json):
+            with self.assertRaisesRegex(KitError, r"bin\.yaml"):
+                read(path)
+
+    def test_a_leading_byte_order_mark_is_stripped_from_yaml_and_json(self):
+        yaml_path, json_path = self.tmp / "b.yaml", self.tmp / "b.json"
+        yaml_path.write_bytes(b"\xef\xbb\xbfbuild:\n  - - make\n")
+        json_path.write_bytes(b"\xef\xbb\xbf{\"a\": 1}\n")
+        self.assertEqual(common.read_yaml(yaml_path), {"build": [["make"]]})
+        self.assertEqual(common.read_json(json_path), {"a": 1})
+
+
+class GitignoreTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name).resolve()
+
+    def test_lines_are_the_three_the_kit_needs(self):
+        self.assertEqual(common.GITIGNORE_LINES, ("__pycache__/", "*.pyc", ".worktrees/"))
+
+    def test_creates_the_file_when_absent(self):
+        self.assertEqual(common.ensure_gitignore(self.root), list(common.GITIGNORE_LINES))
+        self.assertEqual((self.root / ".gitignore").read_text(), "__pycache__/\n*.pyc\n.worktrees/\n")
+
+    def test_appends_only_the_missing_lines_and_keeps_existing_bytes(self):
+        original = b"# mine\r\nnode_modules/\r\n*.pyc\r\n.env"  # CRLF, no final newline
+        (self.root / ".gitignore").write_bytes(original)
+        self.assertEqual(common.ensure_gitignore(self.root), ["__pycache__/", ".worktrees/"])
+        data = (self.root / ".gitignore").read_bytes()
+        self.assertTrue(data.startswith(original))
+        self.assertEqual(data[len(original):], b"\n__pycache__/\n.worktrees/\n")
+
+    def test_a_complete_file_is_left_alone(self):
+        text = "x\n.worktrees/\n__pycache__/\n*.pyc\n"
+        (self.root / ".gitignore").write_text(text)
+        before = (self.root / ".gitignore").stat().st_mtime_ns
+        self.assertEqual(common.ensure_gitignore(self.root), [])
+        self.assertEqual((self.root / ".gitignore").read_text(), text)
+        self.assertEqual((self.root / ".gitignore").stat().st_mtime_ns, before)
+
+    def test_an_unwritable_gitignore_is_a_kit_error(self):
+        (self.root / ".gitignore").mkdir()
+        with self.assertRaisesRegex(KitError, r"\.gitignore"):
+            common.ensure_gitignore(self.root)
+
+
+class PrimaryBranchTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name).resolve()
+
+    def repo(self, branch):
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        subprocess.run(["git", "-C", str(self.root), "symbolic-ref", "HEAD", f"refs/heads/{branch}"], check=True)
+
+    def commit(self):
+        subprocess.run(["git", "-C", str(self.root), "-c", "user.name=T", "-c", "user.email=t@e.x",
+                        "commit", "-q", "--allow-empty", "-m", "c"], check=True)
+
+    def test_a_repository_on_master_names_the_rename(self):
+        self.repo("master")
+        self.commit()
+        message = common.primary_branch_problem(self.root)
+        self.assertIn("main", message)
+        self.assertIn("git branch -m main", message)
+        self.assertNotIn("\n", message)
+
+    def test_main_is_fine_with_or_without_commits(self):
+        self.repo("main")
+        self.assertIsNone(common.primary_branch_problem(self.root))  # unborn main: allowed
+        self.assertIn("no commits", common.primary_branch_problem(self.root, need_commit=True))
+        self.commit()
+        self.assertIsNone(common.primary_branch_problem(self.root, need_commit=True))
+
+    def test_main_exists_while_another_branch_is_checked_out(self):
+        self.repo("main")
+        self.commit()
+        subprocess.run(["git", "-C", str(self.root), "checkout", "-q", "-b", "feature"], check=True)
+        self.assertIsNone(common.primary_branch_problem(self.root, need_commit=True))
+
+    def test_not_a_repository_is_reported(self):
+        self.assertIn("git", common.primary_branch_problem(self.root))
 
 
 if __name__ == "__main__":

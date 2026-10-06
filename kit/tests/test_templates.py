@@ -3,7 +3,9 @@ import re
 import unittest
 from pathlib import Path
 
+import miniyaml
 from _tokens import FORBIDDEN
+from common import read_yaml
 
 TEMPLATES = Path(__file__).resolve().parent.parent / "templates"
 NEW_TEMPLATES = ("discovery.md", "product.md", "SPEC.md", "ARCHITECTURE.md", "adr.md", "roadmap.md",
@@ -46,6 +48,89 @@ class TemplateTests(unittest.TestCase):
     def test_lens_sections_in_freeze_review(self):
         self.assertEqual(headings("freeze_review.md")[:5],
                          ["Architect", "Engineering", "Program", "Project", "Delivery"])
+
+
+FLOW = re.compile(r"[\[{](?![\]}])")  # a flow collection with something inside; [] and {} are the empty literals
+
+
+def yaml_templates() -> list[Path]:
+    return sorted(TEMPLATES.glob("*.yaml"))
+
+
+def example_blocks(text: str) -> list[str]:
+    """The runs of consecutive example comment lines of a YAML file, uncommented."""
+    blocks, current = [], []
+    for line in text.splitlines():
+        if line.startswith("#   "):
+            current.append(line[4:])
+        else:
+            if current:
+                blocks.append("\n".join(current) + "\n")
+            current = []
+    if current:
+        blocks.append("\n".join(current) + "\n")
+    return blocks
+
+
+class YamlTemplateTests(unittest.TestCase):
+    """Finding 10: every YAML shape a template teaches is block style, and the kit's own reader accepts it."""
+
+    def test_every_yaml_template_parses_with_the_kit_reader(self):
+        self.assertGreaterEqual(len(yaml_templates()), 6)
+        for path in yaml_templates():
+            with self.subTest(path.name):
+                read_yaml(path)
+
+    def test_every_example_in_a_template_comment_parses(self):
+        found = 0
+        for path in yaml_templates():
+            for block in example_blocks(path.read_text(encoding="utf-8")):
+                found += 1
+                with self.subTest(path.name, block=block[:40]):
+                    self.assertIsNotNone(miniyaml.loads(block))
+        self.assertGreaterEqual(found, 6)  # checks, environments, register, traceability (x4), gates
+
+    def test_templates_that_teach_commands_and_environments_carry_a_parsed_example(self):
+        checks = example_blocks((TEMPLATES / "checks.yaml").read_text(encoding="utf-8"))
+        self.assertEqual([miniyaml.loads(block) for block in checks], [{"test": [["go", "test", "./..."]]}])
+        environments = example_blocks((TEMPLATES / "environments.yaml").read_text(encoding="utf-8"))
+        entry = miniyaml.loads(environments[0])["environments"]["dev"]
+        self.assertEqual(sorted(entry), ["exists", "notes", "owner"])
+        register = example_blocks((TEMPLATES / "register.yaml").read_text(encoding="utf-8"))
+        self.assertEqual(miniyaml.loads(register[0])["phases"][0]["id"], "P1")
+
+    def test_no_template_comment_teaches_a_flow_collection(self):
+        for path in yaml_templates():
+            for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+                if line.lstrip().startswith("#"):
+                    self.assertIsNone(FLOW.search(line), f"{path.name}:{number}: {line}")
+
+    def test_the_register_template_holds_no_placeholder_task(self):
+        data = miniyaml.loads((TEMPLATES / "register.yaml").read_text(encoding="utf-8"))
+        self.assertEqual(data, {"phases": []})
+
+
+class HandoffTemplateTests(unittest.TestCase):
+    """Lesser 22: the template holds the maintained sections playbook 09 names, outside the generated block."""
+
+    SECTIONS = ["How the program works", "Environment setup", "Known gotchas", "Next steps", "Where the rules live",
+                "Model tiers"]
+
+    def test_maintained_sections_exist_outside_the_generated_block(self):
+        text = (TEMPLATES / "HANDOFF.md").read_text(encoding="utf-8")
+        start, end = "<!-- generated:start -->", "<!-- generated:end -->"
+        outside = text[:text.index(start)] + text[text.index(end) + len(end):]
+        self.assertEqual([line[3:].strip() for line in outside.splitlines() if line.startswith("## ")],
+                         self.SECTIONS)
+        self.assertEqual(text[text.index(start) + len(start):text.index(end)].strip(), "")
+
+    def test_each_section_is_empty_and_playbook_09_names_it(self):
+        text = (TEMPLATES / "HANDOFF.md").read_text(encoding="utf-8")
+        playbook = (TEMPLATES.parent / "playbooks" / "09_handoff.md").read_text(encoding="utf-8").lower()
+        for heading in self.SECTIONS:
+            self.assertIn(heading.lower(), playbook, heading)
+            body = text.split(f"## {heading}", 1)[1].split("\n## ", 1)[0].split("<!--", 1)[0]
+            self.assertEqual(body.strip(), "", heading)
 
 
 if __name__ == "__main__":

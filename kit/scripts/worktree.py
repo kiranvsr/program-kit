@@ -12,7 +12,7 @@ import os
 from pathlib import Path
 
 import register as register_module
-from common import KitError, find_root, git
+from common import KitError, PRIMARY_BRANCH, find_root, git, primary_branch_problem
 
 
 def _resolves(root: Path, ref: str) -> bool:
@@ -43,6 +43,9 @@ def new(root: Path, task_id: str, main: str = "main") -> Path:
     if _resolves(root, f"refs/heads/{branch}"):
         raise KitError(f"branch {branch} already exists")
     if not _resolves(root, f"{main}^{{commit}}"):
+        if main == PRIMARY_BRANCH:  # say how to fix the usual cause (a repository still on master) in one line
+            raise KitError(primary_branch_problem(root, main, need_commit=True)
+                           or f"{main} does not resolve to a commit")
         raise KitError(f"{main} does not resolve to a commit")
     git(root, "worktree", "add", "-b", branch, "--", str(path), main)
     return path

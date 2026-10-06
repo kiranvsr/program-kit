@@ -231,8 +231,8 @@ def validate(register: dict, environments: dict | None, roles: dict | None) -> l
                 if env not in known_envs:
                     problems.append(f"{who}: environment {env} is not defined in environments.yaml")
                 elif not (isinstance(entry, dict) and entry.get("exists") is True) and env not in blocked:
-                    problems.append(f"{who}: environment {env} does not exist yet; "
-                                    f"add blocked_by: [{env}]")
+                    problems.append(f"{who}: environment {env} does not exist yet; list it under blocked_by "
+                                    f"(the line blocked_by:, then - {env} on the next line)")
         if isinstance(ident, str) and ident:
             graph[ident] = [t for t in depends if t != "" and t in known]
     for cycle in _find_cycles(graph):
