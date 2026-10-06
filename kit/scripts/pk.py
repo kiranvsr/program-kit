@@ -23,10 +23,10 @@ KIT_DIR = Path(__file__).resolve().parent.parent
 MIN_PYTHON = (3, 11)
 PRESETS = ("go", "node", "python")
 TEMPLATE_FILES = ("BRIEF.md", "checks.yaml", "environments.yaml", "CLAIM_BOUNDARIES.md", "ledger.yaml",
-                  "HANDOFF.md", "controller-state.json", "rulings.md")
+                  "HANDOFF.md", "controller-state.json", "rulings.md", "register.yaml")
 
 # Modules that register further subcommands (each defines `register(add_command)`).
-COMMAND_MODULES: tuple[str, ...] = ("status", "rulings")
+COMMAND_MODULES: tuple[str, ...] = ("status", "rulings", "register")
 
 COMMANDS: dict[str, Callable[[argparse.Namespace], int]] = {}
 CONFIGURERS: dict[str, tuple[str, Callable[[argparse.ArgumentParser], None] | None]] = {}

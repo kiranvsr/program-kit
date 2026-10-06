@@ -1,0 +1,32 @@
+# The task register: phases contain milestones, milestones contain steps, steps
+# contain tasks. IDs are P<n>, P<n>-M<nn>, P<n>-M<nn>-S<nn> and P<n>-M<nn>-S<nn>-T<nn>;
+# leave one out and `pk register assign-ids` fills it in from its position.
+# gate is G-<NAME> or null.
+phases:
+  - id: P1
+    title: First phase
+    gate: null
+    milestones:
+      - id: P1-M01
+        title: First milestone
+        gate: null
+        steps:
+          - id: P1-M01-S01
+            title: First step
+            tasks:
+              - id: P1-M01-S01-T01
+                title: First task
+                # What the task delivers, in a sentence or two.
+                text: Describe the work.
+                # One of the role ids in kit/interview/roles.yaml.
+                role: backend
+                # S or M; split anything larger into steps.
+                size: S
+                # Named environments (program/environments.yaml) the task needs. A task naming
+                # an environment that does not exist yet must also carry blocked_by: [<name>].
+                environments: []
+                # IDs this task waits for (at most 6, no cycles).
+                depends_on: []
+                gate: null
+                # Requirement IDs this task closes: REQ-<nnn>, NFR-<nnn> or J<n>.
+                closes: []
