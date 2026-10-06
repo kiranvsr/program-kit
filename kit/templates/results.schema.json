@@ -45,7 +45,14 @@
           "killed": {"type": "boolean", "description": "true only when the code built and the test failed"},
           "kill_reason": {"enum": ["test failed", "build failed", "not killed"],
                           "description": "build failed iff builds is false; test failed iff killed; else not killed"},
-          "test_output_sha256": {"type": "string", "pattern": "^([0-9a-f]{64})?$", "description": "empty when no test ran"}
+          "test_output_sha256": {"type": "string", "pattern": "^([0-9a-f]{64})?$", "description": "empty when no test ran"},
+          "path": {"type": "string", "minLength": 1, "description": "the file the bug was planted in, relative to the root"},
+          "find": {"type": "string", "description": "the text that was replaced; empty in the self-test row, which appends"},
+          "replace": {"type": "string", "description": "what it was replaced with; in the self-test row, the appended line"},
+          "build_argv": {"type": ["array", "null"], "minItems": 1, "items": {"type": "string"},
+                         "description": "the build command run on the edited file; null when no build step was given"},
+          "test_argv": {"type": "array", "minItems": 1, "items": {"type": "string"},
+                        "description": "the test command whose exit decided killed"}
         }
       }
     },

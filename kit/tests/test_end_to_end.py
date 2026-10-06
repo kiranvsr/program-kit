@@ -229,6 +229,10 @@ class EndToEndTests(unittest.TestCase):
         self.assertTrue(results["planted_bugs_all_killed"] and results["all_commands_as_expected"])
         bugs = {row["id"]: row for row in results["planted_bugs"]}
         self.assertEqual(len(bugs), 5)  # four real bugs and the non-building self-test row
+        for row in bugs.values():  # each row says what was planted and which commands judged it
+            self.assertEqual((row["path"], row["build_argv"]),
+                             ("src/tiny_service.py", ["python3", "-m", "compileall", "-q", "."]))
+            self.assertEqual(row["test_argv"][:3], ["python3", "-m", "unittest"])
         self.assertEqual([i for i, row in bugs.items() if not row["killed"]], ["self-test-noncompiling"])
         self.assertTrue(any(c["derived"].get("tests", 0) >= 10 for c in results["commands"]))
         self.assertIn("src/tiny_service.py", results["inputs"])
@@ -272,10 +276,11 @@ class EndToEndTests(unittest.TestCase):
         for key in evidence_module.required_keys("acceptance"):
             self.assertIn(key, acceptance)
         (wt / ACCEPTANCE).write_text(json.dumps(acceptance, indent=2) + "\n", encoding="utf-8")
-        project.commit(f"{TASK}: QA acceptance", ACCEPTANCE, cwd=wt)
         project.pk("status", "set", TASK, "done", "--role", "qa", "--evidence", RESULTS, "--evidence", ACCEPTANCE,
                    cwd=wt)
-        project.commit(f"{TASK}: done", STATUS, cwd=wt)
+        project.commit(f"{TASK}: QA acceptance, done", ACCEPTANCE, STATUS, cwd=wt)  # one commit: acceptance and status
+        self.assertEqual(sorted(project.git("show", "--name-only", "--format=", "HEAD", cwd=wt).splitlines()),
+                         sorted([ACCEPTANCE, STATUS]))
         project.pk("status", "validate", cwd=wt)
         project.pk("gate", "binding", TASK, "--branch", BRANCH)
         self.assertEqual(project.git("status", "--porcelain", cwd=wt), "")
@@ -285,6 +290,9 @@ class EndToEndTests(unittest.TestCase):
         self.assertTrue(MERGE_OK.match(check[-1]), check[-3:])
         self.assertEqual(MERGE_OK.match(check[-1]).group(1), project.git("rev-parse", BRANCH))
         self.assertEqual([ln for ln in check if ln.startswith("OK: ")], [check[-1]])
+        # the controller's independent gate run: the build, the tests and the scans, on the trial merge
+        self.assertEqual([ln for ln in check if ln.startswith("step ")],
+                         ["step build: ok", "step test: ok", "step scan: ok"])
         project.git("merge", "--no-ff", "-q", "-m", f"Merge {TASK}", BRANCH)
         self.assertEqual(project.git("status", "--porcelain"), "")
         self.assertEqual(json.loads(project.pk("stale").stdout)["stale"], [])
@@ -382,6 +390,42 @@ class EndToEndTests(unittest.TestCase):
         self.assertIn("FAILED: test python3 -m unittest discover -s src (exit 1)", lines)
         self.assertFalse((project.worktree / RESULTS).exists())  # nothing was produced past the failed step
         self.assertEqual([ln for ln in lines if ln.startswith("step ")], ["step build: ok"])
+
+    @NEEDS_SH
+    @NEEDS_PIP
+    def test_a_branch_that_skipped_the_gate_is_refused_at_the_merge_check(self):
+        project = Project(self.base, with_gitleaks=True)
+        project.prepare()
+        wt = project.worktree
+        # No option reads the rules from anywhere but main.
+        for action in (("handback", TASK), ("merge-check",), ("binding", TASK)):
+            refused = project.pk("gate", *action, "--branch", BRANCH, "--main", BRANCH, expect=1, env=project.gate_env)
+            self.assertEqual((refused.stdout, refused.stderr), ("", f"error: unrecognized arguments: --main {BRANCH}\n"))
+        # The implementer adds a guarded file nobody approved, never runs the gate, and types the OK line itself.
+        (wt / "requirements.txt").write_text("left-pad==1.0\n", encoding="utf-8")
+        gated = project.commit_in_worktree("add a dependency file")
+        project.run(["python3", Path(EVIDENCE) / "produce.py"], cwd=wt, env=project.gate_env)
+        project.pk("status", "set", TASK, "review", "--role", "implementer", "--evidence", RESULTS, cwd=wt)
+        (wt / REPORT).write_text(f"## Gate\n\nOK: {BRANCH} passes the hand-back gate at {gated}\n", encoding="utf-8")
+        project.commit_in_worktree("evidence nobody gated", RESULTS, REPORT, STATUS)
+        # Everything QA is told to run passes: the record is real and it binds.
+        project.pk("evidence", "validate", wt / RESULTS, cwd=wt)
+        self.assertIn(f"binding holds: results.json at {gated}", project.pk("gate", "binding", TASK, "--branch",
+                                                                         BRANCH).stdout)
+        # The controller's merge check is the independent gate run, and it refuses the branch.
+        check = project.pk("gate", "merge-check", "--branch", BRANCH, expect=1, env=project.gate_env)
+        self.assertEqual(check.stdout, "FAILED: guarded files changed: requirements.txt\n")
+        # The same branch with a rejecting acceptance cannot be marked done either.
+        acceptance = {"task_id": TASK, "decision": "rejected", "evidence_sha256": sha256_file(wt / RESULTS),
+                      "source_commit": gated, "accepted_at": utc_now(), "role": "qa", "commands": [],
+                      "planted_bugs": [], "findings": [{"n": 1, "severity": "critical", "location": "requirements.txt",
+                                                        "fix": "remove it or get the guarded edit approved"}],
+                      "blocked_by": []}
+        (wt / ACCEPTANCE).write_text(json.dumps(acceptance), encoding="utf-8")
+        done = project.pk("status", "set", TASK, "done", "--role", "qa", "--evidence", ACCEPTANCE, cwd=wt, expect=1)
+        self.assertEqual(done.stderr, f"error: {TASK}: {ACCEPTANCE}: decision is 'rejected', not "
+                                      "'accepted_development'\n")
+        self.assertIn('"status": "review"', project.pk("status", "show", TASK, cwd=wt).stdout)
 
     @NEEDS_SH
     @NEEDS_PIP

@@ -14,6 +14,7 @@ Rework and token cost, not coding, are what slow a program down. These rules exi
 
 - No QA round until the implementer has run `pk gate handback <ID> --branch task/<ID>` and its last line is the OK line. Exit code 0 alone is never accepted.
 - A hand-back that fails the gate returns to the implementer without a QA round.
+- The controller's `pk gate merge-check` runs the gate's checks again before every merge, without relying on the implementer's run: guarded files, SPEC and PLAN identity, then build, tests and scans on a trial merge. A branch whose implementer skipped the gate cannot reach main.
 
 ## Decide, don't ask
 
@@ -24,8 +25,8 @@ Rework and token cost, not coding, are what slow a program down. These rules exi
 
 - QA returns findings numbered, each with severity, location and the exact fix expected.
 - The same implementer fixes them and hands back a finding-to-fix table: finding, fix, commit, command that shows it fixed.
-- The re-check covers only those findings, the binding check and the hand-back gate. It does not repeat the full review.
-- When the evidence binds at the branch's HEAD, QA verifies recorded gate output by hash and re-runs only the PLAN commands, the planted bugs and its own.
+- The re-check covers only those findings and the binding check. It does not repeat the full review. The implementer re-runs the hand-back gate after the fix; QA does not.
+- QA never re-runs the hand-back gate, and there is no recorded gate output for it to verify. It runs `pk gate binding`, `pk evidence validate` and `pk stale` in the task worktree, re-runs the PLAN commands and the planted bugs, and adds its own.
 
 ## Model tiers
 

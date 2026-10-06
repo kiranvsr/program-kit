@@ -9,9 +9,8 @@ build:
 test:
   - - pnpm
     - test
+# pnpm audit needs the registry, and gate steps never use the network: run audits outside the gate.
 scan:
-  - - pnpm
-    - audit
   - - gitleaks
     - detect
     - '--no-git'

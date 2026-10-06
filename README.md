@@ -61,7 +61,7 @@ Each task is built by an implementer in its own worktree, accepted by a differen
 4. The gate's last line must be exactly `OK: <branch> passes the hand-back gate at <sha>`. Exit code 0 alone is never accepted; a failed gate returns the work with no QA round.
 5. Evidence commit: the implementer sets the task `review` and commits `results.json`, its report and the status file, and nothing else.
 6. Independent QA runs `pk gate binding <ID> --branch task/<ID>`, re-runs the commands, plants its own bugs and checks scope, then accepts (the only way a task becomes `done`) or rejects with numbered findings.
-7. Merge check: from main, `pk gate merge-check --branch task/<ID>` must end with `OK: <branch> merges into main at <sha>`.
+7. Merge check: from main, `pk gate merge-check --branch task/<ID>` must end with `OK: <branch> merges into main at <sha>`. It is the controller's own run of the gate's checks: guarded files, the task's SPEC and PLAN unchanged, then the build, the tests and the scans on a trial merge.
 8. Merge with `git merge --no-ff`, one accepted branch at a time.
 9. Hand-off update: `pk handoff update`, `pk handoff check`, and commit `program/`.
 
@@ -73,7 +73,7 @@ The rules are in `kit/rules/`: `HARD_RULES.md`, `EVIDENCE_HONESTY.md` and `THROU
 
 - It never pushes, deploys or applies infrastructure; that is always your decision.
 - It never claims anything about an environment that does not exist. Environments are listed in `program/environments.yaml`, and work that needs a missing one stays blocked.
-- It never treats an implementer's word as acceptance. A task becomes `done` only through `pk status set ... --role qa` with an acceptance record bound to the evidence, and the briefs require QA to be a different agent from the implementer. The role is a flag the scripts check, not an identity, so who plays it is the controller's responsibility; "accepted for development" is never "ready for production".
+- It never marks a task `done` without an acceptance record that accepts the current, valid evidence, and it refuses that move for any role but QA. The role is a flag the caller passes, so keeping QA a different agent from the implementer is the controller's job, not something the kit can verify. "Accepted for development" is never "ready for production".
 - It never writes evidence from a dirty tree, never downloads inside a gate, and never rewrites history.
 
 ## Upgrading

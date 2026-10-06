@@ -1,6 +1,6 @@
 {
   "title": "program/evidence/<ID>/acceptance.json",
-  "description": "A QA acceptance bound to one evidence file and one source commit. Documents the shape for readers; the required keys are the ones the evidence kit lists.",
+  "description": "A QA acceptance bound to one evidence file and one source commit. Documents the shape for readers. Setting a task to done requires every listed key, the decision accepted_development, the role qa and the task's own ID.",
   "type": "object",
   "required": ["task_id", "decision", "evidence_sha256", "source_commit", "accepted_at", "role", "commands",
                "planted_bugs", "findings", "blocked_by"],

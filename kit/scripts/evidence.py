@@ -4,7 +4,8 @@
 `Evidence(root, task_id)` records HEAD, the main branch and their merge-base, hashes inputs from
 the committed blobs (never the working copy), runs commands as argv lists and records what they
 really did, runs planted bugs on a throwaway mirror of HEAD, and writes `results.json` only when
-every honesty precondition holds. `pk evidence validate <results.json>` re-checks the invariants.
+every honesty precondition holds. `pk evidence validate <results.json>` re-checks the invariants;
+`gate_problems` adds what the hand-back gate, the binding check and `done` require on top of them.
 The kit never assumes a language: the caller passes the build and test argv lists.
 
 Known limits:
@@ -12,6 +13,9 @@ Known limits:
   its commands is the reviewer's job.
 - Gitignored files written by a command are invisible to the clean-tree check.
 - `write` accepts zero commands and surviving planted bugs; the hand-back gate rejects them.
+- The runner cannot know that a test command is not a test, or that a mutant only failed to import.
+  Every planted-bug row therefore records the file, the edit and the build and test argv, so a
+  reviewer can see it in results.json.
 """
 from __future__ import annotations
 
@@ -34,6 +38,7 @@ KILL_REASONS = ("test failed", "build failed", "not killed")
 TEMPLATES = Path(__file__).resolve().parent.parent / "templates"
 COMMAND_KEYS = ("label", "argv", "exit", "expected_exit", "as_expected", "derived", "output_sha256",
                 "output_tail")
+PLANTED_KEYS = ("path", "find", "replace", "build_argv", "test_argv")  # what a row planted and what judged it
 _NO_RUN = (124, 127)  # timeout, program not found: the shell conventions run_argv uses
 
 _HEX40 = re.compile(r"[0-9a-f]{40}\Z")
@@ -242,9 +247,11 @@ class Evidence:
                      timeout: int | None = None) -> list[dict]:
         """Apply each planted bug to a mirror of HEAD, build, run the test; return one row per bug.
 
-        Row: `{id, builds, killed, kill_reason, test_output_sha256}`. The mirror is
-        `git worktree add --detach` of HEAD in a fresh temp dir and is always removed; the working
-        tree is never edited. A table row is `{id, path, find, replace, test_args}`; `test` is the
+        Row: `{id, builds, killed, kill_reason, test_output_sha256, path, find, replace, build_argv,
+        test_argv}`: the last five say what was planted (the file and the edit) and which build and test
+        argv judged it. The mirror is `git worktree add --detach` of HEAD in a fresh temp dir and is
+        always removed; the working tree is never edited. A table row is
+        `{id, path, find, replace, test_args}`; `test` is the
         base argv and a row's `test_args` are appended. `find` must occur exactly once in `path`.
         A row is killed only when the build passed and the test exited non-zero. The unmutated
         mirror must pass first, once per distinct `test_args`, so a test that already fails cannot
@@ -258,9 +265,16 @@ class Evidence:
         whenever the broken file makes the test exit non-zero, and also when the test still passes. In
         practice `build=None` therefore always raises for a project whose tests load the mutated file.
 
+        For an interpreted language a build step that only parses does not load the file: a mutant that
+        parses but cannot be imported (a module-level NameError) passes the build and is recorded as
+        killed by the test. Make the build step import the edited module when that difference matters.
+        The runner also cannot tell that `test` is not a test; the row records both argv lists so a
+        reviewer can.
+
         The last row is always `self-test-noncompiling`: the first row's file with a line that cannot
-        parse or compile appended. It must come back `builds: false, killed: false`; if it does not,
-        the runner cannot tell a build failure from a test failure here and KitError is raised.
+        parse or compile appended (its `find` is empty and its `replace` is that line). It must come
+        back `builds: false, killed: false`; if it does not, the runner cannot tell a build failure
+        from a test failure here and KitError is raised.
         """
         rows = self._check_table(table)
         test = _argv(test, "test")
@@ -357,9 +371,16 @@ class Evidence:
             else:
                 killed, reason = False, "not killed"
             results.append({"id": item["id"], "builds": builds, "killed": killed, "kill_reason": reason,
-                            "test_output_sha256": digest})
+                            "test_output_sha256": digest,
+                            **self._planted(item["path"], item["find"], item["replace"], build, argv)})
         results.append(self._self_test(mirror, rows[0], build, test + rows[0]["test_args"], timeout))
         return results
+
+    @staticmethod
+    def _planted(path: str, find: str, replace: str, build: list[str] | None, argv: list[str]) -> dict:
+        """The PLANTED_KEYS of a row: the file, the edit, and the build and test argv that judged it."""
+        return {"path": path, "find": find, "replace": replace,
+                "build_argv": list(build) if build is not None else None, "test_argv": list(argv)}
 
     def _self_test(self, mirror: Path, first: dict, build: list[str] | None, argv: list[str],
                    timeout: int | None) -> dict:
@@ -380,7 +401,8 @@ class Evidence:
                            f"in {first['path']} (test exit {code}), so the runner cannot tell a build failure from "
                            "a test failure for this project")
         return {"id": SELF_TEST_ID, "builds": False, "killed": False, "kill_reason": "build failed",
-                "test_output_sha256": digest if code is not None else ""}
+                "test_output_sha256": digest if code is not None else "",
+                **self._planted(first["path"], "", BROKEN_LINE, build, argv)}
 
     # --- stale -----------------------------------------------------------------
 
@@ -460,6 +482,20 @@ def _is_int(value) -> bool:
 
 def _str_list(value) -> bool:
     return isinstance(value, list) and all(isinstance(item, str) for item in value)
+
+
+def _planted_problem(row: dict) -> str | None:
+    """The first PLANTED_KEYS field of a row that is present with the wrong type, as `<key> must ...`."""
+    for key in ("path", "find", "replace"):
+        if key in row and (not isinstance(row[key], str) or (key == "path" and not row[key])):
+            return f"{key} must be a {'non-empty ' if key == 'path' else ''}string"
+    for key in ("build_argv", "test_argv"):
+        if key not in row or (key == "build_argv" and row[key] is None):
+            continue
+        if not (_str_list(row[key]) and row[key]):
+            return (f"{key} must be a non-empty argv list of strings"
+                    + (", or null when no build step was given" if key == "build_argv" else ""))
+    return None
 
 
 def validate_results(data) -> list[str]:
@@ -546,6 +582,9 @@ def validate_results(data) -> list[str]:
         digest = row.get("test_output_sha256")
         if not isinstance(digest, str) or not (digest == "" or _HEX64.match(digest)):
             bad(where, "test_output_sha256 must be 64 lowercase hex characters, or empty when no test ran")
+        planted = _planted_problem(row)
+        if planted:
+            bad(where, planted)
         shaped.append(row)
     selfs = [row for row in shaped if row["id"] == SELF_TEST_ID]
     bugs = [row for row in shaped if row["id"] != SELF_TEST_ID]
@@ -560,6 +599,34 @@ def validate_results(data) -> list[str]:
         bad("planted_bugs_all_killed", "does not match the planted-bug rows (self-test row excluded)")
     if data["tree_unchanged_by_run"] is False:
         bad("tree_unchanged_by_run", "is false: the run changed the tree, so this is not valid evidence")
+    return problems
+
+
+def gate_problems(data, task_id: str, head: str | None = None) -> list[str]:
+    """Why a results record does not pass the hand-back gate (empty when it does); `head` None skips the head check.
+
+    On top of `validate_results`: the record is this task's, bound to `head`, every command was as expected,
+    it holds at least one command, every planted bug was killed, and every planted-bug row says what was
+    planted and which commands judged it. The binding check and `pk status set ... done` apply the same rules.
+    """
+    problems = validate_results(data)
+    if problems:
+        return problems
+    if data["task_id"] != task_id:
+        problems.append(f"task_id: is {data['task_id']}, expected {task_id}")
+    if head is not None and data["head"] != head:
+        problems.append(f"head: is {data['head']}, expected the worktree HEAD {head}")
+    if data["all_commands_as_expected"] is not True:
+        problems.append("all_commands_as_expected: is not true")
+    if data["planted_bugs_all_killed"] is not True:
+        problems.append("planted_bugs_all_killed: is not true (a planted bug survived)")
+    if not data["commands"]:
+        problems.append("commands: is empty (evidence must record the commands that were run)")
+    for index, row in enumerate(data["planted_bugs"]):
+        missing = [key for key in PLANTED_KEYS if key not in row]
+        if missing:
+            problems.append(f"planted_bugs[{index}]: does not record {', '.join(missing)} (what was planted and "
+                            "the commands that ran)")
     return problems
 
 

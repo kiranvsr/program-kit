@@ -147,6 +147,21 @@ class Robustness(Base):
         self.assertEqual(report["unreadable"], [])
 
 
+class ChangedInputs(Base):
+    def test_changed_inputs_compares_recorded_hashes_with_the_blobs_at_a_commit(self):
+        first = sh(self.root, "git", "rev-parse", "HEAD").strip()
+        self.put("calc.py", "v2\n")
+        self.commit("change calc")
+        second = sh(self.root, "git", "rev-parse", "HEAD").strip()
+        self.put("calc.py", "uncommitted\n")  # the working copy never matters
+        inputs = {"lib.py": digest("lib1\n"), "gone.py": digest("x"), "calc.py": digest("v1\n")}
+        self.assertEqual(stale.changed_inputs(self.root, first, inputs), {"gone.py": None})
+        changed = stale.changed_inputs(self.root, second, inputs)
+        self.assertEqual(changed, {"calc.py": digest("v2\n"), "gone.py": None})
+        self.assertEqual(list(changed), ["calc.py", "gone.py"])
+        self.assertEqual(stale.changed_inputs(self.root, second, {}), {})
+
+
 class Cli(Base):
     def run_cli(self, *argv):
         out, err = io.StringIO(), io.StringIO()
@@ -164,12 +179,17 @@ class Cli(Base):
         self.assertEqual(data["stale"][0]["changed_inputs"], ["calc.py"])
         self.assertEqual(out, json.dumps(data, indent=2, sort_keys=True) + "\n")
 
-    def test_main_option_and_unresolvable_main(self):
+    def test_no_main_option_and_unresolvable_main(self):
         sh(self.root, "git", "branch", "other")
-        code, out, _ = self.run_cli("--main", "other")
+        code, out, err = self.run_cli("--main", "other")  # the primary branch is fixed: no flag can move it
+        self.assertEqual((code, out), (1, ""))
+        self.assertEqual(err, "error: unrecognized arguments: --main other\n")
+        code, out, _ = self.run_cli()
         self.assertEqual(code, 0)
-        self.assertEqual(json.loads(out)["main"], sh(self.root, "git", "rev-parse", "other").strip())
-        code, out, err = self.run_cli("--main", "nope")
+        self.assertEqual(json.loads(out)["main"], sh(self.root, "git", "rev-parse", "main").strip())
+        sh(self.root, "git", "checkout", "-q", "other")
+        sh(self.root, "git", "branch", "-D", "main")
+        code, out, err = self.run_cli()
         self.assertEqual((code, out), (1, ""))
         self.assertTrue(err.startswith("error: "))
 

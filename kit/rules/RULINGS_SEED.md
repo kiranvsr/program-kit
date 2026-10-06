@@ -30,7 +30,7 @@ Your own program records its rulings in `program/rulings.md` with `pk rulings ad
 
 ## K4. Fix rounds return a finding-to-fix table and get a scoped re-check
 
-**Rule.** QA sends findings to the same implementer, each with severity, location and the exact fix expected. The implementer hands back a table mapping each finding to the commit that fixes it. The re-check covers only those findings, plus the binding check and the hand-back gate.
+**Rule.** QA sends findings to the same implementer, each with severity, location and the exact fix expected. The implementer hands back a table mapping each finding to the commit that fixes it. The re-check covers only those findings, plus the binding check. The implementer re-runs the hand-back gate after the fix (K2); QA does not.
 
 **Why.** The implementer already holds the context, and a full second review repeats work that was already accepted.
 
@@ -46,7 +46,7 @@ Your own program records its rulings in `program/rulings.md` with `pk rulings ad
 
 ## K6. A gate passes on its OK line, not on its exit code
 
-**Rule.** A producer or a QA agent that records a gate or merge check requires the final OK line, not only exit code 0. For the hand-back gate that line is `OK: <branch> passes the hand-back gate at <sha>`; for the merge check it is `OK: <branch> merges into main at <sha>`.
+**Rule.** Whoever runs a gate or merge check (the implementer for the hand-back gate, the controller for the merge check) requires the final OK line, not only exit code 0. For the hand-back gate that line is `OK: <branch> passes the hand-back gate at <sha>`; for the merge check it is `OK: <branch> merges into main at <sha>`.
 
 **Why.** A merge check once exited 0 without checking anything, because a setup file was missing and an exit trap hid the failure.
 
@@ -100,13 +100,13 @@ Your own program records its rulings in `program/rulings.md` with `pk rulings ad
 
 **How to apply.** Order the test: owner updates its record and succeeds, restore it, other principal updates and nothing changes, owner record unchanged.
 
-## K13. QA scopes its re-runs when the evidence binds at HEAD
+## K13. QA checks the binding and re-runs the evidence; the merge check re-runs the gate
 
-**Rule.** When every hashed input in the evidence matches the bytes at the branch's HEAD and the hand-back self-check holds, QA verifies the recorded gate output (OK line, scanner results, secret-scan result) by its recorded hash and tail and does not re-run it. QA always re-runs the PLAN commands, the committed planted bugs and at least three of its own, and reviews the diff, scope, claims and security. If the binding fails, or main moved with code that overlaps the hashed inputs, QA re-runs everything.
+**Rule.** QA does not re-run the hand-back gate and does not treat an OK line in a report as evidence: `results.json` records the producer's commands and planted bugs, not the gate's output. QA runs `pk gate binding <ID> --branch task/<ID>` (the record was committed directly on the commit it names, every later commit touches only the task's evidence and status, and every hashed input matches the blob at that commit), `pk evidence validate` and, in the task worktree, `pk stale`. QA always re-runs the PLAN commands, the committed planted bugs and at least three of its own, and reviews the diff, scope, claims and security. The independent run of the gate's checks is the controller's `pk gate merge-check` before the merge: the guarded-file check, the SPEC and PLAN identity check, and the build, tests and scans on a trial merge. If the binding fails, or main moved with code that overlaps the hashed inputs, QA rejects and the branch merges main and re-produces (K16).
 
-**Why.** Re-running the longest suites on every review burned the session budget for no added assurance.
+**Why.** Re-running the longest suites on every review burned the session budget for no added assurance, and an OK line somebody typed proves nothing. One independent run at the merge is enough, and no branch can skip it.
 
-**How to apply.** Check the binding first, mechanically. Then choose the narrow or the full review and say which in the acceptance.
+**How to apply.** Check the binding first, mechanically. A failed binding is a rejection, not a reason to run the gate yourself. Say in the acceptance which commands and planted bugs you ran.
 
 ## K14. Read only the rules and the rulings your SPEC cites
 
