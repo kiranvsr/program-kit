@@ -3,6 +3,7 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -52,6 +53,7 @@ class BriefsTests(BriefsBase):
     def test_generate_is_deterministic(self):
         first_paths = briefs.generate(self.root)
         first = self.snapshot()
+        shutil.rmtree(self.out)  # a fresh run must rewrite every byte identically, not skip matching files
         second_paths = briefs.generate(self.root)
         self.assertEqual(first_paths, second_paths)
         self.assertEqual(first_paths, sorted(first_paths))
