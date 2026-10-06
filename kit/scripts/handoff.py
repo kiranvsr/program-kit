@@ -23,7 +23,9 @@ from pathlib import Path
 
 import change as change_module
 import status as status_module
+import trace as trace_module
 import worktree as worktree_module
+import register as register_module
 from common import KitError, _atomic_write, find_root, git, read_json
 
 START, END = "<!-- generated:start -->", "<!-- generated:end -->"
@@ -33,7 +35,8 @@ _STATE_FILE = "program/controller-state.json"
 
 
 def _line(text: str) -> str:
-    return " ".join(text.split())
+    """`text` on one line, with `<` escaped so an unterminated `<!--` cannot hide the rest of the block."""
+    return " ".join(text.split()).replace("<", "&lt;")
 
 
 def _mapping(data: dict, key: str) -> dict[str, str]:
@@ -78,7 +81,7 @@ def _worktree_line(root: Path, item: dict) -> str | None:
     except ValueError:
         shown = str(path)
     state = "missing" if item["missing"] else ("dirty" if item["dirty"] else "clean")
-    return f"{shown} ({item['branch'] or 'detached'}) head {item['head'][:7]}, {state}"
+    return _line(f"{shown} ({item['branch'] or 'detached'}) head {item['head'][:7]}, {state}")
 
 
 def render(root: Path, main: str = "main") -> str:
@@ -89,9 +92,16 @@ def render(root: Path, main: str = "main") -> str:
     counts = {name: 0 for name in status_module.STATUSES}
     for record in records:
         counts[record["status"]] = counts.get(record["status"], 0) + 1
-    flying = [f"{r['task_id']} ({r['status']}): {_line(state['stage'].get(r['task_id'], '')) or '(no stage text)'}"
+    unregistered: list[str] = []
+    if (root / "program" / "register.yaml").exists():
+        in_register = {task_id for task_id, _ in trace_module._register_tasks(register_module.load(root))}
+        recorded = {record["task_id"] for record in records}
+        counts["not_started"] += len(in_register - recorded)  # no status record yet means not started
+        unregistered = sorted(recorded - in_register)
+    flying = [f"{_line(r['task_id'])} ({r['status']}): "
+              f"{_line(state['stage'].get(r['task_id'], '')) or '(no stage text)'}"
               for r in records if r["status"] in IN_FLIGHT]
-    branches = [ref[len("refs/heads/"):] for ref in git(
+    branches = [_line(ref[len("refs/heads/"):]) for ref in git(
         root, "for-each-ref", "--format=%(refname)", f"--no-merged={main}", "refs/heads/").splitlines()]
     trees = [line for item in worktree_module.list_all(root) if (line := _worktree_line(root, item))]
     requests = [f"{c['id']}: {_line(c['title'])} ({'approved, not applied' if c['approved'] else 'awaiting approval'})"
@@ -99,10 +109,11 @@ def render(root: Path, main: str = "main") -> str:
     followups = [f"{_line(f['area'])}: {_line(f['item'])}" for f in state["followups"]]
 
     def tasks(table: dict[str, str]) -> list[str]:
-        return [f"{task}: {_line(text)}" for task, text in sorted(table.items())]
+        return [f"{_line(task)}: {_line(text)}" for task, text in sorted(table.items())]
 
     lines = ["### Generated state", "", f"{COMMIT_PREFIX}{_commit(root)}", "",
-             "#### Tasks by status", *[f"- {name}: {number}" for name, number in counts.items()], "",
+             "#### Tasks by status", *[f"- {name}: {number}" for name, number in counts.items()],
+             *([f"- not in register: {', '.join(_line(t) for t in unregistered)}"] if unregistered else []), "",
              "#### In flight", *_bullets(flying), "",
              f"#### Branches not merged into {main}", *_bullets(branches), "",
              "#### Task worktrees", *_bullets(trees), "",
@@ -110,7 +121,10 @@ def render(root: Path, main: str = "main") -> str:
              "#### Parked", *_bullets(tasks(state["parked"])), "",
              "#### Open follow-ups", *_bullets(followups), "",
              "#### Open change requests", *_bullets(requests)]
-    return "\n".join(lines) + "\n"
+    block = "\n".join(lines) + "\n"
+    if any(line.strip() in (START, END) for line in block.splitlines()):  # belt and braces: state text is escaped
+        raise KitError("the generated block would contain a marker line; check controller-state.json")
+    return block
 
 
 def _comparable(block: str) -> str:

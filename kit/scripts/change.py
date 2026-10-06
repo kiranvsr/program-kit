@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 from pathlib import Path
 
@@ -28,6 +29,7 @@ HEADINGS = ("Change", "Why", "Asked by", "Impact", "Approval", "Applied")
 _FILE = re.compile(r"CR-([0-9]{3,})\.md\Z")
 _ID = re.compile(r"CR-[0-9]{3,}\Z")
 _HEADING = re.compile(r"^## (.*?)[ \t\r]*$", re.MULTILINE)
+_ATTEMPTS = 5  # tries at a free number before create gives up
 _FIELDS = re.compile(r"\{(id|change|why|asked_by)\}")
 
 
@@ -95,27 +97,52 @@ def _read(root: Path, cr_id: str) -> tuple[Path, str]:
         raise KitError(f"cannot read {path}: {getattr(exc, 'strerror', None) or exc}") from exc
 
 
+def _create_exclusive(path: Path, text: str) -> bool:
+    """Create `path` with `text`; False when it already exists (another create won the number)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+    except FileExistsError:
+        return False
+    except OSError as exc:
+        raise KitError(f"cannot create {path}: {exc.strerror or exc}") from exc
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+    return True
+
+
+def _next_id(root: Path) -> str:
+    folder = _folder(root)
+    numbers = [n for n in (_number(p.name) for p in folder.iterdir()) if n is not None] if folder.is_dir() else []
+    return f"CR-{max(numbers, default=0) + 1:03d}"
+
+
 def create(root: Path, title: str, why: str, asked_by: str) -> str:
     """Write the next change request (CR-001, CR-002, ...) and return its ID.
 
     Numbers continue after the highest existing file, so gaps are not reused; names that do not
-    match CR-<nnn>.md are ignored. Nothing is written when an argument is refused.
+    match CR-<nnn>.md are ignored. Nothing is written when an argument is refused. The file is
+    created exclusively, and the next number is tried when another create took it first.
     """
     title = _text("title", title)
     why = _text("why", why, one_line=False)
     asked_by = _text("asked-by", asked_by)
-    folder = _folder(root)
-    numbers = [n for n in (_number(p.name) for p in folder.iterdir()) if n is not None] if folder.is_dir() else []
-    cr_id = f"CR-{max(numbers, default=0) + 1:03d}"
     try:
         template = TEMPLATE.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         raise KitError(f"cannot read {TEMPLATE}: {getattr(exc, 'strerror', None) or exc}") from exc
-    values = {"id": cr_id, "change": title, "why": why, "asked_by": asked_by}
-    text = _FIELDS.sub(lambda match: values[match.group(1)], template)
-    _spans(text, str(TEMPLATE))  # a damaged template is refused before anything is written
-    _atomic_write(_path(root, cr_id), text)
-    return cr_id
+    for _ in range(_ATTEMPTS):
+        cr_id = _next_id(root)
+        values = {"id": cr_id, "change": title, "why": why, "asked_by": asked_by}
+        text = _FIELDS.sub(lambda match: values[match.group(1)], template)
+        _spans(text, str(TEMPLATE))  # a damaged template is refused before anything is written
+        if _create_exclusive(_path(root, cr_id), text):
+            return cr_id
+    raise KitError(f"could not allocate a change request number after {_ATTEMPTS} attempts")
 
 
 def _listing(names: list[str]) -> str:

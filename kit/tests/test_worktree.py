@@ -77,7 +77,8 @@ class WorktreeTests(unittest.TestCase):
         self.assertNotIn("task/" + t3, self.branches())
 
     def test_new_refuses_a_bad_task_id_and_leaves_nothing_behind(self):
-        for bad in ("", "p1-m01-s01-t01", "P1-M01-S01", "P1-M01-S01-T01/../x", "--force", "P1-M01-S01-T01\n", "main"):
+        for bad in ("", "P\u0661-M01-S01-T01", "p1-m01-s01-t01", "P1-M01-S01", "P1-M01-S01-T01/../x", "--force",
+                    "P1-M01-S01-T01\n", "main"):
             with self.subTest(bad=bad), self.assertRaises(KitError):
                 worktree.new(self.root, bad)
         self.assertFalse((self.root / ".worktrees").exists())
@@ -91,6 +92,10 @@ class WorktreeTests(unittest.TestCase):
             worktree.new(self.root, T1, main="--orphan")
         self.assertFalse((self.root / ".worktrees").exists())
         self.assertEqual(self.branches(), ["main"])
+        for bad in ("a\x00b", "a b", "a\nb", "a..b", "", "a\tb", "a\x7fb"):
+            with self.subTest(main=bad), self.assertRaises(KitError):
+                worktree.new(self.root, T1, main=bad)
+        self.assertFalse((self.root / ".worktrees").exists())
         sh(self.root, "git", "branch", "trunk")  # the main branch name is a parameter
         self.assertEqual(worktree.new(self.root, T1, main="trunk"), self.root / ".worktrees" / T1.lower())
 

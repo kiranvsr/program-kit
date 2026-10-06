@@ -33,7 +33,8 @@ def new(root: Path, task_id: str, main: str = "main") -> Path:
     root = Path(root)
     if not isinstance(task_id, str) or not register_module.TASK_ID.match(task_id):
         raise KitError(f"{task_id!r} is not a task id (expected P<n>-M<nn>-S<nn>-T<nn>)")
-    if not isinstance(main, str) or not main or main.startswith("-"):
+    if (not isinstance(main, str) or not main or main.startswith("-")
+            or any(ch.isspace() or not ch.isprintable() for ch in main)):
         raise KitError(f"{main!r} is not a usable main branch name")
     path = root / ".worktrees" / task_id.lower()
     branch = f"task/{task_id}"

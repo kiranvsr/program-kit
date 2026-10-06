@@ -108,6 +108,12 @@ class CommonTests(unittest.TestCase):
         common.git(self.tmp, "init", "-q")
         self.assertEqual(common.git(self.tmp, "rev-parse", "--is-inside-work-tree"), "true")
 
+    def test_git_turns_an_unusable_argument_into_kiterror(self):
+        common.git(self.tmp, "init", "-q")
+        with self.assertRaises(KitError) as caught:
+            common.git(self.tmp, "rev-parse", "a\x00b")
+        self.assertEqual(str(caught.exception), "git: invalid argument")
+
     def test_git_raises_kiterror_with_stderr(self):
         common.git(self.tmp, "init", "-q")
         with self.assertRaises(KitError) as ctx:

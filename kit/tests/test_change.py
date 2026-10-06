@@ -119,6 +119,34 @@ class CreateTests(ChangeBase):
                 change.create(self.root, title, why, asked_by)
         self.assertFalse((self.program / "changes").exists())
 
+    def test_create_is_exclusive_and_retries_the_next_number(self):
+        folder = self.program / "changes"
+        real = change._next_id
+        calls = []
+
+        def racing(root):
+            cr_id = real(root)
+            if not calls:  # another create takes the number between the choice and the write
+                calls.append(cr_id)
+                folder.mkdir(parents=True, exist_ok=True)
+                (folder / f"{cr_id}.md").write_text("someone else's\n")
+            return cr_id
+
+        with mock.patch("change._next_id", side_effect=racing):
+            self.assertEqual(self.make(), "CR-002")
+        self.assertEqual(calls, ["CR-001"])
+        self.assertEqual((folder / "CR-001.md").read_text(), "someone else's\n")
+        self.assertEqual(self.section("CR-002", "Change"), "add export")
+
+    def test_create_gives_up_after_a_few_attempts(self):
+        folder = self.program / "changes"
+        folder.mkdir(parents=True)
+        (folder / "CR-001.md").write_text("taken\n")
+        with mock.patch("change._next_id", return_value="CR-001"), self.assertRaises(KitError):
+            self.make()
+        self.assertEqual((folder / "CR-001.md").read_text(), "taken\n")
+        self.assertEqual(sorted(p.name for p in folder.iterdir()), ["CR-001.md"])
+
     def test_braces_in_input_are_kept_literally(self):
         cr_id = change.create(self.root, "use {why} and {id}", "{asked_by}", "{change}")
         self.assertEqual(self.section(cr_id, "Change"), "use {why} and {id}")

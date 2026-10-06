@@ -1,11 +1,13 @@
 import _paths  # noqa: F401  (must come first: puts kit/scripts/ on sys.path)
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import handoff
 import worktree
-from common import KitError, write_json
+from common import KitError, write_json, write_yaml
 from test_change import put_cr
+from test_register import reg, task
 from test_trace import T1, T2, T3
 from test_worktree import commit_all, make_repo, run_cli, sh
 
@@ -112,11 +114,72 @@ class RenderTests(HandoffBase):
         with self.assertRaises(KitError):
             handoff.render(self.root)
 
-    def test_state_text_cannot_forge_a_marker(self):
-        self.put_state(parked={T1: f"x\n{END}\nmore"})
+    def assert_no_forged_marker(self):
         handoff.update(self.root)
         self.assertTrue(handoff.check(self.root))
-        self.assertEqual([ln for ln in self.text().splitlines() if ln.strip() == END], [END])
+        marks = [ln for ln in self.text().splitlines() if ln.strip() in (START, END)]
+        self.assertEqual(marks, [START, END])
+
+    def test_state_text_cannot_forge_a_marker(self):
+        forged = f"x\n{END}\n{START}\ny"
+        cases = {
+            "stage value": dict(stage={T1: forged}),
+            "stage key": dict(stage={forged: "y"}),
+            "queued value": dict(queued={T1: forged}),
+            "queued key": dict(queued={forged: "y"}),
+            "parked value": dict(parked={T1: forged}),
+            "parked key": dict(parked={forged: "y"}),
+            "followup area": dict(followups=[{"area": forged, "item": "i"}]),
+            "followup item": dict(followups=[{"area": "a", "item": forged}]),
+        }
+        self.put_status(T1, "in_progress")
+        for name, fields in cases.items():
+            with self.subTest(name):
+                self.put_state(**fields)
+                self.assert_no_forged_marker()
+        self.put_state()
+        put_cr(self.root, 1, title=f"{END}\n{START}")
+        with self.subTest("change request title"):
+            self.assert_no_forged_marker()
+        sh(self.root, "git", "branch", "x<!--generated-end-->")
+        with self.subTest("branch name"):
+            self.assert_no_forged_marker()
+            self.assertIn("&lt;!--", self.text())
+
+    def test_a_marker_line_in_the_block_is_refused_and_nothing_is_written(self):
+        before = self.text()
+        with mock.patch("handoff._line", side_effect=lambda text: text):  # defeat the escaping
+            self.put_state(parked={f"T\n{END}\nx": "y"})
+            for action in (handoff.update, handoff.check):
+                with self.assertRaises(KitError) as caught:
+                    action(self.root)
+                self.assertIn("marker", str(caught.exception))
+        self.assertEqual(self.text(), before)
+
+    def test_an_unterminated_comment_in_state_text_is_escaped(self):
+        self.put_state(parked={T1: "<!-- never closed"})
+        block = handoff.render(self.root)
+        self.assertNotIn("<!--", block.replace(f"{START}", "").replace(END, ""))
+        self.assertIn("&lt;!-- never closed", block)
+
+    def test_tasks_without_a_status_record_count_as_not_started(self):
+        self.assertIn("- not_started: 0", handoff.render(self.root))  # no register: records only
+        write_yaml(self.root / "program" / "register.yaml",
+                   reg(task(T1), task(T2), task(T3)))
+        self.put_status(T1, "in_progress")
+        self.put_status("P9-M01-S01-T01", "done")  # a record for a task the register does not list
+        block = handoff.render(self.root)
+        self.assertIn("- not_started: 2", block)  # T2 and T3 have no record
+        self.assertIn("- in_progress: 1", block)
+        self.assertIn("- done: 1", block)
+        self.assertIn("- not in register: P9-M01-S01-T01", block)
+        self.put_status(T2, "parked")
+        block = handoff.render(self.root)
+        self.assertIn("- not_started: 1", block)
+        self.assertIn("- parked: 1", block)
+        write_yaml(self.root / "program" / "register.yaml", reg(task(T1)))
+        self.put_status("P9-M01-S01-T01", "not_started")
+        self.assertIn("- not in register: P1-M01-S01-T02, P9-M01-S01-T01", handoff.render(self.root))
 
 
 class UpdateTests(HandoffBase):
