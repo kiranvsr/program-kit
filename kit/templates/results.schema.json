@@ -39,13 +39,14 @@
       "description": "one row per planted bug, then exactly one self-test row (id self-test-noncompiling, builds false, killed false)",
       "items": {
         "type": "object",
-        "required": ["id", "builds", "killed"],
+        "required": ["id", "builds", "killed", "kill_reason", "test_output_sha256"],
         "properties": {
           "id": {"type": "string"},
           "builds": {"type": "boolean"},
           "killed": {"type": "boolean", "description": "true only when the code built and the test failed"},
-          "kill_reason": {"enum": ["test failed", "build failed", "not killed"]},
-          "test_output_sha256": {"type": "string", "description": "empty when no test ran"}
+          "kill_reason": {"enum": ["test failed", "build failed", "not killed"],
+                          "description": "build failed iff builds is false; test failed iff killed; else not killed"},
+          "test_output_sha256": {"type": "string", "pattern": "^([0-9a-f]{64})?$", "description": "empty when no test ran"}
         }
       }
     },

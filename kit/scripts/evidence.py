@@ -6,6 +6,12 @@ the committed blobs (never the working copy), runs commands as argv lists and re
 really did, runs planted bugs on a throwaway mirror of HEAD, and writes `results.json` only when
 every honesty precondition holds. `pk evidence validate <results.json>` re-checks the invariants.
 The kit never assumes a language: the caller passes the build and test argv lists.
+
+Known limits:
+- A record edited consistently by hand still validates; binding it to the commit and re-running
+  its commands is the reviewer's job.
+- Gitignored files written by a command are invisible to the clean-tree check.
+- `write` accepts zero commands and surviving planted bugs; the hand-back gate rejects them.
 """
 from __future__ import annotations
 
@@ -83,6 +89,9 @@ class Evidence:
         self.root = Path(root).resolve()
         self.task_id = task_id
         self.main = main
+        top = Path(git(self.root, "rev-parse", "--show-toplevel")).resolve()
+        if top != self.root:  # `HEAD:<path>` is relative to the top level, so the two must agree
+            raise KitError(f"root must be the git top level: {self.root} is inside {top}")
         self.head = git(self.root, "rev-parse", "HEAD")
         self.main_sha = git(self.root, "rev-parse", "--verify", main + "^{commit}")
         self.merge_base = git(self.root, "merge-base", "HEAD", main)
@@ -90,6 +99,7 @@ class Evidence:
         self.inputs: dict[str, str] = {}
         self.commands: list[dict] = []
         self.planted_bug_rows: list[dict] = []
+        self._mirror: Path | None = None  # the mirror this instance created and may restore
         self.stale_result: dict = {"checked": False, "records": []}
         self.blocked_by: list[str] = []
         self.deviations: list[str] = []
@@ -135,6 +145,7 @@ class Evidence:
         """sha256 of each path's blob at HEAD, sorted by path; directories expand to their tracked files.
 
         Hashing goes through `git cat-file blob`, so a dirty working copy cannot change a hash.
+        A tracked symlink is hashed as its link text (what git stores), never its target.
         The result is also merged into `self.inputs`.
         """
         found: dict[str, str] = {}
@@ -213,6 +224,9 @@ class Evidence:
             path = self._norm(raw.get("path"))
             if self._object_type(path) != "blob":
                 raise KitError(f"planted bug {rid}: {path} is not a tracked file at HEAD")
+            mode = git(self.root, "ls-tree", "HEAD", "--", path).split(None, 1)[0]
+            if mode not in ("100644", "100755"):  # a symlink would let the edit escape the mirror
+                raise KitError(f"planted bug {rid}: {path} is not a regular file at HEAD (mode {mode})")
             try:
                 text = self._blob(path).decode("utf-8")
             except UnicodeDecodeError as exc:
@@ -236,26 +250,33 @@ class Evidence:
         mirror must pass first, once per distinct `test_args`, so a test that already fails cannot
         "kill" anything. Bytecode caches are cleared around every run.
 
-        With `build=None` a row builds unless the test command itself exits 127 or 124 (program not
-        found, timeout); a syntax error is then indistinguishable from a test failure, so pass a
-        build step (for Python, `["python3", "-m", "compileall", "-q", "."]`) when the project has one.
+        A test exit of 127 or 124 (program not found, timeout) is never a kill: the row is
+        `builds: false, kill_reason: "build failed"`, with or without a build step.
+
+        Pass a build step (for Python, `["python3", "-m", "compileall", "-q", "."]`). With `build=None`
+        a syntax error is indistinguishable from a test failure, so the self-test row raises KitError
+        whenever the broken file makes the test exit non-zero, and also when the test still passes. In
+        practice `build=None` therefore always raises for a project whose tests load the mutated file.
 
         The last row is always `self-test-noncompiling`: the first row's file with a line that cannot
         parse or compile appended. It must come back `builds: false, killed: false`; if it does not,
-        the runner cannot tell a build failure from a test failure here and KitError is raised. With
-        `build=None` that row is produced by running `test` on the broken file, which must not pass.
+        the runner cannot tell a build failure from a test failure here and KitError is raised.
         """
         rows = self._check_table(table)
         test = _argv(test, "test")
         build = _argv(build, "build") if build is not None else None
         mirror = Path(tempfile.mkdtemp(prefix="pk-mirror-"))
         added = False
+        self._mirror = mirror
         try:
             git(self.root, "worktree", "add", "--detach", str(mirror), "HEAD")
             added = True
             results = self._run_rows(mirror, rows, build, test, timeout)
         finally:
-            self._remove_mirror(mirror, added)
+            try:
+                self._remove_mirror(mirror, added)
+            finally:
+                self._mirror = None
         self.planted_bug_rows = results
         return results
 
@@ -267,6 +288,20 @@ class Evidence:
             git(self.root, "worktree", "remove", "--force", str(mirror))
         except KitError as exc:
             raise KitError(f"cannot remove mirror {mirror}: {exc}") from exc
+
+    def _restore(self, mirror: Path) -> None:
+        """Return the whole mirror to HEAD: tracked edits undone, untracked and ignored files removed.
+
+        Refuses unless `mirror` is the temp directory this instance created and is its own git top level,
+        so `git clean` can never reach the project.
+        """
+        if self._mirror is None or mirror != self._mirror or mirror == self.root \
+                or not mirror.name.startswith("pk-mirror-"):
+            raise KitError(f"refusing to clean {mirror}: not the mirror this run created")
+        if Path(git(mirror, "rev-parse", "--show-toplevel")).resolve() != mirror.resolve():
+            raise KitError(f"refusing to clean {mirror}: it is not its own worktree")
+        git(mirror, "checkout", "--", ".")
+        git(mirror, "clean", "-fdxq")
 
     def _attempt(self, mirror: Path, path: str, edit: Callable[[bytes], bytes], build: list[str] | None,
                  argv: list[str], timeout: int | None) -> tuple[bool, int | None, str]:
@@ -281,11 +316,10 @@ class Evidence:
                 if code != 0:
                     return False, None, ""
             code, output = run_argv(argv, mirror, env=env, timeout=timeout)
-            builds = build is not None or code not in _NO_RUN
+            builds = code not in _NO_RUN  # a timeout or a missing program is never a kill
             return builds, code, sha256_bytes(output.encode("utf-8"))
         finally:
-            git(mirror, "checkout", "--", path)
-            _clear_bytecode(mirror)
+            self._restore(mirror)
 
     def _baseline(self, mirror: Path, build: list[str] | None, argv: list[str], rid: str,
                   timeout: int | None) -> None:
@@ -301,7 +335,7 @@ class Evidence:
                 raise KitError(f"unmutated mirror fails its own test (exit {code}); a failing test kills "
                                f"nothing (row {rid})")
         finally:
-            _clear_bytecode(mirror)
+            self._restore(mirror)
 
     def _run_rows(self, mirror: Path, rows: list[dict], build: list[str] | None, test: list[str],
                   timeout: int | None) -> list[dict]:
@@ -335,12 +369,13 @@ class Evidence:
 
         builds, code, digest = self._attempt(mirror, first["path"], break_file, build, argv, timeout)
         if build is None:
-            # No build step: the broken file is judged by the test command, which must not pass.
             if code == 0:
                 raise KitError(f"self-test cannot be trusted: {first['path']} with an unparseable line still "
-                               "passes the test, so a broken file is not detected; pass a build step")
-            builds = False
-        elif builds:
+                               "passes the test, so a broken file is not detected; pass a build command")
+            if builds:  # failed for some reason other than "program missing or timed out"
+                raise KitError("self-test cannot be trusted: without a build step a build failure cannot be "
+                               "told from a test failure; pass a build command")
+        elif code is not None:  # the build step accepted the broken file
             raise KitError(f"planted-bug results cannot be trusted: the build step accepted an unparseable line "
                            f"in {first['path']} (test exit {code}), so the runner cannot tell a build failure from "
                            "a test failure for this project")
@@ -501,14 +536,15 @@ def validate_results(data) -> list[str]:
         if row["id"] in seen:
             bad(where, f"repeats id {row['id']}")
         seen.add(row["id"])
-        if "kill_reason" in row and row["kill_reason"] not in KILL_REASONS:
-            bad(where, "kill_reason must be one of: " + ", ".join(KILL_REASONS))
-        elif "kill_reason" in row and (row["kill_reason"] == "test failed") != row["killed"]:
-            bad(where, "killed and kill_reason disagree")
-        if "test_output_sha256" in row and not isinstance(row["test_output_sha256"], str):
-            bad(where, "test_output_sha256 must be a string")
         if row["killed"] and not row["builds"]:
             bad(where, "killed although it does not build")
+        expected = "build failed" if not row["builds"] else "test failed" if row["killed"] else "not killed"
+        if row.get("kill_reason") != expected:
+            bad(where, f"kill_reason must be '{expected}' for builds={str(row['builds']).lower()}, "
+                       f"killed={str(row['killed']).lower()} (found {row.get('kill_reason')!r})")
+        digest = row.get("test_output_sha256")
+        if not isinstance(digest, str) or not (digest == "" or _HEX64.match(digest)):
+            bad(where, "test_output_sha256 must be 64 lowercase hex characters, or empty when no test ran")
         shaped.append(row)
     selfs = [row for row in shaped if row["id"] == SELF_TEST_ID]
     bugs = [row for row in shaped if row["id"] != SELF_TEST_ID]

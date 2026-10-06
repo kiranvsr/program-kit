@@ -55,6 +55,19 @@ def worktrees(root):
     return [ln for ln in sh(root, "git", "worktree", "list", "--porcelain").splitlines() if ln.startswith("worktree ")]
 
 
+@contextlib.contextmanager
+def spy_mkdtemp():
+    """Record every directory evidence creates with tempfile.mkdtemp."""
+    made, real = [], tempfile.mkdtemp
+
+    def spy(*a, **kw):
+        made.append(real(*a, **kw))
+        return made[-1]
+
+    with mock.patch.object(evidence.tempfile, "mkdtemp", spy):
+        yield made
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         tmp, self.root = make_repo()
@@ -94,6 +107,11 @@ class HashInputs(Base):
         got = ev.hash_inputs(["sub", "calc.py"])
         self.assertEqual(list(got), ["calc.py", "sub/a.txt", "sub/b.txt"])
         self.assertTrue(all(len(v) == 64 for v in got.values()))
+
+    def test_root_must_be_the_git_top_level(self):
+        with self.assertRaises(KitError) as ctx:
+            evidence.Evidence(self.root / "sub", "T-1")
+        self.assertIn("top level", str(ctx.exception))
 
     def test_heads_recorded(self):
         ev = evidence.Evidence(self.root, "T-1")
@@ -181,11 +199,19 @@ class PlantedBugs(Base):
             ev.planted_bugs([row("flip")], always_builds, TEST)
         self.assertIn("cannot be trusted", str(ctx.exception))
 
-    def test_build_none_python_self_test_is_not_passing(self):
+    def test_build_none_cannot_tell_build_failure_from_test_failure(self):
         ev = evidence.Evidence(self.root, "T-1")
-        rows = ev.planted_bugs([row("flip")], None, TEST)
-        self.assertEqual((rows[-1]["id"], rows[-1]["builds"], rows[-1]["killed"]), (SELF_TEST, False, False))
-        self.assertTrue(rows[0]["killed"])
+        with self.assertRaises(KitError) as ctx:
+            ev.planted_bugs([row("flip")], None, TEST)
+        self.assertEqual(str(ctx.exception), "self-test cannot be trusted: without a build step a build failure "
+                         "cannot be told from a test failure; pass a build command")
+        self.assertEqual(len(worktrees(self.root)), 1)
+
+    def test_build_none_self_test_that_passes_is_untrusted(self):
+        ev = evidence.Evidence(self.root, "T-1")
+        with self.assertRaises(KitError) as ctx:
+            ev.planted_bugs([row("flip")], None, [PY, "-c", "pass"])
+        self.assertIn("cannot be trusted", str(ctx.exception))
 
     def test_build_none_missing_test_program_is_build_failed(self):
         ev = evidence.Evidence(self.root, "T-1")
@@ -216,6 +242,69 @@ class PlantedBugs(Base):
             ev.planted_bugs([row("same"), row("same")], BUILD, TEST)
         with self.assertRaises(KitError):
             ev.planted_bugs([], BUILD, TEST)
+
+    def test_timeout_is_never_a_kill(self):
+        ev = evidence.Evidence(self.root, "T-1")
+        hang = row("hang", find="return a + b", replace="while True: pass")
+        rows = ev.planted_bugs([hang], BUILD, TEST, timeout=3)
+        self.assertEqual((rows[0]["builds"], rows[0]["killed"], rows[0]["kill_reason"]),
+                         (False, False, "build failed"))
+
+    def test_symlink_row_is_a_table_error_and_outside_file_is_untouched(self):
+        with tempfile.TemporaryDirectory() as other:
+            outside = Path(other).resolve() / "outside_target.py"
+            outside.write_text("secret = 1\n")
+            os.symlink(outside, self.root / "link.py")
+            sh(self.root, "git", "add", "link.py")
+            sh(self.root, "git", "commit", "-q", "-m", "link")
+            ev = evidence.Evidence(self.root, "T-1")
+            with spy_mkdtemp() as made, self.assertRaises(KitError) as ctx:
+                ev.planted_bugs([row("sym", path="link.py", find="outside_target", replace="x")], BUILD, TEST)
+            self.assertIn("120000", str(ctx.exception))
+            self.assertEqual(made, [])
+            self.assertEqual(outside.read_bytes(), b"secret = 1\n")
+            self.assertEqual(ev.hash_inputs(["link.py"]),  # hashed as link text, never followed
+                             {"link.py": hashlib.sha256(str(outside).encode()).hexdigest()})
+
+    def test_baseline_failure_removes_the_mirror(self):
+        ev = evidence.Evidence(self.root, "T-1")
+        with spy_mkdtemp() as made, self.assertRaises(KitError) as ctx:
+            ev.planted_bugs([row("flip")], BUILD, [PY, "-c", "raise SystemExit(1)"])
+        self.assertIn("unmutated", str(ctx.exception))
+        self.assertEqual(len(made), 1)
+        self.assertFalse(os.path.exists(made[0]))
+        self.assertEqual(len(worktrees(self.root)), 1)
+
+    def test_table_error_creates_no_mirror_directory(self):
+        ev = evidence.Evidence(self.root, "T-1")
+        with spy_mkdtemp() as made:
+            for bad in (row("none", find="nope"), row("same", replace="a + b"), row("p", path="../calc.py")):
+                with self.assertRaises(KitError):
+                    ev.planted_bugs([bad], BUILD, TEST)
+        self.assertEqual(made, [])
+        self.assertEqual(len(worktrees(self.root)), 1)
+
+    def test_next_row_starts_from_head_after_a_test_dirties_the_whole_mirror(self):
+        script = ("import os, sys\n"
+                  "if sys.argv[1] == 'dirty':\n"
+                  "    open('junk.txt', 'w').write('x')\n"
+                  "    open('sub/a.txt', 'a').write('more')\n"
+                  "    sys.exit(1 if 'a - b' in open('calc.py').read() else 0)\n"
+                  "clean = not os.path.exists('junk.txt') and open('sub/a.txt').read() == 'a\\n'\n"
+                  "sys.exit(0 if clean else 1)\n")
+        ev = evidence.Evidence(self.root, "T-1")
+        rows = ev.planted_bugs([row("first", test_args=["dirty"]),
+                                row("second", replace="a * b", test_args=["check"])],
+                               BUILD, [PY, "-c", script])
+        self.assertTrue(rows[0]["killed"])
+        self.assertFalse(rows[1]["killed"], "the second row saw files left by the first")
+
+    def test_restore_refuses_anything_but_its_own_mirror(self):
+        ev = evidence.Evidence(self.root, "T-1")
+        (self.root / "keep.txt").write_text("untracked")
+        with self.assertRaises(KitError):
+            ev._restore(self.root)
+        self.assertTrue((self.root / "keep.txt").exists())
 
     def test_working_tree_untouched_and_mirror_removed(self):
         ev = evidence.Evidence(self.root, "T-1")
@@ -349,7 +438,8 @@ class Write(Base):
         with self.assertRaises(KitError) as ctx:
             ev.write(out)
         self.assertIn(SELF_TEST, str(ctx.exception))
-        ev.planted_bug_rows.append({"id": SELF_TEST, "builds": False, "killed": False})
+        ev.planted_bug_rows.append({"id": SELF_TEST, "builds": False, "killed": False,
+                                    "kill_reason": "build failed", "test_output_sha256": ""})
         ev.run_command("bad", [PY, "-c", "raise SystemExit(3)"])
         with self.assertRaises(KitError) as ctx:
             ev.write(out)
@@ -453,6 +543,35 @@ class Validate(Base):
             code, _, stderr = self.run_cli(str(out))
             self.assertEqual(code, 1, name)
             self.assertTrue(stderr.startswith("error: "), name)
+
+    def test_validate_row_reason_rules(self):
+        out = self.written()
+        original = out.read_text()
+        h = "0" * 64
+        cases = {
+            "unbuilt but reason test failed": {"builds": False, "killed": False, "kill_reason": "test failed"},
+            "built killed reason build failed": {"builds": True, "killed": True, "kill_reason": "build failed"},
+            "survivor reason test failed": {"builds": True, "killed": False, "kill_reason": "test failed"},
+            "killed reason not killed": {"builds": True, "killed": True, "kill_reason": "not killed"},
+            "reason missing": {"builds": True, "killed": True, "kill_reason": None},
+            "short digest": {"builds": True, "killed": True, "kill_reason": "test failed", "test_output_sha256": "ab"},
+            "digest missing": {"builds": True, "killed": True, "kill_reason": "test failed", "test_output_sha256": None},
+        }
+        for name, fields in cases.items():
+            data = json.loads(original)
+            bug = {"id": "extra", "test_output_sha256": h, **fields}
+            for key in [k for k, v in bug.items() if v is None]:
+                del bug[key]
+            data["planted_bugs"].insert(0, bug)
+            data["planted_bugs_all_killed"] = False
+            out.write_text(json.dumps(data))
+            self.assertEqual(self.run_cli(str(out))[0], 1, name)
+        good = json.loads(original)
+        good["planted_bugs"].insert(0, {"id": "empty-digest", "builds": False, "killed": False,
+                                        "kill_reason": "build failed", "test_output_sha256": ""})
+        good["planted_bugs_all_killed"] = False
+        out.write_text(json.dumps(good))
+        self.assertEqual(self.run_cli(str(out))[0], 0)
 
     def test_validate_all_killed_recomputed_excluding_self_test_row(self):
         out = self.written()
