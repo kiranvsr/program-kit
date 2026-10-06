@@ -6,11 +6,16 @@ controller's check from main; `claims` and `validate_claims` keep `program/claim
 equal to a recomputation from `gates.yaml`, each record's `acceptance.json` and `environments.yaml`.
 
 Run it from the main checkout: the task worktree defaults to `<root>/.worktrees/<id lowercased>`.
-`checks.yaml`, the guarded files and the `Guarded edit:` lines in the task's SPEC are all read from
-the main checkout and the main branch, so a task branch cannot change the rules it is judged by.
+`checks.yaml` (with its guarded files), the `Guarded edit:` lines in the task's SPEC and the PLAN commands
+are all read from the main branch (`git show <main>:...`), so a task branch or a dirty main checkout
+cannot change the rules it is judged by; the task's PLAN.md must be byte-identical to main's.
 The trial merge happens in a temporary worktree of main and never commits or touches the main checkout.
+`binding` is QA's check that a record's `head` still binds the branch tip, read from git objects only.
 
-Known limits:
+Limits:
+- A produce.py that hand-writes a well-formed results.json is not detectable by the gate; QA re-runs the
+  evidence independently and uses `pk gate binding`.
+- Files written to git-ignored paths are invisible to the clean-tree checks.
 - Projects must git-ignore the bytecode and build output their commands write: the evidence step
   needs a clean tree, and a leftover untracked file fails it.
 - Evidence is bound to the commit it was produced at, and the produced `results.json` is left
@@ -20,15 +25,18 @@ Known limits:
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import shlex
 import shutil
+import subprocess
 import sys
 import tempfile
 from pathlib import Path, PurePosixPath
 
 import evidence as evidence_module
 import stale as stale_module
+import miniyaml
 from common import KitError, find_root, git, read_json, read_yaml, run_argv, sha256_file, write_json
 from register import GATE_ID
 
@@ -36,6 +44,7 @@ CHECK_KEYS = ("build", "test", "scan", "compile_check", "extra_gate")
 ALL_KEYS = CHECK_KEYS + ("guarded_files",)
 STEP_TIMEOUT = 3600  # seconds per command
 TAIL_LINES = 20
+TAIL_PREFIX = "    | "
 PLAN_SECTION = "## Exact Commands"
 NOT_EVALUATED, EVIDENCED, BLOCKED = "not_evaluated", "evidenced", "blocked"
 
@@ -62,12 +71,7 @@ def _argv_lists(value, key: str) -> list[list[str]]:
     return commands
 
 
-def load_checks(root, require: tuple[str, ...] = ()) -> dict:
-    """`program/checks.yaml` as {build, test, scan, compile_check, extra_gate: argv lists; guarded_files: [str]}.
-
-    Keys named in `require` must list at least one command: a gate that runs nothing proves nothing.
-    """
-    data = read_yaml(Path(root) / "program" / "checks.yaml")
+def _parse_checks(data, require: tuple[str, ...]) -> dict:
     if data is None:
         data = {}
     if not isinstance(data, dict):
@@ -86,6 +90,28 @@ def load_checks(root, require: tuple[str, ...] = ()) -> dict:
         if not checks[key]:
             raise KitError(f"checks.yaml: {key} must list at least one command")
     return checks
+
+
+def load_checks(root, require: tuple[str, ...] = ()) -> dict:
+    """`program/checks.yaml` from the working tree as {build, test, scan, compile_check, extra_gate: argv lists;
+    guarded_files: [str]}.
+
+    Keys named in `require` must list at least one command: a gate that runs nothing proves nothing.
+    """
+    return _parse_checks(read_yaml(Path(root) / "program" / "checks.yaml"), require)
+
+
+def load_checks_at(root, ref: str, require: tuple[str, ...] = ()) -> dict:
+    """`program/checks.yaml` as committed at `ref`; the gates use this so the working tree cannot change the rules."""
+    try:
+        text = _git_bytes(Path(root), "show", f"{ref}:program/checks.yaml").decode("utf-8")
+    except (KitError, UnicodeDecodeError) as exc:
+        raise KitError(f"program/checks.yaml cannot be read on {ref}: {exc}") from exc
+    try:
+        data = miniyaml.loads(text)
+    except miniyaml.YAMLError as exc:
+        raise miniyaml.YAMLError(f"program/checks.yaml on {ref}: {exc}") from exc
+    return _parse_checks(data, require)
 
 
 # --- PLAN commands -----------------------------------------------------------------
@@ -117,16 +143,21 @@ def parse_plan(text: str) -> list[tuple[list[str], int]]:
     return found
 
 
-def plan_commands(worktree, task_id: str) -> list[tuple[list[str], int]]:
-    """The PLAN commands of a task in `worktree`; [] when PLAN.md does not exist."""
-    path = Path(worktree) / "program" / "tasks" / task_id / "PLAN.md"
-    if not path.is_file():
-        return []
+def _git_bytes(root: Path, *args: str) -> bytes:
+    """Raw stdout of git in `root` (never stripped, so leading spaces of status lines survive)."""
     try:
-        text = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as exc:
-        raise KitError(f"cannot read {path}: {exc}") from exc
-    return parse_plan(text)
+        proc = subprocess.run(["git", "-C", str(root), *args], capture_output=True)
+    except OSError as exc:
+        raise KitError(f"cannot run git: {exc.strerror or exc}") from exc
+    if proc.returncode != 0:
+        lines = [ln.strip() for ln in proc.stderr.decode("utf-8", "replace").splitlines() if ln.strip()]
+        raise KitError(f"git {' '.join(args)} failed: {lines[0] if lines else f'exit {proc.returncode}'}")
+    return proc.stdout
+
+
+def _git_fields(root: Path, *args: str) -> list[str]:
+    """The NUL-terminated fields of a `-z` git command, unstripped."""
+    return [f for f in _git_bytes(root, *args).decode("utf-8", "replace").split("\0") if f]
 
 
 # --- trial merge -------------------------------------------------------------------
@@ -169,27 +200,39 @@ def trial_merge(root, branch: str, main: str = "main") -> Path:
     except KitError:
         shutil.rmtree(trial, ignore_errors=True)  # git never registered it: this is the empty mkdtemp dir
         raise
-    code, output = run_argv(["git", "-C", str(trial), "merge", "--no-commit", "--no-ff", branch], trial)
-    if code == 0:
-        return trial
     try:
-        conflicted = [p for p in git(trial, "diff", "--name-only", "-z", "--diff-filter=U").split("\0") if p]
-    except KitError:
-        conflicted = []
-    run_argv(["git", "-C", str(trial), "merge", "--abort"], trial)
-    problem = _remove_trial(root, trial)
-    if conflicted:
-        message = f"merge of {branch} into {main} conflicts in: {', '.join(conflicted)}"
-    else:
+        code, output = run_argv(["git", "-C", str(trial), "merge", "--no-commit", "--no-ff",
+                                 f"refs/heads/{branch}"], trial)
+        if code == 0:
+            return trial
+        try:
+            conflicted = _git_fields(trial, "diff", "--name-only", "-z", "--diff-filter=U")
+        except KitError:
+            conflicted = []
+        run_argv(["git", "-C", str(trial), "merge", "--abort"], trial)
+        if conflicted:
+            raise KitError(f"merge of {branch} into {main} conflicts in: {', '.join(conflicted)}")
         lines = [ln.strip() for ln in output.splitlines() if ln.strip()]
-        message = f"merge of {branch} into {main} failed: {lines[-1] if lines else f'exit {code}'}"
-    raise KitError(message + (f" ({problem})" if problem else ""))
+        raise KitError(f"merge of {branch} into {main} failed: {lines[-1] if lines else f'exit {code}'}")
+    except BaseException as exc:  # nothing may leave the trial worktree behind
+        problem = _remove_trial(root, trial)
+        if problem and isinstance(exc, KitError):
+            raise KitError(f"{exc} ({problem})") from None
+        if problem:
+            print(f"warning: {problem}", file=sys.stderr)
+        raise
 
 
 # --- running steps -----------------------------------------------------------------
 
 def _run_commands(step: str, commands: list[tuple[list[str], int]], cwd: Path) -> bool:
-    """Run (argv, expected exit) pairs in order; print the first failure and return False."""
+    """Run (argv, expected exit) pairs in order; print the first failure and return False.
+
+    Output tail lines are indented with `    | ` so a command can never print a line that looks like
+    the gate's own `OK:` line. An empty list runs nothing and prints nothing.
+    """
+    if not commands:
+        return True
     for argv, expect in commands:
         code, output = run_argv(argv, cwd, timeout=STEP_TIMEOUT)
         if code == expect:
@@ -199,7 +242,7 @@ def _run_commands(step: str, commands: list[tuple[list[str], int]], cwd: Path) -
             return False
         print(f"FAILED: {step} {' '.join(argv)} (exit {code})")
         for line in output.splitlines()[-TAIL_LINES:]:
-            print(line)
+            print(TAIL_PREFIX + line)
         return False
     print(f"step {step}: ok")
     return True
@@ -237,45 +280,60 @@ def _task_worktree(root: Path, task_id: str, branch: str, override) -> Path:
     common = Path(wt, git(wt, "rev-parse", "--git-common-dir")).resolve()
     if common != Path(root, git(root, "rev-parse", "--git-common-dir")).resolve():
         raise KitError(f"task worktree {wt} belongs to a different repository")
-    try:
-        current = git(wt, "symbolic-ref", "--short", "HEAD")
+    try:  # the full ref: `--short` turns into `heads/<name>` when a tag has the same name
+        current = git(wt, "symbolic-ref", "HEAD").removeprefix("refs/heads/")
     except KitError:
         current = "a detached HEAD"
     if current != branch:
         raise KitError(f"task worktree {wt} is on {current}, not on {branch}")
-    dirty = git(wt, "status", "--porcelain", "--untracked-files=all")
+    dirty = _changes(wt)
     if dirty:
-        paths = ", ".join(line[3:] for line in dirty.splitlines())
-        raise KitError(f"task worktree {wt} is not clean: {paths}")
+        raise KitError(f"task worktree {wt} is not clean: {', '.join(dirty)}")
     return wt
 
 
+def _norm_guard(entry: str) -> str:
+    while entry.startswith("./"):
+        entry = entry[2:]
+    return entry
+
+
 def _guarded_changes(root: Path, task_id: str, branch: str, main: str, guarded: list[str]) -> list[str]:
-    """Guarded files the branch changed against its merge-base with main and the SPEC does not allow."""
-    if not guarded:
+    """Guarded paths the branch changed against its merge-base with main and the SPEC does not allow.
+
+    An entry is an exact path, or a directory when it ends in `/` (everything under it is guarded).
+    The SPEC allows a changed path with `Guarded edit: <path>`; a directory entry may be allowed whole
+    with `Guarded edit: <directory>/`.
+    """
+    entries = [_norm_guard(entry) for entry in guarded]
+    if not entries:
         return []
     base = git(root, "merge-base", main, f"refs/heads/{branch}")
-    changed = {p for p in git(root, "diff", "--name-only", "--no-renames", "-z", f"{base}..refs/heads/{branch}")
-               .split("\0") if p}
-    touched = [path for path in guarded if path in changed]
+    changed = sorted(_git_fields(root, "diff", "--name-only", "--no-renames", "-z",
+                                 f"{base}..refs/heads/{branch}"))
+
+    def guard(path: str) -> str | None:
+        return next((e for e in entries if path == e or (e.endswith("/") and path.startswith(e))), None)
+
+    touched = [(path, guard(path)) for path in changed if guard(path)]
     if not touched:
         return []
     try:  # the SPEC on main: a branch cannot allow its own edit
-        spec = git(root, "show", f"{main}:program/tasks/{task_id}/SPEC.md")
+        spec = _git_bytes(root, "show", f"{main}:program/tasks/{task_id}/SPEC.md").decode("utf-8", "replace")
     except KitError:
         spec = ""
-    allowed = {m.group(1) for m in map(_GUARDED.match, spec.splitlines()) if m}
-    return [path for path in touched if path not in allowed]
+    allowed = {_norm_guard(m.group(1)) for m in map(_GUARDED.match, spec.splitlines()) if m}
+    return [path for path, entry in touched if path not in allowed and entry not in allowed]
 
 
-def _results_problems(data, task_id: str, head: str) -> list[str]:
-    """Why a results.json does not pass the hand-back gate (empty when it does)."""
+def _results_problems(data, task_id: str, head: str | None) -> list[str]:
+    """Why a results.json does not pass the hand-back gate (empty when it does); `head` None skips the head check."""
     problems = evidence_module.validate_results(data)
     if problems:
         return problems
     if data["task_id"] != task_id:
         problems.append(f"task_id: is {data['task_id']}, expected {task_id}")
-    if data["head"] != head:
+    if head is not None and data["head"] != head:
         problems.append(f"head: is {data['head']}, expected the worktree HEAD {head}")
     if data["all_commands_as_expected"] is not True:
         problems.append("all_commands_as_expected: is not true")
@@ -286,19 +344,28 @@ def _results_problems(data, task_id: str, head: str) -> list[str]:
     return problems
 
 
-def _unexpected_changes(wt: Path, allowed: str) -> list[str]:
-    entries = git(wt, "status", "--porcelain", "-z", "--untracked-files=all").split("\0")
-    paths, skip = [], False
-    for entry in entries:
-        if skip:  # the origin half of a rename or copy
-            skip = False
-            continue
-        if len(entry) < 4:
-            continue
+def _changes(wt: Path) -> list[str]:
+    """Every dirty path of a worktree, one string each (a rename reads `new (renamed from old)`).
+
+    Reads `git status --porcelain=v1 -z` raw: each entry is two status characters, a space and the path,
+    and a rename or copy is followed by a field holding its source path.
+    """
+    fields = _git_fields(wt, "status", "--porcelain=v1", "-z", "--untracked-files=all")
+    changes, index = [], 0
+    while index < len(fields):
+        entry = fields[index]
+        index += 1
+        path = entry[3:]
         if entry[0] in "RC" or entry[1] in "RC":
-            skip = True
-        paths.append(entry[3:])
-    return [path for path in paths if path != allowed]
+            source = fields[index] if index < len(fields) else "?"
+            index += 1
+            path = f"{path} (renamed from {source})"
+        changes.append(path)
+    return changes
+
+
+def _unexpected_changes(wt: Path, allowed: str) -> list[str]:
+    return [path for path in _changes(wt) if path != allowed]
 
 
 def _evidence_step(wt: Path, task_id: str) -> bool:
@@ -343,8 +410,17 @@ def _run_steps(root: Path, checks: dict, task_id: str, wt: Path, trial: Path, ma
     for step in ("test", "scan", "extra_gate"):
         if not _run_commands(step, _commands(checks[step]), wt):
             return 1
+    plan_rel = f"program/tasks/{task_id}/PLAN.md"
     try:
-        plan = plan_commands(wt, task_id)
+        authoritative = _git_bytes(root, "show", f"{main}:{plan_rel}")
+    except KitError:
+        authoritative = None
+    own = wt / plan_rel
+    if authoritative is None or not own.is_file() or own.read_bytes() != authoritative:
+        print(f"FAILED: plan {plan_rel} differs from {main}")
+        return 1
+    try:
+        plan = parse_plan(authoritative.decode("utf-8", "replace"))
     except KitError as exc:
         print(f"FAILED: plan {exc}")
         return 1
@@ -366,7 +442,7 @@ def handback(root, task_id: str, branch: str, worktree=None, main: str = "main")
     _check_ref(main, "main branch")
     sha = _branch_head(root, branch)
     wt = _task_worktree(root, task_id, branch, worktree)
-    checks = load_checks(root, require=("build", "test", "scan"))
+    checks = load_checks_at(root, main, require=("build", "test", "scan"))
     guarded = _guarded_changes(root, task_id, branch, main, checks["guarded_files"])
     if guarded:
         print(f"FAILED: guarded files changed: {', '.join(guarded)}")
@@ -387,7 +463,7 @@ def merge_check(root, branch: str, main: str = "main") -> int:
     root = Path(root).resolve()
     _check_ref(main, "main branch")
     sha = _branch_head(root, branch)
-    checks = load_checks(root, require=("build", "test"))
+    checks = load_checks_at(root, main, require=("build", "test"))
     trial = trial_merge(root, branch, main)
 
     def steps() -> int:
@@ -504,20 +580,25 @@ def _claims_dir(root: Path, gate_id: str) -> Path:
     return root / "program" / "claims" / gate_id
 
 
+def _refuse_symlink(directory: Path) -> None:
+    if directory.is_symlink():
+        raise KitError(f"{directory} is a symlink; refusing to use the claims directory through it")
+
+
 def claims(root, gate_id: str) -> list[Path]:
     """Write `program/claims/<GATE>/<record-name>.json` per record and drop files of records no longer in the gate."""
     root = Path(root).resolve()
     docs = _expected_claims(root, gate_id)
     directory = _claims_dir(root, gate_id)
-    if directory.is_symlink():
-        raise KitError(f"{directory} is a symlink; refusing to write through it")
+    _refuse_symlink(directory)
     written = []
     for name, doc in docs.items():
         write_json(directory / name, doc)
         written.append(directory / name)
-    for entry in sorted(directory.iterdir()):
-        if entry.name not in docs and (entry.is_file() or entry.is_symlink()):
-            entry.unlink()
+    if directory.is_dir():
+        for entry in sorted(directory.iterdir()):
+            if entry.name not in docs and (entry.is_file() or entry.is_symlink()):
+                entry.unlink()
     return written
 
 
@@ -526,6 +607,7 @@ def validate_claims(root, gate_id: str) -> list[str]:
     root = Path(root).resolve()
     docs = _expected_claims(root, gate_id)
     directory = _claims_dir(root, gate_id)
+    _refuse_symlink(directory)
     problems = []
     for name, doc in docs.items():
         path = directory / name
@@ -552,17 +634,63 @@ def validate_claims(root, gate_id: str) -> list[str]:
     return problems
 
 
+# --- binding ----------------------------------------------------------------------
+
+def binding(root, task_id: str, branch: str, main: str = "main") -> list[str]:
+    """Problems that stop a branch's results.json from binding its tip (empty, with a printed line, when it holds).
+
+    Holds only when `program/evidence/<ID>/results.json` on the branch tip validates, its `head` is an
+    ancestor of the tip, and the net change from `head` to the tip touches only `program/evidence/<ID>/`
+    and `program/status/<ID>.json`. Everything is read from git objects, never from a working tree.
+    """
+    root = Path(root).resolve()
+    if not isinstance(task_id, str) or not _TASK.match(task_id):
+        raise KitError(f"not a usable task id: {task_id}")
+    _check_ref(main, "main branch")
+    tip = _branch_head(root, branch)
+    rel = f"program/evidence/{task_id}/results.json"
+    try:
+        text = _git_bytes(root, "show", f"{tip}:{rel}").decode("utf-8")
+        data = json.loads(text)
+    except KitError:
+        return [f"{rel} is absent on {branch}"]
+    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
+        return [f"{rel} on {branch} is not valid JSON: {exc}"]
+    problems = _results_problems(data, task_id, None)
+    if problems:
+        return [f"{rel}: {problem}" for problem in problems]
+    head = data["head"]
+    code, _ = run_argv(["git", "-C", str(root), "merge-base", "--is-ancestor", head, tip], root)
+    if code != 0:
+        return [f"{rel}: head {head} is not an ancestor of {branch} ({tip})"]
+    prefix, status = f"program/evidence/{task_id}/", f"program/status/{task_id}.json"
+    outside = [path for path in sorted(_git_fields(root, "diff", "--name-only", "--no-renames", "-z",
+                                                   f"{head}..{tip}"))
+               if not path.startswith(prefix) and path != status]
+    if outside:
+        return [f"{path}: changed after {head} but is not under {prefix} or {status}" for path in outside]
+    later = int(git(root, "rev-list", "--count", f"{head}..{tip}"))
+    print(f"binding holds: results.json at {head} bound, {later} later commit(s) touch only evidence and status")
+    return []
+
+
 # --- command -----------------------------------------------------------------------
 
 def cmd_gate(args: argparse.Namespace) -> int:
     action = getattr(args, "gate_action", None)
-    if action not in ("handback", "merge-check", "claims", "validate"):
-        raise KitError("gate needs an action: handback, merge-check, claims or validate")
+    if action not in ("handback", "merge-check", "binding", "claims", "validate"):
+        raise KitError("gate needs an action: handback, merge-check, binding, claims or validate")
     root = find_root()
     if action == "handback":
         return handback(root, args.task_id, args.branch, worktree=args.worktree, main=args.main)
     if action == "merge-check":
         return merge_check(root, args.branch, main=args.main)
+    if action == "binding":
+        problems = binding(root, args.task_id, args.branch, main=args.main)
+        if problems:
+            print("\n".join("error: " + problem for problem in problems), file=sys.stderr)
+            return 1
+        return 0
     if action == "claims":
         print(f"wrote {len(claims(root, args.gate))} claim documents")
         return 0
@@ -584,6 +712,10 @@ def _configure(parser: argparse.ArgumentParser) -> None:
     merge = actions.add_parser("merge-check", help="the controller's trial merge, build and test")
     merge.add_argument("--branch", required=True, help="the branch to merge")
     merge.add_argument("--main", default="main", help="main branch name (default: main)")
+    bind = actions.add_parser("binding", help="QA check: the branch's results.json still binds its tip")
+    bind.add_argument("task_id", metavar="ID", help="task ID, for example P0-M01-S01-T01")
+    bind.add_argument("--branch", required=True, help="the task branch")
+    bind.add_argument("--main", default="main", help="main branch name (default: main)")
     make = actions.add_parser("claims", help="write the claim documents of a gate")
     make.add_argument("gate", metavar="GATE", help="gate ID, for example G-P0")
     check = actions.add_parser("validate", help="fail on drift between claim documents and a recomputation")
@@ -591,4 +723,5 @@ def _configure(parser: argparse.ArgumentParser) -> None:
 
 
 def register(add_command) -> None:
-    add_command("gate", cmd_gate, help="gate runner: handback, merge-check, claims, validate", configure=_configure)
+    add_command("gate", cmd_gate, help="gate runner: handback, merge-check, binding, claims, validate",
+                configure=_configure)

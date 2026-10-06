@@ -58,7 +58,7 @@ class PkTests(unittest.TestCase):
         self.assertEqual(sorted(checks), sorted(["build", "test", "scan", "compile_check", "extra_gate",
                                                  "guarded_files"]))
         for key, value in checks.items():
-            self.assertEqual(value, [], key)
+            self.assertEqual(value, ["program/checks.yaml"] if key == "guarded_files" else [], key)
         self.assertEqual(read_yaml(KIT / "templates" / "environments.yaml"), {"environments": {}})
         self.assertEqual(read_yaml(KIT / "templates" / "ledger.yaml"), {"sources": {}, "entries": []})
 
