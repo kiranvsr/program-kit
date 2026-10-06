@@ -47,7 +47,16 @@ def _files(kit_dir: Path) -> dict[str, Path]:
 def write(kit_dir: Path) -> Path:
     """Write `<kit_dir>/MANIFEST.sha256` atomically and return its path."""
     kit_dir = Path(kit_dir)
-    lines = [f"{sha256_file(path)}  {relative}" for relative, path in sorted(_files(kit_dir).items())]
+    lines = []
+    for relative, path in sorted(_files(kit_dir).items()):
+        line = f"{sha256_file(path)}  {relative}"
+        try:
+            line.encode("utf-8")
+        except UnicodeEncodeError:
+            raise KitError(f"{ascii(relative)}: file name is not valid UTF-8 and cannot be recorded") from None
+        if _LINE.match(line) is None or line.splitlines() != [line]:
+            raise KitError(f"{ascii(relative)}: file name cannot be recorded in the manifest (line break or leading space)")
+        lines.append(line)
     target = kit_dir / MANIFEST_NAME
     _atomic_write(target, "".join(line + "\n" for line in lines))
     return target
@@ -56,14 +65,16 @@ def write(kit_dir: Path) -> Path:
 def _read(kit_dir: Path) -> dict[str, str]:
     path = Path(kit_dir) / MANIFEST_NAME
     try:
-        text = path.read_text(encoding="utf-8")
+        text = path.read_bytes().decode("utf-8")  # no newline translation
     except (OSError, UnicodeDecodeError) as exc:
         reason = exc.strerror if isinstance(exc, OSError) and exc.strerror else exc
         raise KitError(f"cannot read {path}: {reason}") from exc
     recorded: dict[str, str] = {}
-    for number, line in enumerate(text.splitlines(), 1):
+    if text and not text.endswith("\n"):
+        raise KitError(f"{path}: malformed manifest (last line has no newline)")
+    for number, line in enumerate(text.split("\n")[:-1], 1):  # split on "\n" only: a CRLF line must not pass
         match = _LINE.match(line)
-        if match is None:
+        if match is None or line.splitlines() != [line]:
             raise KitError(f"{path} line {number}: malformed manifest line")
         if match.group(2) in recorded:
             raise KitError(f"{path} line {number}: duplicate path {match.group(2)}")
@@ -87,7 +98,7 @@ def check(kit_dir: Path) -> list[str]:
 def cmd_manifest(args: argparse.Namespace) -> int:
     if args.action == "write":
         target = write(KIT_DIR)
-        print(f"manifest: {len(target.read_text(encoding='utf-8').splitlines())} files")
+        print(f"manifest: {len(_read(KIT_DIR))} files")
         return 0
     problems = check(KIT_DIR)
     if not problems:

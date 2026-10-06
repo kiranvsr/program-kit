@@ -21,6 +21,22 @@ def _env(**extra):
     return env
 
 
+def snapshot(path):
+    """Every entry under `path` (directories, symlinks and file bytes), for byte-identical comparisons."""
+    found = {}
+    for current, dirs, names in os.walk(path):
+        for name in [*dirs, *names]:
+            entry = Path(current) / name
+            key = entry.relative_to(path).as_posix()
+            if entry.is_symlink():
+                found[key] = ("link", os.readlink(entry))
+            elif entry.is_dir():
+                found[key] = ("dir",)
+            else:
+                found[key] = ("file", entry.read_bytes())
+    return found
+
+
 class InstallCase(unittest.TestCase):
     shell = "sh"
 
@@ -141,6 +157,78 @@ class InstallTests(InstallCase):
         self.assert_refused(self.install(target, "--upgrade"), "MANIFEST.sha256")
         self.assertTrue((target / "kit" / "scripts" / "pk.py").is_file())
 
+    def test_upgrade_does_not_trust_the_installed_kit_to_check_itself(self):
+        target = self.repo()
+        self.assert_ok(self.install(target))
+        (target / "kit" / "scripts" / "pk.py").write_text('print("manifest: clean")\n')
+        (target / "kit" / "templates" / "BRIEF.md").write_text("edited\n")
+        before = snapshot(target / "kit")
+        result = self.install(target, "--upgrade")
+        self.assert_refused(result, "modified: templates/BRIEF.md")
+        self.assertEqual(snapshot(target / "kit"), before)
+        self.assertEqual(self.leftovers(target), [])
+
+    def test_upgrade_refuses_a_symlink_inside_the_installed_kit(self):
+        target = self.repo()
+        self.assert_ok(self.install(target))
+        os.symlink("VERSION", target / "kit" / "link")
+        before = snapshot(target / "kit")
+        self.assert_refused(self.install(target, "--upgrade"), "symlink")
+        self.assertEqual(snapshot(target / "kit"), before)
+        self.assertEqual(self.leftovers(target), [])
+
+    def test_upgrade_never_reuses_an_existing_old_directory(self):
+        target = self.repo()
+        self.assert_ok(self.install(target))
+        stale = target / ".kit.old.12345"
+        (stale / "sub").mkdir(parents=True)
+        (stale / "sub" / "keep.txt").write_bytes(b"not ours\n")
+        before_stale, before_kit = snapshot(stale), snapshot(target / "kit")
+        result = self.install(target, "--upgrade", env=_env(PK_INSTALL_PID="12345"))
+        self.assert_refused(result, ".kit.old.12345")
+        self.assertEqual(snapshot(stale), before_stale)
+        self.assertEqual(snapshot(target / "kit"), before_kit)
+        self.assertEqual(self.leftovers(target), [".kit.old.12345"])
+
+    def test_upgrade_does_not_follow_a_symlink_at_the_old_directory(self):
+        target = self.repo()
+        self.assert_ok(self.install(target))
+        victim = self.tmp / "victim"
+        victim.mkdir()
+        (victim / "precious.txt").write_bytes(b"precious\n")
+        os.symlink(victim, target / ".kit.old.12345")
+        before_victim, before_kit = snapshot(victim), snapshot(target / "kit")
+        result = self.install(target, "--upgrade", env=_env(PK_INSTALL_PID="12345"))
+        self.assert_refused(result, ".kit.old.12345")
+        self.assertEqual(snapshot(victim), before_victim)
+        self.assertEqual(snapshot(target / "kit"), before_kit)
+        self.assertTrue((target / ".kit.old.12345").is_symlink())
+
+    def test_fresh_install_never_reuses_an_existing_temporary_directory(self):
+        target = self.repo()
+        stale = target / ".kit.tmp.12345"
+        stale.mkdir()
+        (stale / "keep.txt").write_bytes(b"not ours\n")
+        before = snapshot(stale)
+        result = self.install(target, env=_env(PK_INSTALL_PID="12345"))
+        self.assert_refused(result, ".kit.tmp.12345")
+        self.assertEqual(snapshot(stale), before)
+        self.assertFalse((target / "kit").exists())
+
+    def test_a_non_numeric_pid_override_is_ignored(self):
+        target = self.repo()
+        self.assert_ok(self.install(target, env=_env(PK_INSTALL_PID="../x")))
+        self.assertFalse((self.tmp / "x").exists())
+
+    def test_cdpath_does_not_disturb_the_target_path(self):
+        target = self.repo()
+        elsewhere = self.tmp / "elsewhere"
+        elsewhere.mkdir()
+        result = self.install(os.path.relpath(target, elsewhere), cwd=elsewhere,
+                              env=_env(CDPATH=f".{os.pathsep}{self.tmp}{os.pathsep}/"))
+        self.assert_ok(result)
+        self.assertEqual(result.stdout.splitlines()[-1], f"installed program-kit {VERSION} into {target}")
+
     def test_unknown_preset_copies_nothing(self):
         target = self.repo()
         self.assert_refused(self.install(target, "--preset", "cobol"), "preset")
@@ -220,6 +308,37 @@ class InstallTests(InstallCase):
         self.assertIn("error: ", result.stderr)
         self.assertEqual(self.leftovers(target), [])
         self.assertFalse((target / "kit").exists())
+
+    def _broken_source(self):
+        source = self.tmp / "source"
+        source.mkdir()
+        shutil.copy(INSTALL, source / "install.sh")
+        shutil.copytree(KIT, source / "kit", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        unreadable = source / "kit" / "templates" / "rulings.md"
+        unreadable.chmod(0)
+        self.addCleanup(unreadable.chmod, 0o644)
+        return source / "install.sh"
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root reads every file")
+    def test_failed_copy_of_an_unreadable_source_file_leaves_nothing_behind(self):
+        target = self.repo()
+        result = self.install(target, script=self._broken_source())
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("error: ", result.stderr)
+        self.assertEqual(self.leftovers(target), [])
+        self.assertFalse((target / "kit").exists())
+        self.assertFalse((target / "program").exists())
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root reads every file")
+    def test_failed_copy_during_upgrade_leaves_the_old_kit_byte_identical(self):
+        target = self.repo()
+        self.assert_ok(self.install(target))
+        before = snapshot(target / "kit")
+        result = self.install(target, "--upgrade", script=self._broken_source())
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("error: ", result.stderr)
+        self.assertEqual(snapshot(target / "kit"), before)
+        self.assertEqual(self.leftovers(target), [])
 
     def test_requires_python_3_11(self):
         target = self.repo()

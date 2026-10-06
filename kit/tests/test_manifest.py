@@ -54,6 +54,31 @@ class ManifestTests(unittest.TestCase):
         with self.assertRaises(KitError):
             manifest.write(self.kit)
 
+    def test_write_rejects_names_that_do_not_round_trip(self):
+        for name in ("bad\nname.txt", "bad\rname.txt", "bad\x0bname.txt", "bad\u2028name.txt", " lead.txt"):
+            with self.subTest(name=ascii(name)):
+                try:
+                    (self.kit / name).write_text("x\n")
+                except OSError:
+                    self.skipTest("file system refuses this name")
+                with self.assertRaises(KitError):
+                    manifest.write(self.kit)
+                (self.kit / name).unlink()
+        self.assertFalse((self.kit / "MANIFEST.sha256").exists())
+
+    def test_check_rejects_crlf_and_unterminated_manifests(self):
+        manifest.write(self.kit)
+        path = self.kit / "MANIFEST.sha256"
+        good = path.read_bytes()
+        path.write_bytes(good.replace(b"\n", b"\r\n"))
+        with self.assertRaises(KitError):
+            manifest.check(self.kit)
+        path.write_bytes(good.rstrip(b"\n"))
+        with self.assertRaises(KitError):
+            manifest.check(self.kit)
+        path.write_bytes(good)
+        self.assertEqual(manifest.check(self.kit), [])
+
     def test_cli_write_and_check(self):
         def run(*argv):
             out, err = io.StringIO(), io.StringIO()

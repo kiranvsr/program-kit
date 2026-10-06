@@ -12,9 +12,7 @@
 
 ## Exact Commands
 
-*Each command is a line starting with `$ `, optionally ending ` # expect N` for the exit code it must return. Commands run without a shell, so no pipes, redirects or substitutions.*
-
-$ echo example # expect 0
+*Each command is one line beginning with a dollar sign and a space, such as `python3 -m unittest discover`, optionally ending with ` # expect N` for the exit code it must return. Commands run without a shell, so no pipes, redirects or substitutions. List them below this paragraph.*
 
 ## Definition Of Done
 

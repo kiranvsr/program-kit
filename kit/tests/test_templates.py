@@ -33,13 +33,14 @@ class TemplateTests(unittest.TestCase):
             self.assertTrue(text.startswith("# "), name)
             self.assertGreaterEqual(len(headings(name)), 3, name)
 
-    def test_exact_commands_section_explains_the_line_format(self):
+    def test_exact_commands_section_explains_the_line_format_and_lists_no_command(self):
         text = (TEMPLATES / "task_PLAN.md").read_text(encoding="utf-8")
         section = text.split("## Exact Commands", 1)[1].split("\n## ", 1)[0]
-        self.assertIn("$ ", section)
+        self.assertIn("dollar sign", section)
         self.assertIn("# expect", section)
         self.assertIn("without a shell", section)
-        self.assertEqual(len([l for l in section.splitlines() if l.startswith("$ ")]), 1)
+        # An unedited template must hold zero commands, so the gate fails honestly instead of running a sample.
+        self.assertEqual([line for line in text.splitlines() if line.startswith("$ ")], [])
 
     def test_lens_sections_in_freeze_review(self):
         self.assertEqual(headings("freeze_review.md")[:5],

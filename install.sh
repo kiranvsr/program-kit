@@ -47,7 +47,7 @@ case "$preset" in
 esac
 
 # Where the kit comes from: the directory this script lives in, whatever the working directory.
-source_root=$(cd "$(dirname -- "$0")" && pwd -P) || fail 'cannot resolve the location of install.sh'
+source_root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P) || fail 'cannot resolve the location of install.sh'
 source_kit="$source_root/kit"
 [ -d "$source_kit" ] || fail "kit directory not found at $source_kit"
 [ -f "$source_kit/VERSION" ] || fail "$source_kit/VERSION not found"
@@ -56,7 +56,7 @@ version=$(cat "$source_kit/VERSION")
 
 # The target: an existing directory that is the top level of a git repository.
 [ -d "$target_arg" ] || fail "$target_arg is not a directory"
-target=$(cd "$target_arg" && pwd -P) || fail "cannot enter $target_arg"
+target=$(CDPATH= cd -- "$target_arg" && pwd -P) || fail "cannot enter $target_arg"
 command -v git >/dev/null 2>&1 || fail 'git was not found on PATH'
 top=$(git -C "$target" rev-parse --show-toplevel 2>/dev/null) || fail "$target is not inside a git repository"
 [ "$top" = "$target" ] || fail "$target is not the top level of a git repository (top level is $top)"
@@ -69,23 +69,29 @@ python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' >/dev
 PYTHONDONTWRITEBYTECODE=1
 export PYTHONDONTWRITEBYTECODE
 
+# The suffix of the two work directories is this process id. PK_INSTALL_PID overrides it (digits only) so the
+# tests can plant a clashing directory; a clash is always an error, never reused.
+case "${PK_INSTALL_PID:-}" in
+    '' | *[!0-9]*) suffix=$$ ;;
+    *) suffix=$PK_INSTALL_PID ;;
+esac
 kit_dir="$target/kit"
-tmp_dir="$target/.kit.tmp.$$"
-old_dir="$target/.kit.old.$$"
+tmp_dir="$target/.kit.tmp.$suffix"
+old_dir="$target/.kit.old.$suffix"
 tmp_made=0
 old_made=0
 
-# Removes only the two directories this run creates. If an interrupt lands between the two renames
-# of an upgrade, the old kit is put back before anything is deleted.
+# Removes only the two directories this run created (each flag is set right after its mkdir succeeded). The old
+# kit lives at "$old_dir/kit"; if an interrupt lands between the two renames of an upgrade it is put back first.
 cleanup() {
     trap - EXIT INT TERM HUP
-    if [ "$old_made" = 1 ] && [ -d "$old_dir" ] && [ ! -e "$kit_dir" ]; then
-        mv "$old_dir" "$kit_dir" || printf 'error: could not restore the previous kit; it is at %s\n' "$old_dir" >&2
+    if [ "$old_made" = 1 ] && [ -d "$old_dir/kit" ] && [ ! -e "$kit_dir" ] && [ ! -L "$kit_dir" ]; then
+        mv "$old_dir/kit" "$kit_dir" || printf 'error: could not restore the previous kit; it is at %s\n' "$old_dir/kit" >&2
     fi
     if [ "$tmp_made" = 1 ] && [ -d "$tmp_dir" ]; then
         rm -rf "$tmp_dir"
     fi
-    if [ "$old_made" = 1 ] && [ -d "$old_dir" ] && [ -e "$kit_dir" ]; then
+    if [ "$old_made" = 1 ] && [ -d "$old_dir" ] && { [ -e "$kit_dir" ] || [ -L "$kit_dir" ]; }; then
         rm -rf "$old_dir"
     fi
 }
@@ -102,14 +108,9 @@ else
     if [ -L "$kit_dir" ] || [ ! -d "$kit_dir" ]; then
         fail "$kit_dir does not exist (or is not a directory); nothing to upgrade"
     fi
-    # The installed kit's own check; a kit that predates the manifest command is checked with the source's module.
-    if [ -f "$kit_dir/scripts/manifest.py" ]; then
-        problems=$(python3 "$kit_dir/scripts/pk.py" manifest check 2>&1) || {
-            printf '%s\n' "$problems" >&2
-            fail "$kit_dir does not match its manifest; refusing to upgrade"
-        }
-    else
-        problems=$(python3 -c '
+    # The installed kit is verified with the SOURCE kit's manifest module against the installed MANIFEST.sha256, in
+    # isolated mode with no bytecode, so nothing under the target is imported or run.
+    problems=$(python3 -I -B -c '
 import sys
 sys.path.insert(0, sys.argv[1])
 import manifest
@@ -123,18 +124,20 @@ for line in found:
     print("error: " + line)
 sys.exit(1 if found else 0)
 ' "$source_kit/scripts" "$kit_dir" 2>&1) || {
-            printf '%s\n' "$problems" >&2
-            fail "$kit_dir does not match its manifest; refusing to upgrade"
-        }
-    fi
+        printf '%s\n' "$problems" >&2
+        fail "$kit_dir does not match its manifest; refusing to upgrade"
+    }
+    # Claim the directory for the old kit now: mkdir fails on any existing path, including a symlink.
+    mkdir "$old_dir" || fail "cannot create $old_dir (it may already exist)"
+    old_made=1
 fi
 
 # Copy the kit to a temporary sibling, without caches.
 if [ -n "$(find "$source_kit" -type l)" ]; then
     fail "$source_kit contains a symbolic link; the kit ships none"
 fi
-dirs=$(cd "$source_kit" && find . -name __pycache__ -prune -o -type d -print)
-files=$(cd "$source_kit" && find . -name __pycache__ -prune -o -type f ! -name '*.pyc' ! -name .DS_Store -print)
+dirs=$(CDPATH= cd -- "$source_kit" && find . -name __pycache__ -prune -o -type d -print)
+files=$(CDPATH= cd -- "$source_kit" && find . -name __pycache__ -prune -o -type f ! -name '*.pyc' ! -name .DS_Store -print)
 mkdir "$tmp_dir" || fail "cannot create $tmp_dir"
 tmp_made=1
 newline='
@@ -151,13 +154,17 @@ set +f
 unset IFS
 
 if [ "$upgrade" = 0 ]; then
+    # mv would move the directory INTO an existing kit_dir, so test again right before the rename. A kit created
+    # by someone else in the instant between this test and the mv is a race this script cannot close.
+    if [ -e "$kit_dir" ] || [ -L "$kit_dir" ]; then
+        fail "$kit_dir appeared during the install; use --upgrade"
+    fi
     mv "$tmp_dir" "$kit_dir" || fail "cannot move $tmp_dir to $kit_dir"
     tmp_made=0
 else
-    mv "$kit_dir" "$old_dir" || fail "cannot move $kit_dir aside"
-    old_made=1
+    mv "$kit_dir" "$old_dir/kit" || fail "cannot move $kit_dir aside"
     if ! mv "$tmp_dir" "$kit_dir"; then
-        mv "$old_dir" "$kit_dir" || fail "cannot install the new kit and cannot restore the old one (at $old_dir)"
+        mv "$old_dir/kit" "$kit_dir" || fail "cannot install the new kit and cannot restore the old one (at $old_dir/kit)"
         fail "cannot move $tmp_dir to $kit_dir; the previous kit was restored"
     fi
     tmp_made=0
@@ -170,10 +177,10 @@ if [ -e "$target/program" ] || [ -L "$target/program" ]; then
     printf 'program/ exists; left untouched\n'
 else
     if [ -n "$preset" ]; then
-        (cd "$target" && python3 "$kit_dir/scripts/pk.py" init --preset "$preset") ||
+        (CDPATH= cd -- "$target" && python3 "$kit_dir/scripts/pk.py" init --preset "$preset") ||
             fail "kit installed, but pk init failed"
     else
-        (cd "$target" && python3 "$kit_dir/scripts/pk.py" init) || fail "kit installed, but pk init failed"
+        (CDPATH= cd -- "$target" && python3 "$kit_dir/scripts/pk.py" init) || fail "kit installed, but pk init failed"
     fi
 fi
 
