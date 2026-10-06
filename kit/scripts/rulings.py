@@ -22,7 +22,7 @@ from pathlib import Path
 
 from common import KitError, find_root, utc_now
 
-_HEADER = re.compile(r"## R(\d+) \((\d{4}-\d{2}-\d{2}), ([^()\n]+)\)\Z")
+_HEADER = re.compile(r"## R(\d+) \((\d{4}-\d{2}-\d{2}), ([^()\n]+)\)\Z", re.ASCII)
 _SUPERSEDES = re.compile(r"\bsupersedes R(\d+)\b", re.IGNORECASE)
 _FIELDS = ("Question", "Decision", "Precedent")
 _MARKERS = tuple(f"**{name}.**" for name in _FIELDS)

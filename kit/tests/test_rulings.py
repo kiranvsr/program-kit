@@ -143,6 +143,13 @@ class RulingsTests(unittest.TestCase):
         self.assertEqual(self.path.read_bytes(), before)
 
     # malformed input
+    def test_a_non_ascii_digit_in_a_header_is_malformed(self):
+        for header in ("## R\u0661 (2026-01-02, controller)", "## R1 (\u0662026-01-02, controller)"):
+            self.seed(HEADER + f"\n{header}\n\n**Question.** Which?\n\n**Decision.** X.\n")
+            with self.assertRaises(KitError) as caught:
+                rulings.read(self.root)
+            self.assertIn("malformed ruling header", str(caught.exception))
+
     def test_malformed_block_is_reported_with_its_line(self):
         self.seed(HEADER + "\n## R1 (2026-01-02, controller)\n\n**Question.** Q?\n\n**Precedent.** P.\n")
         with self.assertRaisesRegex(KitError, r"rulings\.md line 5: R1 .*Decision"):

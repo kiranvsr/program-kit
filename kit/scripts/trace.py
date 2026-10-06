@@ -188,14 +188,32 @@ def validate(root: Path, stage: int) -> list[str]:
 
 # --- sync --------------------------------------------------------------------
 
+def _children(node, field: str, where: str) -> list:
+    """The list under `field` of a register node; an absent or empty one is empty, a wrong shape raises."""
+    value = node.get(field) if isinstance(node, dict) else None
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise KitError(f"program/register.yaml is malformed: {where}.{field} must be a list; run: pk register validate")
+    for number, item in enumerate(value, 1):
+        if not isinstance(item, dict):
+            raise KitError(f"program/register.yaml is malformed: {where}.{field}[{number}] must be a mapping; "
+                           "run: pk register validate")
+    return value
+
+
 def _register_tasks(register: dict) -> list[tuple[str, list[str]]]:
-    """(task id, closes) for every task in register order; entries of the wrong shape are skipped."""
+    """(task id, closes) for every task in register order; a task without a string id is skipped.
+
+    Raises KitError when a phase, milestone, step or task list has the wrong shape, so that `sync` never
+    rewrites the `tasks` section from half a register.
+    """
     found = []
-    for phase in register["phases"]:
-        for milestone in (phase.get("milestones") if isinstance(phase, dict) else None) or []:
-            for step in (milestone.get("steps") if isinstance(milestone, dict) else None) or []:
-                for item in (step.get("tasks") if isinstance(step, dict) else None) or []:
-                    if isinstance(item, dict) and isinstance(item.get("id"), str):
+    for phase in _children(register, "phases", "register"):
+        for milestone in _children(phase, "milestones", "phase"):
+            for step in _children(milestone, "steps", "milestone"):
+                for item in _children(step, "tasks", "step"):
+                    if isinstance(item.get("id"), str):
                         closes = item.get("closes")
                         found.append((item["id"], [c for c in closes if isinstance(c, str)]
                                       if isinstance(closes, list) else []))
@@ -258,7 +276,8 @@ def impact(root: Path, ids: list[str]) -> dict:
 
     def listed(table: dict, ident: str, field: str) -> set[str]:
         entry = table.get(ident)
-        return {x for x in (entry.get(field) if isinstance(entry, dict) else None) or [] if isinstance(x, str)}
+        value = entry.get(field) if isinstance(entry, dict) else None
+        return {x for x in value if isinstance(x, str)} if isinstance(value, list) else set()
 
     def holders(table: dict, ident: str, field: str) -> set[str]:
         return {key for key in table if ident in listed(table, key, field)}

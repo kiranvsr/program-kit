@@ -246,6 +246,52 @@ class SyncTests(TraceBase):
                          matrix(tasks={T1: {"closes": ["REQ-001"]}}))
 
 
+class MalformedRegisterTests(TraceBase):
+    """A hand-edited register of the wrong shape is one error line, and sync changes nothing."""
+
+    def put_raw_register(self, **fields):
+        write_yaml(self.root / "program" / "register.yaml", {"phases": [dict(
+            {"id": "P1", "title": "p", "gate": None}, **fields)]})
+
+    def test_sync_refuses_a_register_of_the_wrong_shape_and_keeps_the_tasks_section(self):
+        data = full_matrix(tasks={T1: {"closes": ["REQ-001"]}})
+        self.put(data)
+        path = self.root / "program" / "traceability.yaml"
+        before = path.read_bytes()
+        for fields in ({"milestones": 5}, {"milestones": [{"id": "P1-M01", "steps": "oops"}]},
+                       {"milestones": [{"id": "P1-M01", "steps": [{"id": "P1-M01-S01", "tasks": 7}]}]},
+                       {"milestones": [5]}):
+            with self.subTest(fields=fields):
+                self.put_raw_register(**fields)
+                code, out, err = self.run_cli("trace", "sync")
+                self.assertEqual((code, out), (1, ""))
+                self.assertEqual(err.count("\n"), 1, err)
+                self.assertTrue(err.startswith("error: program/register.yaml is malformed"), err)
+                self.assertEqual(path.read_bytes(), before)
+
+    def test_impact_refuses_a_register_of_the_wrong_shape_with_one_line(self):
+        self.put(full_matrix())
+        self.put_raw_register(milestones=5)
+        code, out, err = self.run_cli("trace", "impact", "J1")
+        self.assertEqual((code, out), (1, ""))
+        self.assertEqual(err.count("\n"), 1, err)
+        self.assertTrue(err.startswith("error: "), err)
+
+    def test_impact_survives_a_journey_whose_requirements_is_not_a_list(self):
+        for value in (5, "REQ-001", {"a": 1}):
+            with self.subTest(value=value):
+                self.put(full_matrix(journeys={"J1": {"title": "a", "requirements": value}}))
+                self.put_register(task(T1, closes=["J1"]))
+                code, out, err = self.run_cli("trace", "impact", "J1")
+                self.assertEqual((code, err), (0, ""))
+                self.assertEqual(json.loads(out)["tasks"]["not_started"], [T1])
+
+    def test_a_missing_or_empty_list_is_still_an_empty_list(self):
+        self.put(matrix())
+        self.put_raw_register(milestones=None)
+        self.assertEqual(trace_module.sync(self.root), 0)
+
+
 class ImpactTests(TraceBase):
     def setUp(self):
         super().setUp()

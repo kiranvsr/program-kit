@@ -11,6 +11,7 @@ from unittest import mock
 import interview
 import pk
 from common import KitError, read_json, read_yaml, sha256_file, write_yaml
+from test_register import reg, task
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "coverage_min.yaml"
 SOURCES = {"S1": {"kind": "user", "ref": "message 1", "at": "2026-10-01T10:00:00Z"}}
@@ -29,6 +30,11 @@ def entry(ident, topics=("T1.1",), tags=(), **extra):
     base.update(extra)
     return base
 
+
+# a challenge report every lens has answered, as a replay installs it
+FINISHED_CHALLENGE = "# challenge\n\n" + "".join(
+    f"## {lens}\n\n| # | Finding | Severity | Resolution |\n|---|---|---|---|\n\nNo findings.\n\n"
+    for lens in interview.LENSES)
 
 # closes T1.1 (measure + beneficiary)
 CLOSING = [entry("F-1", tags=["measure"]), entry("F-2", tags=["beneficiary"])]
@@ -55,8 +61,15 @@ class InterviewBase(unittest.TestCase):
         return path
 
     def challenge(self, stage):
-        """The (empty) challenge report of `stage`; stages 2 and later cannot be approved without one."""
-        return interview.challenge_init(self.root, stage)
+        """A finished challenge report of `stage` (every lens: no findings); stages 2 and later need one."""
+        path = interview.challenge_init(self.root, stage)
+        path.write_text(path.read_text(encoding="utf-8").replace(
+            "|---|---|---|---|", "|---|---|---|---|\n\nNo findings."), encoding="utf-8")
+        return path
+
+    def put_register(self, *tasks):
+        """A register `stopping_rule` accepts at stage 6 (the default is one task needing no environment)."""
+        write_yaml(self.root / "program" / "register.yaml", reg(*(tasks or (task("P1-M01-S01-T01"),))))
 
     def states(self, stage=1):
         return interview.topic_states(self.root, stage)
@@ -189,11 +202,11 @@ class StoppingRuleTests(InterviewBase):
         self.put_ledger(CLOSING)
         path = interview.challenge_init(self.root, 1)
         self.assertEqual(path, self.root / "program" / "reports" / "stage-1-challenge.md")
-        self.assertEqual(interview.stopping_rule(self.root, 1), [])  # an empty table has no findings
         text = path.read_text(encoding="utf-8")
         for lens in interview.LENSES:
             self.assertIn(f"## {lens}\n", text)
         self.assertEqual(text.count("| # | Finding | Severity | Resolution |"), 5)
+        text = text.replace("|---|---|---|---|", "|---|---|---|---|\n\nNo findings.")
         rows = "| 1 | no target | high |  |\n| 2 | no owner | low | answered in F-9 |\n| 3 | a | b | |\n"
         path.write_text(text.rstrip("\n") + "\n" + rows, encoding="utf-8")
         self.assertEqual(interview.stopping_rule(self.root, 1), ["stage-1-challenge.md: 2 findings unresolved"])
@@ -228,15 +241,17 @@ class StoppingRuleTests(InterviewBase):
                              [] if answered else ["Q-3: blocking question unanswered"], answerer["id"])
 
     def test_unconfirmed_assumption_blocks_stage_5(self):
-        self.put_ledger([entry("A-4", topics=["T2.1"]), entry("A-5", topics=["T2.1"], confirmed=True)])
+        self.put_ledger(CLOSING + [entry("A-4", topics=["T2.1"]), entry("A-5", topics=["T2.1"], confirmed=True)])
         for stage in (4, 5, 6):
             self.challenge(stage)
+        self.put_register()
         self.assertEqual(interview.stopping_rule(self.root, 4), [])
         with mock.patch("trace.validate", return_value=[]):
             self.assertEqual(interview.stopping_rule(self.root, 5), ["A-4: assumption unconfirmed at stage 5"])
             self.assertEqual(interview.stopping_rule(self.root, 6), ["A-4: assumption unconfirmed at stage 6"])
 
     def test_stage_5_and_6_include_trace_problems(self):
+        self.put_ledger(CLOSING + [entry("F-3", topics=["T2.1"])])  # the earlier stages are closed
         self.challenge(5)
         with mock.patch("trace.validate", return_value=["REQ-001: names no component"]) as validate:
             self.assertEqual(interview.stopping_rule(self.root, 5), ["REQ-001: names no component"])
@@ -330,6 +345,7 @@ class ApprovalTests(InterviewBase):
             self.assertEqual(interview.next_stage(self.root), 5)
             self.put_ledger(stage2 + [entry("F-11"), entry("F-12")])
             self.challenge(6)
+            write_yaml(self.root / "program" / "register.yaml", reg(task("P1-M01-S01-T01")))
             interview.approve(self.root, 6, [product])
         # stage 7 is never approved: once stages 1 to 6 are current, 7 is the final value
         self.assertEqual(interview.next_stage(self.root), 7)
@@ -448,6 +464,16 @@ class ReportTests(InterviewBase):
         self.assertEqual(first, path.read_bytes())
 
 
+    def test_report_lists_the_assumptions_still_unconfirmed(self):
+        path = interview.report(self.root, 1)
+        self.assertIn("## Unconfirmed assumptions\n\nnone\n", path.read_text(encoding="utf-8"))
+        self.put_ledger([entry("A-1"), entry("A-2", confirmed=True),
+                         entry("A-3", topics=["T2.1", "T1.1"], text="a | b\n c")])
+        text = interview.report(self.root, 1).read_text(encoding="utf-8")
+        self.assertIn("## Unconfirmed assumptions\n\n- A-1 (T1.1): text of A-1\n- A-3 (T2.1, T1.1): a | b c\n", text)
+        self.assertNotIn("A-2", text.split("## Unconfirmed assumptions")[1])
+
+
 class SourceTests(InterviewBase):
     def test_ingest_copies_file_and_adds_a_source_only(self):
         doc = self.write("incoming/spec.pdf.txt", "hello\n")
@@ -503,7 +529,7 @@ class ReplayTests(InterviewBase):
         (artifacts / "product.md").write_text("p\n", encoding="utf-8")
         (artifacts / "reports").mkdir()
         (artifacts / "reports" / "stage-2-challenge.md").write_text(
-            "# challenge\n\n| # | Finding | Severity | Resolution |\n|---|---|---|---|\n", encoding="utf-8")
+            FINISHED_CHALLENGE, encoding="utf-8")
         return recorded, artifacts
 
     def test_replay_approves_in_order_and_stops_on_first_gap(self):
@@ -565,6 +591,11 @@ class AdrApprovalTests(InterviewBase):
             encoding="utf-8")
         self.challenge(4)
         self.write("program/ARCHITECTURE.md", "a\n")
+        approvals = self.root / "program" / "approvals"
+        approvals.mkdir()
+        for stage in (1, 2, 3):  # the stages below 4 the one-stage coverage map does not list: current, empty records
+            (approvals / f"stage-{stage}.json").write_text(
+                json.dumps({"stage": stage, "at": "x", "artifacts": {}, "ledger_sha256": "x"}), encoding="utf-8")
 
     def test_default_approval_hashes_every_adr_in_name_order(self):
         self.write("program/adr/0002-b.md", "b\n")
@@ -593,7 +624,7 @@ class AdrApprovalTests(InterviewBase):
         (artifacts / "ARCHITECTURE.md").write_text("a\n", encoding="utf-8")
         (artifacts / "adr" / "0001-a.md").write_text("adr\n", encoding="utf-8")
         (artifacts / "reports" / "stage-4-challenge.md").write_text(
-            "# challenge\n\n| # | Finding | Severity | Resolution |\n|---|---|---|---|\n", encoding="utf-8")
+            FINISHED_CHALLENGE, encoding="utf-8")
         shutil.rmtree(self.root / "program" / "reports")  # the replay installs its own challenge report
         interview.replay(self.root, recorded, artifacts)
         record = read_json(self.root / "program" / "approvals" / "stage-4.json")
@@ -651,6 +682,321 @@ class AdrAddedAfterApprovalTests(InterviewBase):
         self.assertEqual(interview.amend(self.root, 4), [])
 
 
+class ChallengeRoundTests(InterviewBase):
+    """The challenge round is not satisfied by the untouched skeleton."""
+
+    SKELETON = "stage-2-challenge.md: still the untouched skeleton; each lens needs a finding row or a No findings. line"
+
+    def setUp(self):
+        super().setUp()
+        self.put_ledger(CLOSING + [entry("F-3", topics=["T2.1"])])
+        self.path = interview.challenge_init(self.root, 2)
+
+    def fill(self, **sections):
+        """Rewrite the skeleton: each lens given gets the text, the others `No findings.`."""
+        text = self.path.read_text(encoding="utf-8")
+        for lens in interview.LENSES:
+            marker = f"## {lens}\n\n| # | Finding | Severity | Resolution |\n|---|---|---|---|\n"
+            self.assertIn(marker, text)
+            text = text.replace(marker, marker + sections.get(lens, "\nNo findings.\n"))
+        self.path.write_text(text, encoding="utf-8")
+
+    def test_the_untouched_skeleton_is_refused(self):
+        self.assertEqual(interview.stopping_rule(self.root, 2), [self.SKELETON])
+        with self.assertRaises(KitError) as caught:
+            interview.approve(self.root, 2, [self.write("program/product.md")])
+        self.assertEqual(str(caught.exception), self.SKELETON)
+        self.assertFalse((self.root / "program" / "approvals").exists())
+
+    def test_a_skeleton_with_only_trailing_blank_lines_added_is_still_the_skeleton(self):
+        self.path.write_text(self.path.read_text(encoding="utf-8") + "\n\n", encoding="utf-8")
+        self.assertEqual(interview.stopping_rule(self.root, 2), [self.SKELETON])
+
+    def test_every_empty_section_is_named(self):
+        self.fill(architect="| 1 | gap | minor | answered in F-3 |\n")
+        self.path.write_text(self.path.read_text(encoding="utf-8").replace(
+            "## program\n\n| # | Finding | Severity | Resolution |\n|---|---|---|---|\n\nNo findings.\n",
+            "## program\n\n| # | Finding | Severity | Resolution |\n|---|---|---|---|\n"), encoding="utf-8")
+        self.assertEqual(interview.stopping_rule(self.root, 2), [
+            "stage-2-challenge.md: section program is empty; add a finding row or a No findings. line"])
+
+    def test_a_blank_row_does_not_count_and_a_missing_section_is_empty(self):
+        self.fill(delivery="| | | | |\n")
+        self.assertEqual(interview.stopping_rule(self.root, 2), [
+            "stage-2-challenge.md: section delivery is empty; add a finding row or a No findings. line"])
+        text = self.path.read_text(encoding="utf-8")
+        self.path.write_text(text.replace("## engineering", "## engineers"), encoding="utf-8")
+        reasons = interview.stopping_rule(self.root, 2)
+        self.assertIn("stage-2-challenge.md: section engineering is empty; add a finding row or a No findings. line",
+                      reasons)
+
+    def test_a_row_or_a_no_findings_line_satisfies_each_section(self):
+        self.fill(architect="| 1 | gap | minor | answered in F-3 |\n", delivery="\nno findings.\n")
+        self.assertEqual(interview.stopping_rule(self.root, 2), [])
+        self.write("program/product.md")
+        self.assertEqual(interview.approve(self.root, 2, [self.root / "program" / "product.md"]).name, "stage-2.json")
+
+    def test_a_row_without_a_resolution_is_still_unresolved_not_empty(self):
+        self.fill(architect="| 1 | gap | minor | |\n")
+        self.assertEqual(interview.stopping_rule(self.root, 2), ["stage-2-challenge.md: 1 finding unresolved"])
+
+    def test_the_cli_refuses_the_skeleton_with_one_line(self):
+        self.write("program/product.md")
+        self.run_cli_approved_one()
+        code, out, err = self.run_cli("interview", "approve", "2")
+        self.assertEqual((code, out), (1, ""))
+        self.assertEqual(err, f"error: {self.SKELETON}\n")
+
+    def run_cli_approved_one(self):
+        self.write("program/discovery.md")
+        self.assertEqual(self.run_cli("interview", "approve", "1")[0], 0)
+
+
+def _register_with_a_cycle():
+    return reg(task("P1-M01-S01-T01", depends_on=["P1-M01-S01-T02"]),
+               task("P1-M01-S01-T02", depends_on=["P1-M01-S01-T01"]),
+               task("P1-M01-S01-T03"), task("P1-M01-S01-T03"))
+
+
+class FreezeAndRegisterTests(InterviewBase):
+    """Stage 5 re-runs the stopping rules of stages 1 to 4; stage 6 validates the register."""
+
+    def setUp(self):
+        super().setUp()
+        self.entries = CLOSING + [entry("F-3", topics=["T2.1"])]
+        self.put_ledger(self.entries)
+        for stage in (5, 6):
+            self.challenge(stage)
+        self.put_register()
+        patcher = mock.patch("trace.validate", return_value=[])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_a_clean_ledger_passes_the_freeze_and_stage_6(self):
+        self.assertEqual(interview.stopping_rule(self.root, 5), [])
+        self.assertEqual(interview.stopping_rule(self.root, 6), [])
+
+    def test_a_reopened_topic_in_an_earlier_stage_refuses_the_freeze_and_names_the_stage(self):
+        self.put_ledger([item for item in self.entries if item["id"] != "F-1"])
+        self.assertEqual(interview.stopping_rule(self.root, 5),
+                         ["T1.1: required topic open at stage 1 (missing: measure)"])
+        self.assertEqual(interview.stopping_rule(self.root, 6),
+                         ["T1.1: required topic open at stage 1 (missing: measure)"])
+        with self.assertRaises(KitError) as caught:
+            interview.approve(self.root, 5, [self.write("program/freeze/review.md")])
+        self.assertIn("T1.1: required topic open at stage 1", str(caught.exception))
+        self.assertFalse((self.root / "program" / "approvals").exists())
+
+    def test_a_new_blocking_question_in_an_earlier_stage_refuses_the_freeze_and_names_the_stage(self):
+        self.put_ledger(self.entries + [entry("Q-9", topics=["T2.1"], blocking=True)])
+        self.assertEqual(interview.stopping_rule(self.root, 5), ["Q-9: blocking question unanswered at stage 2"])
+        self.put_ledger(self.entries + [entry("Q-9", topics=["T2.1"], blocking=True), entry("F-4", answers=["Q-9"])])
+        self.assertEqual(interview.stopping_rule(self.root, 5), [])
+
+    def test_stages_below_the_freeze_do_not_look_back_or_forward(self):
+        self.put_ledger([entry("F-3", topics=["T2.1"])])  # stage 1 is open, stage 2 is closed
+        self.challenge(2)
+        self.assertEqual(interview.stopping_rule(self.root, 2), [])  # a stage 2 approval ignores stage 1
+        self.put_ledger(CLOSING)  # stage 2 is open
+        self.assertEqual(interview.stopping_rule(self.root, 1), [])
+
+    def test_a_register_the_validator_rejects_refuses_stage_6_with_its_problems(self):
+        from register import validate as validate_register
+
+        write_yaml(self.root / "program" / "register.yaml", _register_with_a_cycle())
+        expected = validate_register(_register_with_a_cycle(), None,
+                                     read_yaml(interview.KIT_DIR / "interview" / "roles.yaml"))
+        self.assertTrue(any("duplicate id" in line for line in expected), expected)
+        self.assertTrue(any(line.startswith("cycle:") for line in expected), expected)
+        self.assertEqual(interview.stopping_rule(self.root, 6), expected)
+        with self.assertRaises(KitError) as caught:
+            interview.approve(self.root, 6, [self.root / "program" / "register.yaml"])
+        self.assertEqual(str(caught.exception), "; ".join(expected))
+
+    def test_a_register_with_a_malformed_collection_refuses_stage_6(self):
+        write_yaml(self.root / "program" / "register.yaml", {"phases": [{"id": "P1", "title": "p", "milestones": 5}]})
+        self.assertIn("P1.milestones: must be a list", interview.stopping_rule(self.root, 6))
+
+    def test_a_missing_register_refuses_stage_6_and_the_environments_are_read(self):
+        (self.root / "program" / "register.yaml").unlink()
+        self.assertEqual(interview.stopping_rule(self.root, 6), ["program/register.yaml is missing"])
+        self.put_register(task("P1-M01-S01-T01", environments=["staging"]))
+        write_yaml(self.root / "program" / "environments.yaml",
+                   {"environments": {"staging": {"exists": False, "owner": "ops", "notes": ""}}})
+        self.assertEqual(len(interview.stopping_rule(self.root, 6)), 1)
+        self.assertIn("environment staging does not exist yet", interview.stopping_rule(self.root, 6)[0])
+
+    def test_stage_6_through_the_cli_prints_one_error_line_per_problem_set(self):
+        write_yaml(self.root / "program" / "register.yaml", _register_with_a_cycle())
+        code, out, err = self.run_cli("interview", "approve", "6", "--artifact", "program/register.yaml")
+        self.assertEqual((code, out), (1, ""))
+        self.assertEqual(err.count("\n"), 1)
+        self.assertTrue(err.startswith("error: "), err)
+
+
+class EarlierStagesTests(InterviewBase):
+    """`pk interview approve N` needs every stage below N approved and current; `next` says why a stage is back."""
+
+    def approve_cli(self, stage):
+        return self.run_cli("interview", "approve", str(stage))
+
+    def setUp(self):
+        super().setUp()
+        self.put_ledger(CLOSING + [entry("F-3", topics=["T2.1"])])
+        self.write("program/discovery.md", "d1\n")
+        self.write("program/product.md", "p1\n")
+        self.challenge(2)
+
+    def test_approving_a_later_stage_names_the_lowest_stage_not_approved(self):
+        code, out, err = self.approve_cli(2)
+        self.assertEqual((code, out), (1, ""))
+        self.assertEqual(err, "error: stage 1 is not approved yet; approve it before stage 2\n")
+        code, out, err = self.approve_cli(3)
+        self.assertEqual(err, "error: stage 1 is not approved yet; approve it before stage 3\n")
+        self.assertFalse((self.root / "program" / "approvals").exists())
+
+    def test_the_lowest_stage_that_is_not_current_is_named_even_when_a_higher_one_is_approved(self):
+        self.assertEqual(self.approve_cli(1)[0], 0)
+        self.assertEqual(self.approve_cli(2)[0], 0)
+        self.write("program/discovery.md", "d2\n")
+        code, out, err = self.approve_cli(3)
+        self.assertEqual((code, out), (1, ""))
+        self.assertEqual(err, "error: stage 1 was approved and its files changed (program/discovery.md); "
+                              "run pk interview amend 1 or raise a change request before approving stage 3\n")
+        self.assertEqual(self.run_cli("interview", "amend", "1")[0], 0)
+        self.assertEqual(self.approve_cli(2)[0], 0)  # a re-approval of a stage whose lower stages are current
+
+    def test_a_current_chain_lets_the_next_stage_through_and_stage_1_has_no_predecessor(self):
+        self.assertEqual(self.approve_cli(1)[0], 0)
+        self.assertEqual(self.approve_cli(1)[0], 0)
+        code, out, err = self.approve_cli(2)
+        self.assertEqual((code, err), (0, ""))
+
+    def test_next_says_when_a_stage_is_approved_but_modified(self):
+        self.assertEqual(self.approve_cli(1)[0], 0)
+        self.write("program/discovery.md", "d2\n")
+        code, out, err = self.run_cli("interview", "next")
+        self.assertEqual((code, err), (0, ""))
+        lines = out.splitlines()
+        self.assertEqual(lines[0], "next stage: 1 (discover)")
+        self.assertIn("stage 1 was approved and its files changed: program/discovery.md; "
+                      "run pk interview amend 1 for a correction, or raise a change request", lines)
+        self.assertEqual(self.run_cli("interview", "amend", "1")[1], "program/discovery.md\n")
+        code, out, err = self.run_cli("interview", "next")
+        self.assertEqual(out.splitlines()[0], "next stage: 2 (define the product)")
+        self.assertNotIn("was approved", out)
+
+    def test_next_for_a_stage_never_approved_says_nothing_about_changes(self):
+        out = self.run_cli("interview", "next")[1]
+        self.assertEqual(out.splitlines()[0], "next stage: 1 (discover)")
+        self.assertNotIn("approved", out)
+
+    def test_next_names_a_changed_ledger_after_the_freeze(self):
+        (self.root / "program" / "discovery.md").unlink()  # the stages below record no files here
+        (self.root / "program" / "product.md").unlink()
+        ledger = sha256_file(self.root / "program" / "ledger.yaml")
+        approvals = self.root / "program" / "approvals"
+        approvals.mkdir()
+        for stage in (1, 2, 3, 4, 5, 6):
+            (approvals / f"stage-{stage}.json").write_text(
+                json.dumps({"stage": stage, "at": "x", "artifacts": {}, "ledger_sha256": ledger}), encoding="utf-8")
+        self.assertEqual(interview.next_stage(self.root), 7)
+        self.put_ledger(CLOSING + [entry("F-3", topics=["T2.1"]), entry("F-4")])
+        out = self.run_cli("interview", "next")[1]
+        self.assertIn("stage 6 was approved and its files changed: program/ledger.yaml", out)
+
+
+class RemovedAdrTests(InterviewBase):
+    """An ADR removed or renamed after the approval is re-hashed out of the set by amend, like an added one is in."""
+
+    def setUp(self):
+        super().setUp()
+        (self.root / "kit" / "interview" / "coverage.yaml").write_text(
+            "stages:\n  4:\n    name: architect\n    budget: 0\n    artifacts:\n      - ARCHITECTURE.md\n    topics: {}\n",
+            encoding="utf-8")
+        self.challenge(4)
+        self.write("program/ARCHITECTURE.md", "a\n")
+        self.write("program/adr/0001-first.md", "first\n")
+        self.write("program/adr/0002-second.md", "second\n")
+        ledger = sha256_file(self.root / "program" / "ledger.yaml")
+        approvals = self.root / "program" / "approvals"
+        approvals.mkdir()
+        for stage in (1, 2, 3, 5, 6):
+            (approvals / f"stage-{stage}.json").write_text(
+                json.dumps({"stage": stage, "at": "x", "artifacts": {}, "ledger_sha256": ledger}), encoding="utf-8")
+        interview.approve(self.root, 4, interview.stage_artifacts(
+            self.root, 4, interview.load_coverage(self.root)["stages"][4]))
+
+    def recorded(self):
+        return list(read_json(self.root / "program" / "approvals" / "stage-4.json")["artifacts"])
+
+    def test_amend_drops_a_removed_adr(self):
+        (self.root / "program" / "adr" / "0002-second.md").unlink()
+        self.assertEqual(interview.next_stage(self.root), 4)
+        self.assertEqual(interview.amend(self.root, 4), ["program/adr/0002-second.md"])
+        self.assertEqual(self.recorded(), ["program/ARCHITECTURE.md", "program/adr/0001-first.md"])
+        self.assertEqual(interview.next_stage(self.root), 7)
+        self.assertEqual(interview.amend(self.root, 4), [])
+
+    def test_amend_follows_a_renamed_adr_and_next_names_both_paths(self):
+        adr = self.root / "program" / "adr"
+        (adr / "0002-second.md").rename(adr / "0002-renamed.md")
+        out = self.run_cli("interview", "next")[1]
+        self.assertIn("program/adr/0002-renamed.md", out)
+        self.assertIn("program/adr/0002-second.md", out)
+        self.assertEqual(self.run_cli("interview", "amend", "4"), (0, "program/adr/0002-renamed.md\n"
+                                                                     "program/adr/0002-second.md\n", ""))
+        self.assertEqual(self.recorded(), ["program/ARCHITECTURE.md", "program/adr/0001-first.md",
+                                           "program/adr/0002-renamed.md"])
+        self.assertEqual(interview.next_stage(self.root), 7)
+
+    def test_amend_and_replay_and_approve_agree_after_a_removal(self):
+        (self.root / "program" / "adr" / "0001-first.md").unlink()
+        interview.amend(self.root, 4)
+        amended = read_json(self.root / "program" / "approvals" / "stage-4.json")["artifacts"]
+        interview.approve(self.root, 4, interview.stage_artifacts(
+            self.root, 4, interview.load_coverage(self.root)["stages"][4]))
+        self.assertEqual(read_json(self.root / "program" / "approvals" / "stage-4.json")["artifacts"], amended)
+        self.assertEqual(interview.amend(self.root, 4), [])
+
+    def test_a_removed_listed_artifact_is_still_an_error_not_silently_dropped(self):
+        (self.root / "program" / "ARCHITECTURE.md").unlink()
+        with self.assertRaises(KitError) as caught:
+            interview.amend(self.root, 4)
+        self.assertIn("cannot read", str(caught.exception))
+        self.assertIn("ARCHITECTURE.md", self.recorded()[0])
+
+    def test_an_added_adr_still_works_in_the_other_direction(self):
+        self.write("program/adr/0003-third.md", "third\n")
+        self.assertEqual(interview.next_stage(self.root), 4)
+        self.assertEqual(interview.amend(self.root, 4), ["program/adr/0003-third.md"])
+        self.assertEqual(interview.next_stage(self.root), 7)
+
+
+class MalformedLedgerValueTests(InterviewBase):
+    """A ledger entry whose source or kind is a list or mapping is a problem line, not an unhashable-type traceback."""
+
+    def test_unhashable_source_and_kind_are_problems(self):
+        for field, value in (("source", []), ("source", {}), ("kind", []), ("kind", {}), ("source", ["S1"])):
+            with self.subTest(field=field, value=value):
+                self.put_ledger(CLOSING + [entry("F-3", **{field: value})])
+                problems = interview.ledger_validate(self.root)
+                self.assertEqual(len(problems), 1, problems)
+                self.assertTrue(problems[0].startswith("F-3: "), problems)
+                code, out, err = self.run_cli("interview", "validate")
+                self.assertEqual((code, out), (1, ""))
+                self.assertEqual(err.count("\n"), 1, err)
+                code, out, err = self.run_cli("interview", "approve", "1", "--artifact", "program/ledger.yaml")
+                self.assertEqual((code, out), (1, ""))
+                self.assertTrue(err.startswith("error: "), err)
+                self.assertNotIn("Traceback", err)
+
+    def test_a_non_ascii_digit_is_not_an_entry_number(self):
+        self.put_ledger([entry("F-\u0661")])
+        self.assertEqual(interview.ledger_validate(self.root),
+                         ["F-\u0661: id must look like F-<n>, A-<n>, D-<n> or Q-<n>"])
+
+
 class CliTests(InterviewBase):
     def test_cli_round_trip(self):
         code, out, err = self.run_cli("interview", "next")
@@ -668,6 +1014,12 @@ class CliTests(InterviewBase):
         code, out, err = self.run_cli("interview", "challenge", "1")
         self.assertEqual((code, out), (1, ""))
         self.assertTrue(err.startswith("error: "))
+        code, out, err = self.run_cli("interview", "approve", "1")  # the skeleton alone is not a challenge round
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("untouched skeleton", err)
+        challenge = self.root / "program" / "reports" / "stage-1-challenge.md"
+        challenge.write_text(challenge.read_text(encoding="utf-8").replace(
+            "|---|---|---|---|", "|---|---|---|---|\n\nNo findings."), encoding="utf-8")
         code, out, err = self.run_cli("interview", "approve", "1")  # artifacts default to the coverage map's list
         self.assertEqual((code, out.strip(), err), (0, "approved stage 1: program/approvals/stage-1.json", ""))
         code, out, _ = self.run_cli("interview", "next")
