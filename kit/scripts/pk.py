@@ -96,15 +96,18 @@ def cmd_init(args: argparse.Namespace) -> int:
             contents[name] = source.read_bytes()
         except OSError as exc:
             raise KitError(f"cannot read {source}: {exc.strerror or exc}") from exc
-    staging = Path(tempfile.mkdtemp(dir=target.parent, prefix=".program.", suffix=".tmp"))
+    staging = None
     try:
+        staging = Path(tempfile.mkdtemp(dir=target.parent, prefix=".program.", suffix=".tmp"))
         for name, data in contents.items():
             (staging / name).write_bytes(data)
         os.chmod(staging, 0o777 & ~_umask())  # mkdtemp makes it 0700
         staging.rename(target)
-    except BaseException:
-        shutil.rmtree(staging, ignore_errors=True)
-        raise
+    except OSError as exc:
+        raise KitError(f"cannot create {target}: {exc.strerror or exc}") from exc
+    finally:
+        if staging is not None and staging.exists():  # still there only if the rename did not happen
+            shutil.rmtree(staging, ignore_errors=True)
     print(f"created {target}")
     return 0
 

@@ -1,2 +1,3 @@
-# Named environments a claim can depend on (for example staging, production-like). Empty until you add some.
-environments: []
+# Named environments a claim can depend on. One row per environment:
+#   <name>: {exists: bool, owner: str, notes: str}
+environments: {}

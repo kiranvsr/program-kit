@@ -1,2 +1,3 @@
-# Evidence ledger: one entry per recorded piece of evidence. Empty until you add some.
+# Evidence ledger: sources maps a source name to its details; entries lists recorded evidence.
+sources: {}
 entries: []

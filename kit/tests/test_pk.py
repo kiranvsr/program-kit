@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest import mock
 
 import pk
-from common import KitError, read_json
+from common import KitError, read_json, read_yaml
 
 KIT = Path(__file__).resolve().parent.parent
 TEMPLATE_FILES = ["BRIEF.md", "checks.yaml", "environments.yaml", "CLAIM_BOUNDARIES.md", "ledger.yaml",
@@ -51,6 +51,26 @@ class PkTests(unittest.TestCase):
         self.assertEqual(out, "")
         self.assertTrue(err.startswith("error: ") and "exists" in err and err.count("\n") == 1, err)
         self.assertEqual((self.tmp / "program" / "BRIEF.md").read_text(), "mine\n")
+
+    def test_yaml_templates_have_the_spec_shapes(self):
+        checks = read_yaml(KIT / "templates" / "checks.yaml")
+        self.assertEqual(sorted(checks), sorted(["build", "test", "scan", "compile_check", "extra_gate",
+                                                 "guarded_files"]))
+        for key, value in checks.items():
+            self.assertEqual(value, [], key)
+        self.assertEqual(read_yaml(KIT / "templates" / "environments.yaml"), {"environments": {}})
+        self.assertEqual(read_yaml(KIT / "templates" / "ledger.yaml"), {"sources": {}, "entries": []})
+
+    def test_init_write_failure_is_one_line_and_leaves_nothing(self):
+        if os.geteuid() == 0:
+            self.skipTest("root ignores directory permissions")
+        self.tmp.chmod(0o555)
+        self.addCleanup(self.tmp.chmod, 0o755)
+        rc, out, err = self.run_pk("init")
+        self.tmp.chmod(0o755)
+        self.assertEqual((rc, out), (1, ""))
+        self.assertTrue(err.startswith("error: ") and err.count("\n") == 1, err)
+        self.assertEqual(sorted(p.name for p in self.tmp.iterdir()), [".git"])
 
     def test_init_leaves_no_staging_directory(self):
         self.run_pk("init")

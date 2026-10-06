@@ -1,2 +1,9 @@
-# Checks the program runs (commands with expected outcomes). Empty until you add some.
-checks: []
+# Commands the program runs. Each of build, test, scan, compile_check and extra_gate
+# is a list of argv lists, for example: - [go, test, ./...]
+build: []
+test: []
+scan: []
+compile_check: []
+extra_gate: []
+# Files that only the controller may change.
+guarded_files: []
