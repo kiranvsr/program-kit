@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 .worktrees/
 .superpowers/
+.DS_Store
