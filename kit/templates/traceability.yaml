@@ -1,0 +1,21 @@
+# The traceability matrix: journeys -> requirements -> components -> gates -> tasks.
+# Checked by `pk trace validate --stage N`; every rule is cumulative with the stages below it.
+#
+# Journeys (J<n>) are what a user does. A journey lists the requirements that deliver it:
+#   J1: {title: str, requirements: [REQ-001]}  
+journeys: {}
+# Requirements (REQ-<nnn>) and non-functional requirements (NFR-<nnn>). A requirement names the
+# journeys it serves (not needed when nfr: true) and, from stage 4, the components that build it.
+# Journey and requirement lists must agree. release: "first" is the default; any other value
+# keeps the requirement out of the "every first-release requirement is closed" rule.
+#   REQ-001: {title: str, journeys: [J1], components: [C1], nfr: false, release: "first"}
+requirements: {}
+# Components (C<n>) are the parts that are built:
+#   C1: {title: str, requirements: [REQ-001]}
+components: {}
+# Gates (G-<NAME>) listed here must also be defined in gates.yaml (stage 4 and later):
+#   G-P0: {claims: [str], records: [path]}
+gates: {}
+# Tasks closing IDs. Do not edit by hand: `pk trace sync` rewrites this section from the register.
+#   P1-M01-S01-T01: {closes: [REQ-001, J1]}
+tasks: {}

@@ -13,7 +13,7 @@ from common import KitError, read_json, read_yaml
 KIT = Path(__file__).resolve().parent.parent
 TEMPLATE_FILES = ["BRIEF.md", "checks.yaml", "environments.yaml", "CLAIM_BOUNDARIES.md", "ledger.yaml",
                   "HANDOFF.md", "controller-state.json", "rulings.md",
-                  "register.yaml"]
+                  "register.yaml", "traceability.yaml", "gates.yaml"]
 
 
 class PkTests(unittest.TestCase):

@@ -32,6 +32,7 @@ _ID = {
 _SHAPE = {"phase": "P<n>", "milestone": "P<n>-M<n>", "step": "P<n>-M<n>-S<n>", "task": "P<n>-M<n>-S<n>-T<n>"}
 _GATE = re.compile(r"G-[A-Z0-9][A-Z0-9_]*\Z")
 _CLOSES = re.compile(r"(?:REQ-\d{3}|NFR-\d{3}|J\d+)\Z")
+GATE_ID, CLOSES_ID, TASK_ID = _GATE, _CLOSES, _ID["task"]  # public aliases for trace.py
 
 
 def _path(root: Path) -> Path:

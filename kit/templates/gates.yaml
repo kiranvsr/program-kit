@@ -1,0 +1,10 @@
+# Gates: the claims a phase makes and the records that prove them. Each gate needs at least one
+# record from stage 4. One row per gate, ID G-<NAME>:
+#   G-P0:
+#     title: str
+#     claims: [str]            what the gate says is true
+#     environment: str         a name from environments.yaml
+#     records:                 evidence, each with the path and what accepting it means
+#       - path: program/evidence/G-P0/results.json
+#         acceptance: str
+gates: {}
