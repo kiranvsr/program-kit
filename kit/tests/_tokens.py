@@ -3,9 +3,9 @@
 Each token is assembled from fragments so that no file in the repository, this one included, holds a
 forbidden token literally. Every test that checks neutrality imports from here.
 
-DISTINCTIVE names are unlikely to occur inside another word, so a neutrality check matches them as substrings
-anywhere. SHORT names could occur inside ordinary words, so a check matches them unless an ASCII letter directly
-precedes or follows (a digit or underscore next to one still counts). Matching is case-insensitive.
+Every name is matched as a substring, case-insensitively, glued to anything; where an ordinary word contains
+a short name, the text is reworded. DISTINCTIVE names are the long ones, SHORT names the three to five letter
+ones. A hyphen inside a name also matches a space or an underscore (test_neutrality.py builds that pattern).
 """
 
 DISTINCTIVE = (
@@ -16,6 +16,7 @@ DISTINCTIVE = (
     "ent-" + "harness",
     "Son" + "net",
 )
+ORIGIN = DISTINCTIVE[4]  # the originating project, the one name with a hyphen
 SHORT = (
     "G" + "PT",
     "Co" + "dex",
