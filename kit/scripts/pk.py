@@ -26,7 +26,7 @@ TEMPLATE_FILES = ("BRIEF.md", "checks.yaml", "environments.yaml", "CLAIM_BOUNDAR
                   "HANDOFF.md", "controller-state.json", "rulings.md")
 
 # Modules that register further subcommands (each defines `register(add_command)`).
-COMMAND_MODULES: tuple[str, ...] = ("status",)
+COMMAND_MODULES: tuple[str, ...] = ("status", "rulings")
 
 COMMANDS: dict[str, Callable[[argparse.Namespace], int]] = {}
 CONFIGURERS: dict[str, tuple[str, Callable[[argparse.ArgumentParser], None] | None]] = {}
