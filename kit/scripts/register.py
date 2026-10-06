@@ -301,13 +301,14 @@ def validate(register: dict, environments: dict | None, roles: dict | None) -> l
 _LOG_TITLE = "# Register change log\n"
 
 
-def change(root: Path, note: str) -> list[Path]:
+def change(root: Path, note: str, after=None) -> list[Path]:
     """Append `- <date>: <note>` to program/changes/register-log.md, then regenerate the briefs.
 
     Returns the generated brief paths. The log is append-only. A note that is empty or spans several
     lines, or a register the briefs cannot be built from, is refused before anything is written. When the
     briefs cannot be written after the log line was appended, the line is removed again and the briefs are
-    put back as they were, so a failed change leaves the log and the briefs unchanged.
+    put back as they were, so a failed change leaves the log and the briefs unchanged. `after`, when given, is
+    called once the briefs are written; if it raises, the change is rolled back the same way.
     """
     import briefs  # lazy: briefs imports this module
 
@@ -333,15 +334,19 @@ def change(root: Path, note: str) -> list[Path]:
     except OSError as exc:
         raise KitError(f"cannot write {path}: {exc.strerror or exc}") from exc
     try:
-        return briefs.generate(root)
+        generated = briefs.generate(root)
+        if after is not None:
+            after()
+        return generated
     except BaseException:
         try:
             if data is None:
                 path.unlink()
-                path.parent.rmdir()  # only when it came with the log line
             else:
                 path.write_bytes(data)
             briefs.restore(root, saved)
+            if data is None:
+                path.parent.rmdir()  # only when it came with the log line
         except (OSError, KitError):
             pass  # the original failure is the one to report
         raise

@@ -183,13 +183,14 @@ def approve(root: Path, cr_id: str, by: str) -> None:
 
 
 def apply(root: Path, cr_id: str, note: str) -> None:
-    """Record the register change, check the matrix at stage 6, then fill Applied.
+    """Check the register and the matrix at stage 6, record the register change, then fill Applied.
 
-    Refused without Approval or when already applied. Refused before anything is written when the register is
-    invalid or the matrix's copy of the tasks differs from what `pk trace sync` would write (the stage 6
-    requirement check reads that copy). The register log entry (`<CR-id>: <note>`) is then written and the log
-    is append-only, so when the matrix check reports problems the entry stays, Applied stays empty and KitError
-    lists the problems; apply again after fixing them (which appends a further log line).
+    Refused without Approval or when already applied. Every check runs before anything is written: the register
+    must be valid, the matrix's copy of the tasks must equal what `pk trace sync` would write (the stage 6
+    requirement check reads that copy), `trace.validate` at stage 6 must pass and the briefs must render. When
+    one fails KitError says why and the register log, the briefs and the change request are as they were. Only
+    then are the log line (`<CR-id>: <note>`) and the briefs written and Applied filled; if a write fails part-way
+    the log and the briefs are put back.
     """
     note = _text("note", note)
     path, text = _read(root, cr_id)
@@ -204,12 +205,12 @@ def apply(root: Path, cr_id: str, note: str) -> None:
     unsynced = trace_module.unsynced(root)
     if unsynced:
         raise KitError(f"{cr_id} not applied: {unsynced[0]}")
-    register_module.change(root, f"{cr_id}: {note}")
     problems = trace_module.validate(root, 6)
     if problems:
         raise KitError(f"{cr_id} not applied: traceability at stage 6 has {len(problems)} problem(s): "
-                       + "; ".join(problems) + ". The register log entry stays (the log is append-only)")
-    write_text(path, _replace(text, "Applied", f"{utc_now()[:10]}: {note}", cr_id))
+                       + "; ".join(problems))
+    register_module.change(root, f"{cr_id}: {note}",
+                           after=lambda: write_text(path, _replace(text, "Applied", f"{utc_now()[:10]}: {note}", cr_id)))
 
 
 def open_requests(root: Path) -> list[dict]:
