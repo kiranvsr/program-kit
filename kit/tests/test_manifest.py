@@ -101,7 +101,12 @@ class ManifestTests(unittest.TestCase):
 
 
 class KitTestsAreNotKitContentTests(unittest.TestCase):
-    """Finding 15: the kit's own tests (top-level kit/tests) are not part of what is installed or recorded."""
+    """Finding 15: the kit's own tests (top-level kit/tests) are not part of what is installed or recorded.
+
+    N5: that holds where the kit's installer sits beside kit/ (the kit's own repository, or a copy of the whole
+    template). Anywhere else kit/ is an installed kit, and a file under kit/tests its manifest does not list is
+    a local addition like any other.
+    """
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -117,12 +122,52 @@ class KitTestsAreNotKitContentTests(unittest.TestCase):
         (self.kit / "tests" / "test_a.py").write_text("t\n")
         (self.kit / "tests" / "fixtures" / "f.txt").write_text("f\n")
 
+    def put_installer(self, text=None):
+        """Make the tree the kit's own repository: the kit's installer beside kit/."""
+        (self.kit.parent / "install.sh").write_text(
+            (REPO_KIT.parent / "install.sh").read_text(encoding="utf-8") if text is None else text, encoding="utf-8")
+
     def test_write_does_not_list_the_top_level_tests_directory(self):
         self.put_tests()
+        self.put_installer()
         manifest.write(self.kit)
         names = [line.split("  ", 1)[1] for line in (self.kit / "MANIFEST.sha256").read_text().splitlines()]
         self.assertEqual(names, ["a.txt", "b.txt", "sub/c.txt"])
         self.assertEqual(manifest.check(self.kit), [])
+
+    def test_a_file_under_tests_of_an_installed_kit_is_an_added_file(self):
+        manifest.write(self.kit)
+        self.assertEqual(manifest.check(self.kit), [])  # an installed kit has no tests directory
+        self.put_tests()
+        self.assertEqual(manifest.check(self.kit), ["added: tests/fixtures/f.txt", "added: tests/test_a.py"])
+        manifest.write(self.kit)  # never recorded, so writing the manifest again does not hide them
+        self.assertEqual(manifest.check(self.kit), ["added: tests/fixtures/f.txt", "added: tests/test_a.py"])
+        self.put_installer()
+        self.assertEqual(manifest.check(self.kit), [])
+
+    def test_only_the_kits_installer_beside_the_kit_makes_it_the_kits_own_repository(self):
+        self.put_tests()
+        manifest.write(self.kit)
+        for text in ("#!/bin/sh\nmake install\n", ""):  # a project's own script of the same name
+            with self.subTest(text=text):
+                self.put_installer(text)
+                self.assertEqual(manifest.check(self.kit), ["added: tests/fixtures/f.txt", "added: tests/test_a.py"])
+        (self.kit.parent / "install.sh").unlink()
+        (self.kit.parent / "install.sh").mkdir()
+        self.assertEqual(manifest.check(self.kit), ["added: tests/fixtures/f.txt", "added: tests/test_a.py"])
+
+    def test_the_cli_reports_an_added_test_file_in_an_installed_kit(self):
+        from unittest import mock
+
+        manifest.write(self.kit)
+        self.put_tests()
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(manifest, "KIT_DIR", self.kit), contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(err):
+            rc = pk.main(["manifest", "check"])
+        self.assertEqual((rc, out.getvalue()), (1, ""))
+        self.assertEqual(err.getvalue().splitlines(),
+                         ["error: added: tests/fixtures/f.txt", "error: added: tests/test_a.py"])
 
     def test_only_the_top_level_directory_is_skipped(self):
         (self.kit / "sub" / "tests").mkdir()
@@ -130,17 +175,20 @@ class KitTestsAreNotKitContentTests(unittest.TestCase):
         manifest.write(self.kit)
         self.assertIn("sub/tests/x.txt", (self.kit / "MANIFEST.sha256").read_text())
 
-    def test_check_ignores_tests_whether_recorded_by_an_older_kit_or_present_on_disk(self):
+    def test_tests_recorded_by_an_older_kit_check_clean_and_only_an_unrecorded_file_is_added(self):
         self.put_tests()
         manifest.write(self.kit)
         text = (self.kit / "MANIFEST.sha256").read_text()
         older = text + "".join(f"{manifest.sha256_file(self.kit / rel)}  {rel}\n"
                                for rel in ("tests/fixtures/f.txt", "tests/test_a.py"))
-        (self.kit / "MANIFEST.sha256").write_text(older)  # an older kit recorded its tests
+        (self.kit / "MANIFEST.sha256").write_text(older)  # an older kit installed and recorded its tests
         self.assertEqual(manifest.check(self.kit), [])
         (self.kit / "tests" / "test_a.py").write_text("edited\n")
-        (self.kit / "tests" / "new.py").write_text("n\n")
         (self.kit / "tests" / "fixtures" / "f.txt").unlink()
+        self.assertEqual(manifest.check(self.kit), [])  # the recorded tests are still not kit content
+        (self.kit / "tests" / "new.py").write_text("n\n")
+        self.assertEqual(manifest.check(self.kit), ["added: tests/new.py"])
+        self.put_installer()  # in the kit's own repository the whole directory is the kit's test suite
         self.assertEqual(manifest.check(self.kit), [])
         (self.kit / "a.txt").write_text("changed\n")  # everything else is still checked
         self.assertEqual(manifest.check(self.kit), ["modified: a.txt"])

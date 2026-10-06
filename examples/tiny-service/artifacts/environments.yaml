@@ -1,5 +1,8 @@
-# Named environments a claim can depend on. One row per environment:
-#   <name>: {exists: bool, owner: str, notes: str}
+# Named environments a claim can depend on. One entry per environment:
+#   <name>:
+#     exists: bool
+#     owner: str
+#     notes: str
 environments:
   dev:
     exists: true

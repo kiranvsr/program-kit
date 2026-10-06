@@ -14,7 +14,7 @@ Throughout, `pk` means `python3 kit/scripts/pk.py`.
    python3 kit/scripts/pk.py doctor
    ```
 
-   `init` also adds `__pycache__/`, `*.pyc` and `.worktrees/` to `.gitignore` if they are missing, so the first commit holds no bytecode. `doctor` prints `doctor: ok` when Python and git are usable, the branch is named `main` and `program/checks.yaml` lists at least one `build`, `test` and `scan` command (fill them in first if you left the preset out); otherwise it prints one `error:` line per problem.
+   `init` also adds `__pycache__/`, `*.pyc` and `.worktrees/` to `.gitignore` if they are missing, so the first commit holds no bytecode. `doctor` prints `doctor: ok` when Python and git are usable, the branch is named `main` and `program/checks.yaml` lists at least one `build`, `test` and `scan` command (fill them in first if you left the preset out); otherwise it prints one `error:` line per problem. Without a preset, the three `checks.yaml` lines are expected until the architecture stage (stage 4) fills `program/checks.yaml`; pass `--preset` to start with working commands.
 3. Replace the contents of `program/BRIEF.md` with your brief: anything from three lines to a full document.
 4. Commit, then point your agent at `kit/playbooks/00_START.md` and tell it to follow it.
 
@@ -78,7 +78,7 @@ The rules are in `kit/rules/`: `HARD_RULES.md`, `EVIDENCE_HONESTY.md` and `THROU
 
 ## Upgrading
 
-Run `sh install.sh /path/to/your-repo --upgrade` from a newer copy of the kit. The installer first checks the new copy against its own manifest and the installed `kit/` against its `kit/MANIFEST.sha256`, and refuses if either does not match (for the installed one, if you changed anything under it), then replaces `kit/` wholesale; a `kit/tests` left by an older install goes with the old kit. It never reads, writes or lists `program/` and leaves `.gitignore` alone. Keep your own changes in `program/`, not in `kit/`.
+Run `sh install.sh /path/to/your-repo --upgrade` from a newer copy of the kit. The installer first checks the new copy against its own manifest and the installed `kit/` against its `kit/MANIFEST.sha256`, and refuses if either does not match (for the installed one, if you changed anything under it, a file you added under `kit/tests` included), then replaces `kit/` wholesale; a `kit/tests` left by an older install goes with the old kit. It never reads, writes or lists `program/` and leaves `.gitignore` alone. Keep your own changes in `program/`, not in `kit/`.
 
 ## Requirements
 

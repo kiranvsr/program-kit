@@ -142,7 +142,8 @@ def _acceptance_problem(root: Path, task_id: str, evidence: list[str]) -> str | 
 
     None only when the acceptance file is listed, has every key acceptance.schema.json requires, accepts
     (`decision` is `accepted_development`), is QA's and this task's, binds the current results.json by hash,
-    and that results.json passes the checks of the hand-back gate (`evidence.gate_problems`).
+    that results.json passes the checks of the hand-back gate (`evidence.gate_problems`), and the acceptance's
+    `source_commit` is the commit that record names as its `head`.
     """
     acceptance = f"program/evidence/{task_id}/acceptance.json"
     results = f"program/evidence/{task_id}/results.json"
@@ -165,10 +166,14 @@ def _acceptance_problem(root: Path, task_id: str, evidence: list[str]) -> str | 
     if claimed != actual:
         return (f"{task_id}: {acceptance} binds evidence_sha256 {claimed} but {results} hashes to {actual}; "
                 f"acceptance is stale")
-    problems = evidence_module.gate_problems(read_json(Path(root) / results), task_id)
+    record = read_json(Path(root) / results)
+    problems = evidence_module.gate_problems(record, task_id)
     if problems:
         more = f" (and {len(problems) - 1} more; run pk evidence validate)" if len(problems) > 1 else ""
         return f"{task_id}: {results}: {problems[0]}{more}"
+    if bound["source_commit"] != record["head"]:
+        return (f"{task_id}: {acceptance}: source_commit is {bound['source_commit']!r}, not {record['head']}, "
+                f"the head {results} names")
     return None
 
 

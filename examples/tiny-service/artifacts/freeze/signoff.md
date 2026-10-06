@@ -7,7 +7,7 @@
 Each path is relative to `program/`.
 
 - `discovery.md`: `be54c0320275fd821f27bf5be91e212ff9974e3fdfb386b8a7978dba511cbc3e`
-- `environments.yaml`: `79001c3606a5d13dfe31e56ed5f7ec3f3eae8fe9863d091c1590aaba6f1913e8`
+- `environments.yaml`: `7d65e8e44a630397a3b67c0787d1f98269e8d71ed1b56e22ad9ef3b9a7e36875`
 - `CLAIM_BOUNDARIES.md`: `f169b85735b97a98b1648aab05dc7d4e55212a98ea02365d80a953601d3046fb`
 - `product.md`: `b0a6f0409e4077ca4a022138fdfd3e38851b964f0d7264b2373e72a77a67cbc2`
 - `SPEC.md`: `4711496227b7694d523c6caf38613dace1bd2b861eab8b9e0b02ca05d51877ae`

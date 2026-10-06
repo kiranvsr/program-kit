@@ -2,8 +2,8 @@
 """The gate runner: hand-back gate, merge check and gate claim documents (standard library only).
 
 `handback` is the gate an implementer passes before independent QA; `merge_check` is the
-controller's independent run before every merge: the guarded-file check, the SPEC and PLAN identity
-check, then the build, the tests and the scans on the trial merge, so a branch whose implementer
+controller's independent run before every merge: the guarded-file check, the SPEC, PLAN and review.md
+identity check, then the build, the tests and the scans on the trial merge, so a branch whose implementer
 skipped the hand-back gate still cannot reach main. `claims` and `validate_claims` keep
 `program/claims/<GATE>/*.json` equal to a recomputation from `gates.yaml`, each record's
 `acceptance.json` and `environments.yaml`.
@@ -12,7 +12,8 @@ Run it from the main checkout: the task worktree defaults to `<root>/.worktrees/
 `checks.yaml` (with its guarded files), the `Guarded edit:` lines in the task's SPEC and the PLAN commands
 are all read from the primary branch, which is always `main` (`git show main:...`): no option names
 another branch, so a task branch or a dirty main checkout cannot change the rules it is judged by. The
-task's SPEC.md and PLAN.md must be byte-identical to main's, and a task's branch is `task/<ID>`.
+task's SPEC.md and PLAN.md, and the spec-QA record review.md, must be byte-identical to main's, and a task's
+branch is `task/<ID>`.
 The trial merge happens in a temporary worktree of main and never commits or touches the main checkout.
 `binding` is QA's check that a record's `head` still binds the branch tip, read from git objects only:
 the record was committed directly on `head`, every later commit touches only the task's evidence and
@@ -467,23 +468,28 @@ def _stale_step(wt: Path) -> bool:
 
 
 def _frozen_plan(root: Path, tree: Path, task_id: str) -> bytes | None:
-    """Main's PLAN.md for the task, when the task's SPEC.md and PLAN.md in `tree` are byte-identical to main's.
+    """Main's PLAN.md for the task, when the task's SPEC.md, PLAN.md and review.md in `tree` are byte-identical
+    to main's.
 
-    Otherwise prints the failure line of the first file that differs (or is missing on either side) and
-    returns None: a branch may not narrow the SPEC it is reviewed against or ease the PLAN it is run by.
+    Otherwise prints the failure line of the first file that differs and returns None: a branch may not narrow
+    the SPEC it is reviewed against, ease the PLAN it is run by or rewrite the spec-QA record (`review.md`) of
+    its own dispatch. The SPEC and the PLAN must exist on both sides; the review record is compared as main has
+    it, so a branch may neither change nor remove main's, nor add one main does not have.
     """
-    authoritative = None
-    for step, name in (("spec", "SPEC.md"), ("plan", "PLAN.md")):  # the PLAN last: its bytes are returned
+    plan = None
+    for step, name, required in (("spec", "SPEC.md", True), ("plan", "PLAN.md", True), ("review", "review.md", False)):
         rel = f"program/tasks/{task_id}/{name}"
         try:
             authoritative = _git_bytes(root, "show", f"{MAIN}:{rel}")
         except KitError:
             authoritative = None
         own = tree / rel
-        if authoritative is None or not own.is_file() or own.read_bytes() != authoritative:
+        if (own.read_bytes() if own.is_file() else None) != authoritative or (required and authoritative is None):
             _out(f"FAILED: {step} {rel} differs from {MAIN}")
             return None
-    return authoritative
+        if name == "PLAN.md":
+            plan = authoritative
+    return plan
 
 
 def _run_steps(checks: dict, task_id: str, wt: Path, trial: Path, authoritative: bytes) -> int:
@@ -537,7 +543,7 @@ def merge_check(root, branch: str) -> int:
     """The controller's independent gate run before a merge; 0 and a final `OK:` line only when all of it passed.
 
     It does not rely on the hand-back gate having been run: the guarded-file check, then on the trial merge the
-    SPEC and PLAN identity check and every build, compile_check, test, scan and extra_gate command of main's
+    SPEC, PLAN and review.md identity check and every build, compile_check, test, scan and extra_gate command of main's
     `checks.yaml`. The task is the one the branch `task/<ID>` names; any other branch is refused.
     """
     root = Path(root).resolve()

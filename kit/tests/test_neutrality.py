@@ -3,16 +3,20 @@
 Scope: every file under the repository root except the directories .git, .worktrees, .superpowers and
 __pycache__ (and *.pyc and .DS_Store files). Rules, with nothing exempt from the first:
 - no forbidden token (see _tokens.py), matched case-insensitively as a substring, in the text of every file and in
-  every relative path (each directory and file name); a hyphen inside a name also matches a space or underscore;
+  every relative path (each directory and file name); a hyphen inside a name also matches a space, an underscore
+  or nothing at all;
 - no URL of any scheme in any case (a scheme name, a colon and two slashes) outside docs/FAQ.md and the test files listed in URL_EXEMPT_FILES;
-- every scanned file is valid UTF-8 and holds no zero-width or invisible character (U+00AD, U+034F, U+200B to
-  U+200F, U+2060, U+FEFF), in its text or in its path.
+- every scanned file is valid UTF-8 and holds no zero-width or invisible character, in its text or in its path:
+  no character of Unicode category Cf (format characters, such as U+00AD, U+200B to U+200F, U+2060 to U+2064,
+  U+2066 to U+2069, U+180E and U+FEFF), no variation selector (U+FE00 to U+FE0F and the supplement U+E0100 to
+  U+E01EF) and no U+034F. A name split by one of them would otherwise pass the token rule.
 """
 import _paths  # noqa: F401  (must come first: puts kit/scripts on sys.path)
 import os
 import re
 import shutil
 import tempfile
+import unicodedata
 import unittest
 from pathlib import Path
 
@@ -31,9 +35,18 @@ ZERO_WIDTH = "".join(chr(code) for code in (0x200B, 0x200C, 0x200D, 0x2060, 0xFE
 INVISIBLE_CODES = (0x00AD, 0x034F, 0x200E, 0x200F)  # soft hyphen, combining grapheme joiner, direction marks
 INVISIBLE_CHARS = ZERO_WIDTH + "".join(chr(code) for code in INVISIBLE_CODES)
 
-TOKEN = re.compile("|".join(re.escape(t).replace(r"\-", "[-_ ]") for t in FORBIDDEN), re.IGNORECASE)
+VARIATION_SELECTORS = (range(0xFE00, 0xFE10), range(0xE0100, 0xE01F0))
+
+TOKEN = re.compile("|".join(re.escape(t).replace(r"\-", "[-_ ]?") for t in FORBIDDEN), re.IGNORECASE)
 URL = re.compile(r"[a-z][a-z0-9+.-]*://", re.IGNORECASE)
-INVISIBLE = re.compile("[" + INVISIBLE_CHARS + "]")
+
+
+def invisible(text: str) -> bool:
+    """Whether `text` holds a format character (category Cf), a variation selector or one of INVISIBLE_CHARS."""
+    if text.isascii():
+        return False
+    return any(char in INVISIBLE_CHARS or unicodedata.category(char) == "Cf"
+               or any(ord(char) in block for block in VARIATION_SELECTORS) for char in text)
 
 
 def _walk(root: Path):
@@ -57,7 +70,7 @@ def path_problems(root: Path) -> list:
             rel = (base / name).relative_to(root).as_posix()
             for match in TOKEN.finditer(name):
                 out.append(f"{rel}: forbidden token {match.group(0)!r} in the path")
-            if INVISIBLE.search(name):
+            if invisible(name):
                 out.append(f"{rel}: invisible character in the path")
     return out
 
@@ -76,7 +89,7 @@ def problems(root: Path) -> list:
                 out.append(f"{rel}:{number}: forbidden token {match.group(0)!r}")
             if URL.search(line) and rel not in URL_EXEMPT_FILES:
                 out.append(f"{rel}:{number}: URL")
-            if INVISIBLE.search(line):
+            if invisible(line):
                 out.append(f"{rel}:{number}: zero-width or invisible character")
     return out
 
@@ -145,17 +158,27 @@ class ScanBehaviourTests(unittest.TestCase):
                     self.put("README.md", caught + "\n")
                     self.assertEqual(len(problems(self.root)), 1)
 
-    def test_the_project_name_is_caught_with_a_space_or_underscore_for_its_hyphen(self):
+    def test_the_project_name_is_caught_with_a_space_an_underscore_or_nothing_for_its_hyphen(self):
         first, second = (ORIGIN.split("-")[0], ORIGIN.split("-")[1])
-        for separator in ("-", " ", "_"):
+        for separator in ("-", " ", "_", ""):
             for text in (f"the {first}{separator}{second} repo", f"{first.upper()}{separator}{second.upper()}",
-                         f"x{first}{separator}{second}y"):
+                         f"x{first}{separator}{second}y", f"{first.title()}{separator}{second.title()}"):
                 with self.subTest(text=text):
                     self.put("README.md", text + "\n")
                     self.assertEqual(len(problems(self.root)), 1)
-        self.put("README.md", f"{first} {second[:3]} and {first}{second}\n")  # no separator: not the name
+        for rel in (f"docs/{first}{second}.md", f"kit/{first.title()}{second.title()}/a.md"):
+            with self.subTest(rel=rel):
+                shutil.rmtree(self.root)
+                self.root.mkdir()
+                self.put(rel, "clean\n")
+                found = problems(self.root)
+                self.assertEqual(len(found), 1, found)
+                self.assertIn("in the path", found[0])
+                shutil.rmtree(self.root)
+                self.root.mkdir()
+        self.put("README.md", f"{first} {second[:3]} and {first}{second[:-1]}\n")  # not the whole name
         self.assertEqual(problems(self.root), [])
-        self.put("README.md", f"{first}, {second}\n")
+        self.put("README.md", f"{first}, {second} and {first}  {second}\n")  # more than one separator
         self.assertEqual(problems(self.root), [])
 
     def test_a_name_that_appears_only_in_a_path_is_caught(self):
@@ -231,6 +254,47 @@ class ScanBehaviourTests(unittest.TestCase):
                 self.assertIn("invisible", found[0])
         self.put("docs/DESIGN.md", "plain text\n")
         self.assertEqual(problems(self.root), [])
+
+    def test_every_format_character_and_variation_selector_is_a_problem(self):
+        # a sample by code point (none written literally): invisible separator, variation selectors 16 and 1,
+        # Mongolian vowel separator, first strong isolate, Arabic letter mark, a tag character, a selector supplement
+        sample = (0x2063, 0xFE0F, 0xFE00, 0x180E, 0x2068, 0x061C, 0xE0041, 0xE0100)
+        for code in sample:
+            with self.subTest(code=hex(code)):
+                self.assertTrue(invisible(f"a{chr(code)}b"))
+                self.put("docs/DESIGN.md", f"plain\na{chr(code)}b\n")
+                found = problems(self.root)
+                self.assertEqual(len(found), 1, found)
+                self.assertIn("docs/DESIGN.md:2: zero-width or invisible character", found[0])
+        self.put("docs/DESIGN.md", "plain text\n")
+        for code in range(0x110000):  # the rule is the category, not a list
+            if unicodedata.category(chr(code)) == "Cf" or any(code in block for block in VARIATION_SELECTORS):
+                self.assertTrue(invisible(chr(code)), hex(code))
+        for text in ("plain ASCII", "caf\u00e9 na\u00efve \u2192 \u2264 \u4e2d\u6587", "tab\tand\nnewline"):
+            self.assertFalse(invisible(text), ascii(text))
+
+    def test_a_format_character_in_a_path_is_caught(self):
+        for code in (0x2063, 0xFE0F, 0x180E, 0x2068):
+            with self.subTest(code=hex(code)):
+                rel = f"kit/a{chr(code)}b.md"
+                try:
+                    self.put(rel, "clean\n")
+                except OSError:
+                    self.skipTest("file system refuses this name")
+                found = problems(self.root)
+                self.assertEqual(len(found), 1, found)
+                self.assertIn("invisible character in the path", found[0])
+                shutil.rmtree(self.root / "kit")
+
+    def test_a_name_split_by_a_format_character_or_a_variation_selector_does_not_pass(self):
+        for token in (DISTINCTIVE[0], ORIGIN):
+            for code in (0x2063, 0xFE0F, 0x180E, 0x2068):
+                name = token[:3] + chr(code) + token[3:]
+                with self.subTest(token=ascii(token), code=hex(code)):
+                    self.put("README.md", f"x {name} y\n")
+                    found = problems(self.root)
+                    self.assertEqual(len(found), 1, found)  # the character itself is the problem
+                    self.assertIn("invisible", found[0])
 
     def test_an_invisible_character_inside_a_name_does_not_hide_it(self):
         for char in INVISIBLE_CHARS:

@@ -16,8 +16,9 @@ import evidence as evidence_module
 import gate as gate_module
 import interview
 import pk
-from common import read_json, read_yaml, run_argv, sha256_bytes, sha256_file, utc_now
+from common import read_json, read_yaml, run_argv, sha256_bytes, sha256_file, utc_now, write_yaml
 from test_neutrality import TOKEN as FORBIDDEN, URL  # the same compiled rules the repository-wide scan uses
+from test_templates import FLOW  # a flow collection with something inside
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 EXAMPLE = ROOT / "examples" / "tiny-service"
@@ -510,6 +511,42 @@ class EndToEndTests(unittest.TestCase):
             for relative in interview.load_coverage(ROOT)["stages"][stage]["artifacts"]:
                 self.assertIn(relative, listed)
         self.assertIn("adr/0001-stdlib-http.md", listed)
+
+    def test_example_replay_is_current_and_its_stage_6_answers_do_not_reopen_the_freeze(self):
+        root = self.base / "replayed"
+        (root / "program").mkdir(parents=True)
+        interview.replay(root, EXAMPLE / "ledger.yaml", EXAMPLE / "artifacts")
+        self.assertEqual(interview.next_stage(root), 7)
+        self.assertEqual(sha256_file(root / "program" / "ledger.yaml"), sha256_file(EXAMPLE / "ledger.yaml"))
+        approvals = root / "program" / "approvals"
+        self.assertEqual(sorted(p.name for p in approvals.iterdir()), [f"stage-{n}.json" for n in range(1, 7)])
+        self.assertIn("frozen_entries_sha256", read_json(approvals / "stage-5.json"))
+        (approvals / "stage-6.json").unlink()  # back to the moment after approval 5
+        ledger = read_yaml(EXAMPLE / "ledger.yaml")
+        later = set(interview.load_coverage(root)["stages"][6]["topics"])
+        answers = [item for item in ledger["entries"] if set(item["topics"]) <= later]
+        self.assertTrue(answers)
+        earlier = [item for item in ledger["entries"] if not set(item["topics"]) & later]
+
+        def put(entries):
+            write_yaml(root / "program" / "ledger.yaml", {"sources": ledger["sources"], "entries": entries})
+            return interview.next_stage(root)
+
+        self.assertEqual(put(earlier), 6)  # the ledger as it stood when stage 5 was approved
+        self.assertEqual(put(earlier + answers[:1]), 6)
+        self.assertEqual(put(ledger["entries"]), 6)
+        interview.approve(root, 6, interview.stage_artifacts(root, 6, interview.load_coverage(root)["stages"][6]))
+        self.assertEqual(interview.next_stage(root), 7)
+        (approvals / "stage-6.json").unlink()
+        self.assertEqual(put([dict(earlier[0], text="another outcome"), *ledger["entries"][1:]]), 5)
+
+    def test_no_example_yaml_comment_teaches_a_flow_collection(self):
+        files = sorted(EXAMPLE.rglob("*.yaml"))
+        self.assertIn(EXAMPLE / "artifacts" / "environments.yaml", files)
+        for path in files:
+            for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+                if line.lstrip().startswith("#"):
+                    self.assertIsNone(FLOW.search(line), f"{path.relative_to(ROOT).as_posix()}:{number}: {line}")
 
 
 if __name__ == "__main__":
