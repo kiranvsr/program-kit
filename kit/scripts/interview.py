@@ -632,12 +632,17 @@ def _frozen_entries_hash(root: Path) -> str:
 
     An entry is left out only when every topic it lists belongs to a stage after the freeze (stage 6), so the
     answers recorded for stage 6 after approval 5 do not change the digest; an entry that also names an earlier
-    topic, or lists no topic the map knows, stays in. The digest is over a canonical form (JSON, sorted keys),
+    topic, or lists no topic the map knows, stays in. A tag counts wherever it sits, so the digest also holds
+    whether each stage 1 to 5 topic applies over the whole ledger: a tag on a stage 6 entry that switches an
+    earlier conditional topic on or off changes it. The digest is over a canonical form (JSON, sorted keys),
     so the file's layout and comments do not count.
     """
-    later = {topic for stage, info in load_coverage(root)["stages"].items() if stage > FREEZE_STAGE
-             for topic in info["topics"]}
+    stages = load_coverage(root)["stages"]
+    later = {topic for stage, info in stages.items() if stage > FREEZE_STAGE for topic in info["topics"]}
     ledger = _load_ledger(root)
+    tags = _all_tags(ledger["entries"])
+    applies = {topic_id: evaluate_condition(topic["condition"], tags) for stage, info in stages.items()
+               if stage <= FREEZE_STAGE for topic_id, topic in info["topics"].items()}
     kept = []
     for item in ledger["entries"]:
         topics = item.get("topics")
@@ -646,7 +651,8 @@ def _frozen_entries_hash(root: Path) -> str:
     cited = {item["source"] for item in kept if isinstance(item.get("source"), str)}
     sources = {key: record for key, record in ledger["sources"].items() if key in cited}
     try:
-        text = json.dumps({"entries": kept, "sources": sources}, sort_keys=True, separators=(",", ":"))
+        text = json.dumps({"entries": kept, "sources": sources, "applies": applies}, sort_keys=True,
+                          separators=(",", ":"))
     except (TypeError, ValueError) as exc:
         raise KitError(f"{_ledger_path(root)}: cannot be hashed: {exc}") from exc
     return sha256_bytes(text.encode("utf-8"))
@@ -745,14 +751,18 @@ def _first_open(root: Path, last: int) -> tuple[int, list[str]] | None:
     The ledger grows while stages 1 to 4 are worked, so their approvals compare artifact hashes only. After the
     freeze (stage 5 on) a ledger change is a change request: the ledger is compared for the highest approval
     of stage 5 or later among the stages looked at (`_ledger_changed`: stage 5 by its digest of the entries that
-    touch stages 1 to 5, because stage 6 still adds its own answers; stage 6 by the whole file).
+    touch stages 1 to 5, because stage 6 still adds its own answers; stage 6 by the whole file). A freeze
+    approval that carries that digest is compared even after stage 6 is approved, so a later edit to an
+    earlier-stage entry names stage 5 and cannot be absorbed by amending stage 6 alone.
     """
     approved = [stage for stage in range(1, last + 1) if _approval_path(root, stage).exists()]
     frozen = [stage for stage in approved if stage >= FREEZE_STAGE]
     for stage in range(1, last + 1):
         if stage not in approved:
             return stage, []
-        changed = _changes(root, read_json(_approval_path(root, stage)), bool(frozen) and stage == frozen[-1], stage)
+        record = read_json(_approval_path(root, stage))
+        digest = stage == FREEZE_STAGE and isinstance(record, dict) and isinstance(record.get(FROZEN_ENTRIES), str)
+        changed = _changes(root, record, bool(frozen) and (stage == frozen[-1] or digest), stage)
         if changed:
             return stage, changed
     return None

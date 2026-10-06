@@ -349,9 +349,10 @@ class ApprovalTests(InterviewBase):
             interview.approve(self.root, 6, [product])
         # stage 7 is never approved: once stages 1 to 6 are current, 7 is the final value
         self.assertEqual(interview.next_stage(self.root), 7)
-        # a ledger change after the freeze makes the highest frozen approval (stage 6) stale, and only that one
+        # an entry on an earlier-stage topic added after approval 6 names the freeze, not only stage 6: the
+        # stage 5 digest is still compared, so amending stage 6 alone cannot absorb it
         self.put_ledger(stage2 + [entry("F-11"), entry("F-12"), entry("F-13")])
-        self.assertEqual(interview.next_stage(self.root), 6)
+        self.assertEqual(interview.next_stage(self.root), 5)
         # an artifact change is caught at any stage
         self.put_ledger(stage2 + [entry("F-11"), entry("F-12")])
         self.assertEqual(interview.next_stage(self.root), 7)
@@ -1113,6 +1114,34 @@ class StageSixAnswersTests(InterviewBase):
         self.assertEqual(self.next().splitlines()[0], "next stage: 7 (stage 7)")
         self.put_ledger(self.spec + answers + [entry("F-8", topics=["T6.2"])])  # an added one, too
         self.assertIn("stage 6 was approved and its files changed: program/ledger.yaml", self.next())
+
+    def test_a_tag_on_a_stage_6_entry_that_switches_an_earlier_topic_on_reopens_the_freeze(self):
+        self.assertEqual(interview.topic_states(self.root, 1)["T1.9"]["state"], "not_applicable")
+        self.put_ledger(self.spec + [entry("F-6", topics=["T6.1"], tags=["payments"])])  # a tag counts anywhere
+        self.assertEqual(interview.topic_states(self.root, 1)["T1.9"]["state"], "open")
+        self.assert_freeze_reopened()
+        self.assertEqual(self.run_cli("interview", "amend", "5"), (0, "program/ledger.yaml\n", ""))
+        self.put_ledger(self.spec + [entry("F-6", topics=["T6.1"])])  # and taking the tag away switches it off again
+        self.assert_freeze_reopened()
+
+    def test_a_tag_on_a_stage_6_entry_that_switches_nothing_leaves_the_freeze_current(self):
+        self.put_ledger(self.spec + [entry("F-6", topics=["T6.1"], tags=["measure"])])
+        self.assertEqual(self.next().splitlines()[0], "next stage: 6 (roadmap and register)")
+
+    def test_after_approval_6_an_earlier_entry_edit_names_the_freeze_and_amending_stage_6_cannot_absorb_it(self):
+        answers = [entry("F-6", topics=["T6.1"]), entry("F-7", topics=["T6.2"])]
+        self.put_ledger(self.spec + answers)
+        self.assertEqual(self.run_cli("interview", "approve", "6")[0], 0)
+        edited = [dict(item, text="another meaning") if item["id"] == "F-3" else item for item in self.spec]
+        self.put_ledger(edited + answers)
+        out = self.next()
+        self.assertEqual(out.splitlines()[0], "next stage: 5 (freeze review)")
+        self.assertIn("stage 5 was approved and its files changed: program/ledger.yaml; run pk interview amend 5", out)
+        self.run_cli("interview", "amend", "6")
+        self.assertEqual(self.next().splitlines()[0], "next stage: 5 (freeze review)")
+        self.assertEqual(self.run_cli("interview", "amend", "5"), (0, "program/ledger.yaml\n", ""))
+        self.run_cli("interview", "amend", "6")
+        self.assertEqual(self.next().splitlines()[0], "next stage: 7 (stage 7)")
 
     def test_an_approval_written_before_the_second_digest_falls_back_to_the_whole_file(self):
         path = self.root / "program" / "approvals" / "stage-5.json"

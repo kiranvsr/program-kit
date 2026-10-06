@@ -14,7 +14,7 @@ Rework and token cost, not coding, are what slow a program down. These rules exi
 
 - No QA round until the implementer has run `pk gate handback <ID> --branch task/<ID>` and its last line is the OK line. Exit code 0 alone is never accepted.
 - A hand-back that fails the gate returns to the implementer without a QA round.
-- The controller's `pk gate merge-check` runs the gate's checks again before every merge, without relying on the implementer's run: guarded files, SPEC and PLAN identity, then build, tests and scans on a trial merge. A branch whose implementer skipped the gate cannot reach main.
+- The controller's `pk gate merge-check` runs the gate's checks again before every merge, without relying on the implementer's run: guarded files, SPEC, PLAN and review identity, then build, tests and scans on a trial merge. A branch whose implementer skipped the gate cannot reach main.
 
 ## Decide, don't ask
 
