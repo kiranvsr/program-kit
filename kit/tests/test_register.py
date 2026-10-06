@@ -142,8 +142,18 @@ class RegisterTests(unittest.TestCase):
         self.assertIsNone(register.CLOSES_ID.match(f"REQ-00{arabic}"))
         self.assertIsNone(register.CLOSES_ID.match(f"J{arabic}"))
         self.assertIsNotNone(register.CLOSES_ID.match("J1"))
-        for kind, shape in register._ID.items():
+        self.assertEqual(tuple(register.ID_PATTERNS), register.KINDS)
+        self.assertIs(register.TASK_ID, register.ID_PATTERNS["task"])
+        for kind, shape in register.ID_PATTERNS.items():
             self.assertTrue(shape.flags & re.ASCII, kind)
+
+    def test_template_comment_names_the_optional_task_fields(self):
+        text = (KIT / "templates" / "register.yaml").read_text(encoding="utf-8")
+        brief = (KIT / "templates" / "task_brief.md").read_text(encoding="utf-8")
+        for field in ("tests_unit", "tests_integration", "done"):
+            self.assertRegex(text, rf"(?m)^\s*#\s+{field}: ", field)  # a comment line, never a live key
+            self.assertIn(f"${field}", brief, field)  # and the brief template really uses the field
+            self.assertNotRegex(text, rf"(?m)^\s*{field}:", field)
 
     def test_validate_checks_ids_gates_and_closes(self):
         a = "P1-M01-S01-T01"
@@ -227,8 +237,9 @@ class RegisterCliTests(unittest.TestCase):
         code, out, err = self.run_cli("register", "validate")
         self.assertEqual((code, out), (1, ""))
         lines = err.splitlines()
-        self.assertEqual(len(lines), 2, err)
-        self.assertTrue(all(line.startswith("P1-M01-S01-T02") for line in lines), err)
+        self.assertEqual(len(lines), 3, err)
+        self.assertEqual(lines[0], "error: register invalid: 2 problem(s)")
+        self.assertTrue(all(line.startswith("error: P1-M01-S01-T02") for line in lines[1:]), err)
 
     def test_cli_validate_ok_counts_tasks_and_reads_environments(self):
         write_yaml(self.path, reg(task("P1-M01-S01-T01"), task("P1-M01-S01-T02", environments=["staging"])))

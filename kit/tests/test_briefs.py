@@ -227,6 +227,20 @@ class ChangeTests(BriefsBase):
         self.assertIn("renamed", (self.out / "tasks" / "P1-M01-S01-T02.md").read_text())
         self.assertEqual(briefs.check(self.root), [])
 
+    def test_change_returns_the_generated_paths_and_generates_once(self):
+        with mock.patch("briefs.generate", wraps=briefs.generate) as generate:
+            paths = register.change(self.root, "first")
+        self.assertEqual(generate.call_count, 1)
+        self.assertEqual(paths, briefs.generate(self.root))
+        self.assertEqual(briefs.brief_count(paths), 9)
+
+    def test_cli_change_generates_the_briefs_once(self):
+        with mock.patch("briefs.generate", wraps=briefs.generate) as generate:
+            code, out, err = self.run_cli("register", "change", "--note", "once")
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(generate.call_count, 1)
+        self.assertIn("generated 9 briefs", out)
+
     def test_change_refuses_bad_notes_and_writes_nothing(self):
         register.change(self.root, "first")
         before = self.log.read_bytes()

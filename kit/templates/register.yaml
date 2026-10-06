@@ -30,3 +30,7 @@ phases:
                 gate: null
                 # Requirement IDs this task closes: REQ-<nnn>, NFR-<nnn> or J<n>.
                 closes: []
+                # Optional text fields, copied into the task brief when present:
+                #   tests_unit: the unit tests the task adds.
+                #   tests_integration: the integration tests the task adds.
+                #   done: what must be true for the task to count as done.

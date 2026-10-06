@@ -23,9 +23,9 @@ from common import KitError, find_root, read_yaml, write_yaml
 SECTIONS = ("journeys", "requirements", "components", "gates", "tasks")
 STAGE_JOURNEYS, STAGE_LINKS, STAGE_COMPONENTS, STAGE_TASKS = 2, 3, 4, 6
 
-_JOURNEY = re.compile(r"J\d+\Z")
-_REQUIREMENT = re.compile(r"(?:REQ|NFR)-\d{3}\Z")
-_COMPONENT = re.compile(r"C\d+\Z")
+_JOURNEY = re.compile(r"J\d+\Z", re.ASCII)
+_REQUIREMENT = re.compile(r"(?:REQ|NFR)-\d{3}\Z", re.ASCII)
+_COMPONENT = re.compile(r"C\d+\Z", re.ASCII)
 _KINDS = {  # kind -> (pattern, how it is written)
     "journey": (_JOURNEY, "J<n>"),
     "requirement": (_REQUIREMENT, "REQ-<nnn> or NFR-<nnn>"),

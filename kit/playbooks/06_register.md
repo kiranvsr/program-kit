@@ -18,10 +18,10 @@ Project owns phase shaping, capacity and parking. Architect, program, delivery a
 1. Run `pk interview next` and confirm stage 6.
 2. Run the interview loop as in `01_discover.md` step 3 for the three topics: phase shaping, capacity and cadence, parking and blockers.
 3. Write `program/roadmap.md`. Shape phases by capability. Phase 1 is a walking skeleton: one thin end-to-end journey through every component, deployed to every environment that exists. Then vertical slices by journey. Attach a gate to each phase end.
-4. Fill `program/register.yaml`: phases, milestones, steps and tasks. Each task has a one-paragraph `text`, a `role` from `roles.yaml`, a `size` of S or M (anything larger becomes a step of several tasks), its `environments`, `depends_on` (at most six), its `gate` (or `null`) and the requirement and journey IDs it `closes`. One task is one change, by one role.
+4. Fill `program/register.yaml`: phases, milestones, steps and tasks. Each task has a one-paragraph `text`, a `role` from `roles.yaml`, a `size` of S or M (anything larger becomes a step of several tasks), its `environments`, `depends_on` (at most six), its `gate` (or `null`) and the requirement and journey IDs it `closes`. One task is one change, by one role: a convention you apply when you review the register, not something a script checks.
 5. A task that needs an environment marked `exists: false` carries `blocked_by: [<environment>]`. Park what waits on a user decision with an owner and a date.
-6. Run `pk register assign-ids` to fill any missing IDs (existing IDs never change), then `pk register validate`. Fix every problem: duplicate IDs, missing dependencies, cycles, unmapped first-release requirements, granularity.
-7. Run `pk trace sync` to copy each task's `closes` into the matrix, then `pk trace validate --stage 6`.
+6. Run `pk register assign-ids` to fill any missing IDs (existing IDs never change), then `pk register validate`. Fix every problem: duplicate IDs, missing dependencies, cycles, a size other than S or M, more than six dependencies, an unknown role, a missing `blocked_by`. That command does not check that every first-release requirement is closed by a task: step 7 does.
+7. Run `pk trace sync` to copy each task's `closes` into the matrix, then `pk trace validate --stage 6`, which fails on a first-release requirement that no task closes and on a `closes` ID that does not exist.
 8. Run `pk briefs generate`, then `pk briefs check`. The briefs under `program/briefs/` are generated and immutable once approved.
 9. Write back, get corrections, run `pk interview report 6`.
 10. Challenge round: `pk interview challenge 6`, each lens in its own session, every row resolved or deferred with an owner and a date.

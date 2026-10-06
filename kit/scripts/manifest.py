@@ -13,7 +13,7 @@ import re
 import sys
 from pathlib import Path
 
-from common import KitError, _atomic_write, sha256_file
+from common import KitError, sha256_file, write_text
 
 KIT_DIR = Path(__file__).resolve().parent.parent
 MANIFEST_NAME = "MANIFEST.sha256"
@@ -58,7 +58,7 @@ def write(kit_dir: Path) -> Path:
             raise KitError(f"{ascii(relative)}: file name cannot be recorded in the manifest (line break or leading space)")
         lines.append(line)
     target = kit_dir / MANIFEST_NAME
-    _atomic_write(target, "".join(line + "\n" for line in lines))
+    write_text(target, "".join(line + "\n" for line in lines))
     return target
 
 

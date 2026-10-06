@@ -23,7 +23,7 @@ SIZES = ("S", "M")
 KINDS = ("phase", "milestone", "step", "task")
 _CHILD = ("milestones", "steps", "tasks")  # the list each of the first three kinds holds
 _LETTER = ("", "M", "S", "T")
-_ID = {
+ID_PATTERNS = {
     "phase": re.compile(r"P\d+\Z", re.ASCII),
     "milestone": re.compile(r"P\d+-M\d+\Z", re.ASCII),
     "step": re.compile(r"P\d+-M\d+-S\d+\Z", re.ASCII),
@@ -32,7 +32,7 @@ _ID = {
 _SHAPE = {"phase": "P<n>", "milestone": "P<n>-M<n>", "step": "P<n>-M<n>-S<n>", "task": "P<n>-M<n>-S<n>-T<n>"}
 _GATE = re.compile(r"G-[A-Z0-9][A-Z0-9_]*\Z")
 _CLOSES = re.compile(r"(?:REQ-\d{3}|NFR-\d{3}|J\d+)\Z", re.ASCII)
-GATE_ID, CLOSES_ID, TASK_ID = _GATE, _CLOSES, _ID["task"]  # public aliases for trace.py
+GATE_ID, CLOSES_ID, TASK_ID = _GATE, _CLOSES, ID_PATTERNS["task"]  # public aliases for trace.py (ID_PATTERNS is for briefs.py)
 
 
 def _path(root: Path) -> Path:
@@ -192,7 +192,7 @@ def validate(register: dict, environments: dict | None, roles: dict | None) -> l
             who = label
         else:
             who = ident
-            if not _ID[kind].match(ident):
+            if not ID_PATTERNS[kind].match(ident):
                 problems.append(f"{who}: id is not a valid {kind} id (expected {_SHAPE[kind]})")
             if ident in seen:
                 problems.append(f"{who}: duplicate id")
@@ -245,11 +245,11 @@ def validate(register: dict, environments: dict | None, roles: dict | None) -> l
 _LOG_TITLE = "# Register change log\n"
 
 
-def change(root: Path, note: str) -> None:
+def change(root: Path, note: str) -> list[Path]:
     """Append `- <date>: <note>` to program/changes/register-log.md, then regenerate the briefs.
 
-    The log is append-only. A note that is empty or spans several lines, or a register
-    the briefs cannot be built from, is refused before anything is written.
+    Returns the generated brief paths. The log is append-only. A note that is empty or spans several
+    lines, or a register the briefs cannot be built from, is refused before anything is written.
     """
     import briefs  # lazy: briefs imports this module
 
@@ -272,7 +272,7 @@ def change(root: Path, note: str) -> None:
             handle.write((prefix + entry).encode("utf-8"))
     except OSError as exc:
         raise KitError(f"cannot write {path}: {exc.strerror or exc}") from exc
-    briefs.generate(root)
+    return briefs.generate(root)
 
 
 # --- command -----------------------------------------------------------------
@@ -285,8 +285,8 @@ def cmd_register(args: argparse.Namespace) -> int:
     if action == "change":
         import briefs
 
-        change(root, args.note)
-        print(f"recorded register change; generated {briefs.brief_count(briefs.generate(root))} briefs")
+        generated = change(root, args.note)
+        print(f"recorded register change; generated {briefs.brief_count(generated)} briefs")
         return 0
     register = load(root)
     if action == "assign-ids":
@@ -299,7 +299,8 @@ def cmd_register(args: argparse.Namespace) -> int:
     roles = read_yaml(KIT_DIR / "interview" / "roles.yaml")
     problems = validate(register, environments, roles)
     if problems:
-        print("\n".join(problems), file=sys.stderr)
+        print(f"error: register invalid: {len(problems)} problem(s)", file=sys.stderr)
+        print("\n".join(f"error: {problem}" for problem in problems), file=sys.stderr)
         return 1
     print(f"register valid: {task_count(register)} tasks")
     return 0

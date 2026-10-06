@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 import pk
+from _tokens import FORBIDDEN
 
 KIT = Path(__file__).resolve().parent.parent
 PLAYBOOK_DIR = KIT / "playbooks"
@@ -30,12 +31,11 @@ HANDBACK_LINE = "`OK: <branch> passes the hand-back gate at <sha>`"
 MERGE_LINE = "`OK: <branch> merges into main at <sha>`"
 
 
-# Built from fragments so this file does not itself contain a forbidden token.
-FORBIDDEN = re.compile("|".join(["cla" + "ude", "anthr" + "opic", "open" + "ai", "g" + "pt", "co" + "dex",
-                                 "gem" + "ini", "gr" + "ok", "ent-" + "harness", "fa" + "ble", "op" + "us",
-                                 "son" + "net", "co" + "pilot", "ll" + "ama", "mist" + "ral", "deep" + "seek",
-                                 "qw" + "en", "x" + "ai\\b"]), re.I)
-URL = re.compile(r"https?://|ftp://|www\.", re.I)
+# FORBIDDEN comes from _tokens (assembled from fragments); these further names are fragments too, so this file
+# does not itself contain a forbidden token.
+OTHER_NAMES = ["co" + "pilot", "ll" + "ama", "mist" + "ral", "deep" + "seek", "qw" + "en", "x" + "ai\\b"]
+FORBIDDEN_RE = re.compile("|".join([*map(re.escape, FORBIDDEN), *OTHER_NAMES]), re.I)
+URL = re.compile(r"[a-z][a-z0-9+.-]*" + ":" + "//|www\\.", re.I)  # no URL written literally here
 PLAYBOOK_FILE = re.compile(r"\b\d\d_[a-z_]+\.md\b")
 
 
@@ -243,7 +243,7 @@ class NeutralityTests(unittest.TestCase):
     def test_no_forbidden_token_or_url_and_no_stray_ok_line(self):
         for path in all_files():
             text = read(path)
-            self.assertIsNone(FORBIDDEN.search(text), f"{path.name}: names a vendor, model or tool")
+            self.assertIsNone(FORBIDDEN_RE.search(text), f"{path.name}: names a vendor, model or tool")
             self.assertIsNone(URL.search(text), f"{path.name}: contains a URL")
             for line in text.splitlines():
                 self.assertFalse(line.lstrip().startswith("OK: "), f"{path.name}: line starts with 'OK: '")

@@ -1,5 +1,4 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "program/evidence/<ID>/results.json",
   "description": "Written by pk's evidence kit (Evidence.write) and checked by `pk evidence validate`. The checker enforces the same shape in code; its list of required keys is read from this file.",
   "type": "object",

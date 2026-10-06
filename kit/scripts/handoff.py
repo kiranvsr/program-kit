@@ -26,7 +26,7 @@ import status as status_module
 import trace as trace_module
 import worktree as worktree_module
 import register as register_module
-from common import KitError, _atomic_write, find_root, git, read_json
+from common import KitError, find_root, git, read_json, write_text
 
 START, END = "<!-- generated:start -->", "<!-- generated:end -->"
 COMMIT_PREFIX = "Commit: "
@@ -179,7 +179,7 @@ def update(root: Path) -> bool:
     block = render(root)
     if _comparable(text[begin:finish]) == _comparable(block):
         return False
-    _atomic_write(path, text[:begin] + block + text[finish:])
+    write_text(path, text[:begin] + block + text[finish:])
     return True
 
 

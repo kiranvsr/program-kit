@@ -2,6 +2,7 @@ import _paths  # noqa: F401  (must come first: puts kit/scripts/ on sys.path)
 import contextlib
 import io
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -165,6 +166,18 @@ class ValidateTests(TraceBase):
         self.assertEqual(flagged, {"j1", "REQ-1", "c1", "program/traceability.yaml", "T1"})
         self.assertIn("program/traceability.yaml: g-p0 is not a valid gate id (expected G-<NAME>)", problems)
         self.assertTrue(all("REQ-1" in p or "J-1" in p or "Cx" in p or "is not a valid" in p for p in problems))
+
+    def test_id_patterns_accept_only_ascii_digits(self):
+        arabic = "\u0661"  # ARABIC-INDIC DIGIT ONE, which \d accepts unless the pattern is compiled with re.ASCII
+        for name in ("_JOURNEY", "_REQUIREMENT", "_COMPONENT"):
+            self.assertTrue(getattr(trace_module, name).flags & re.ASCII, name)
+        self.put(matrix(journeys={f"J{arabic}": {"requirements": []}},
+                        requirements={f"REQ-00{arabic}": {"journeys": [], "components": []}},
+                        components={f"C{arabic}": {}}))
+        flagged = {p.split(":")[0] for p in self.validate(1)}
+        self.assertEqual(flagged, {f"J{arabic}", f"REQ-00{arabic}", f"C{arabic}"})
+        self.put(matrix(journeys={"J1": {"requirements": []}}, components={"C1": {}}))
+        self.assertEqual([p for p in self.validate(1) if "is not a valid" in p], [])
 
     def test_malformed_gate_key_is_reported_once_per_file(self):
         self.put(matrix(journeys={"J1": {"requirements": []}}, gates={"g-p0": {"records": ["a"]}}))
