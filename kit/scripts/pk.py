@@ -26,7 +26,7 @@ TEMPLATE_FILES = ("BRIEF.md", "checks.yaml", "environments.yaml", "CLAIM_BOUNDAR
                   "HANDOFF.md", "controller-state.json", "rulings.md")
 
 # Modules that register further subcommands (each defines `register(add_command)`).
-COMMAND_MODULES: tuple[str, ...] = ()
+COMMAND_MODULES: tuple[str, ...] = ("status",)
 
 COMMANDS: dict[str, Callable[[argparse.Namespace], int]] = {}
 CONFIGURERS: dict[str, tuple[str, Callable[[argparse.ArgumentParser], None] | None]] = {}
@@ -47,8 +47,12 @@ class _Parser(argparse.ArgumentParser):
 
 
 def build_parser() -> argparse.ArgumentParser:
+    def add_once(name, handler, **kwargs):  # build_parser runs on every main(): re-adding the same command is a no-op
+        if COMMANDS.get(name) is not handler:
+            register(name, handler, **kwargs)
+
     for module_name in COMMAND_MODULES:
-        importlib.import_module(module_name).register(register)
+        importlib.import_module(module_name).register(add_once)
     parser = _Parser(prog="pk", description="program-kit command line")
     sub = parser.add_subparsers(dest="command", metavar="command", parser_class=_Parser)
     for name in COMMANDS:

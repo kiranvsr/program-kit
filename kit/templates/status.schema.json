@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "program/status/<ID>.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["task_id", "status", "role", "updated_at", "note", "evidence", "blocked_by", "history"],
+  "properties": {
+    "task_id": {"type": "string"},
+    "status": {"enum": ["not_started", "in_progress", "review", "done", "blocked", "parked"]},
+    "role": {"enum": ["controller", "implementer", "qa"]},
+    "updated_at": {"type": "string", "description": "UTC, YYYY-MM-DDTHH:MM:SSZ"},
+    "note": {"type": "string"},
+    "evidence": {"type": "array", "items": {"type": "string"}, "description": "paths relative to the project root"},
+    "blocked_by": {"type": "array", "items": {"type": "string"}},
+    "history": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["status", "role", "at"],
+        "properties": {
+          "status": {"enum": ["not_started", "in_progress", "review", "done", "blocked", "parked"]},
+          "role": {"enum": ["controller", "implementer", "qa"]},
+          "at": {"type": "string"}
+        }
+      }
+    }
+  }
+}
