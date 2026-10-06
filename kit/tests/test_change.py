@@ -55,7 +55,8 @@ class ChangeBase(unittest.TestCase):
                 for p in sorted((self.program / "evidence").rglob("*")) if p.is_file()}
 
     def put_status(self, task_id, state):
-        record = {"task_id": task_id, "status": state, "role": "", "updated_at": "", "note": "",
+        role = "" if state == "not_started" else "qa" if state == "done" else "controller"
+        record = {"task_id": task_id, "status": state, "role": role, "updated_at": "", "note": "",
                   "evidence": [], "blocked_by": [], "history": []}
         write_json(self.program / "status" / f"{task_id}.json", record)
 

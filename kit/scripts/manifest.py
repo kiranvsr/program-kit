@@ -21,7 +21,7 @@ import re
 import sys
 from pathlib import Path
 
-from common import KitError, sha256_file, write_text
+from common import KitError, read_text, sha256_file, write_text
 
 KIT_DIR = Path(__file__).resolve().parent.parent
 MANIFEST_NAME = "MANIFEST.sha256"
@@ -83,11 +83,7 @@ def write(kit_dir: Path) -> Path:
 
 def _read(kit_dir: Path) -> dict[str, str]:
     path = Path(kit_dir) / MANIFEST_NAME
-    try:
-        text = path.read_bytes().decode("utf-8")  # no newline translation
-    except (OSError, UnicodeDecodeError) as exc:
-        reason = exc.strerror if isinstance(exc, OSError) and exc.strerror else exc
-        raise KitError(f"cannot read {path}: {reason}") from exc
+    text = read_text(path, newline="")  # no newline translation
     recorded: dict[str, str] = {}
     if text and not text.endswith("\n"):
         raise KitError(f"{path}: malformed manifest (last line has no newline)")

@@ -131,6 +131,50 @@ class PlaybookTests(unittest.TestCase):
         self.assertRegex(text, r"(?i)suite passes on main|main suite")
 
 
+class ReviewRecordTests(unittest.TestCase):
+    """Wherever the gate's frozen-file check is described, the spec-QA record is part of it and must be on main."""
+
+    MISSING = "`FAILED: review program/tasks/<ID>/review.md is missing on main`"
+
+    def test_the_documents_that_describe_the_check_say_the_record_must_be_on_main(self):
+        for path in (PLAYBOOK_DIR / "08_execute.md", BRIEF_DIR / "implementer.md", BRIEF_DIR / "controller.md",
+                     KIT.parent / "README.md"):
+            with self.subTest(path.name):
+                self.assertIn(self.MISSING, read(path))
+
+    def test_the_example_dispatches_with_the_record(self):
+        example = KIT.parent / "examples" / "tiny-service"
+        self.assertTrue((example / "tasks" / "P1-M01-S01-T01" / "review.md").is_file())
+        loop = sections(read(example / "README.md"))["The loop, command by command"]
+        self.assertIn("copy the task's SPEC, PLAN and spec-QA `review.md`", loop)
+        self.assertIn("commit the four together to main", loop)
+
+    def test_the_task_spec_playbook_says_a_dispatch_without_the_record_fails_both_gates(self):
+        text = read(PLAYBOOK_DIR / "07_task_specs.md")
+        self.assertIn("review.md", sections(text)["Done when"])
+        self.assertIn("fails the hand-back gate and the merge check", text)
+
+    def test_the_merge_check_is_described_with_the_review_record_everywhere(self):
+        execute = sections(read(PLAYBOOK_DIR / "08_execute.md"))["Steps"]
+        merge = execute[execute.index("11. Merge"):]
+        self.assertIn("SPEC, PLAN and spec-QA `review.md` are main's", merge)
+        readme = read(KIT.parent / "README.md")
+        self.assertIn("the task's SPEC, PLAN and spec-QA `review.md` on main and unchanged", readme)
+        self.assertIn("commits its SPEC, PLAN, spec-QA `review.md` and status file to main together", readme)
+
+
+class KnownLimitsTests(unittest.TestCase):
+    """The FAQ says in plain words what the kit does not do."""
+
+    def test_the_faq_has_a_known_limits_answer_covering_the_four_limits(self):
+        answer = sections(read(KIT.parent / "docs" / "FAQ.md")).get("What are the known limits?")
+        self.assertIsNotNone(answer)
+        for needle in ("binds", "merge check", "not locked", "controller error", "install.sh", "kit/tests",
+                       "Python 3.11", "3.14"):
+            self.assertIn(needle, answer)
+        self.assertLess(len(answer.split()), 330)  # a short answer
+
+
 class BriefTests(unittest.TestCase):
     def test_briefs_name_the_four_needs_context_cases(self):
         for name in BRIEFS:

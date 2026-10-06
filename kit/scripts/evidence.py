@@ -6,6 +6,8 @@ the committed blobs (never the working copy), runs commands as argv lists and re
 really did, runs planted bugs on a throwaway mirror of HEAD, and writes `results.json` only when
 every honesty precondition holds. `pk evidence validate <results.json>` re-checks the invariants;
 `gate_problems` adds what the hand-back gate, the binding check and `done` require on top of them.
+`results.schema.json` describes the record those three accept: its planted-bug rows require ROW_KEYS
+and PLANTED_KEYS, and `validate` refuses a row that lacks any of them.
 The kit never assumes a language: the caller passes the build and test argv lists.
 
 Known limits:
@@ -38,8 +40,10 @@ KILL_REASONS = ("test failed", "build failed", "not killed")
 TEMPLATES = Path(__file__).resolve().parent.parent / "templates"
 COMMAND_KEYS = ("label", "argv", "exit", "expected_exit", "as_expected", "derived", "output_sha256",
                 "output_tail")
+ROW_KEYS = ("id", "builds", "killed", "kill_reason", "test_output_sha256")  # what a planted-bug row found
 PLANTED_KEYS = ("path", "find", "replace", "build_argv", "test_argv")  # what a row planted and what judged it
-_NO_RUN = (124, 127)  # timeout, program not found: the shell conventions run_argv uses
+_TIMED_OUT = 124
+_NO_RUN = (_TIMED_OUT, 127)  # timeout, program not found: the shell conventions run_argv uses
 
 _HEX40 = re.compile(r"[0-9a-f]{40}\Z")
 _HEX64 = re.compile(r"[0-9a-f]{64}\Z")
@@ -73,6 +77,28 @@ def _argv(value, what: str) -> list[str]:
     if not isinstance(value, list) or not value or not all(isinstance(part, str) for part in value):
         raise KitError(f"{what} must be a non-empty argv list of strings, not a shell string")
     return list(value)
+
+
+def _then(body: Callable[[], object], cleanup: Callable[[], str | None], describe: Callable[[object], str]):
+    """`body()`, then `cleanup()` whatever happened (it returns why it failed, or None); return the body's result.
+
+    A cleanup failure never replaces or hides what the body did. After a KitError both are raised as one
+    KitError, the body's first; any other exception is raised as it is, with the cleanup failure attached as a
+    note; after a result the KitError says what the body gave (`describe(result)`), then why the cleanup failed.
+    """
+    try:
+        result = body()
+    except BaseException as exc:
+        problem = cleanup()
+        if problem and isinstance(exc, KitError):
+            raise KitError(f"{exc}; {problem}") from exc
+        if problem:
+            exc.add_note(problem)
+        raise
+    problem = cleanup()
+    if problem:
+        raise KitError(f"{describe(result)}; {problem}")
+    return result
 
 
 def _clear_bytecode(mirror: Path) -> None:
@@ -258,7 +284,9 @@ class Evidence:
         "kill" anything. Bytecode caches are cleared around every run.
 
         A test exit of 127 or 124 (program not found, timeout) is never a kill: the row is
-        `builds: false, kill_reason: "build failed"`, with or without a build step.
+        `builds: false, kill_reason: "build failed"`, with or without a build step. The one exception is
+        the self-test row when no build step was given: a timeout there raises KitError naming the timeout,
+        because a hang is not a build failure and nothing else could tell the two apart.
 
         Pass a build step (for Python, `["python3", "-m", "compileall", "-q", "."]`). With `build=None`
         a syntax error is indistinguishable from a test failure, so the self-test row raises KitError
@@ -275,33 +303,40 @@ class Evidence:
         parse or compile appended (its `find` is empty and its `replace` is that line). It must come
         back `builds: false, killed: false`; if it does not, the runner cannot tell a build failure
         from a test failure here and KitError is raised.
+
+        A failure to restore or remove the mirror never replaces or hides what a row did: the error names
+        the row's own error or result first, then the failure to clean up.
         """
         rows = self._check_table(table)
         test = _argv(test, "test")
         build = _argv(build, "build") if build is not None else None
         mirror = Path(tempfile.mkdtemp(prefix="pk-mirror-"))
-        added = False
+        added = []  # non-empty once git has registered the mirror
         self._mirror = mirror
-        try:
+
+        def run() -> list[dict]:
             git(self.root, "worktree", "add", "--detach", str(mirror), "HEAD")
-            added = True
-            results = self._run_rows(mirror, rows, build, test, timeout)
+            added.append(mirror)
+            return self._run_rows(mirror, rows, build, test, timeout)
+
+        try:
+            results = _then(run, lambda: self._remove_mirror(mirror, bool(added)),
+                            lambda found: f"{len(found)} planted-bug rows ran")
         finally:
-            try:
-                self._remove_mirror(mirror, added)
-            finally:
-                self._mirror = None
+            self._mirror = None
         self.planted_bug_rows = results
         return results
 
-    def _remove_mirror(self, mirror: Path, added: bool) -> None:
+    def _remove_mirror(self, mirror: Path, added: bool) -> str | None:
+        """Remove the mirror; why that failed, or None."""
         if not added:  # git never registered it: remove the empty directory this call created
             shutil.rmtree(mirror, ignore_errors=True)
-            return
+            return None
         try:
             git(self.root, "worktree", "remove", "--force", str(mirror))
         except KitError as exc:
-            raise KitError(f"cannot remove mirror {mirror}: {exc}") from exc
+            return f"cannot remove mirror {mirror}: {exc}"
+        return None
 
     def _restore(self, mirror: Path) -> None:
         """Return the whole mirror to HEAD: tracked edits undone, untracked and ignored files removed.
@@ -317,12 +352,21 @@ class Evidence:
         git(mirror, "checkout", "--", ".")
         git(mirror, "clean", "-fdxq")
 
-    def _attempt(self, mirror: Path, path: str, edit: Callable[[bytes], bytes], build: list[str] | None,
+    def _restore_problem(self, mirror: Path) -> str | None:
+        """Restore the mirror; why that failed, or None."""
+        try:
+            self._restore(mirror)
+        except (KitError, OSError) as exc:
+            return f"the mirror could not be restored: {exc}"
+        return None
+
+    def _attempt(self, mirror: Path, rid: str, path: str, edit: Callable[[bytes], bytes], build: list[str] | None,
                  argv: list[str], timeout: int | None) -> tuple[bool, int | None, str]:
         """Edit `path` in the mirror, build, test, restore. Returns (builds, test exit or None, test hash)."""
         env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
         target = mirror / path
-        try:
+
+        def run() -> tuple[bool, int | None, str]:
             target.write_bytes(edit(target.read_bytes()))
             _clear_bytecode(mirror)
             if build is not None:
@@ -332,13 +376,18 @@ class Evidence:
             code, output = run_argv(argv, mirror, env=env, timeout=timeout)
             builds = code not in _NO_RUN  # a timeout or a missing program is never a kill
             return builds, code, sha256_bytes(output.encode("utf-8"))
-        finally:
-            self._restore(mirror)
+
+        def gave(result) -> str:
+            return (f"planted bug {rid} gave builds: {str(result[0]).lower()}, "
+                    f"test exit: {'not run' if result[1] is None else result[1]}")
+
+        return _then(run, lambda: self._restore_problem(mirror), gave)
 
     def _baseline(self, mirror: Path, build: list[str] | None, argv: list[str], rid: str,
                   timeout: int | None) -> None:
         env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
-        try:
+
+        def run() -> None:
             if build is not None:
                 code, _ = run_argv(build, mirror, env=env, timeout=timeout)
                 if code != 0:
@@ -348,8 +397,8 @@ class Evidence:
             if code != 0:
                 raise KitError(f"unmutated mirror fails its own test (exit {code}); a failing test kills "
                                f"nothing (row {rid})")
-        finally:
-            self._restore(mirror)
+
+        _then(run, lambda: self._restore_problem(mirror), lambda _: f"unmutated mirror passes its test (row {rid})")
 
     def _run_rows(self, mirror: Path, rows: list[dict], build: list[str] | None, test: list[str],
                   timeout: int | None) -> list[dict]:
@@ -363,7 +412,7 @@ class Evidence:
             def plant(data: bytes, item=item) -> bytes:
                 return data.decode("utf-8").replace(item["find"], item["replace"]).encode("utf-8")
 
-            builds, code, digest = self._attempt(mirror, item["path"], plant, build, argv, timeout)
+            builds, code, digest = self._attempt(mirror, item["id"], item["path"], plant, build, argv, timeout)
             if not builds:
                 killed, reason = False, "build failed"
             elif code != 0:
@@ -388,11 +437,16 @@ class Evidence:
             lead = b"" if not data or data.endswith(b"\n") else b"\n"
             return data + lead + BROKEN_LINE.encode() + b"\n"
 
-        builds, code, digest = self._attempt(mirror, first["path"], break_file, build, argv, timeout)
+        builds, code, digest = self._attempt(mirror, SELF_TEST_ID, first["path"], break_file, build, argv, timeout)
         if build is None:
             if code == 0:
                 raise KitError(f"self-test cannot be trusted: {first['path']} with an unparseable line still "
                                "passes the test, so a broken file is not detected; pass a build command")
+            if code == _TIMED_OUT:  # a hang is not a build failure, and with no build step nothing tells them apart
+                limit = f"after {timeout}s" if timeout is not None else f"(exit {code})"
+                raise KitError(f"self-test cannot be trusted: the test timed out {limit} on {first['path']} with an "
+                               "unparseable line, and without a build step a timeout cannot be told from a build "
+                               "failure; pass a build command or a longer timeout")
             if builds:  # failed for some reason other than "program missing or timed out"
                 raise KitError("self-test cannot be trusted: without a build step a build failure cannot be "
                                "told from a test failure; pass a build command")
@@ -582,6 +636,9 @@ def validate_results(data) -> list[str]:
         digest = row.get("test_output_sha256")
         if not isinstance(digest, str) or not (digest == "" or _HEX64.match(digest)):
             bad(where, "test_output_sha256 must be 64 lowercase hex characters, or empty when no test ran")
+        absent = [key for key in PLANTED_KEYS if key not in row]
+        if absent:
+            bad(where, f"does not record {', '.join(absent)} (what was planted and the commands that ran)")
         planted = _planted_problem(row)
         if planted:
             bad(where, planted)

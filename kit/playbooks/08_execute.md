@@ -17,7 +17,7 @@ Build the register's tasks one at a time with an implementer, independent QA and
 2. Choose the next task in dependency order. Its SPEC and PLAN are accepted. Count running agents: at most three implementers and four agents in all.
 3. Dispatch. The gate reads the SPEC, the PLAN and `checks.yaml` from main, so they must be on main first.
    - `pk status set <ID> in_progress --role controller`.
-   - Commit the SPEC, the PLAN, the spec-QA `review.md` and that status file to main together, as one commit.
+   - Commit the SPEC, the PLAN, the spec-QA `review.md` and that status file to main together, as one commit. The gate needs all three task files on main: without the review record it stops at `FAILED: review program/tasks/<ID>/review.md is missing on main`.
    - Then `pk worktree new <ID>` creates the worktree under `.worktrees/` and the branch `task/<ID>`. The project must git-ignore `.worktrees/`; add it to `.gitignore` before the first dispatch, or every worktree makes main look dirty. From here on the status record changes only on the task branch.
    - Give the implementer `kit/briefs/implementer.md`, the task brief, the SPEC, the PLAN, the rules, the full text of the rulings the SPEC cites, and the report path `program/evidence/<ID>/report.md` (written after the gate passes and committed with `results.json` in the evidence commit).
 4. Build (implementer). Test first, and build exactly the PLAN's boundary.
@@ -29,7 +29,7 @@ Build the register's tasks one at a time with an implementer, independent QA and
    - A planted bug counts only when a test fails, never when the build fails. The runner needs a build command and always carries one non-building row recorded as not caught.
 6. Hand-back gate (implementer, from the main checkout, in the background): `pk gate handback <ID> --branch task/<ID>`.
    - It runs, in order: the guarded-file check; the check that the branch's SPEC.md and PLAN.md, and the spec-QA `review.md`, are byte-identical to main's; a trial merge of the branch into main; the build and compile check on the trial merge; then the test, scan and extra gate commands; the PLAN's `## Exact Commands` lines (each starts `$ `, with an optional ` # expect N`); evidence production (`produce.py`); the stale list.
-   - It fails a branch that changed its own SPEC.md or PLAN.md, or a guarded file without its `Guarded edit:` line.
+   - It fails a branch that changed its own SPEC.md or PLAN.md or the spec-QA `review.md`, or a guarded file without its `Guarded edit:` line. It fails a task whose `review.md` is not on main at all (`FAILED: review program/tasks/<ID>/review.md is missing on main`): the fix is the controller's, on main, never the branch's.
    - On success its last line is exactly `OK: <branch> passes the hand-back gate at <sha>`. Exit code 0 alone is never accepted: read the last line.
    - A failure returns to the implementer with no QA round.
 7. Evidence commit (implementer). The gate leaves `results.json` uncommitted. In the task worktree run `pk status set <ID> review --role implementer --evidence program/evidence/<ID>/results.json`. Commit the files of `program/evidence/<ID>/` that are new (`results.json` and `report.md`) and the status file, and nothing else. That is the evidence commit, and it follows the gated commit.
@@ -43,7 +43,7 @@ Build the register's tasks one at a time with an implementer, independent QA and
 10. Fix rounds. Findings go back to the same implementer, who returns a finding-to-fix table. The re-check covers only the findings and the binding. It may run on Tier 2 (a cheaper model), which must report ESCALATE for anything outside its checklist. After a fix, repeat steps 6 and 7.
 11. Merge, one branch at a time, right after acceptance.
    - From main run `pk gate merge-check --branch task/<ID>`. Its last line must be exactly `OK: <branch> merges into main at <sha>`.
-   - The merge check is the controller's own run of the gate's checks and does not trust that the implementer ran it: the guarded-file check, then on a trial merge the check that the task's SPEC and PLAN are main's, and the build, compile check, test, scan and extra gate commands from main's `checks.yaml`. A branch that skipped the hand-back gate fails here.
+   - The merge check is the controller's own run of the gate's checks and does not trust that the implementer ran it: the guarded-file check, then on a trial merge the check that the task's SPEC, PLAN and spec-QA `review.md` are main's (all three must be on main), and the build, compile check, test, scan and extra gate commands from main's `checks.yaml`. A branch that skipped the hand-back gate fails here.
    - Then `git merge --no-ff task/<ID>`. Never rebase.
    - Afterwards leave the worktree in place, or remove it by literal path with `git worktree remove <path>`. The kit has no remove command on purpose.
    - The merge appends the stale list (`pk stale`) for batched re-binding later. Do not chase stale evidence one merge at a time.

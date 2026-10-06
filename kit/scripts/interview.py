@@ -17,11 +17,10 @@ import os
 import re
 import string
 import sys
-import tempfile
 from pathlib import Path, PurePosixPath
 
-from common import (KitError, find_root, read_json, read_text, read_yaml, sha256_bytes, sha256_file, utc_now,
-                    write_json, write_yaml)
+from common import (KitError, find_root, new_file, read_json, read_text, read_yaml, sha256_bytes, sha256_file,
+                    utc_now, write_json, write_yaml)
 
 KIT_DIR = Path(__file__).resolve().parent.parent
 LENSES = ("architect", "engineering", "program", "project", "delivery")
@@ -842,13 +841,10 @@ def ingest(root: Path, file: Path) -> str:
     temp = None
     placed = False
     try:
-        descriptor, temp_name = tempfile.mkstemp(dir=stored.parent, prefix=".ingest.", suffix=".tmp")
+        descriptor, temp_name = new_file(stored.parent, ".ingest.")
         temp = Path(temp_name)
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(data)
-        mask = os.umask(0)
-        os.umask(mask)
-        os.chmod(temp, 0o666 & ~mask)
         os.replace(temp, stored)  # the copy first: a ledger never names a file that is not there
         temp = None
         placed = not existed

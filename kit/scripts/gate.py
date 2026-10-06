@@ -13,7 +13,7 @@ Run it from the main checkout: the task worktree defaults to `<root>/.worktrees/
 are all read from the primary branch, which is always `main` (`git show main:...`): no option names
 another branch, so a task branch or a dirty main checkout cannot change the rules it is judged by. The
 task's SPEC.md and PLAN.md, and the spec-QA record review.md, must be byte-identical to main's, and a task's
-branch is `task/<ID>`.
+branch is `task/<ID>`. All three must be on main: a task dispatched without its review.md fails both gates.
 The trial merge happens in a temporary worktree of main and never commits or touches the main checkout.
 `binding` is QA's check that a record's `head` still binds the branch tip, read from git objects only:
 the record was committed directly on `head`, every later commit touches only the task's evidence and
@@ -46,7 +46,7 @@ from pathlib import Path, PurePosixPath
 import evidence as evidence_module
 import stale as stale_module
 import miniyaml
-from common import KitError, find_root, git, read_json, read_yaml, run_argv, sha256_file, write_json
+from common import KitError, drop_bom, find_root, git, read_json, read_yaml, run_argv, sha256_file, write_json
 from register import GATE_ID
 
 MAIN = "main"  # the primary branch; fixed, so no caller can choose where the rules are read from
@@ -147,7 +147,7 @@ def load_checks(root, require: tuple[str, ...] = ()) -> dict:
 def load_checks_at(root, ref: str, require: tuple[str, ...] = ()) -> dict:
     """`program/checks.yaml` as committed at `ref`; the gates use this so the working tree cannot change the rules."""
     try:
-        text = _git_bytes(Path(root), "show", f"{ref}:program/checks.yaml").decode("utf-8")
+        text = drop_bom(_git_bytes(Path(root), "show", f"{ref}:program/checks.yaml").decode("utf-8"))
     except (KitError, UnicodeDecodeError) as exc:
         raise KitError(f"program/checks.yaml cannot be read on {_show(ref)}: {_show(exc)}") from exc
     try:
@@ -392,7 +392,7 @@ def _guarded_changes(root: Path, task_id: str, branch: str, main: str, guarded: 
     if not touched:
         return []
     try:  # the SPEC on main: a branch cannot allow its own edit
-        spec = _git_bytes(root, "show", f"{main}:program/tasks/{task_id}/SPEC.md").decode("utf-8", "replace")
+        spec = drop_bom(_git_bytes(root, "show", f"{main}:program/tasks/{task_id}/SPEC.md").decode("utf-8", "replace"))
     except KitError:
         spec = ""
     allowed = {_norm_guard(m.group(1)) for m in map(_GUARDED.match, spec.splitlines()) if m}
@@ -471,20 +471,24 @@ def _frozen_plan(root: Path, tree: Path, task_id: str) -> bytes | None:
     """Main's PLAN.md for the task, when the task's SPEC.md, PLAN.md and review.md in `tree` are byte-identical
     to main's.
 
-    Otherwise prints the failure line of the first file that differs and returns None: a branch may not narrow
+    Otherwise prints the failure line of the first file that fails and returns None: a branch may not narrow
     the SPEC it is reviewed against, ease the PLAN it is run by or rewrite the spec-QA record (`review.md`) of
-    its own dispatch. The SPEC and the PLAN must exist on both sides; the review record is compared as main has
-    it, so a branch may neither change nor remove main's, nor add one main does not have.
+    its own dispatch. All three must exist on main and be the same bytes in `tree`. A review record that main
+    does not have is `FAILED: review <path> is missing on main`, whatever the branch holds: the record is part
+    of the dispatch commit, so a task without one was dispatched without spec QA and a branch cannot supply it.
     """
     plan = None
-    for step, name, required in (("spec", "SPEC.md", True), ("plan", "PLAN.md", True), ("review", "review.md", False)):
+    for step, name in (("spec", "SPEC.md"), ("plan", "PLAN.md"), ("review", "review.md")):
         rel = f"program/tasks/{task_id}/{name}"
         try:
             authoritative = _git_bytes(root, "show", f"{MAIN}:{rel}")
         except KitError:
             authoritative = None
+        if authoritative is None and name == "review.md":
+            _out(f"FAILED: {step} {rel} is missing on {MAIN}")
+            return None
         own = tree / rel
-        if (own.read_bytes() if own.is_file() else None) != authoritative or (required and authoritative is None):
+        if authoritative is None or (own.read_bytes() if own.is_file() else None) != authoritative:
             _out(f"FAILED: {step} {rel} differs from {MAIN}")
             return None
         if name == "PLAN.md":
@@ -500,7 +504,7 @@ def _run_steps(checks: dict, task_id: str, wt: Path, trial: Path, authoritative:
         if not _run_commands(step, _commands(checks[step]), wt):
             return 1
     try:
-        plan = parse_plan(authoritative.decode("utf-8", "replace"))
+        plan = parse_plan(drop_bom(authoritative.decode("utf-8", "replace")))
     except KitError as exc:
         _out(f"FAILED: plan {exc}")
         return 1
@@ -781,8 +785,7 @@ def binding(root, task_id: str, branch: str) -> list[str]:
     tip = _branch_head(root, branch)
     rel = f"program/evidence/{task_id}/results.json"
     try:
-        text = _git_bytes(root, "show", f"{tip}:{rel}").decode("utf-8")
-        data = json.loads(text)
+        data = json.loads(drop_bom(_git_bytes(root, "show", f"{tip}:{rel}").decode("utf-8")))
     except KitError:
         return [f"{_show(rel)} is absent on {_show(branch)}"]
     except (UnicodeDecodeError, ValueError, RecursionError) as exc:
@@ -858,7 +861,8 @@ def _configure(parser: argparse.ArgumentParser) -> None:
     hand.add_argument("--worktree", help="the task worktree (default: <root>/.worktrees/<id lowercased>)")
     # No subcommand takes a main-branch option: the rules are always read from `main`.
     merge = actions.add_parser("merge-check", help="the controller's gate run before a merge: guarded files, "
-                                                   "SPEC and PLAN, then build, test and scan on a trial merge")
+                                                   "SPEC, PLAN and review.md, then build, test and scan on a "
+                                                   "trial merge")
     merge.add_argument("--branch", required=True, help="the task branch to merge, task/<ID>")
     bind = actions.add_parser("binding", help="QA check: the branch's results.json still binds its tip")
     bind.add_argument("task_id", metavar="ID", help="task ID, for example P0-M01-S01-T01")
