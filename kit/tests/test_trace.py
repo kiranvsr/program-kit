@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import miniyaml
 import pk
 import trace as trace_module  # kit/scripts/trace.py (it shadows the standard library module of that name)
 from common import KitError, read_yaml, write_json, write_yaml
@@ -76,26 +77,25 @@ class ValidateTests(TraceBase):
 
         self.put(matrix(journeys={"J1": {"title": "sign up", "requirements": []}}))
         self.assertEqual(self.validate(2), [])  # journeys may precede any requirement
-        self.assertEqual(len(self.validate(3)), 1)
-        self.assertTrue(self.validate(3)[0].startswith("J1:"))
+        self.assertEqual(self.validate(3), ["J1: lists no requirement"])
 
         self.put(full_matrix(components={}, gates={}, requirements={
             "REQ-001": {"title": "form", "journeys": ["J1"], "components": [], "nfr": False}}))
         self.assertEqual(self.validate(3), [])
         stage4 = self.validate(4)
-        self.assertTrue(any(p.startswith("REQ-001:") and "component" in p for p in stage4), stage4)
-        self.assertIn("program/gates.yaml is missing", stage4)
+        self.assertEqual(stage4, ["REQ-001: names no component", "program/gates.yaml is missing"])
 
         self.put(full_matrix())
         self.put({"gates": {"G-P0": {"title": "p0", "claims": [], "environment": "dev", "records": []}}}, "gates.yaml")
-        self.assertTrue(any(p.startswith("G-P0:") and "record" in p for p in self.validate(4)))
+        self.assertEqual(self.validate(4), ["G-P0: has no records in gates.yaml"])
         self.assertEqual(self.validate(3), [])  # gates only matter from stage 4
 
         self.put(GATES, "gates.yaml")
         self.assertEqual(self.validate(4), [])
         self.assertEqual(self.validate(5), [])
-        stage6 = self.validate(6)
-        self.assertEqual(sorted(p.split(":")[0] for p in stage6), ["NFR-001", "REQ-001"])  # nothing closes them yet
+        self.assertEqual(self.validate(6), [  # nothing closes them yet
+            "REQ-001: first-release requirement is not closed by any task",
+            "NFR-001: first-release requirement is not closed by any task"])
 
         self.put(full_matrix(tasks={T1: {"closes": ["REQ-001", "J1"]}, T2: {"closes": ["NFR-001"]}}))
         self.assertEqual(self.validate(6), [])
@@ -104,13 +104,12 @@ class ValidateTests(TraceBase):
         self.put(full_matrix(journeys={"J1": {"title": "a", "requirements": ["REQ-001"]},
                                        "J2": {"title": "b", "requirements": []},
                                        "J3": {"title": "c"}}))
-        problems = self.validate(3)
-        self.assertEqual([p.split(":")[0] for p in problems], ["J2", "J3"])
-        # stage 2 tolerates it only while the requirements section is still empty
-        self.assertEqual([p.split(":")[0] for p in self.validate(2)], ["J2", "J3"])
+        self.assertEqual(self.validate(3), ["J2: lists no requirement", "J3: lists no requirement"])
+        # the rule starts at stage 3, even with a non-empty requirements section
+        self.assertEqual(self.validate(2), [])
         self.put(matrix(journeys={"J2": {"title": "b", "requirements": []}}))
         self.assertEqual(self.validate(2), [])
-        self.assertEqual([p.split(":")[0] for p in self.validate(3)], ["J2"])
+        self.assertEqual(self.validate(3), ["J2: lists no requirement"])
 
     def test_stage_2_needs_journeys(self):
         self.put(matrix())
@@ -121,10 +120,8 @@ class ValidateTests(TraceBase):
     def test_task_closing_unknown_id_fails(self):
         self.put(GATES, "gates.yaml")
         self.put(full_matrix(tasks={T1: {"closes": ["REQ-001", "REQ-099", "J7", "NFR-001"]}}))
-        problems = self.validate(6)
-        self.assertEqual([p.split(":")[0] for p in problems], [T1, T1])
-        self.assertTrue(any("REQ-099" in p for p in problems))
-        self.assertTrue(any("J7" in p for p in problems))
+        self.assertEqual(self.validate(6), [f"{T1}: closes REQ-099 which does not exist",
+                                            f"{T1}: closes J7 which does not exist"])
         self.assertEqual(self.validate(5), [])  # unknown references only matter at stage 6
 
     def test_non_first_release_requirement_need_not_be_closed(self):
@@ -165,18 +162,46 @@ class ValidateTests(TraceBase):
                         components={"c1": {}}, gates={"g-p0": {}}, tasks={"T1": {"closes": ["REQ-1"]}}))
         problems = self.validate(1)
         flagged = {p.split(":")[0] for p in problems}
-        self.assertEqual(flagged, {"j1", "REQ-1", "c1", "g-p0", "T1"})
+        self.assertEqual(flagged, {"j1", "REQ-1", "c1", "program/traceability.yaml", "T1"})
+        self.assertIn("program/traceability.yaml: g-p0 is not a valid gate id (expected G-<NAME>)", problems)
         self.assertTrue(all("REQ-1" in p or "J-1" in p or "Cx" in p or "is not a valid" in p for p in problems))
 
+    def test_malformed_gate_key_is_reported_once_per_file(self):
+        self.put(matrix(journeys={"J1": {"requirements": []}}, gates={"g-p0": {"records": ["a"]}}))
+        self.put({"gates": {"g-p0": {"records": [{"path": "a", "acceptance": "ok"}]}}}, "gates.yaml")
+        for stage in (1, 4):
+            problems = [p for p in self.validate(stage) if "g-p0" in p]
+            self.assertEqual(problems, [
+                "program/traceability.yaml: g-p0 is not a valid gate id (expected G-<NAME>)",
+                "program/gates.yaml: g-p0 is not a valid gate id (expected G-<NAME>)"], stage)
+
+    def test_lower_stage_problems_are_reported_in_a_higher_stage_run(self):
+        self.put(full_matrix(journeys={"J1": {"title": "a", "requirements": ["REQ-001"]}, "J2": {"title": "b"}},
+                             requirements={"REQ-001": {"title": "x", "journeys": ["J1"], "components": []},
+                                           "NFR-001": {"title": "y", "components": ["C2"], "nfr": True}}))
+        self.put(GATES, "gates.yaml")
+        self.assertEqual(self.validate(3), ["J2: lists no requirement"])
+        self.assertEqual(self.validate(4), ["J2: lists no requirement", "REQ-001: names no component"])
+        self.assertEqual(self.validate(6), [
+            "J2: lists no requirement", "REQ-001: names no component",
+            "REQ-001: first-release requirement is not closed by any task",
+            "NFR-001: first-release requirement is not closed by any task"])
+
     def test_wrong_shape_raises(self):
-        for data in (["a"], matrix(journeys=["J1"]), matrix(tasks="x")):
+        for data in (["a"], matrix(journeys=["J1"]), matrix(tasks="x"),
+                     matrix(requirements={"REQ-001": "bar"}), matrix(gates={"G-P0": ["x"]})):
             self.put(data)
             with self.assertRaises(KitError):
                 self.validate(2)
         self.put(full_matrix())
-        self.put(["x"], "gates.yaml")
-        with self.assertRaises(KitError):
-            self.validate(4)
+        for data in (["x"], {"gates": {"G-P0": "bar"}}):
+            self.put(data, "gates.yaml")
+            with self.assertRaises(KitError):
+                self.validate(4)
+        with self.assertRaises(KitError) as caught:
+            self.put(matrix(requirements={"REQ-001": "bar"}))
+            self.validate(1)
+        self.assertEqual(str(caught.exception), "program/traceability.yaml: REQ-001 must be a mapping")
 
     def test_empty_sections_may_be_null(self):
         (self.root / "program" / "traceability.yaml").write_text("journeys:\nrequirements:\n")
@@ -287,6 +312,12 @@ class CliTests(TraceBase):
         self.put(GATES, "gates.yaml")
         self.assertEqual(self.run_cli("trace", "validate", "--stage", "4"), (0, "traceability valid at stage 4\n", ""))
 
+    def test_string_entry_is_one_error_line(self):
+        self.put(matrix(requirements={"REQ-001": "bar"}))
+        code, out, err = self.run_cli("trace", "validate", "--stage", "3")
+        self.assertEqual((code, out), (1, ""))
+        self.assertEqual(err, "error: program/traceability.yaml: REQ-001 must be a mapping\n")
+
     def test_validate_needs_a_numeric_stage(self):
         self.assertEqual(self.run_cli("trace", "validate")[0], 1)
         code, _, err = self.run_cli("trace", "validate", "--stage", "two")
@@ -313,7 +344,30 @@ class CliTests(TraceBase):
         self.assertEqual(self.run_cli("trace")[0], 1)
 
 
+def commented_examples(path):
+    """Each run of comment lines indented three or more spaces after the `#`, dedented, as YAML text."""
+    blocks, current = [], []
+    for line in path.read_text().splitlines():
+        if line.startswith("#   "):
+            current.append(line[2:])
+        elif current:
+            blocks.append(current)
+            current = []
+    if current:
+        blocks.append(current)
+    return ["\n".join(line[2:] for line in block) + "\n" for block in blocks]
+
+
 class TemplateTests(unittest.TestCase):
+    def test_commented_examples_parse_under_the_yaml_subset(self):
+        for name, expected in (("traceability.yaml", 5), ("gates.yaml", 1)):
+            path = KIT / "templates" / name
+            examples = commented_examples(path)
+            self.assertEqual(len(examples), expected, name)
+            for text in examples:
+                self.assertIsInstance(miniyaml.loads(text), dict, f"{name}: {text}")
+            self.assertNotRegex(path.read_text(), r"(?m)[ \t]+$", f"{name} has trailing whitespace")
+
     def test_templates_parse_to_empty_sections(self):
         self.assertEqual(read_yaml(KIT / "templates" / "traceability.yaml"), matrix())
         self.assertEqual(read_yaml(KIT / "templates" / "gates.yaml"), {"gates": {}})

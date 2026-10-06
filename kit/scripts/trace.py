@@ -5,7 +5,8 @@ The matrix links journeys (J<n>) to requirements (REQ-<nnn>, NFR-<nnn>), require
 to components (C<n>), gates (G-<NAME>) to the records that prove them, and tasks to
 the IDs they close. `validate` applies the checks that belong to an interview stage,
 cumulatively; `sync` copies each task's `closes` from the register; `impact` answers
-what a change to some IDs reaches. Both files are optional until the stage that needs them.
+what a change to some IDs reaches (a gate whose claims name only a journey is not matched).
+Both files are optional until the stage that needs them.
 """
 from __future__ import annotations
 
@@ -69,19 +70,25 @@ class _Entries:
     def __init__(self, problems: list[str]):
         self.problems = problems
 
-    def key(self, key, kind: str) -> str:
+    def key(self, key, kind: str, file: str | None = None) -> str:
+        """Report a malformed key; gate keys appear in two files, so theirs are prefixed by the file."""
         pattern, shape = _KINDS[kind]
         if not (isinstance(key, str) and pattern.match(key)):
-            self.problems.append(f"{key}: is not a valid {kind} id (expected {shape})")
+            prefix = f"{file}: {key} is" if file else f"{key}: is"
+            self.problems.append(f"{prefix} not a valid {kind} id (expected {shape})")
         return str(key)
 
-    def entry(self, key: str, value) -> dict:
-        if value is None:
-            return {}
-        if not isinstance(value, dict):
-            self.problems.append(f"{key}: must be a mapping")
-            return {}
-        return value
+    def table(self, section: dict, kind: str, file: str) -> dict[str, dict]:
+        """The entries of `section` by key. An entry that is not a mapping raises (wrong shape)."""
+        found = {}
+        for key, value in section.items():
+            name = self.key(key, kind, file if kind == "gate" else None)
+            if value is None:
+                value = {}
+            elif not isinstance(value, dict):
+                raise KitError(f"{file}: {key} must be a mapping")
+            found[name] = value
+        return found
 
     def strings(self, who: str, entry: dict, field: str) -> None:
         value = entry.get(field)
@@ -107,17 +114,17 @@ def validate(root: Path, stage: int) -> list[str]:
     matrix = _load(root, "traceability.yaml", SECTIONS)
     if matrix is None:
         return ["program/traceability.yaml is missing"] if stage >= STAGE_JOURNEYS else []
-    gate_file = None
-    if stage >= STAGE_COMPONENTS:
-        gate_file = _load(root, "gates.yaml", ("gates",))
+    gate_file = _load(root, "gates.yaml", ("gates",))  # read at every stage: its IDs are checked everywhere
 
     problems: list[str] = []
     read = _Entries(problems)
-    journeys = {read.key(k, "journey"): read.entry(str(k), v) for k, v in matrix["journeys"].items()}
-    requirements = {read.key(k, "requirement"): read.entry(str(k), v) for k, v in matrix["requirements"].items()}
-    components = {read.key(k, "component"): read.entry(str(k), v) for k, v in matrix["components"].items()}
-    gates = {read.key(k, "gate"): read.entry(str(k), v) for k, v in matrix["gates"].items()}
-    tasks = {read.key(k, "task"): read.entry(str(k), v) for k, v in matrix["tasks"].items()}
+    where = "program/traceability.yaml"
+    journeys = read.table(matrix["journeys"], "journey", where)
+    requirements = read.table(matrix["requirements"], "requirement", where)
+    components = read.table(matrix["components"], "component", where)
+    gates = read.table(matrix["gates"], "gate", where)
+    tasks = read.table(matrix["tasks"], "task", where)
+    defined = read.table(gate_file["gates"], "gate", "program/gates.yaml") if gate_file is not None else {}
 
     journey_reqs = {j: read.ids(j, e, "requirements", "requirement") for j, e in journeys.items()}
     req_journeys = {r: read.ids(r, e, "journeys", "journey") for r, e in requirements.items()}
@@ -132,7 +139,7 @@ def validate(root: Path, stage: int) -> list[str]:
         if not journeys:
             problems.append("program/traceability.yaml: no journeys listed")
         for journey in journeys:
-            if not journey_reqs[journey] and (requirements or stage >= STAGE_LINKS):
+            if not journey_reqs[journey] and stage >= STAGE_LINKS:
                 problems.append(f"{journey}: lists no requirement")
     if stage >= STAGE_LINKS:
         for req, entry in requirements.items():
@@ -160,7 +167,6 @@ def validate(root: Path, stage: int) -> list[str]:
         if gate_file is None:
             problems.append("program/gates.yaml is missing")
         else:
-            defined = {read.key(k, "gate"): read.entry(str(k), v) for k, v in gate_file["gates"].items()}
             for gate, entry in defined.items():
                 records = entry.get("records")
                 if not isinstance(records, list) or not records:
