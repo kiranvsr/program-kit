@@ -194,6 +194,16 @@ def _check_stage(stage) -> int:
     return stage
 
 
+PER_TASK_STAGE = 7
+PER_TASK_MESSAGE = "stage 7 is per task: run playbooks 07 and 08 for each task; there is nothing to approve"
+
+
+def _refuse_per_task(stage) -> None:
+    """Stage 7 (task specs) is never approved, reported, challenged or amended as a whole."""
+    if stage == PER_TASK_STAGE and not isinstance(stage, bool):
+        raise KitError(PER_TASK_MESSAGE)
+
+
 def _stage(coverage: dict, stage: int) -> dict:
     """The map entry for `stage`; a stage the map does not list (such as 7) has a name and no topics."""
     _check_stage(stage)
@@ -405,19 +415,9 @@ def _unresolved_findings(path: Path) -> int:
     return count
 
 
-def _register_problems(root: Path) -> list[str]:
-    import register as register_module
-
-    if not (Path(root) / "program" / "register.yaml").exists():
-        return ["program/register.yaml: missing"]
-    environments_path = Path(root) / "program" / "environments.yaml"
-    environments = read_yaml(environments_path) if environments_path.exists() else None
-    roles = read_yaml(KIT_DIR / "interview" / "roles.yaml")
-    return register_module.validate(register_module.load(root), environments, roles)
-
-
 def stopping_rule(root: Path, stage: int) -> list[str]:
     """Reasons `stage` cannot be approved, each starting with a topic or entry ID or a file name."""
+    _refuse_per_task(stage)
     coverage = load_coverage(root)
     topics = _stage(coverage, stage)["topics"]
     ledger = _load_ledger(root)
@@ -446,8 +446,6 @@ def stopping_rule(root: Path, stage: int) -> list[str]:
         import trace as trace_module  # lazy: trace imports register and status
 
         reasons.extend(trace_module.validate(root, stage))
-    if stage == 7:
-        reasons.extend(_register_problems(root))
     return reasons
 
 
@@ -478,6 +476,7 @@ def _cell(text) -> str:
 
 def report(root: Path, stage: int) -> Path:
     """Write `program/reports/stage-N.md`: every topic with its state, owner, gaps and entries."""
+    _refuse_per_task(stage)
     coverage = load_coverage(root)
     info = _stage(coverage, stage)
     entries = _load_ledger(root)["entries"]
@@ -510,6 +509,7 @@ def questions_line(root: Path, stage: int) -> str:
 
 def challenge_init(root: Path, stage: int) -> Path:
     """Write the challenge report skeleton, one section per lens; never overwrites an existing report."""
+    _refuse_per_task(stage)
     info = _stage(load_coverage(root), stage)
     sections = "\n\n".join(f"## {lens}\n\n{CHALLENGE_HEADER}\n|---|---|---|---|" for lens in LENSES)
     text = _template("challenge_report.md").substitute(stage=stage, name=info["name"], sections=sections)
@@ -545,6 +545,7 @@ def _ledger_hash(root: Path) -> str | None:
 def approve(root: Path, stage: int, artifacts: list[Path]) -> Path:
     """Write `program/approvals/stage-N.json`, or refuse with the stopping-rule reasons (writing nothing)."""
     _check_stage(stage)
+    _refuse_per_task(stage)
     reasons = stopping_rule(root, stage)
     if reasons:
         raise KitError("; ".join(reasons))
@@ -574,25 +575,28 @@ def _stale(root: Path, record, check_ledger: bool) -> bool:
 
 
 def next_stage(root: Path) -> int:
-    """First stage 1..7 that is unapproved or whose approved files changed; 8 when all are current.
+    """First stage 1..6 that is unapproved or whose approved files changed; 7 once all six are current.
 
-    The ledger grows while stages 1 to 4 are worked, so their approvals compare artifact hashes only. After the
-    freeze (stage 5 on) a ledger change is a change request: the ledger hash is compared for the highest approval
+    Stage 7 (task specs) is never approved: it names the per-task loop, so 7 is the final value. The ledger
+    grows while stages 1 to 4 are worked, so their approvals compare artifact hashes only. After the freeze
+    (stage 5 on) a ledger change is a change request: the ledger hash is compared for the highest approval
     of stage 5 or later.
     """
-    approved = [stage for stage in STAGES if _approval_path(root, stage).exists()]
+    last = PER_TASK_STAGE - 1
+    approved = [stage for stage in range(1, last + 1) if _approval_path(root, stage).exists()]
     frozen = [stage for stage in approved if stage >= FREEZE_STAGE]
-    for stage in STAGES:
+    for stage in range(1, last + 1):
         if stage not in approved:
             return stage
         if _stale(root, read_json(_approval_path(root, stage)), check_ledger=bool(frozen) and stage == frozen[-1]):
             return stage
-    return STAGES[-1] + 1
+    return PER_TASK_STAGE
 
 
 def amend(root: Path, stage: int) -> list[str]:
     """Re-hash an approval's artifacts and the ledger; rewrite it if any changed; return the changed paths."""
     _check_stage(stage)
+    _refuse_per_task(stage)
     path = _approval_path(root, stage)
     if not path.exists():
         raise KitError(f"stage {stage} has no approval to amend")
@@ -725,8 +729,9 @@ def cmd_interview(args: argparse.Namespace) -> int:
     root = find_root()
     if action == "next":
         stage = next_stage(root)
-        if stage > STAGES[-1]:
-            print("all stages approved")
+        if stage == PER_TASK_STAGE:
+            print(f"next stage: {stage} ({_stage(load_coverage(root), stage)['name']})\n"
+                  "discovery is complete: run playbooks 07 and 08 for each task")
             return 0
         info = _stage(load_coverage(root), stage)
         states = topic_states(root, stage)
@@ -739,6 +744,7 @@ def cmd_interview(args: argparse.Namespace) -> int:
     elif action == "challenge":
         print(_show(root, challenge_init(root, args.stage)))
     elif action == "approve":
+        _refuse_per_task(args.stage)
         artifacts = [Path.cwd() / item for item in args.artifact] if args.artifact else [
             root / "program" / item for item in _stage(load_coverage(root), args.stage)["artifacts"]]
         if not artifacts:
@@ -772,9 +778,9 @@ def _configure(parser: argparse.ArgumentParser) -> None:
     for name, text in (("report", "write the stage coverage report"),
                        ("challenge", "write the challenge report skeleton"),
                        ("amend", "re-hash an approval after a correction")):
-        actions.add_parser(name, help=text).add_argument("stage", type=int, help="interview stage, 1 to 7")
+        actions.add_parser(name, help=text).add_argument("stage", type=int, help="interview stage, 1 to 6")
     approver = actions.add_parser("approve", help="approve a stage if the stopping rule holds")
-    approver.add_argument("stage", type=int, help="interview stage, 1 to 7")
+    approver.add_argument("stage", type=int, help="interview stage, 1 to 6")
     approver.add_argument("--artifact", nargs="+", metavar="PATH",
                           help="artifact files (default: the coverage map's list for the stage)")
     actions.add_parser("ingest", help="copy a document into program/sources/ and record it").add_argument(
