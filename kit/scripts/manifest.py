@@ -4,6 +4,10 @@
 sorted); `check` compares the directory with the recorded lines and reports modified, missing
 and added files. The upgrade path of install.sh uses `check` to refuse replacing a kit
 that has local changes.
+
+The kit's own tests (the top-level `tests/` directory) are neither recorded nor checked: they run in the
+kit's own repository and are not installed into projects. A manifest written by an older kit that did
+record them still checks clean, so an upgrade from such an install works and removes them.
 """
 from __future__ import annotations
 
@@ -18,6 +22,7 @@ from common import KitError, sha256_file, write_text
 KIT_DIR = Path(__file__).resolve().parent.parent
 MANIFEST_NAME = "MANIFEST.sha256"
 _SKIPPED_DIRS = {"__pycache__"}
+_UNRECORDED_TOP = "tests"
 _SKIPPED_FILES = {".DS_Store"}
 _LINE = re.compile(r"([0-9a-f]{64})  (\S.*)\Z")
 
@@ -31,7 +36,8 @@ def _files(kit_dir: Path) -> dict[str, Path]:
         for name in dirs:
             if (base / name).is_symlink():
                 raise KitError(f"{(base / name).relative_to(kit_dir).as_posix()}: symlinks are not allowed in the kit")
-        dirs[:] = sorted(name for name in dirs if name not in _SKIPPED_DIRS)
+        dirs[:] = sorted(name for name in dirs if name not in _SKIPPED_DIRS
+                         and not (base == kit_dir and name == _UNRECORDED_TOP))
         for name in names:
             path = base / name
             relative = path.relative_to(kit_dir).as_posix()
@@ -84,7 +90,8 @@ def _read(kit_dir: Path) -> dict[str, str]:
 
 def check(kit_dir: Path) -> list[str]:
     """Sorted `modified: `, `missing: ` and `added: ` lines; empty when the kit matches its manifest."""
-    recorded = _read(kit_dir)
+    recorded = {name: digest for name, digest in _read(kit_dir).items()
+                if not name.startswith(_UNRECORDED_TOP + "/")}
     present = _files(kit_dir)
     problems = [f"added: {name}" for name in present if name not in recorded]
     for name, digest in recorded.items():

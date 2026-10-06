@@ -1,5 +1,13 @@
-# Commands the program runs. Each of build, test, scan, compile_check and extra_gate
-# is a list of argv lists, for example: - [go, test, ./...]
+# Commands the program runs. Each of build, test, scan, compile_check and extra_gate is a list of
+# commands, and each command is an argv list: the program, then its arguments, one entry per line.
+# For example, `go test ./...` is written
+#
+#   test:
+#     - - go
+#       - test
+#       - ./...
+#
+# build, test and scan must each list at least one command before `pk doctor` passes.
 build: []
 test: []
 scan: []

@@ -100,5 +100,55 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(manifest.check(REPO_KIT), [])
 
 
+class KitTestsAreNotKitContentTests(unittest.TestCase):
+    """Finding 15: the kit's own tests (top-level kit/tests) are not part of what is installed or recorded."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.kit = Path(self._tmp.name).resolve() / "kit"
+        (self.kit / "sub").mkdir(parents=True)
+        (self.kit / "b.txt").write_text("b\n")
+        (self.kit / "a.txt").write_text("a\n")
+        (self.kit / "sub" / "c.txt").write_text("c\n")
+
+    def put_tests(self):
+        (self.kit / "tests" / "fixtures").mkdir(parents=True)
+        (self.kit / "tests" / "test_a.py").write_text("t\n")
+        (self.kit / "tests" / "fixtures" / "f.txt").write_text("f\n")
+
+    def test_write_does_not_list_the_top_level_tests_directory(self):
+        self.put_tests()
+        manifest.write(self.kit)
+        names = [line.split("  ", 1)[1] for line in (self.kit / "MANIFEST.sha256").read_text().splitlines()]
+        self.assertEqual(names, ["a.txt", "b.txt", "sub/c.txt"])
+        self.assertEqual(manifest.check(self.kit), [])
+
+    def test_only_the_top_level_directory_is_skipped(self):
+        (self.kit / "sub" / "tests").mkdir()
+        (self.kit / "sub" / "tests" / "x.txt").write_text("x\n")
+        manifest.write(self.kit)
+        self.assertIn("sub/tests/x.txt", (self.kit / "MANIFEST.sha256").read_text())
+
+    def test_check_ignores_tests_whether_recorded_by_an_older_kit_or_present_on_disk(self):
+        self.put_tests()
+        manifest.write(self.kit)
+        text = (self.kit / "MANIFEST.sha256").read_text()
+        older = text + "".join(f"{manifest.sha256_file(self.kit / rel)}  {rel}\n"
+                               for rel in ("tests/fixtures/f.txt", "tests/test_a.py"))
+        (self.kit / "MANIFEST.sha256").write_text(older)  # an older kit recorded its tests
+        self.assertEqual(manifest.check(self.kit), [])
+        (self.kit / "tests" / "test_a.py").write_text("edited\n")
+        (self.kit / "tests" / "new.py").write_text("n\n")
+        (self.kit / "tests" / "fixtures" / "f.txt").unlink()
+        self.assertEqual(manifest.check(self.kit), [])
+        (self.kit / "a.txt").write_text("changed\n")  # everything else is still checked
+        self.assertEqual(manifest.check(self.kit), ["modified: a.txt"])
+
+    def test_the_shipped_manifest_does_not_list_the_kits_tests(self):
+        recorded = (REPO_KIT / "MANIFEST.sha256").read_text().splitlines()
+        self.assertEqual([line for line in recorded if line.split("  ", 1)[1].startswith("tests/")], [])
+
+
 if __name__ == "__main__":
     unittest.main()

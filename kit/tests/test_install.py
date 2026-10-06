@@ -7,6 +7,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import common
+
 ROOT = Path(__file__).resolve().parent.parent.parent
 INSTALL = ROOT / "install.sh"
 KIT = ROOT / "kit"
@@ -49,6 +51,7 @@ class InstallCase(unittest.TestCase):
         path = self.tmp / name
         path.mkdir()
         subprocess.run(["git", "init", "-q", str(path)], check=True, env=_env())
+        subprocess.run(["git", "-C", str(path), "symbolic-ref", "HEAD", "refs/heads/main"], check=True, env=_env())
         return path
 
     def install(self, *args, script=INSTALL, cwd=None, env=None, shell=None):
@@ -372,6 +375,193 @@ class InstallUnderDashTests(InstallCase):
         self.assert_ok(upgrade)
         self.assertIn("program/ exists; left untouched", upgrade.stdout)
         self.assert_refused(self.install(target), "already exists; use --upgrade")
+
+
+class ProjectPreparationTests(InstallCase):
+    """Finding 8: a first commit made by following the README leaves a clean tree and tracks no bytecode."""
+
+    LINES = ["__pycache__/", "*.pyc", ".worktrees/"]
+
+    def test_install_creates_gitignore_with_the_three_lines(self):
+        target = self.repo()
+        self.assert_ok(self.install(target))
+        self.assertEqual((target / ".gitignore").read_text().splitlines(), self.LINES)
+
+    def test_install_appends_only_the_missing_lines_and_keeps_existing_bytes(self):
+        target = self.repo()
+        original = b"# mine\r\nnode_modules/\r\n*.pyc\r\n.env"  # CRLF and no final newline
+        (target / ".gitignore").write_bytes(original)
+        self.assert_ok(self.install(target))
+        data = (target / ".gitignore").read_bytes()
+        self.assertTrue(data.startswith(original))
+        self.assertEqual(data[len(original):], b"\n__pycache__/\n.worktrees/\n")
+
+    def test_install_leaves_a_complete_gitignore_byte_identical_even_when_program_exists(self):
+        target = self.repo()
+        text = b"dist/\n.worktrees/\n*.pyc\n__pycache__/\n"
+        (target / ".gitignore").write_bytes(text)
+        (target / "program").mkdir()
+        self.assert_ok(self.install(target))
+        self.assertEqual((target / ".gitignore").read_bytes(), text)
+
+    def test_install_adds_the_lines_when_program_already_exists(self):
+        target = self.repo()
+        (target / "program").mkdir()
+        self.assert_ok(self.install(target))
+        self.assertEqual((target / ".gitignore").read_text().splitlines(), self.LINES)
+
+    def test_a_failed_install_leaves_gitignore_alone(self):
+        target = self.repo()
+        self.assert_refused(self.install(target, "--preset", "cobol"), "preset")
+        self.assertFalse((target / ".gitignore").exists())
+
+    def clean_env(self):
+        return {k: v for k, v in _env().items() if k != "PYTHONDONTWRITEBYTECODE"}
+
+    def run_in(self, target, *argv):
+        return subprocess.run(list(argv), cwd=target, capture_output=True, text=True, env=self.clean_env())
+
+    def first_commit_is_clean(self, target):
+        pk = [sys.executable, "kit/scripts/pk.py"]
+        self.assertEqual(self.run_in(target, *pk, "doctor").stdout, "doctor: ok\n")
+        for command in (["interview", "next"], ["register", "validate"], ["manifest", "check"], ["handoff", "check"]):
+            self.run_in(target, *pk, *command)  # whatever they answer, they must leave no file behind
+        self.run_in(target, "git", "add", "kit", "program", ".gitignore")
+        commit = self.run_in(target, "git", "-c", "user.name=T", "-c", "user.email=t@example.com",
+                             "commit", "-q", "-m", "Add program-kit")
+        self.assertEqual(commit.returncode, 0, commit.stderr)
+        self.assertEqual(self.run_in(target, "git", "status", "--short").stdout, "")
+        tracked = self.run_in(target, "git", "ls-files").stdout.splitlines()
+        self.assertEqual([name for name in tracked if name.endswith(".pyc") or "__pycache__" in name], [])
+        # the tree the next gate sees is still clean after the commands run again
+        self.run_in(target, *pk, "doctor")
+        self.assertEqual(self.run_in(target, "git", "status", "--short").stdout, "")
+
+    def test_readme_start_in_an_existing_repository_leaves_a_clean_tree(self):
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        for step in ("git branch -m main", "sh install.sh", "kit/scripts/pk.py doctor", ".gitignore",
+                     "git add kit program .gitignore"):
+            self.assertIn(step, readme)
+        target = self.tmp / "existing"
+        target.mkdir()
+        self.run_in(target, "git", "init", "-q")  # git's default branch name here is not main
+        self.run_in(target, "git", "symbolic-ref", "HEAD", "refs/heads/master")
+        self.run_in(target, "git", "branch", "-m", "main")  # README: the primary branch must be main
+        result = self.install(target, "--preset", "python", env=self.clean_env())
+        self.assert_ok(result)
+        self.first_commit_is_clean(target)
+
+    def test_readme_start_in_a_new_repository_leaves_a_clean_tree(self):
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn("kit/scripts/pk.py init --preset python", readme)
+        target = self.tmp / "fresh"
+        target.mkdir()
+        shutil.copytree(KIT, target / "kit", ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "tests"))
+        shutil.copy(ROOT / ".gitignore", target / ".gitignore")
+        self.run_in(target, "git", "init", "-q")
+        self.run_in(target, "git", "symbolic-ref", "HEAD", "refs/heads/main")
+        self.assertEqual(self.run_in(target, sys.executable, "kit/scripts/pk.py", "init", "--preset", "python").returncode, 0)
+        self.first_commit_is_clean(target)
+
+    def test_readme_start_in_a_new_repository_works_from_a_bare_template_copy_without_gitignore(self):
+        target = self.tmp / "bare"
+        target.mkdir()
+        shutil.copytree(KIT, target / "kit", ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "tests"))
+        self.run_in(target, "git", "init", "-q")
+        self.run_in(target, "git", "symbolic-ref", "HEAD", "refs/heads/main")
+        self.assertEqual(self.run_in(target, sys.executable, "kit/scripts/pk.py", "init", "--preset", "go").returncode, 0)
+        self.first_commit_is_clean(target)
+
+
+class KitTestsStayInTheKitRepositoryTests(InstallCase):
+    """Finding 15: the kit's tests are not installed; an upgrade removes them from an older install."""
+
+    def test_install_does_not_copy_kit_tests(self):
+        target = self.repo()
+        self.assert_ok(self.install(target))
+        self.assertFalse((target / "kit" / "tests").exists())
+        self.assertNotIn("tests/", (target / "kit" / "MANIFEST.sha256").read_text())
+        check = self.pk(target, "manifest", "check")
+        self.assertEqual((check.returncode, check.stdout, check.stderr), (0, "manifest: clean\n", ""))
+
+    def test_the_source_checkout_has_tests_but_the_install_does_not_need_them(self):
+        self.assertTrue((KIT / "tests").is_dir())
+        target = self.repo()
+        self.assert_ok(self.install(target))
+        self.assertEqual(sorted(p.name for p in (target / "kit").iterdir()),
+                         sorted(p.name for p in KIT.iterdir() if p.name not in ("tests", "__pycache__")))
+
+    def test_upgrade_from_an_install_that_has_kit_tests_works_and_removes_them(self):
+        target = self.repo()
+        self.assert_ok(self.install(target))
+        shutil.copytree(KIT / "tests", target / "kit" / "tests", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        lines = []  # an older kit recorded its tests in the manifest
+        for path in sorted((target / "kit" / "tests").rglob("*")):
+            if path.is_file():
+                lines.append(f"{common.sha256_file(path)}  {path.relative_to(target / 'kit').as_posix()}\n")
+        manifest_path = target / "kit" / "MANIFEST.sha256"
+        manifest_path.write_text(manifest_path.read_text() + "".join(sorted(lines, key=lambda l: l.split("  ")[1])))
+        result = self.install(target, "--upgrade")
+        self.assert_ok(result)
+        self.assertFalse((target / "kit" / "tests").exists())
+        self.assertEqual(self.pk(target, "manifest", "check").stdout, "manifest: clean\n")
+        self.assertEqual(self.leftovers(target), [])
+
+
+class SourceManifestTests(InstallCase):
+    """Lesser 15: a source kit that does not match its own manifest is refused with one error line."""
+
+    def source(self):
+        source = self.tmp / "source"
+        source.mkdir()
+        shutil.copy(INSTALL, source / "install.sh")
+        shutil.copytree(KIT, source / "kit", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        return source
+
+    def assert_one_line(self, result, fragment):
+        self.assert_refused(result, fragment)
+        self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
+        self.assertIn("manifest", result.stderr)
+
+    def test_a_modified_source_file_is_refused_on_install(self):
+        source = self.source()
+        (source / "kit" / "templates" / "BRIEF.md").write_text("edited\n")
+        target = self.repo()
+        self.assert_one_line(self.install(target, script=source / "install.sh"), "modified: templates/BRIEF.md")
+        self.assertEqual(sorted(p.name for p in target.iterdir() if p.name != ".git"), [])
+
+    def test_an_added_and_a_missing_source_file_are_both_named(self):
+        source = self.source()
+        (source / "kit" / "extra.txt").write_text("x\n")
+        (source / "kit" / "VERSION.bak").write_text("x\n")
+        (source / "kit" / "rules" / "THROUGHPUT.md").unlink()
+        target = self.repo()
+        result = self.install(target, script=source / "install.sh")
+        self.assert_one_line(result, "added: extra.txt")
+        self.assertIn("missing: rules/THROUGHPUT.md", result.stderr)
+
+    def test_a_stale_manifest_is_refused_on_upgrade_and_the_installed_kit_is_untouched(self):
+        target = self.repo()
+        self.assert_ok(self.install(target))
+        source = self.source()
+        (source / "kit" / "scripts" / "common.py").write_text(
+            (source / "kit" / "scripts" / "common.py").read_text() + "# newer, manifest not rewritten\n")
+        before = snapshot(target / "kit")
+        self.assert_one_line(self.install(target, "--upgrade", script=source / "install.sh"),
+                             "modified: scripts/common.py")
+        self.assertEqual(snapshot(target / "kit"), before)
+        self.assertEqual(self.leftovers(target), [])
+
+    def test_a_missing_source_manifest_is_one_error_line(self):
+        source = self.source()
+        (source / "kit" / "MANIFEST.sha256").unlink()
+        target = self.repo()
+        result = self.install(target, script=source / "install.sh")
+        self.assert_one_line(result, "MANIFEST.sha256")
+        self.assertFalse((target / "kit").exists())
+
+    def test_the_shipped_source_passes(self):
+        self.assert_ok(self.install(self.repo()))
 
 
 if __name__ == "__main__":

@@ -6,7 +6,7 @@ Throughout, `pk` means `python3 kit/scripts/pk.py`.
 
 ## Five-minute start: a new repository
 
-1. Create a new repository from this template (use the "use this template" feature of your git host, or copy the files into a fresh `git init`) and enter it.
+1. Create a new repository from this template (use the "use this template" feature of your git host, or copy the files into a fresh `git init`) and enter it. The primary branch must be called `main`; if `git init` gave you another name, run `git branch -m main`.
 2. Create the project's working directory, choosing the preset for your language (`go`, `node` or `python`; leave `--preset` out to fill `program/checks.yaml` yourself):
 
    ```
@@ -14,26 +14,26 @@ Throughout, `pk` means `python3 kit/scripts/pk.py`.
    python3 kit/scripts/pk.py doctor
    ```
 
-   `doctor` prints `doctor: ok` when Python, git and `program/checks.yaml` are usable.
+   `init` also adds `__pycache__/`, `*.pyc` and `.worktrees/` to `.gitignore` if they are missing, so the first commit holds no bytecode. `doctor` prints `doctor: ok` when Python and git are usable, the branch is named `main` and `program/checks.yaml` lists at least one `build`, `test` and `scan` command (fill them in first if you left the preset out); otherwise it prints one `error:` line per problem.
 3. Replace the contents of `program/BRIEF.md` with your brief: anything from three lines to a full document.
 4. Commit, then point your agent at `kit/playbooks/00_START.md` and tell it to follow it.
 
 ## Five-minute start: an existing repository
 
-1. From a copy of this repository, install the kit into the top level of your project (it must be a git repository):
+1. Your repository must be a git repository whose primary branch is called `main` (`git branch -m main` renames it; `pk doctor` refuses anything else). From a copy of this repository, install the kit into its top level:
 
    ```
    sh install.sh /path/to/your-repo --preset python
    ```
 
-   This copies `kit/` into your repository and, because `program/` does not exist yet, creates it from the templates with the chosen preset (`go`, `node` or `python`; leave it out to fill `program/checks.yaml` yourself). It commits nothing.
+   This copies `kit/` into your repository (not the kit's own tests, which stay in the kit's repository), appends `__pycache__/`, `*.pyc` and `.worktrees/` to your `.gitignore` if they are missing (existing lines are left as they are), and, because `program/` does not exist yet, creates it from the templates with the chosen preset (`go`, `node` or `python`; leave it out to fill `program/checks.yaml` yourself). It commits nothing, and it refuses a copy of the kit that does not match its own manifest.
 2. Check it:
 
    ```
    cd /path/to/your-repo
    python3 kit/scripts/pk.py doctor
    ```
-3. Put your brief in `program/BRIEF.md`, commit `kit/` and `program/`, and point your agent at `kit/playbooks/00_START.md`.
+3. Put your brief in `program/BRIEF.md`, then commit with `git add kit program .gitignore` and `git commit`, and point your agent at `kit/playbooks/00_START.md`. Running `pk` writes no bytecode, so the tree stays clean for the first gate.
 
 A worked example with an end-to-end test lives in `examples/tiny-service/`.
 
@@ -73,16 +73,16 @@ The rules are in `kit/rules/`: `HARD_RULES.md`, `EVIDENCE_HONESTY.md` and `THROU
 
 - It never pushes, deploys or applies infrastructure; that is always your decision.
 - It never claims anything about an environment that does not exist. Environments are listed in `program/environments.yaml`, and work that needs a missing one stays blocked.
-- It never lets an implementer accept its own work. Only an independent QA agent can set a task `done`, and "accepted for development" is never "ready for production".
+- It never treats an implementer's word as acceptance. A task becomes `done` only through `pk status set ... --role qa` with an acceptance record bound to the evidence, and the briefs require QA to be a different agent from the implementer. The role is a flag the scripts check, not an identity, so who plays it is the controller's responsibility; "accepted for development" is never "ready for production".
 - It never writes evidence from a dirty tree, never downloads inside a gate, and never rewrites history.
 
 ## Upgrading
 
-Run `sh install.sh /path/to/your-repo --upgrade` from a newer copy of the kit. The installer first checks the installed `kit/` against `kit/MANIFEST.sha256` and refuses if you changed anything under it, then replaces `kit/` wholesale. It never reads, writes or lists `program/`. Keep your own changes in `program/`, not in `kit/`.
+Run `sh install.sh /path/to/your-repo --upgrade` from a newer copy of the kit. The installer first checks the new copy against its own manifest and the installed `kit/` against its `kit/MANIFEST.sha256`, and refuses if either does not match (for the installed one, if you changed anything under it), then replaces `kit/` wholesale; a `kit/tests` left by an older install goes with the old kit. It never reads, writes or lists `program/` and leaves `.gitignore` alone. Keep your own changes in `program/`, not in `kit/`.
 
 ## Requirements
 
-Python 3.11 or newer (standard library only), git, and a POSIX shell for `install.sh`. Run the kit's own tests with `TMPDIR=$(mktemp -d) python3 -W error -m unittest discover -s kit/tests`.
+Python 3.11 or newer (standard library only), git, and a POSIX shell for `install.sh`. The kit's own tests run in the kit's own repository (they need its `install.sh`, `examples/`, `docs/` and `LICENSE`, and are not installed into projects): `TMPDIR=$(mktemp -d) python3 -W error -m unittest discover -s kit/tests`.
 
 ## Licence
 

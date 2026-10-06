@@ -3,9 +3,10 @@
 #
 #   install.sh <target-repo> [--preset go|node|python] [--upgrade]
 #
-# Fresh install copies kit/ and, when program/ is absent, runs `pk init`.
-# --upgrade replaces kit/ wholesale after checking it has no local changes;
-# program/ is never read, written or listed.
+# Fresh install copies kit/ (without kit/tests, which belong to the kit's own repository), makes sure the
+# project's .gitignore lists __pycache__/, *.pyc and .worktrees/, and, when program/ is absent, runs `pk init`.
+# --upgrade replaces kit/ wholesale after checking it has no local changes; program/ and .gitignore are never
+# read, written or listed. Either way the source kit is first checked against its own manifest.
 set -eu
 
 usage='usage: install.sh <target-repo> [--preset go|node|python] [--upgrade]'
@@ -69,6 +70,32 @@ python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' >/dev
 PYTHONDONTWRITEBYTECODE=1
 export PYTHONDONTWRITEBYTECODE
 
+# Prints one `modified: `, `missing: ` or `added: ` line per difference between the kit at $1 and its own
+# MANIFEST.sha256, or one `error: ` line when the manifest cannot be read; exits 1 on any. The check is the SOURCE
+# kit's manifest module, run in isolated mode with no bytecode, so nothing under the target is imported or run.
+manifest_problems() {
+    python3 -I -B -c '
+import sys
+sys.path.insert(0, sys.argv[1])
+import manifest
+from common import KitError
+try:
+    found = manifest.check(sys.argv[2])
+except KitError as exc:
+    print("error: " + " ".join(str(exc).split()))
+    sys.exit(1)
+for line in found:
+    print("error: " + line)
+sys.exit(1 if found else 0)
+' "$source_kit/scripts" "$1" 2>&1
+}
+
+# A source kit that does not match its own manifest would install a kit that every later upgrade refuses.
+if ! problems=$(manifest_problems "$source_kit"); then
+    summary=$(printf '%s\n' "$problems" | sed 's/^error: //' | tr '\n' ';' | sed 's/;$//; s/;/; /g')
+    fail "the kit at $source_kit does not match its manifest ($summary); run: python3 kit/scripts/pk.py manifest write"
+fi
+
 # The suffix of the two work directories is this process id. PK_INSTALL_PID overrides it (digits only) so the
 # tests can plant a clashing directory; a clash is always an error, never reused.
 case "${PK_INSTALL_PID:-}" in
@@ -108,22 +135,10 @@ else
     if [ -L "$kit_dir" ] || [ ! -d "$kit_dir" ]; then
         fail "$kit_dir does not exist (or is not a directory); nothing to upgrade"
     fi
-    # The installed kit is verified with the SOURCE kit's manifest module against the installed MANIFEST.sha256, in
-    # isolated mode with no bytecode, so nothing under the target is imported or run.
-    problems=$(python3 -I -B -c '
-import sys
-sys.path.insert(0, sys.argv[1])
-import manifest
-from common import KitError
-try:
-    found = manifest.check(sys.argv[2])
-except KitError as exc:
-    print("error: " + " ".join(str(exc).split()))
-    sys.exit(1)
-for line in found:
-    print("error: " + line)
-sys.exit(1 if found else 0)
-' "$source_kit/scripts" "$kit_dir" 2>&1) || {
+    # The installed kit is verified with the SOURCE kit's manifest module against the installed MANIFEST.sha256, so
+    # nothing under the target is imported or run. A manifest that still lists kit/tests (older kits installed
+    # them) checks clean: tests are not kit content, and the upgrade removes them with the rest of the old kit.
+    problems=$(manifest_problems "$kit_dir") || {
         printf '%s\n' "$problems" >&2
         fail "$kit_dir does not match its manifest; refusing to upgrade"
     }
@@ -136,8 +151,8 @@ fi
 if [ -n "$(find "$source_kit" -type l)" ]; then
     fail "$source_kit contains a symbolic link; the kit ships none"
 fi
-dirs=$(CDPATH= cd -- "$source_kit" && find . -name __pycache__ -prune -o -type d -print)
-files=$(CDPATH= cd -- "$source_kit" && find . -name __pycache__ -prune -o -type f ! -name '*.pyc' ! -name .DS_Store -print)
+dirs=$(CDPATH= cd -- "$source_kit" && find . \( -name __pycache__ -o -path ./tests \) -prune -o -type d -print)
+files=$(CDPATH= cd -- "$source_kit" && find . \( -name __pycache__ -o -path ./tests \) -prune -o -type f ! -name '*.pyc' ! -name .DS_Store -print)
 mkdir "$tmp_dir" || fail "cannot create $tmp_dir"
 tmp_made=1
 newline='
@@ -170,6 +185,24 @@ else
     tmp_made=0
     rm -rf "$old_dir"
     old_made=0
+fi
+
+# Bytecode and task worktrees must never reach a commit: the first gate refuses a dirty tree. Append only the
+# lines the project's .gitignore lacks (a CRLF line ending is ignored when comparing); existing bytes stay as they are.
+if [ "$upgrade" = 0 ]; then
+    ignore_file="$target/.gitignore"
+    if [ -e "$ignore_file" ] && [ ! -f "$ignore_file" ]; then
+        fail "$ignore_file is not a regular file"
+    fi
+    for line in '__pycache__/' '*.pyc' '.worktrees/'; do
+        if [ -f "$ignore_file" ] && tr -d '\r' < "$ignore_file" | grep -qxF -- "$line"; then
+            continue
+        fi
+        if [ -s "$ignore_file" ] && [ -n "$(tail -c 1 "$ignore_file")" ]; then
+            printf '\n' >> "$ignore_file" || fail "cannot update $ignore_file"
+        fi
+        printf '%s\n' "$line" >> "$ignore_file" || fail "cannot update $ignore_file"
+    done
 fi
 
 # program/ is the project's: the only thing asked of it is whether it exists.

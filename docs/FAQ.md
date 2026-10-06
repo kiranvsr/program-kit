@@ -12,7 +12,7 @@ Because it has to work for whoever runs it, and because names go stale faster th
 
 ## Why a YAML subset, and what is in it?
 
-The kit's scripts use only the Python standard library, which cannot read YAML, so `kit/scripts/miniyaml.py` reads a deliberately small subset: block mappings and sequences nested by spaces, `- key: value` items, the literals `[]` and `{}`, comments, and plain, single-quoted and double-quoted scalars (`true`, `false`, `null`, integers and floats are recognised). It rejects anchors, aliases, tags, flow collections, block scalars (`|` and `>`), tab indentation, duplicate keys and multi-line scalars, and it names the line number when it does. The subset is also a feature: the full language has surprises (a bare `no` or `on` becoming a boolean, a duplicate key silently winning) that a governance tool should not have. A real YAML library will read every file the kit writes, so nothing is locked in.
+The kit's scripts use only the Python standard library, which cannot read YAML, so `kit/scripts/miniyaml.py` reads a deliberately small subset: block mappings and sequences nested by spaces (a sequence may sit at its key's indent or deeper), `- key: value` items, the literals `[]` and `{}`, comments, and plain, single-quoted and double-quoted scalars (`true`, `false`, `null`, integers and floats are recognised). It rejects anchors, aliases, tags, flow collections, block scalars (`|` and `>`), tab indentation, duplicate keys and multi-line scalars, and it names the line number when it does. The subset is also a feature: the full language has surprises (a bare `no` or `on` becoming a boolean, a duplicate key silently winning) that a governance tool should not have. Files the kit writes read in any YAML library. Going the other way, a file from another tool reads here only if it stays inside the subset: block style throughout, with a list either indented under its key or written at the key's own indent (the default output of most YAML writers), and an optional leading byte-order mark. Flow collections (a list or mapping written inline in brackets or braces), anchors and block scalars are rejected with their line number, so rewrite them as block lists and plain or quoted strings.
 
 ## How do I add a preset?
 
@@ -32,7 +32,11 @@ No. The kit never imports the standard-library `trace`, and every kit script run
 
 ## Why must a project git-ignore bytecode and build output?
 
-Evidence is produced only from a clean working tree, because a record "bound to one commit" is a lie if untracked files influenced the run. The clean-tree check treats any untracked, non-ignored file as dirt, so a test run that leaves `__pycache__/`, `*.pyc`, `dist/`, `target/` or `node_modules/` behind makes evidence production fail. Put those patterns in `.gitignore` before you start. This is a loud failure on purpose; the quiet alternative, ignoring untracked files, would hide real leftovers too.
+Evidence is produced only from a clean working tree, because a record "bound to one commit" is a lie if untracked files influenced the run. The clean-tree check treats any untracked, non-ignored file as dirt, so a test run that leaves `__pycache__/`, `*.pyc`, `dist/`, `target/` or `node_modules/` behind makes evidence production fail. Put those patterns in `.gitignore` before your first commit. `install.sh` and `pk init` add `__pycache__/`, `*.pyc` and `.worktrees/` for you when they are missing (and `pk` itself never writes bytecode); the build output of your own language is yours to add. This is a loud failure on purpose; the quiet alternative, ignoring untracked files, would hide real leftovers too.
+
+## Why must the primary branch be called `main`?
+
+The gates, `pk worktree new` and `pk handoff` all compare against `main`, and the gate reads its rules from it so that a task branch cannot change the rules it is judged by. A fixed name keeps that guarantee simple: there is no option to point the gate at another branch. `pk doctor` refuses a repository with no `main` and says how to fix it (`git branch -m main`), and `pk worktree new` and `pk handoff` give the same one-line answer.
 
 ## Why can `depends_on` name a phase, a milestone or a step as well as a task?
 
