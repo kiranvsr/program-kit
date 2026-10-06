@@ -221,6 +221,26 @@ class StatusTests(unittest.TestCase):
         self.assertTrue(any("A-3" in p and "task_id" in p for p in problems), problems)
         self.assertTrue(any("A-3" in p and "blocked_by" in p for p in problems), problems)
 
+    def test_evidence_path_outside_root_or_with_dotdot_is_refused(self):
+        outside = str(self.root.parent / "elsewhere.json")
+        for bad in ("../x.json", "program/../../x.json", outside):
+            self.refused("evidence path", TID, "in_progress", "controller", evidence=[bad])
+        self.assertFalse((self.root / "program").exists())
+
+    def test_wrong_shape_record_is_a_kit_error_not_a_traceback(self):
+        full = {"task_id": TID, "status": "in_progress", "role": "controller", "updated_at": "", "note": "",
+                "evidence": [], "blocked_by": [], "history": []}
+        for case in ({}, {k: v for k, v in full.items() if k != "evidence"},
+                     {k: v for k, v in full.items() if k != "history"}, dict(full, status="shipped"),
+                     dict(full, history="x")):
+            write_json(self.record_path(), case)
+            before = self.record_path().read_bytes()
+            with self.assertRaisesRegex(KitError, TID):
+                status.transition(self.root, TID, "review", "implementer")
+            with self.assertRaises(KitError):
+                status.list_all(self.root)
+            self.assertEqual(self.record_path().read_bytes(), before)
+
     def test_schema_template_describes_the_record(self):
         schema = json.loads((Path(__file__).resolve().parent.parent / "templates" / "status.schema.json")
                             .read_text(encoding="utf-8"))
@@ -279,6 +299,22 @@ class StatusCliTests(unittest.TestCase):
         rc, out, err = self.run_pk("status")
         self.assertEqual((rc, out), (1, ""))
         self.assertTrue(err.startswith("error: "))
+
+    def test_wrong_shape_record_gives_one_error_line_through_transition_and_list(self):
+        folder = self.root / "program" / "status"
+        full = {"task_id": TID, "status": "in_progress", "role": "controller", "updated_at": "", "note": "",
+                "evidence": [], "blocked_by": [], "history": []}
+        for missing in ("evidence", "history"):
+            write_json(folder / f"{TID}.json", {k: v for k, v in full.items() if k != missing})
+            before = (folder / f"{TID}.json").read_bytes()
+            for argv in (("status", "set", TID, "review", "--role", "implementer"), ("status", "list")):
+                rc, out, err = self.run_pk(*argv)
+                self.assertEqual((rc, out), (1, ""), argv)
+                self.assertTrue(err.startswith("error: "), err)
+                self.assertEqual(err.count("\n"), 1, err)
+                self.assertIn(missing, err)
+                self.assertNotIn("Traceback", err)
+            self.assertEqual((folder / f"{TID}.json").read_bytes(), before)
 
     def test_validate_prints_each_problem_and_fails(self):
         self.run_pk("status", "set", TID, "in_progress", "--role", "controller")

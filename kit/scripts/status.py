@@ -46,14 +46,19 @@ def _record_path(root: Path, task_id: str) -> Path:
 
 
 def _norm(root: Path, path: str) -> str:
-    """Evidence path as stored: relative to root, posix separators, no `./` or `..` detours."""
+    """Evidence path as stored: relative to root, posix separators, no `./` parts.
+
+    A `..` component or an absolute path outside the root is refused.
+    """
     candidate = Path(path)
     if candidate.is_absolute():
         try:
             candidate = candidate.relative_to(Path(root).resolve())
         except ValueError:
-            return candidate.as_posix()
+            raise KitError(f"evidence path {path} is outside the project root") from None
     parts = [part for part in candidate.as_posix().split("/") if part not in ("", ".")]
+    if ".." in parts:
+        raise KitError(f"evidence path {path} must not contain '..'")
     return "/".join(parts)
 
 
@@ -62,13 +67,29 @@ def _blank(task_id: str) -> dict:
             "evidence": [], "blocked_by": [], "history": []}
 
 
+def _shape_problem(record) -> str | None:
+    """Why `record` is not a usable status record, or None. Shared by read and validate."""
+    if not isinstance(record, dict):
+        return "not a status record (expected a JSON object)"
+    missing = [field for field in _FIELDS if field not in record]
+    if missing:
+        return f"missing field(s) {', '.join(missing)}"
+    if record["status"] not in STATUSES:
+        return f"unknown status {record['status']!r}"
+    for field in ("evidence", "blocked_by", "history"):
+        if not isinstance(record[field], list):
+            return f"{field} must be a list"
+    return None
+
+
 def read(root: Path, task_id: str) -> dict:
     path = _record_path(root, task_id)
     if not path.exists():
         return _blank(task_id)
     record = read_json(path)
-    if not isinstance(record, dict):
-        raise KitError(f"{path}: not a status record")
+    problem = _shape_problem(record)
+    if problem:
+        raise KitError(f"{path}: {problem}")
     return record
 
 
@@ -149,20 +170,14 @@ def validate(root: Path) -> list[str]:
         except KitError as exc:
             problems.append(f"{name}: {exc}")
             continue
-        if not isinstance(record, dict):
-            problems.append(f"{name}: not a status record (expected a JSON object)")
-            continue
-        missing = [field for field in _FIELDS if field not in record]
-        if missing:
-            problems.append(f"{name}: missing field(s) {', '.join(missing)}")
+        problem = _shape_problem(record)
+        if problem:
+            problems.append(f"{name}: {problem}")
             continue
         if record["task_id"] != name:
             problems.append(f"{name}: task_id {record['task_id']!r} does not match the file name")
         state = record["status"]
-        if state not in STATUSES:
-            problems.append(f"{name}: unknown status {state!r}")
-            continue
-        evidence = record["evidence"] if isinstance(record["evidence"], list) else []
+        evidence = record["evidence"]
         for item in evidence:
             if not isinstance(item, str) or not (root / item).is_file():
                 problems.append(f"{name}: evidence file missing: {item}")
