@@ -5,7 +5,8 @@ forbidden token literally. Every test that checks neutrality imports from here.
 
 Every name is matched as a substring, case-insensitively, glued to anything; where an ordinary word contains
 a short name, the text is reworded. DISTINCTIVE names are the long ones, SHORT names the three to five letter
-ones. A hyphen inside a name also matches a space or an underscore (test_neutrality.py builds that pattern).
+ones. A hyphen inside a name also matches a space, an underscore or nothing (test_neutrality.py builds that
+pattern), so the name written as one word or in mixed case is caught too.
 """
 
 DISTINCTIVE = (
