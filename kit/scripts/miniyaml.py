@@ -7,7 +7,8 @@ quoted strings, and plain strings. A document with no content loads as None.
 
 Rejected with `line N`: anchors, aliases, tags, flow collections (other than
 `[]`/`{}`), block scalars (| >), tab indentation, duplicate keys, multi-line
-scalars, and a sequence at the same indent as its parent key.
+scalars. A block sequence may sit at the same indent as the key that holds it (the default
+output of common YAML writers) or deeper; a leading UTF-8 byte-order mark is ignored.
 """
 from __future__ import annotations
 
@@ -189,11 +190,15 @@ class _Parser:
             if rest and not rest.startswith("#"):
                 result[key] = _scalar(rest, number)
                 i += 1
+            elif i + 1 < len(self.lines) and self.lines[i + 1][1] == indent and _is_item(self.lines[i + 1][2]):
+                # `key:` then `- item` at the key's own indent: the list belongs to the key. (A list item's
+                # own keys sit past its dash, so a dash at the dash column is the next item, not this value.)
+                result[key], i = self.sequence(i + 1, indent, keyed=True)
             else:
                 result[key], i = self.nested(i + 1, indent)
         return result, i
 
-    def sequence(self, i: int, indent: int):
+    def sequence(self, i: int, indent: int, keyed: bool = False):
         result: list = []
         while i < len(self.lines):
             number, line_indent, content = self.lines[i]
@@ -202,6 +207,8 @@ class _Parser:
             if line_indent > indent:
                 raise _err(number, "bad indentation")
             if not _is_item(content):
+                if keyed:
+                    break  # the next key of the mapping that holds this list
                 raise _err(number, "expected '- ' list item")
             rest = content[1:].lstrip(" ")
             if not rest or rest.startswith("#"):
@@ -215,7 +222,7 @@ class _Parser:
 
 
 def loads(text: str):
-    return _Parser(text).parse()
+    return _Parser(text[1:] if text.startswith("\ufeff") else text).parse()
 
 
 def _needs_quotes(text: str) -> bool:
