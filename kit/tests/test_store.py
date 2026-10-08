@@ -246,6 +246,17 @@ class Integrity(Base):
         self.assertEqual(len(problems), 1, problems)
         self.assertIn("is missing", problems[0])
 
+    def test_a_pointer_whose_full_digest_differs_from_its_record_is_named(self):
+        appended = store.record(self.root, "T-1", "results", {"head": "a" * 40})
+        self.commit("evidence")
+        pointer = self.root / store.pointer_path("T-1")
+        data = read_json(pointer)
+        data["results"]["digest"] = appended["digest"][:12] + "0" * 52  # the planted defect: same name prefix
+        pointer.write_text(json.dumps(data))
+        self.assertEqual(store.integrity(self.root),
+                         [f"{store.pointer_path('T-1')}: results: immutable record altered: {appended['path']} hashes "
+                          f"to {appended['digest']}, not the pointed-at {data['results']['digest']}"])
+
     def test_a_misnamed_file_in_a_record_directory_is_named(self):
         store.record(self.root, "T-1", "results", {"head": "a" * 40})
         (self.root / "program" / "evidence" / "T-1" / "results" / "extra.json").write_text("{}")
