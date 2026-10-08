@@ -819,6 +819,20 @@ class HandbackTests(HandbackBase):
                                                  f"(calc.py): program/evidence/{TASK}/produce.py must append a new "
                                                  "results record"])
 
+    def test_another_tasks_drifted_record_leaves_the_gate_passing(self):
+        main_sha = sh(self.root, "git", "rev-parse", "main").strip()
+        other = store.record(self.root, "OTHER", "results", {  # OTHER bound calc.py as main has it
+            "task_id": "OTHER", "head": main_sha, "inputs": {"calc.py": hashlib.sha256(CALC.encode()).hexdigest()}})
+        commit(self.root, "OTHER evidence on main")
+        sh(self.wt, "git", "merge", "-q", "--no-edit", "main")
+        merged = sh(self.wt, "git", "rev-parse", "HEAD").strip()
+        rc, out = self.handback()  # this branch changed calc.py, so OTHER's record drifts here
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out.splitlines()[-1], f"OK: {BRANCH} passes the hand-back gate at {merged}")
+        self.assertIn(f"OTHER drifted since {main_sha}: calc.py", out.splitlines())
+        self.assertNotIn("OTHER", " ".join(gate._changes(self.wt)))  # nothing asked OTHER to refresh
+        self.assertTrue((self.wt / other["path"]).is_file())
+
     def test_a_commit_that_rewrites_a_record_fails_the_evidence_step(self):
         rc, out = self.handback()
         self.assertEqual(rc, 0, out)

@@ -138,7 +138,7 @@ class ResultsSchemaTests(unittest.TestCase):
                   "commands": [{"label": "unit", "argv": ["make", "test"], "exit": 0, "expected_exit": 0,
                                 "as_expected": True, "derived": {}, "output_sha256": digest, "output_tail": ""}],
                   "planted_bugs": [row, own], "planted_bugs_all_killed": True, "all_commands_as_expected": True,
-                  "tree_unchanged_by_run": True, "stale": {"checked": False, "records": []}, "blocked_by": [],
+                  "tree_unchanged_by_run": True, "blocked_by": [],
                   "deviations": []}
         self.assertEqual(evidence.gate_problems(record, "T-1"), [])
         for key in self.row_schema()["required"]:

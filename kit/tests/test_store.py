@@ -257,6 +257,65 @@ class Integrity(Base):
                          [f"{store.pointer_path('T-1')}: results: immutable record altered: {appended['path']} hashes "
                           f"to {appended['digest']}, not the pointed-at {data['results']['digest']}"])
 
+    def merge(self, branch, *extra):
+        sh(self.root, "git", "merge", "-q", "--no-ff", *extra, "-m", f"merge {branch}", branch)
+
+    def test_a_record_deleted_inside_a_merge_commit_is_named(self):
+        kept = store.record(self.root, "T-1", "results", {"head": "a" * 40})
+        self.commit("T-1 evidence on main")
+        sh(self.root, "git", "checkout", "-q", "-b", "task/T-2")
+        store.record(self.root, "T-2", "results", {"head": "b" * 40})
+        self.commit("T-2 evidence")
+        sh(self.root, "git", "checkout", "-q", "main")
+        self.merge("task/T-2", "--no-commit")
+        kept["file"].chmod(0o644)
+        sh(self.root, "git", "rm", "-q", kept["path"])  # the planted defect: the merge drops a record,
+        store.record(self.root, "T-1", "results", {"head": "a" * 40, "forged": True})  # adds a re-digested one
+        merge = self.commit("merge task/T-2")  # and repoints latest.json, all inside the merge commit
+        self.assertEqual(len(sh(self.root, "git", "rev-list", "--parents", "-n", "1", "HEAD").split()), 3)
+        problems = store.integrity(self.root)
+        self.assertEqual(problems, [f"evidence history rewritten: {kept['path']} deleted in {merge}"])
+
+    def test_a_normal_workflow_with_merges_and_a_refresh_reports_nothing(self):
+        for task in ("T-1", "T-2"):
+            sh(self.root, "git", "checkout", "-q", "-b", f"task/{task}", "main")
+            store.record(self.root, task, "results", {"head": "a" * 40})
+            self.commit(f"{task} evidence")
+        (self.root / "a.txt").write_text("main moves\n")
+        sh(self.root, "git", "checkout", "-q", "main")
+        self.commit("main moves")
+        sh(self.root, "git", "checkout", "-q", "task/T-1")
+        self.merge("main")  # main merged into the branch, twice
+        store.record(self.root, "T-1", "results", {"head": "b" * 40})  # a refresh
+        store.record(self.root, "T-1", "acceptance", {"decision": "accepted_development"})
+        self.commit("T-1 refresh and acceptance")
+        (self.root / "b.txt").write_text("more\n")
+        sh(self.root, "git", "checkout", "-q", "main")
+        self.commit("main moves again")
+        sh(self.root, "git", "checkout", "-q", "task/T-1")
+        self.merge("main")
+        sh(self.root, "git", "checkout", "-q", "main")
+        self.merge("task/T-1")
+        self.merge("task/T-2")
+        self.assertEqual(store.integrity(self.root), [])
+        self.assertEqual(store.rewritten(self.root), [])
+
+    def test_a_record_that_is_only_staged_is_pending_not_committed(self):
+        appended = store.record(self.root, "T-1", "results", {"head": "a" * 40})
+        sh(self.root, "git", "add", "-A")  # staged, not committed
+        self.assertEqual(store.check(self.root), ([], [(appended["path"], store.pointer_path("T-1"))]))
+
+    def test_a_pointer_rolled_back_to_an_older_record_is_named(self):
+        old = store.record(self.root, "T-1", "results", {"head": "a" * 40})
+        old_entry = store.read_pointer(self.root, "T-1")["results"]
+        new = store.record(self.root, "T-1", "results", {"head": "b" * 40})
+        self.commit("two records")
+        store.set_entry(self.root, "T-1", "results", old_entry)  # the planted defect: "latest" rolled back
+        self.commit("roll the pointer back")
+        self.assertEqual(store.integrity(self.root),
+                         [f"{store.pointer_path('T-1')}: results: names {old['path']}, not the newest results record "
+                          f"{new['path']}"])
+
     def test_a_misnamed_file_in_a_record_directory_is_named(self):
         store.record(self.root, "T-1", "results", {"head": "a" * 40})
         (self.root / "program" / "evidence" / "T-1" / "results" / "extra.json").write_text("{}")

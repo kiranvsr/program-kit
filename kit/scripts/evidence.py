@@ -864,7 +864,7 @@ def _lint(args) -> int:
 def _history(args) -> int:
     rows = store.history(find_root(), args.task_id)
     if not rows:
-        print(f"{args.task_id}: no records in the evidence store")
+        print(f"{args.task_id}: no records under program/evidence/{args.task_id}/")
         return 0
     for row in rows:
         state = "current" if row["current"] else "superseded"

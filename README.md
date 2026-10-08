@@ -67,7 +67,7 @@ Each task is built by an implementer in its own worktree, accepted by a differen
 
 ## Where evidence lives
 
-Evidence records are committed, append-only files named by their own digest under `program/evidence/<ID>/results/` and `acceptance/`; the kit never modifies or deletes one. each task's pointer `program/evidence/<ID>/latest.json`, the only evidence file that changes, names its latest record, and every check reads that one. `pk evidence history <ID>` shows every earlier record. A later change never makes a record stale; `pk stale` reports which records have drifted from the current tree, for information. A project made with kit 0.1 moves to the new layout with `pk evidence import` (see `docs/FAQ.md`).
+Evidence records are committed, append-only files named by their own digest under `program/evidence/<ID>/results/` and `acceptance/`; the kit never modifies or deletes one. Each task's pointer `program/evidence/<ID>/latest.json`, the only evidence file that changes, names its latest record, and every check reads that one. `pk evidence history <ID>` shows every earlier record. A later change never makes a record stale; `pk stale` reports which records have drifted from the current tree, for information. A project made with kit 0.1 moves to the new layout with `pk evidence import` (see `docs/FAQ.md`).
 
 ## Where the rules live
 

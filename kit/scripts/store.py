@@ -163,10 +163,6 @@ def load(root, rel: str, digest: str | None = None) -> dict:
 
 # --- the pointers ---------------------------------------------------------------------
 
-def empty_index() -> dict:
-    return {"schema_version": SCHEMA_VERSION, "tasks": {}}
-
-
 def _entry_problem(kind: str, entry) -> str | None:
     fields = RESULTS_FIELDS if kind == "results" else ACCEPTANCE_FIELDS
     if not isinstance(entry, dict) or set(entry) != set(fields):
@@ -253,7 +249,7 @@ def acceptance_entry(appended: dict, data: dict) -> dict:
 
 
 def record(root, task_id: str, kind: str, data) -> dict:
-    """Append a record and point the index at it: the one way the kit adds evidence. Returns the append result.
+    """Append a record and point its task's pointer at it: the one way the kit adds evidence. Returns the append result.
 
     `data` is the record dict, or its exact bytes (an import keeps the bytes, so digests bound to them still hold).
     """
@@ -270,7 +266,9 @@ def record(root, task_id: str, kind: str, data) -> dict:
 
 
 def load_latest(root, task_id: str, kind: str, index: dict | None = None) -> tuple[dict, dict] | None:
-    """(index entry, record) of the latest `kind` record of `task_id`, or None when the index has none."""
+    """(pointer entry, record) of the latest `kind` record of `task_id`, or None when its pointer names none.
+
+    `index` is the in-memory mapping `read_index` returns (all pointers); by default it is read now."""
     index = read_index(root) if index is None else index
     entry = latest(index, task_id, kind)
     if entry is None:
@@ -294,7 +292,7 @@ def _record_files(root) -> list[str]:
 def history(root, task_id: str) -> list[dict]:
     """Every record of `task_id`, newest first: {kind, digest, path, head, at, decision, current, altered}.
 
-    `current` is true for the record the index points at; `altered` names a record whose bytes no longer match
+    `current` is true for the record the task's pointer names; `altered` names a record whose bytes no longer match
     its name."""
     check_task(task_id)
     index = read_index(root)
@@ -335,16 +333,20 @@ def rewritten(root, base: str | None = None, head: str = "HEAD") -> list[str]:
         git(root, "rev-parse", "--verify", "--quiet", f"{head}^{{commit}}")
     except KitError:
         return []
-    listing = git(root, "log", "--diff-filter=MD", "--no-renames", "--name-status", "--format=commit %H", span,
+    # `-m` shows a merge commit's changes against each parent, so a record dropped or edited while resolving a
+    # merge (every task reaches main by a merge) is seen; a file that is merely new on one side shows as added.
+    listing = git(root, "log", "-m", "--diff-filter=MD", "--no-renames", "--name-status", "--format=commit %H", span,
                   "--", *RECORD_PATHSPECS)
     found, commit = [], "?"
     for line in listing.splitlines():
         if line.startswith("commit "):
-            commit = line[len("commit "):]
+            commit = line.split()[1]
         elif "\t" in line:
             status, path = line.split("\t", 1)
             how = "modified" if status.startswith("M") else "deleted"
-            found.append(f"evidence history rewritten: {path} {how} in {commit}")
+            message = f"evidence history rewritten: {path} {how} in {commit}"
+            if message not in found:  # one line per (path, commit), however many parents showed it
+                found.append(message)
     return found
 
 
@@ -352,8 +354,9 @@ def integrity(root, base: str | None = None, uncommitted: set[str] | frozenset =
     """Every reason the evidence of the checkout at `root` cannot be trusted; empty when it can.
 
     (1) every record file's sha256 matches the digest in its name; (2) no commit in `base..HEAD` (the whole history
-    when `base` is None) modified or deleted a record file; (3) every pointer entry resolves to a committed record
-    with its digest (paths in `uncommitted` may be new, not yet committed records).
+    when `base` is None), merge commits included, modified or deleted a record file; (3) every pointer entry names
+    the newest record of its kind and resolves to a record committed at HEAD with its digest (paths in
+    `uncommitted` may be new, not yet committed records).
     """
     problems, pending = check(root, base)
     return problems + [f"{path}: not committed (pointed at by {owner})" for path, owner in pending
@@ -377,8 +380,9 @@ def check(root, base: str | None = None) -> tuple[list[str], list[tuple[str, str
     except KitError as exc:
         return problems + [str(exc)], pending
     entries = [(task, kind, entry) for task, kinds in sorted(index["tasks"].items()) for kind, entry in kinds.items()]
-    try:
-        tracked = set(git(root, "ls-files", "-z", "--", BASE).split("\0")) if entries else set()
+    try:  # committed means in HEAD's tree; a record that is only staged is still pending
+        tracked = set(git(root, "ls-tree", "-r", "-z", "--name-only", "HEAD", "--", BASE).split("\0")) \
+            if entries else set()
     except KitError:
         tracked = set()
     for task, kind, entry in entries:
@@ -391,6 +395,11 @@ def check(root, base: str | None = None) -> tuple[list[str], list[tuple[str, str
         if sha256_bytes(raw) != entry["digest"]:
             problems.append(f"{where}: immutable record altered: {entry['path']} hashes to {sha256_bytes(raw)}, not "
                             f"the pointed-at {entry['digest']}")
+            continue
+        names = [n for n in os.listdir(root / BASE / task / kind) if _NAME.match(n)]
+        newest = f"{BASE}/{task}/{kind}/{max(names)}"
+        if entry["path"] != newest:
+            problems.append(f"{where}: names {entry['path']}, not the newest {kind} record {newest}")
             continue
         if entry["path"] not in tracked:
             pending.append((entry["path"], pointer_path(task)))
