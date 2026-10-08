@@ -166,11 +166,11 @@ class ReviewRecordTests(unittest.TestCase):
 class KnownLimitsTests(unittest.TestCase):
     """The FAQ says in plain words what the kit does not do."""
 
-    def test_the_faq_has_a_known_limits_answer_covering_the_four_limits(self):
+    def test_the_faq_has_a_known_limits_answer_covering_the_five_limits(self):
         answer = sections(read(KIT.parent / "docs" / "FAQ.md")).get("What are the known limits?")
         self.assertIsNotNone(answer)
         for needle in ("binds", "merge check", "not locked", "controller error", "install.sh", "kit/tests",
-                       "Python 3.11", "3.14"):
+                       "Python 3.11", "3.14", "not signed"):
             self.assertIn(needle, answer)
         self.assertLess(len(answer.split()), 330)  # a short answer
 
@@ -216,9 +216,11 @@ class RulesTests(unittest.TestCase):
         self.assertIn("program/HANDOFF.md", block_titled("controller documents"))
         self.assertRegex(block_titled("nothing else merges"), r"(?i)quiet main")
 
-    def test_evidence_honesty_has_ten_rules(self):
+    def test_evidence_honesty_has_twelve_rules(self):
         text = read(RULES_DIR / "EVIDENCE_HONESTY.md")
-        self.assertEqual([int(n) for n in re.findall(r"^(\d+)\. ", text, re.M)], list(range(1, 11)))
+        self.assertEqual([int(n) for n in re.findall(r"^(\d+)\. ", text, re.M)], list(range(1, 13)))
+        self.assertIn("the index is the only mutable evidence file", text)  # rule 11
+        self.assertIn("A record binds only its inputs, never a derived output", text)  # rule 12
 
     def test_throughput_covers_required_topics(self):
         text = read(RULES_DIR / "THROUGHPUT.md").lower()

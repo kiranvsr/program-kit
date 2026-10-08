@@ -59,11 +59,15 @@ Each task is built by an implementer in its own worktree, accepted by a differen
 2. `pk worktree new <ID>` creates the worktree and branch `task/<ID>`; the implementer builds test first.
 3. The implementer writes an evidence producer, then runs the hand-back gate: `pk gate handback <ID> --branch task/<ID>`.
 4. The gate's last line must be exactly `OK: <branch> passes the hand-back gate at <sha>`. Exit code 0 alone is never accepted; a failed gate returns the work with no QA round.
-5. Evidence commit: the implementer sets the task `review` and commits `results.json`, its report and the status file, and nothing else.
-6. Independent QA runs `pk gate binding <ID> --branch task/<ID>`, re-runs the commands, plants its own bugs and checks scope, then accepts (the only way a task becomes `done`) or rejects with numbered findings.
+5. Evidence commit: the implementer sets the task `review` and commits the new results record (`program/evidence/<ID>/results/<utc>-<digest>.json`), `program/evidence/index.json`, its report and the status file, and nothing else.
+6. Independent QA runs `pk gate binding <ID> --branch task/<ID>`, re-runs the commands, plants its own bugs and checks scope, then accepts with `pk evidence accept <ID> <file>` (the only way a task becomes `done`) or rejects with numbered findings.
 7. Merge check: from main, `pk gate merge-check --branch task/<ID>` must end with `OK: <branch> merges into main at <sha>`. It is the controller's own run of the gate's checks: guarded files, the task's SPEC, PLAN and spec-QA `review.md` on main and unchanged, then the build, the tests and the scans on a trial merge.
 8. Merge with `git merge --no-ff`, one accepted branch at a time.
 9. Hand-off update: `pk handoff update`, `pk handoff check`, and commit `program/`.
+
+## Where evidence lives
+
+Evidence records are committed, append-only files named by their own digest under `program/evidence/<ID>/results/` and `acceptance/`; the kit never modifies or deletes one. `program/evidence/index.json`, the only evidence file that changes, points at each task's latest record, and every check reads that one. `pk evidence history <ID>` shows every earlier record. A later change never makes a record stale; `pk stale` reports which records have drifted from the current tree, for information. A project made with kit 0.1 moves to the new layout with `pk evidence import` (see `docs/FAQ.md`).
 
 ## Where the rules live
 
@@ -73,8 +77,8 @@ The rules are in `kit/rules/`: `HARD_RULES.md`, `EVIDENCE_HONESTY.md` and `THROU
 
 - It never pushes, deploys or applies infrastructure; that is always your decision.
 - It never claims anything about an environment that does not exist. Environments are listed in `program/environments.yaml`, and work that needs a missing one stays blocked.
-- It never marks a task `done` without an acceptance record that accepts the current, valid evidence, and it refuses that move for any role but QA. The role is a flag the caller passes, so keeping QA a different agent from the implementer is the controller's job, not something the kit can verify. "Accepted for development" is never "ready for production".
-- It never writes evidence from a dirty tree, never downloads inside a gate, and never rewrites history.
+- It never marks a task `done` unless the latest acceptance record accepts and binds the latest, valid results record, and it refuses that move for any role but QA. The role is a flag the caller passes, so keeping QA a different agent from the implementer is the controller's job, not something the kit can verify. "Accepted for development" is never "ready for production".
+- It never writes evidence from a dirty tree, never modifies or deletes an evidence record, never downloads inside a gate, and never rewrites history.
 
 ## Upgrading
 
