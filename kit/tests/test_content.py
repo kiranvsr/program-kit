@@ -219,7 +219,7 @@ class RulesTests(unittest.TestCase):
     def test_evidence_honesty_has_twelve_rules(self):
         text = read(RULES_DIR / "EVIDENCE_HONESTY.md")
         self.assertEqual([int(n) for n in re.findall(r"^(\d+)\. ", text, re.M)], list(range(1, 13)))
-        self.assertIn("the index is the only mutable evidence file", text)  # rule 11
+        self.assertIn("the per-task latest.json is the only mutable evidence file", text)  # rule 11
         self.assertIn("A record binds only its inputs, never a derived output", text)  # rule 12
 
     def test_throughput_covers_required_topics(self):

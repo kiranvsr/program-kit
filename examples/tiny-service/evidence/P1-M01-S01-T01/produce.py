@@ -3,7 +3,7 @@
 Run by the hand-back gate from the clean task worktree: python3 program/evidence/P1-M01-S01-T01/produce.py
 It records the head and main commits, the hash of every input, each PLAN command exactly as written with its
 real exit code, and the planted bugs the unit tests must catch. The record is named by its digest, never
-rewritten, and program/evidence/index.json then points at it as the task's latest record.
+rewritten, and program/evidence/<ID>/latest.json then points at it as the task's latest record.
 """
 import re
 import sys

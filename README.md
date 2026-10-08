@@ -59,7 +59,7 @@ Each task is built by an implementer in its own worktree, accepted by a differen
 2. `pk worktree new <ID>` creates the worktree and branch `task/<ID>`; the implementer builds test first.
 3. The implementer writes an evidence producer, then runs the hand-back gate: `pk gate handback <ID> --branch task/<ID>`.
 4. The gate's last line must be exactly `OK: <branch> passes the hand-back gate at <sha>`. Exit code 0 alone is never accepted; a failed gate returns the work with no QA round.
-5. Evidence commit: the implementer sets the task `review` and commits the new results record (`program/evidence/<ID>/results/<utc>-<digest>.json`), `program/evidence/index.json`, its report and the status file, and nothing else.
+5. Evidence commit: the implementer sets the task `review` and commits the new results record (`program/evidence/<ID>/results/<utc>-<digest>.json`), `program/evidence/<ID>/latest.json`, its report and the status file, and nothing else.
 6. Independent QA runs `pk gate binding <ID> --branch task/<ID>`, re-runs the commands, plants its own bugs and checks scope, then accepts with `pk evidence accept <ID> <file>` (the only way a task becomes `done`) or rejects with numbered findings.
 7. Merge check: from main, `pk gate merge-check --branch task/<ID>` must end with `OK: <branch> merges into main at <sha>`. It is the controller's own run of the gate's checks: guarded files, the task's SPEC, PLAN and spec-QA `review.md` on main and unchanged, then the build, the tests and the scans on a trial merge.
 8. Merge with `git merge --no-ff`, one accepted branch at a time.
@@ -67,7 +67,7 @@ Each task is built by an implementer in its own worktree, accepted by a differen
 
 ## Where evidence lives
 
-Evidence records are committed, append-only files named by their own digest under `program/evidence/<ID>/results/` and `acceptance/`; the kit never modifies or deletes one. `program/evidence/index.json`, the only evidence file that changes, points at each task's latest record, and every check reads that one. `pk evidence history <ID>` shows every earlier record. A later change never makes a record stale; `pk stale` reports which records have drifted from the current tree, for information. A project made with kit 0.1 moves to the new layout with `pk evidence import` (see `docs/FAQ.md`).
+Evidence records are committed, append-only files named by their own digest under `program/evidence/<ID>/results/` and `acceptance/`; the kit never modifies or deletes one. each task's pointer `program/evidence/<ID>/latest.json`, the only evidence file that changes, names its latest record, and every check reads that one. `pk evidence history <ID>` shows every earlier record. A later change never makes a record stale; `pk stale` reports which records have drifted from the current tree, for information. A project made with kit 0.1 moves to the new layout with `pk evidence import` (see `docs/FAQ.md`).
 
 ## Where the rules live
 

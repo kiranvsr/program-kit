@@ -35,9 +35,9 @@ at the same quality bar, with the least rework. All state is in the repository.
    - git status on main, and git branch --no-merged main; compare with HANDOFF.
    - pk worktree list.
      In each worktree run git status --short. A modified or
-     untracked evidence record, a modified program/evidence/index.json or claim file
+     untracked evidence record, a modified program/evidence/<ID>/latest.json or claim file
      is void partial evidence: delete the record by literal path and restore the
-     index or claim file by exact path (git checkout -- <path>). Never commit it.
+     pointer or claim file by exact path (git checkout -- <path>). Never commit it.
      Never edit or delete a committed record. Never force-remove a dirty worktree.
    - Look for leftover processes and containers that this program started, and check
      free disk space. Touch only what is ours, by exact name.
