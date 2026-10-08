@@ -16,6 +16,7 @@ import evidence as evidence_module
 import gate as gate_module
 import interview
 import pk
+import store
 from common import read_json, read_yaml, run_argv, sha256_bytes, sha256_file, utc_now, write_yaml
 from test_neutrality import TOKEN as FORBIDDEN, URL  # the same compiled rules the repository-wide scan uses
 from test_templates import FLOW  # a flow collection with something inside
@@ -27,8 +28,8 @@ OTHER = "P1-M01-S01-T02"
 BRANCH = f"task/{TASK}"
 GATE = "G-P1"
 EVIDENCE = f"program/evidence/{TASK}"
-RESULTS = f"{EVIDENCE}/results.json"
-ACCEPTANCE = f"{EVIDENCE}/acceptance.json"
+RESULTS = f"{EVIDENCE}/results.json"  # the record's name in gates.yaml (a 0.1 path, which names the task)
+INDEX = store.INDEX
 REPORT = f"{EVIDENCE}/report.md"
 STATUS = f"program/status/{TASK}.json"
 HANDBACK_OK = re.compile(re.escape(f"OK: {BRANCH} passes the hand-back gate at ") + r"([0-9a-f]{40})\Z")
@@ -131,6 +132,10 @@ class Project:
         assert text.count(old) == 1, (relative, old)
         path.write_text(text.replace(old, new), encoding="utf-8")
 
+    def latest(self, kind="results", cwd=None):
+        """(index entry, record) of the task's latest record in a checkout (default: the task worktree)."""
+        return store.load_latest(cwd or self.worktree, TASK, kind)
+
     def handback_fails(self):
         """Run the hand-back gate expecting a refusal; returns its output lines, none of which may be an OK line."""
         gate = self.pk("gate", "handback", TASK, "--branch", BRANCH, expect=1, env=self.gate_env)
@@ -168,6 +173,7 @@ class Project:
         assert (repo / "program" / "register.yaml").read_bytes() == (EXAMPLE / "artifacts" / "register.yaml").read_bytes()
         self.pk("briefs", "generate")
         self.pk("briefs", "check")
+        self.pk("evidence", "init")  # the empty pointer index, committed with the kit
         self.commit("install the kit and replay the recorded discovery")
 
         # Dispatch: SPEC, PLAN, review and the in_progress status go to main as one commit, then the worktree.
@@ -222,11 +228,13 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual([ln for ln in lines if ln.startswith("OK: ")], [lines[-1]])
         gated = project.git("rev-parse", BRANCH)
         self.assertEqual(match.group(1), gated)
-        results_file = wt / RESULTS
-        self.assertTrue(results_file.is_file())
-        self.assertEqual(project.git("status", "--porcelain", cwd=wt), f"?? {RESULTS}")
+        entry, results = project.latest()
+        record = entry["path"]
+        results_file = wt / record
+        status = project.run(["git", "status", "--porcelain", "--untracked-files=all"], cwd=wt).stdout.splitlines()
+        self.assertEqual(sorted(status), sorted([f" M {INDEX}", f"?? {record}"]))  # the new record and the index, nothing else
         project.pk("evidence", "validate", results_file, cwd=wt)
-        results = read_json(results_file)
+        self.assertIsNone(results["supersedes"])
         self.assertEqual(results["head"], gated)
         self.assertTrue(results["planted_bugs_all_killed"] and results["all_commands_as_expected"])
         bugs = {row["id"]: row for row in results["planted_bugs"]}
@@ -240,21 +248,23 @@ class EndToEndTests(unittest.TestCase):
         self.assertIn("src/tiny_service.py", results["inputs"])
         self.assertIn(f"program/tasks/{TASK}/PLAN.md", results["inputs"])
 
-        # Evidence commit: results.json, the report and the status file, nothing else.
-        project.pk("status", "set", TASK, "review", "--role", "implementer", "--evidence", RESULTS, cwd=wt)
+        # Evidence commit: the record, the index, the report and the status file, nothing else.
+        project.pk("status", "set", TASK, "review", "--role", "implementer", "--evidence", record, cwd=wt)
         report = ["# Report: " + TASK, "## Status", "DONE", "## Gate", lines[-1], "## Commands"]
         report += [f"- {' '.join(c['argv'])}: exit {c['exit']}" for c in results["commands"]]
         report += ["## Planted bugs"] + [f"- {i}: builds {r['builds']}, killed {r['killed']}" for i, r in bugs.items()]
         (wt / REPORT).write_text("\n".join(report) + "\n", encoding="utf-8")
-        project.commit(f"{TASK}: evidence", RESULTS, REPORT, STATUS, cwd=wt)
+        project.commit(f"{TASK}: evidence", record, INDEX, REPORT, STATUS, cwd=wt)
         self.assertEqual(sorted(project.git("show", "--name-only", "--format=", "HEAD", cwd=wt).splitlines()),
-                         sorted([RESULTS, REPORT, STATUS]))
+                         sorted([record, INDEX, REPORT, STATUS]))
 
-        # QA: binding, staleness, its own commands and planted bugs, then the acceptance.
-        project.pk("gate", "binding", TASK, "--branch", BRANCH)
-        stale = json.loads(project.pk("stale", cwd=wt).stdout)
-        self.assertEqual(stale["checked"], 1)
-        self.assertEqual([row["path"] for row in stale["stale"]], [RESULTS])  # its own record: main lacks src/ yet
+        # QA: binding, drift, its own commands and planted bugs, then the acceptance.
+        bound = project.pk("gate", "binding", TASK, "--branch", BRANCH).stdout
+        self.assertIn("fresh at the tip", bound)
+        drift = json.loads(project.pk("stale", "--strict", cwd=wt).stdout)
+        self.assertEqual((drift["checked"], drift["drifted"]), (1, 0))
+        self.assertEqual(drift["tasks"][0]["state"], "fresh")
+        project.pk("evidence", "validate", cwd=wt)  # names, history and index intact
         for path, digest in results["inputs"].items():
             self.assertEqual(sha256_bytes(project.run(["git", "show", f"{gated}:{path}"], cwd=wt).stdout.encode()),
                              digest)
@@ -277,12 +287,16 @@ class EndToEndTests(unittest.TestCase):
                       "findings": [], "blocked_by": []}
         for key in evidence_module.required_keys("acceptance"):
             self.assertIn(key, acceptance)
-        (wt / ACCEPTANCE).write_text(json.dumps(acceptance, indent=2) + "\n", encoding="utf-8")
-        project.pk("status", "set", TASK, "done", "--role", "qa", "--evidence", RESULTS, "--evidence", ACCEPTANCE,
-                   cwd=wt)
-        project.commit(f"{TASK}: QA acceptance, done", ACCEPTANCE, STATUS, cwd=wt)  # one commit: acceptance and status
+        written = project.scratch / "acceptance.json"  # QA's draft, outside the repository
+        written.write_text(json.dumps(acceptance, indent=2) + "\n", encoding="utf-8")
+        project.pk("evidence", "accept", TASK, written, cwd=wt)
+        accepted = project.latest("acceptance")[0]["path"]
+        project.pk("status", "set", TASK, "done", "--role", "qa", cwd=wt)
+        project.commit(f"{TASK}: QA acceptance, done", accepted, INDEX, STATUS, cwd=wt)  # one commit
         self.assertEqual(sorted(project.git("show", "--name-only", "--format=", "HEAD", cwd=wt).splitlines()),
-                         sorted([ACCEPTANCE, STATUS]))
+                         sorted([accepted, INDEX, STATUS]))
+        history = project.pk("evidence", "history", TASK, cwd=wt).stdout.splitlines()
+        self.assertEqual([line.split("\t")[:2] for line in history], [["current", "acceptance"], ["current", "results"]])
         project.pk("status", "validate", cwd=wt)
         project.pk("gate", "binding", TASK, "--branch", BRANCH)
         self.assertEqual(project.git("status", "--porcelain", cwd=wt), "")
@@ -297,7 +311,8 @@ class EndToEndTests(unittest.TestCase):
                          ["step build: ok", "step test: ok", "step scan: ok"])
         project.git("merge", "--no-ff", "-q", "-m", f"Merge {TASK}", BRANCH)
         self.assertEqual(project.git("status", "--porcelain"), "")
-        self.assertEqual(json.loads(project.pk("stale").stdout)["stale"], [])
+        self.assertEqual(json.loads(project.pk("stale").stdout)["drifted"], 0)
+        project.pk("doctor")  # the evidence on main: every record named by its digest, none rewritten, all indexed
         self.assertIn(f"{TASK}\tdone", project.pk("status", "list").stdout)
         self.assertEqual(project.pk("status", "show", OTHER).stdout.count('"status": "not_started"'), 1)
         project.pk("status", "validate")
@@ -379,7 +394,7 @@ class EndToEndTests(unittest.TestCase):
         gate = project.pk("gate", "handback", TASK, "--branch", BRANCH, expect=1, env=project.gate_env)
         self.assertIn("FAILED: scan missing tool: gitleaks", gate.stdout)
         self.assertEqual([ln for ln in gate.stdout.splitlines() if ln.startswith("OK: ")], [])
-        self.assertFalse((project.worktree / RESULTS).exists())
+        self.assertIsNone(project.latest())
 
     @NEEDS_SH
     @NEEDS_PIP
@@ -390,7 +405,7 @@ class EndToEndTests(unittest.TestCase):
         project.commit_in_worktree("break the health answer")
         lines = project.handback_fails()
         self.assertIn("FAILED: test python3 -m unittest discover -s src (exit 1)", lines)
-        self.assertFalse((project.worktree / RESULTS).exists())  # nothing was produced past the failed step
+        self.assertIsNone(project.latest())  # nothing was produced past the failed step
         self.assertEqual([ln for ln in lines if ln.startswith("step ")], ["step build: ok"])
 
     @NEEDS_SH
@@ -407,25 +422,29 @@ class EndToEndTests(unittest.TestCase):
         (wt / "requirements.txt").write_text("left-pad==1.0\n", encoding="utf-8")
         gated = project.commit_in_worktree("add a dependency file")
         project.run(["python3", Path(EVIDENCE) / "produce.py"], cwd=wt, env=project.gate_env)
-        project.pk("status", "set", TASK, "review", "--role", "implementer", "--evidence", RESULTS, cwd=wt)
+        record = project.latest()[0]["path"]
+        project.pk("status", "set", TASK, "review", "--role", "implementer", "--evidence", record, cwd=wt)
         (wt / REPORT).write_text(f"## Gate\n\nOK: {BRANCH} passes the hand-back gate at {gated}\n", encoding="utf-8")
-        project.commit_in_worktree("evidence nobody gated", RESULTS, REPORT, STATUS)
+        project.commit_in_worktree("evidence nobody gated", record, INDEX, REPORT, STATUS)
         # Everything QA is told to run passes: the record is real and it binds.
-        project.pk("evidence", "validate", wt / RESULTS, cwd=wt)
-        self.assertIn(f"binding holds: results.json at {gated}", project.pk("gate", "binding", TASK, "--branch",
-                                                                         BRANCH).stdout)
+        project.pk("evidence", "validate", wt / record, cwd=wt)
+        self.assertIn(f" at {gated} bound; fresh at the tip", project.pk("gate", "binding", TASK, "--branch",
+                                                                        BRANCH).stdout)
         # The controller's merge check is the independent gate run, and it refuses the branch.
         check = project.pk("gate", "merge-check", "--branch", BRANCH, expect=1, env=project.gate_env)
         self.assertEqual(check.stdout, "FAILED: guarded files changed: requirements.txt\n")
         # The same branch with a rejecting acceptance cannot be marked done either.
-        acceptance = {"task_id": TASK, "decision": "rejected", "evidence_sha256": sha256_file(wt / RESULTS),
+        acceptance = {"task_id": TASK, "decision": "rejected", "evidence_sha256": sha256_file(wt / record),
                       "source_commit": gated, "accepted_at": utc_now(), "role": "qa", "commands": [],
                       "planted_bugs": [], "findings": [{"n": 1, "severity": "critical", "location": "requirements.txt",
                                                         "fix": "remove it or get the guarded edit approved"}],
                       "blocked_by": []}
-        (wt / ACCEPTANCE).write_text(json.dumps(acceptance), encoding="utf-8")
-        done = project.pk("status", "set", TASK, "done", "--role", "qa", "--evidence", ACCEPTANCE, cwd=wt, expect=1)
-        self.assertEqual(done.stderr, f"error: {TASK}: {ACCEPTANCE}: decision is 'rejected', not "
+        draft = project.scratch / "rejection.json"
+        draft.write_text(json.dumps(acceptance), encoding="utf-8")
+        project.pk("evidence", "accept", TASK, draft, cwd=wt)  # a rejection is appended like any acceptance
+        rejected = project.latest("acceptance")[0]["path"]
+        done = project.pk("status", "set", TASK, "done", "--role", "qa", cwd=wt, expect=1)
+        self.assertEqual(done.stderr, f"error: {TASK}: latest acceptance {rejected}: decision is 'rejected', not "
                                       "'accepted_development'\n")
         self.assertIn('"status": "review"', project.pk("status", "show", TASK, cwd=wt).stdout)
 
@@ -439,10 +458,11 @@ class EndToEndTests(unittest.TestCase):
                    '     "replace": "bigger bodies are refused"},\n'
         project.edit_in_worktree(producer.as_posix(), "PLANTED_BUGS = [\n", "PLANTED_BUGS = [\n" + survivor)
         project.commit_in_worktree("plant a bug the tests cannot see")
-        lines = project.handback_fails()  # the producer writes results.json; the gate then refuses it
+        lines = project.handback_fails()  # the producer appends its record; the gate then refuses it
         self.assertIn("FAILED: evidence", lines)
         self.assertIn("planted_bugs_all_killed: is not true (a planted bug survived)", lines)
-        results_file = project.worktree / RESULTS
+        entry, _ = project.latest()
+        results_file = project.worktree / entry["path"]
         project.pk("evidence", "validate", results_file, cwd=project.worktree)  # the record itself is well formed
         results = read_json(results_file)
         rows = {row["id"]: row for row in results["planted_bugs"]}
@@ -450,9 +470,9 @@ class EndToEndTests(unittest.TestCase):
                           rows["comment-only"]["kill_reason"]), (True, False, "not killed"))
         self.assertFalse(results["planted_bugs_all_killed"])
         # QA's binding check refuses the same record when it is committed to the branch.
-        project.commit_in_worktree("commit the record anyway", RESULTS)
+        project.commit_in_worktree("commit the record anyway", entry["path"], INDEX)
         binding = project.pk("gate", "binding", TASK, "--branch", BRANCH, expect=1)
-        self.assertIn(f"error: {RESULTS}: planted_bugs_all_killed: is not true (a planted bug survived)",
+        self.assertIn(f"error: {entry['path']}: planted_bugs_all_killed: is not true (a planted bug survived)",
                       binding.stderr)
 
     @NEEDS_SH
@@ -462,7 +482,7 @@ class EndToEndTests(unittest.TestCase):
         project.prepare(plan_edit=lambda text: text.replace(" # expect 2\n", "\n"))  # real exit is 2, plan says 0
         lines = project.handback_fails()
         self.assertIn("FAILED: plan python3 src/tiny_service.py --port abc (exit 2)", lines)
-        self.assertFalse((project.worktree / RESULTS).exists())
+        self.assertIsNone(project.latest())
 
     def test_example_ledger_validates_and_closes_all_required_topics(self):
         root = self.base / "ledger-only"
