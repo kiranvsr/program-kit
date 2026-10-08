@@ -4,16 +4,18 @@
 `Evidence(root, task_id)` records HEAD, the main branch and their merge-base, hashes inputs from
 the committed blobs (never the working copy), runs commands as argv lists and records what they
 really did, runs planted bugs on a throwaway mirror of HEAD, and appends a results record to the
-evidence store (`store.py`) only when every honesty precondition holds; the repository's pointer index
-`program/evidence/index.json` then names it as the task's latest record, and the record it replaces stays
-in the store as history (`supersedes` names it). `pk evidence validate <record>` re-checks the invariants;
+task's committed, append-only record directory (`store.py`) only when every honesty precondition holds; the
+pointer index `program/evidence/index.json` then names it as the task's latest record, and the record it replaces
+stays as history (`supersedes` names it). A record is a fingerprint: at commit `head` these inputs produced this
+outcome. A later change never makes it stale; it only drifts from the current tree (`pk stale`). `pk evidence validate <record>` re-checks the invariants;
 `gate_problems` adds what the hand-back gate, the binding check and `done` require on top of them.
 `results.schema.json` describes the record those three accept: its planted-bug rows require ROW_KEYS
 and PLANTED_KEYS, and `validate` refuses a row that lacks any of them.
 `lint_record` keeps the evidence graph acyclic: a record binds only inputs that can change its outcome,
 never a derived output (another record, an acceptance, a gate result, a status snapshot, a ledger, a claim
 document or anything under `program/evidence/` but its tooling); only a gate record binds other records, by
-digest, and nothing binds a gate record.
+digest (each child row says whether that child had drifted from the tree the gate ran on), and nothing binds a
+gate record.
 The kit never assumes a language: the caller passes the build and test argv lists.
 
 Known limits:
@@ -479,30 +481,38 @@ class Evidence:
         """Bind the latest results and acceptance record of each task by digest (a gate record only).
 
         Each child must have a results record in the index; its acceptance is bound when there is one. A record
-        whose bytes no longer match the index is refused. Returns the rows added to `self.children`.
+        whose bytes no longer match the index is refused. Each row records the child's drift at HEAD: `fresh` when
+        every input of its results record is unchanged, else `drifted`. Drift is information for the reader, never
+        a failure. Returns the rows added to `self.children`.
         """
+        import stale as stale_module  # lazy: stale imports nothing from here, but keep the module graph flat
+
         if not is_gate(self.task_id):
             raise KitError(f"{self.task_id} is not a gate: only a gate record binds other records")
         index = store.read_index(self.root)
-        source = store.require(self.root)
         added = []
         for task_id in task_ids:
             if is_gate(task_id):
                 raise KitError(f"binds a gate record: {task_id} (nothing may bind a gate record)")
             if store.latest(index, task_id, "results") is None:
                 raise KitError(f"{task_id} has no results record in {store.INDEX}")
+            entry = store.latest(index, task_id, "results")
+            inputs = store.load(self.root, entry["path"], entry["digest"]).get("inputs")
+            changed = stale_module.changed_inputs(self.root, self.head, inputs if isinstance(inputs, dict) else {})
+            drift = "drifted" if changed or not isinstance(inputs, dict) else "fresh"
             for kind in store.KINDS:
                 entry = store.latest(index, task_id, kind)
                 if entry is not None:
-                    store.load(source, entry["path"], entry["digest"])
-                    added.append({"task_id": task_id, "kind": kind, "digest": entry["digest"]})
+                    store.load(self.root, entry["path"], entry["digest"])
+                    added.append({"task_id": task_id, "kind": kind, "digest": entry["digest"], "drift": drift})
         self.children = [*self.children, *added]
         return added
 
     # --- stale -----------------------------------------------------------------
 
     def stale(self, main: str | None = None) -> dict:
-        """List records whose hashed inputs changed on `main` (delegates to stale.py) and remember the result."""
+        """List the latest records whose hashed inputs drifted from `main` (delegates to stale.py) and remember
+        the result. Drift is information: a drifted record is still a true record of what it verified."""
         try:
             import stale as stale_module  # lazy: stale.py arrives with the stale-check task
         except ModuleNotFoundError as exc:
@@ -511,24 +521,25 @@ class Evidence:
             raise KitError("stale check unavailable: kit/scripts/stale.py is missing") from exc
         except ImportError as exc:
             raise KitError(f"stale check unavailable: {exc}") from exc
-        report = stale_module.stale_records(self.root, main or self.main)
-        self.stale_result = {"checked": True, "records": list(report.get("stale", [])),
+        report = stale_module.drift_report(self.root, main or self.main)
+        self.stale_result = {"checked": True,
+                             "records": [row for row in report.get("tasks", []) if row.get("state") == "drifted"],
                              "unreadable": list(report.get("unreadable", []))}
         return self.stale_result
 
     # --- write -----------------------------------------------------------------
 
     def write(self, path=None) -> dict:
-        """Append the results record to the evidence store and point the index at it; return
-        {digest, path (relative to the store), file}. Raise KitError listing every reason it refused (nothing is
+        """Append the results record to `program/evidence/<task>/results/` and point the index at it; return
+        {digest, path (relative to the root), file}. Raise KitError listing every reason it refused (nothing is
         appended and the index is untouched).
 
         The checks run before anything is written, so updating the index does not count as dirtying the tree.
         The record names the task's previous latest results record as `supersedes` (null for the first one).
         """
         if path is not None:
-            raise KitError("Evidence.write takes no path since program-kit 0.2.0: the record is appended to the "
-                           "evidence store and program/evidence/index.json points at it (see pk evidence init)")
+            raise KitError("Evidence.write takes no path since program-kit 0.2.0: the record is appended to "
+                           "program/evidence/<ID>/results/ and program/evidence/index.json points at it")
         reasons: list[str] = []
         now_dirty = self._dirty_paths()
         head_now = git(self.root, "rev-parse", "HEAD")
@@ -553,7 +564,7 @@ class Evidence:
             reasons.append("no inputs hashed (call hash_inputs)")
         previous = None
         try:
-            store.require(self.root)
+            store.check_task(self.task_id)
             entry = store.latest(store.read_index(self.root), self.task_id, "results")
             previous = entry["digest"] if entry is not None else None
         except KitError as exc:
@@ -713,10 +724,12 @@ def validate_results(data) -> list[str]:
         bad("supersedes", "must be the 64-character sha256 of the record it replaces, or null")
     children = data.get("children", [])
     if not isinstance(children, list) or not all(
-            isinstance(child, dict) and set(child) == {"task_id", "kind", "digest"}
+            isinstance(child, dict) and set(child) == {"task_id", "kind", "digest", "drift"}
             and isinstance(child["task_id"], str) and child["kind"] in store.KINDS
-            and isinstance(child["digest"], str) and _HEX64.match(child["digest"]) for child in children):
-        bad("children", "must be a list of {task_id, kind: results or acceptance, digest: sha256}")
+            and isinstance(child["digest"], str) and _HEX64.match(child["digest"])
+            and child["drift"] in ("fresh", "drifted") for child in children):
+        bad("children", "must be a list of {task_id, kind: results or acceptance, digest: sha256, "
+                        "drift: fresh or drifted}")
     return problems
 
 
@@ -725,10 +738,8 @@ def is_gate(task_id) -> bool:
     return isinstance(task_id, str) and GATE_ID.match(task_id) is not None
 
 
-def derived_output(path: str, store_prefix: str | None = None) -> bool:
+def derived_output(path: str) -> bool:
     """Whether a hashed input is a derived output that no record may bind (rule 12)."""
-    if store_prefix and (path == store_prefix or path.startswith(store_prefix + "/")):
-        return True
     pure = PurePosixPath(path)
     if path.startswith("program/evidence/"):
         return pure.suffix not in _TOOLING
@@ -736,28 +747,18 @@ def derived_output(path: str, store_prefix: str | None = None) -> bool:
             or any(path.startswith(prefix) for prefix in _DERIVED_DIRS))
 
 
-def _store_prefix(root) -> str | None:
-    """The store's path relative to `root` when it lies inside that checkout (a misconfiguration, but bound
-    paths under it are still derived outputs), else None."""
-    try:
-        return store.store_dir(root).relative_to(Path(root).resolve()).as_posix()
-    except (KitError, ValueError):
-        return None
-
-
 def lint_record(data, root=None) -> list[str]:
     """Why a results record makes the evidence graph cyclic (empty when it does not).
 
     One `binds a derived output: <path>` line per offending input. Only a gate record binds other records,
-    by digest (`children`), and no record binds a gate record. `root` adds the store's own path when the
-    store lies inside that checkout.
+    by digest (`children`), and no record binds a gate record. `root` is accepted for symmetry with the other
+    checks; the rules do not depend on the checkout.
     """
     if not isinstance(data, dict):
         return []
-    prefix = _store_prefix(root) if root is not None else None
     inputs = data.get("inputs")
     problems = [f"binds a derived output: {path}" for path in sorted(inputs)
-                if derived_output(path, prefix)] if isinstance(inputs, dict) else []
+                if derived_output(path)] if isinstance(inputs, dict) else []
     children = data.get("children") or []
     if not isinstance(children, list):
         return problems
@@ -828,7 +829,7 @@ def gate_problems(data, task_id: str, head: str | None = None, root=None) -> lis
 # --- command -----------------------------------------------------------------------
 
 def _store_kind(path: Path) -> str | None:
-    """`results` or `acceptance` for a file named like a store record in a directory of that kind, else None."""
+    """`results` or `acceptance` for a file named like a record in a directory of that kind, else None."""
     if store._NAME.match(path.name) and path.parent.name in store.KINDS:
         return path.parent.name
     return None
@@ -847,6 +848,13 @@ def _root_or_none():
 
 
 def _validate(args) -> int:
+    if args.record is None:  # the whole evidence tree: names, history and index
+        root = find_root()
+        problems = store.integrity(root, args.base)
+        if problems:
+            return _errors(problems)
+        print("evidence intact" + (f" since {args.base}" if args.base else ""))
+        return 0
     path = Path(args.record)
     kind = _store_kind(path)
     if kind is not None:
@@ -854,9 +862,9 @@ def _validate(args) -> int:
             raw = path.read_bytes()
         except OSError as exc:
             raise KitError(f"cannot read {path}: {exc.strerror or exc}") from exc
-        problem = store.altered(path, raw)
+        problem = store.altered(path.name, raw)
         if problem:
-            return _errors([problem])
+            return _errors([problem.replace(path.name, str(path), 1)])
     data = read_json(path)
     problems = validate_acceptance(data) if kind == "acceptance" else validate_results(data)
     if problems:
@@ -893,7 +901,8 @@ def _history(args) -> int:
 
 def accept(root, task_id: str, data) -> dict:
     """Append an acceptance record for `task_id` and point the index at it; refuse one that does not bind the
-    latest results record (by digest and by its head). Returns the append result."""
+    latest results record (by digest and by its head). A re-acceptance after a refresh appends again; nothing is
+    rewritten. Returns the append result."""
     problems = validate_acceptance(data)
     if problems:
         raise KitError("; ".join(problems))
@@ -920,14 +929,14 @@ def _accept(args) -> int:
 
 
 def import_legacy(root) -> tuple[list[str], list[str]]:
-    """Copy every 0.1 `program/evidence/<ID>/results.json` and `acceptance.json` into the store, byte for byte,
-    and point the index at them; ([lines describing what was imported], [paths to git rm]).
+    """Copy every 0.1 `program/evidence/<ID>/results.json` and `acceptance.json` into the append-only layout
+    (`program/evidence/<ID>/results/` and `acceptance/`), byte for byte, as the first history entry, and point the
+    index at them; ([lines describing what was imported], [paths to git rm]).
 
     A record the index already points at (same digest) is not copied again. Every file is read and checked
     before anything is appended. The originals are never deleted.
     """
     root = Path(root)
-    store.require(root)
     index = store.read_index(root)
     base = root / "program" / "evidence"
     plan, legacy = [], []
@@ -964,7 +973,7 @@ def _import(args) -> int:
     done, legacy = import_legacy(root)
     for line in done:
         print(line)
-    print(f"{len(done)} record(s) imported into {store.store_dir(root)}")
+    print(f"{len(done)} record(s) imported; commit them with {store.INDEX}")
     if legacy:
         print("the originals stay; remove them from the repository by exact path:")
         for rel in legacy:
@@ -974,7 +983,7 @@ def _import(args) -> int:
 
 def _init(args) -> int:
     path, created = store.init(find_root())
-    print(f"evidence store {'created' if created else 'exists'}: {path}")
+    print(f"evidence index {'created' if created else 'exists'}: {path}")
     return 0
 
 
@@ -991,10 +1000,11 @@ def cmd_evidence(args: argparse.Namespace) -> int:
 
 def _configure(parser: argparse.ArgumentParser) -> None:
     actions = parser.add_subparsers(dest="evidence_action", metavar="action", parser_class=type(parser))
-    actions.add_parser("init", help="create the evidence store and its STORE.json")
-    checker = actions.add_parser("validate", help="check a record against its schema and invariants (a store "
-                                                  "record also against its name)")
-    checker.add_argument("record", metavar="record.json", help="path to the record")
+    actions.add_parser("init", help="create program/evidence/index.json when it is absent")
+    checker = actions.add_parser("validate", help="check one record against its schema and invariants (and its "
+                                                  "name), or, with no record, every record, the history and the index")
+    checker.add_argument("record", metavar="record.json", nargs="?", help="path to one record")
+    checker.add_argument("--base", metavar="REF", help="check the history from REF only (default: all of it)")
     linter = actions.add_parser("lint", help="refuse a results record that binds a derived output")
     linter.add_argument("record", metavar="results.json", help="path to the results record")
     lister = actions.add_parser("history", help="every record of a task, newest first")
@@ -1002,7 +1012,8 @@ def _configure(parser: argparse.ArgumentParser) -> None:
     accepter = actions.add_parser("accept", help="append QA's acceptance record (it must bind the latest results)")
     accepter.add_argument("task_id", metavar="ID")
     accepter.add_argument("acceptance", metavar="acceptance.json", help="the acceptance QA wrote, outside the repo")
-    actions.add_parser("import", help="copy 0.1 program/evidence/<ID>/*.json into the store and build the index")
+    actions.add_parser("import", help="copy 0.1 program/evidence/<ID>/*.json into the append-only layout and build "
+                                      "the index")
 
 
 def register(add_command) -> None:

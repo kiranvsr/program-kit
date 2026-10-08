@@ -34,8 +34,7 @@ def sh(cwd, *argv):
 def make_repo():
     """A throwaway repository on branch main with a tiny module, its unittest and a .gitignore."""
     tmp = tempfile.TemporaryDirectory()
-    root = Path(tmp.name).resolve() / "repo"  # the evidence store is its sibling, inside the temporary directory
-    root.mkdir()
+    root = Path(tmp.name).resolve()
     sh(root, "git", "init", "-q", "-b", "main")
     sh(root, "git", "config", "user.name", "Test")
     sh(root, "git", "config", "user.email", "test@example.com")
@@ -79,15 +78,10 @@ class Base(unittest.TestCase):
     def setUp(self):
         tmp, self.root = make_repo()
         self.addCleanup(tmp.cleanup)
-        env = mock.patch.dict(os.environ)
-        env.start()
-        self.addCleanup(env.stop)
-        os.environ.pop(store.ENV, None)
-        self.store, _ = store.init(self.root)
 
     def appended(self):
-        """The record files in the store (every kind, every task)."""
-        return sorted((self.store / "records").rglob("*.json"))
+        """The record files (every kind, every task)."""
+        return sorted((self.root / store.BASE).glob("*/*/*.json"))
 
     def ready(self, **kw):
         """An Evidence with one command, hashed inputs and planted bugs: writable."""
@@ -517,7 +511,7 @@ class Write(Base):
         ev = self.ready()
         written = ev.write()
         out = written["file"]
-        self.assertEqual(out, self.store / written["path"])
+        self.assertEqual(out, self.root / written["path"])
         self.assertEqual(written["digest"], sha256_bytes(out.read_bytes()))
         data = read_json(out)
         for key in evidence.required_keys("results"):
@@ -554,13 +548,6 @@ class Write(Base):
         with self.assertRaisesRegex(KitError, "takes no path since program-kit 0.2.0"):
             ev.write(self.root / "results.json")
         self.assertEqual(self.appended(), [])
-
-    def test_write_needs_an_initialised_store(self):
-        ev = self.ready()
-        os.environ[store.ENV] = str(self.root.parent / "no-store")
-        with self.assertRaisesRegex(KitError, "run pk evidence init"):
-            ev.write()
-        self.assertFalse((self.root / store.INDEX).exists())
 
     def test_write_refuses_a_record_that_binds_a_derived_output(self):
         for derived in ("program/evidence/T-0/results.json", "program/evidence/index.json",
@@ -671,17 +658,18 @@ class Write(Base):
         self.assertIn("kit/scripts/stale.py is missing", str(ctx.exception))
         self.assertEqual(ev.stale_result, {"checked": False, "records": []})
 
-    def test_stale_delegates_to_stale_records(self):
+    def test_stale_delegates_to_the_drift_report_and_keeps_the_drifted_rows(self):
         ev = evidence.Evidence(self.root, "T-1")
         fake = mock.Mock()
         bad = {"path": "u", "changed_inputs": [], "error": "no inputs mapping"}
-        fake.stale_records.return_value = {"main": "x" * 40, "stale": [{"path": "p", "changed_inputs": ["q"]}],
-                                           "unreadable": [bad], "checked": 2}
+        drifted = {"task_id": "T-2", "path": "p", "head": "h", "state": "drifted", "changed_inputs": ["q"]}
+        fresh = dict(drifted, task_id="T-3", state="fresh", changed_inputs=[])
+        fake.drift_report.return_value = {"ref": "x" * 40, "tasks": [drifted, fresh], "drifted": 1,
+                                          "unreadable": [bad], "checked": 3}
         with mock.patch.dict(sys.modules, {"stale": fake}):
             got = ev.stale("main")
-        fake.stale_records.assert_called_once_with(self.root, "main")
-        self.assertEqual(got, {"checked": True, "records": [{"path": "p", "changed_inputs": ["q"]}],
-                               "unreadable": [bad]})
+        fake.drift_report.assert_called_once_with(self.root, "main")
+        self.assertEqual(got, {"checked": True, "records": [drifted], "unreadable": [bad]})
         self.assertEqual(ev.stale_result, got)
 
 
@@ -873,33 +861,29 @@ class Lint(Base):
                          [f"binds a derived output: {path}" for path in sorted(derived)])
         self.assertEqual(evidence.lint_record(self.record(allowed)), [])
 
-    def test_a_store_inside_the_checkout_is_a_derived_output_too(self):
-        os.environ[store.ENV] = str(self.root / "evidence-store")
-        self.assertEqual(evidence.lint_record(self.record(["evidence-store/records/T-1/x.json", "calc.py"]),
-                                              self.root),
-                         ["binds a derived output: evidence-store/records/T-1/x.json"])
-
     def test_only_a_gate_record_binds_children_and_never_a_gate(self):
-        child = {"task_id": "T-2", "kind": "results", "digest": "1" * 64}
-        gate_child = {"task_id": "G-P0", "kind": "results", "digest": "2" * 64}
+        child = {"task_id": "T-2", "kind": "results", "digest": "1" * 64, "drift": "fresh"}
+        gate_child = {"task_id": "G-P0", "kind": "results", "digest": "2" * 64, "drift": "fresh"}
         self.assertEqual(evidence.lint_record(self.record(["calc.py"], "G-P1", [child])), [])
         self.assertEqual(evidence.lint_record(self.record(["calc.py"], "T-1", [child])),
                          ["binds child records but T-1 is not a gate: only a gate record binds other records"])
         self.assertEqual(evidence.lint_record(self.record(["calc.py"], "G-P1", [child, gate_child])),
                          ["binds a gate record: G-P0 (nothing may bind a gate record)"])
 
-    def test_a_gate_record_binds_the_latest_child_records_by_digest(self):
+    def test_a_gate_record_binds_the_latest_child_records_by_digest_with_their_drift(self):
         child = self.ready().write()
         sh(self.root, "git", "add", "-A")
         sh(self.root, "git", "commit", "-q", "-m", "T-1 evidence")
+        (self.root / "test_calc.py").write_text(CALC_TEST + "\n# later\n")  # T-1 drifts; it is not refreshed
+        sh(self.root, "git", "commit", "-q", "-am", "a later change")
         gate_run = evidence.Evidence(self.root, "G-P0")
         gate_run.hash_inputs(["calc.py", "test_calc.py"])
         gate_run.run_command("tests", TEST + ["test_calc"])
         gate_run.planted_bugs([row("flip")], BUILD, TEST)
-        self.assertEqual(gate_run.bind_children(["T-1"]), [{"task_id": "T-1", "kind": "results",
-                                                            "digest": child["digest"]}])
-        data = read_json(gate_run.write()["file"])
-        self.assertEqual(data["children"], [{"task_id": "T-1", "kind": "results", "digest": child["digest"]}])
+        rows = [{"task_id": "T-1", "kind": "results", "digest": child["digest"], "drift": "drifted"}]
+        self.assertEqual(gate_run.bind_children(["T-1"]), rows)
+        data = read_json(gate_run.write()["file"])  # drift is information in the record, never a refusal
+        self.assertEqual(data["children"], rows)
         self.assertEqual(evidence.gate_problems(data, "G-P0"), [])
         with self.assertRaisesRegex(KitError, "nothing may bind a gate record"):
             gate_run.bind_children(["G-P0"])
@@ -908,7 +892,7 @@ class Lint(Base):
 
     def test_write_refuses_children_on_a_task_record(self):
         ev = self.ready()
-        ev.children = [{"task_id": "T-2", "kind": "results", "digest": "1" * 64}]  # the planted defect
+        ev.children = [{"task_id": "T-2", "kind": "results", "digest": "1" * 64, "drift": "fresh"}]  # planted
         with self.assertRaisesRegex(KitError, "only a gate record binds other records"):
             ev.write()
         self.assertEqual(self.appended(), [])
@@ -998,13 +982,26 @@ class StoreCommands(Base):
                           ("superseded", "results", first["digest"])])
         self.assertEqual(lines[0][-1], "decision accepted_development")
 
-    def test_init_command_creates_the_store_once(self):
-        os.environ[store.ENV] = str(self.root.parent / "fresh-store")
+    def test_init_command_creates_the_index_once(self):
         with mock.patch.object(evidence, "find_root", return_value=self.root):
             self.assertEqual(run_pk("evidence", "init")[1],
-                             f"evidence store created: {self.root.parent / 'fresh-store'}\n")
+                             f"evidence index created: {self.root / store.INDEX}\n")
             self.assertEqual(run_pk("evidence", "init")[1],
-                             f"evidence store exists: {self.root.parent / 'fresh-store'}\n")
+                             f"evidence index exists: {self.root / store.INDEX}\n")
+
+    def test_validate_without_a_record_checks_names_history_and_index(self):
+        written = self.ready().write()
+        sh(self.root, "git", "add", "-A")
+        sh(self.root, "git", "commit", "-q", "-m", "evidence")
+        with mock.patch.object(evidence, "find_root", return_value=self.root):
+            self.assertEqual(run_pk("evidence", "validate"), (0, "evidence intact\n", ""))
+            written["file"].chmod(0o644)
+            written["file"].write_text("{}\n")  # the planted defect, committed: history rewritten
+            sh(self.root, "git", "commit", "-q", "-am", "rewrite the record")
+            code, _, stderr = run_pk("evidence", "validate")
+        self.assertEqual(code, 1)
+        self.assertIn(f"error: immutable record altered: {written['path']} ", stderr)
+        self.assertIn(f"error: evidence history rewritten: {written['path']} modified in ", stderr)
 
 
 class Import(Base):
@@ -1033,7 +1030,7 @@ class Import(Base):
         index = store.read_index(self.root)
         results = store.latest(index, "T-1", "results")
         self.assertEqual(results["digest"], sha256_bytes(raw))
-        self.assertEqual((self.store / results["path"]).read_bytes(), raw)
+        self.assertEqual((self.root / results["path"]).read_bytes(), raw)
         self.assertEqual(store.latest(index, "T-1", "acceptance")["results_digest"], results["digest"])
         self.assertTrue((self.root / "program" / "evidence" / "T-1" / "results.json").is_file())  # never deleted
         self.assertEqual(evidence.import_legacy(self.root)[0], [])  # a second run copies nothing again

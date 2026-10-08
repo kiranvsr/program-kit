@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Which evidence records are stale against main (standard library only).
+"""Evidence drift: how the latest records relate to the current tree (standard library only).
 
-Only the latest results record of each task counts: the one `program/evidence/index.json` points at, read
-from the evidence store. A superseded record is history, never stale. The latest record is stale when any
-hashed input no longer matches the committed blob on `main`, or when that path no longer exists there; a gate
-record is also stale when a child record it binds by digest is no longer its task's latest. Hashing goes through
+A results record is a fingerprint: at commit `head` these inputs, with these digests, produced this outcome. That
+claim stays true forever, so a later change never makes a record stale. What a later change does is make the
+record drift: its recorded input digests no longer equal the committed blobs of the tree being looked at. Only the
+latest record of each task counts (the one `program/evidence/index.json` points at); older records are history.
+A record is `fresh` when every input matches, else `drifted` (since its `head`), with the changed inputs listed.
+Drift is information for the reader, never a failure: `pk stale` prints the report and exits 0, unless
+`--strict` is given, when a drifted or unreadable record exits 1. Hashing goes through
 git (`ls-tree` once for path -> blob id, then `cat-file blob` once per distinct blob), so the
 working copy never matters and a large evidence set does not spawn a process per input.
-`pk stale` always exits 0 and prints the report; only a repository with no `main` branch is an error.
 `changed_inputs` is the same comparison against any one commit; `pk gate binding` uses it to
 recompute a record's hashes at the commit the record names.
 """
@@ -60,21 +62,6 @@ def _inputs(data: dict):
     return inputs, None
 
 
-def _superseded_children(data: dict, index: dict) -> list[str]:
-    """`<task> <kind>` for each child record a gate record binds that is no longer its task's latest."""
-    children = data.get("children")
-    if not isinstance(children, list):
-        return []
-    found = []
-    for child in children:
-        if not isinstance(child, dict):
-            continue
-        entry = store.latest(index, str(child.get("task_id")), str(child.get("kind")))
-        if entry is None or entry["digest"] != child.get("digest"):
-            found.append(f"{child.get('task_id')} {child.get('kind')}")
-    return sorted(found)
-
-
 def _hasher(root: Path, sha: str):
     """A function path -> sha256 of the blob at commit `sha`, or None when it is not a file there."""
     tree = _tree(root, sha)
@@ -98,29 +85,27 @@ def changed_inputs(root, sha: str, inputs: dict) -> dict[str, str | None]:
     return {path: current(path) for path, digest in sorted(inputs.items()) if current(path) != digest}
 
 
-def stale_records(root, main: str = "main") -> dict:
-    """Compare the latest results record of every task in the index with `main`; return
-    {main, stale, unreadable, checked}.
+def drift_report(root, ref: str = "HEAD") -> dict:
+    """Compare the latest results record of every task in the index with the tree of `ref`; return
+    {ref, tasks, drifted, unreadable, checked}.
 
-    `stale` rows are {task_id, path, changed_inputs, superseded_children}; `unreadable` rows are
-    {task_id, path, changed_inputs: [], error} (a record missing from the store, altered, or unusable). `path`
-    is the record's path in the store. Both lists are sorted by task, and `checked` counts every record examined.
+    `tasks` rows are {task_id, path, head, state: fresh or drifted, changed_inputs}; `drifted` counts the drifted
+    ones; `unreadable` rows are {task_id, path, changed_inputs: [], error} (a record missing, altered or without
+    inputs). Both lists are sorted by task, and `checked` counts every record examined.
     """
     root = Path(root)
-    if not isinstance(main, str) or not main or main.startswith("-"):
-        raise KitError(f"not a usable branch name: {main}")
-    sha = git(root, "rev-parse", "--verify", main + "^{commit}")
+    if not isinstance(ref, str) or not ref or ref.startswith("-"):
+        raise KitError(f"not a usable commit name: {ref}")
+    sha = git(root, "rev-parse", "--verify", ref + "^{commit}")
     current = _hasher(root, sha)  # shared by every record of this run
     index = store.read_index(root)
     entries = [(task, entry) for task in sorted(index["tasks"])
                if (entry := store.latest(index, task, "results")) is not None]
-    source = store.store_dir(root) if entries else None
-
-    stale_rows, unreadable = [], []
+    rows, unreadable = [], []
     for task, entry in entries:
         rel = entry["path"]
         try:
-            data = store.load(source, rel, entry["digest"])
+            data = store.load(root, rel, entry["digest"])
         except KitError as exc:
             unreadable.append({"task_id": task, "path": rel, "changed_inputs": [], "error": _one_line(exc)})
             continue
@@ -129,20 +114,21 @@ def stale_records(root, main: str = "main") -> dict:
             unreadable.append({"task_id": task, "path": rel, "changed_inputs": [], "error": error})
             continue
         changed = sorted(path for path, digest in inputs.items() if current(path) != digest)
-        children = _superseded_children(data, index)
-        if changed or children:
-            stale_rows.append({"task_id": task, "path": rel, "changed_inputs": changed,
-                               "superseded_children": children})
-    return {"main": sha, "stale": stale_rows, "unreadable": unreadable, "checked": len(entries)}
+        rows.append({"task_id": task, "path": rel, "head": str(data.get("head", "")),
+                     "state": "drifted" if changed else "fresh", "changed_inputs": changed})
+    return {"ref": sha, "tasks": rows, "drifted": sum(row["state"] == "drifted" for row in rows),
+            "unreadable": unreadable, "checked": len(entries)}
 
 
 # --- command -----------------------------------------------------------------------
 
 def cmd_stale(args: argparse.Namespace) -> int:
-    report = stale_records(find_root(), "main")  # the primary branch is fixed; a flag here could hide staleness
+    report = drift_report(find_root(), "HEAD")
     print(json.dumps(report, indent=2, sort_keys=True))
-    return 0
+    return 1 if args.strict and (report["drifted"] or report["unreadable"]) else 0
 
 
 def register(add_command) -> None:
-    add_command("stale", cmd_stale, help="list evidence records whose inputs changed on main")
+    add_command("stale", cmd_stale, help="drift report: is each task's latest record fresh against the current tree",
+                configure=lambda p: p.add_argument("--strict", action="store_true",
+                                                   help="exit 1 when a record drifted or cannot be read"))

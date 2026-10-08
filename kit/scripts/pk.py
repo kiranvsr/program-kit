@@ -175,6 +175,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     branch = primary_branch_problem(root)
     if branch:
         problems.append(branch)
+    import store  # lazy, like gate: the evidence checks of `pk evidence validate` over the whole history
+
+    problems.extend(" ".join(problem.split()) for problem in store.integrity(root))
     for problem in problems:
         print("error: " + problem, file=sys.stderr)
     if problems:
