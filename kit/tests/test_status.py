@@ -3,13 +3,15 @@ import contextlib
 import io
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
 import pk
 import status
-from common import KitError, read_json, sha256_file, write_json, write_yaml
+import store
+from common import KitError, read_json, write_json, write_yaml
 
 TID = "P1-M01-S01-T01"
 REGISTERED = (TID, "P1-M01-S01-T02", "A-1", "A-2", "B-1")
@@ -21,6 +23,28 @@ def write_register(root, task_ids=REGISTERED):
     tasks = [{"id": task_id, "title": task_id} for task_id in task_ids]
     write_yaml(Path(root) / "program" / "register.yaml", {"phases": [{"id": "P1", "milestones": [
         {"id": "P1-M01", "steps": [{"id": "P1-M01-S01", "tasks": tasks}]}]}]})
+
+
+def git_repo(root) -> str:
+    """Make `root` a repository with one commit; its sha."""
+    def sh(*argv):
+        return subprocess.run(["git", *argv], cwd=str(root), check=True, capture_output=True, text=True).stdout
+    sh("init", "-q", "-b", "main")
+    sh("config", "user.name", "Test")
+    sh("config", "user.email", "test@example.com")
+    sh("add", "-A")
+    sh("commit", "-q", "-m", "init")
+    return sh("rev-parse", "HEAD").strip()
+
+
+def raw_record(root, tid, kind, raw: bytes) -> str:
+    """Append bytes that are no usable record and point the index at them; their path."""
+    appended = store.append(root, tid, kind, raw)
+    entry = ({"digest": appended["digest"], "path": appended["path"], "head": "", "produced_at": ""}
+             if kind == "results" else {"digest": appended["digest"], "path": appended["path"], "decision": "",
+                                        "accepted_at": "", "results_digest": ""})
+    store.set_entry(root, tid, kind, entry)
+    return appended["path"]
 
 
 def results_record(task_id=TID, **over):
@@ -47,32 +71,32 @@ class StatusTests(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.root = Path(self._tmp.name).resolve()
-        (self.root / ".git").mkdir()
         write_register(self.root)
+        self.head = git_repo(self.root)
 
     # helpers
     def record_path(self, tid=TID):
         return self.root / "program" / "status" / f"{tid}.json"
 
     def evidence(self, tid=TID, results=None, drop=(), **over):
-        """Write results.json and an accepting acceptance.json bound to it; return the acceptance path (relative).
+        """Append a results record and an accepting acceptance bound to it; return the acceptance path.
 
-        `results` replaces the record (a str is written as it is); `over` replaces acceptance fields and
-        `drop` removes them.
+        `results` replaces the record (bytes or a non-object are appended as they are); `over` replaces
+        acceptance fields and `drop` removes them. The records are appended as `pk evidence accept` would,
+        without its checks, so a test can plant a bad acceptance.
         """
-        folder = self.root / "program" / "evidence" / tid
-        folder.mkdir(parents=True, exist_ok=True)
-        if isinstance(results, str):
-            (folder / "results.json").write_text(results, encoding="utf-8")
+        data = results_record(tid, head=self.head) if results is None else results
+        if isinstance(data, dict):
+            digest = store.record(self.root, tid, "results", data)["digest"]
         else:
-            write_json(folder / "results.json", results_record(tid) if results is None else results)
-        acceptance = {"task_id": tid, "decision": "accepted_development",
-                      "evidence_sha256": sha256_file(folder / "results.json"), "source_commit": "a" * 40,
-                      "accepted_at": "2026-01-01T00:00:00Z", "role": "qa", "commands": [], "planted_bugs": [],
-                      "findings": [], "blocked_by": []}
+            raw_record(self.root, tid, "results", data if isinstance(data, bytes) else store.encode(data))
+            digest = store.latest(store.read_index(self.root), tid, "results")["digest"]
+        acceptance = {"task_id": tid, "decision": "accepted_development", "evidence_sha256": digest,
+                      "source_commit": self.head, "accepted_at": "2026-01-01T00:00:00Z", "role": "qa",
+                      "commands": [], "planted_bugs": [], "findings": [], "blocked_by": []}
         acceptance.update(over)
-        write_json(folder / "acceptance.json", {k: v for k, v in acceptance.items() if k not in drop})
-        return f"program/evidence/{tid}/acceptance.json"
+        return store.record(self.root, tid, "acceptance",
+                            {k: v for k, v in acceptance.items() if k not in drop})["path"]
 
     def to_review(self, tid=TID):
         status.transition(self.root, tid, "in_progress", "controller")
@@ -133,11 +157,10 @@ class StatusTests(unittest.TestCase):
 
     def test_review_to_done_only_qa_with_bound_acceptance(self):
         self.to_review()
+        self.refused("done needs an acceptance record in program/evidence/index.json", TID, "done", "qa")
         acceptance = self.evidence()
         for wrong in ("controller", "implementer"):
-            self.refused("qa", TID, "done", wrong, evidence=[acceptance])
-        self.refused("acceptance", TID, "done", "qa")                       # no evidence at all
-        self.refused("acceptance", TID, "done", "qa", evidence=["README.md"])  # acceptance not listed
+            self.refused("qa", TID, "done", wrong)
         rec = status.transition(self.root, TID, "done", "qa", evidence=[acceptance], note="accepted")
         self.assertEqual((rec["status"], rec["evidence"]), ("done", [acceptance]))
         self.assertEqual(read_json(self.record_path()), rec)
@@ -152,34 +175,40 @@ class StatusTests(unittest.TestCase):
         rec = status.transition(self.root, TID, "done", "qa")
         self.assertEqual(rec["evidence"], [acceptance])  # deduplicated
 
-    def test_done_refuses_acceptance_bound_to_other_evidence(self):
+    def test_done_refuses_an_acceptance_that_does_not_bind_the_latest_results_record(self):
         self.to_review()
-        acceptance = self.evidence()
-        stale = sha256_file(self.root / "program" / "evidence" / TID / "results.json")
-        (self.root / "program" / "evidence" / TID / "results.json").write_text("results v2", encoding="utf-8")
-        current = sha256_file(self.root / "program" / "evidence" / TID / "results.json")
-        with self.assertRaises(KitError) as ctx:
-            status.transition(self.root, TID, "done", "qa", evidence=[acceptance])
-        self.assertIn(stale, str(ctx.exception))
-        self.assertIn(current, str(ctx.exception))
+        self.evidence()
+        bound = store.latest(store.read_index(self.root), TID, "results")["digest"]
+        refreshed = store.record(self.root, TID, "results", results_record(head=self.head, deviations=["again"]))
+        with self.assertRaises(KitError) as ctx:  # the planted defect: a refresh after the acceptance
+            status.transition(self.root, TID, "done", "qa")
+        self.assertIn("acceptance does not bind the latest results record", str(ctx.exception))
+        self.assertIn(bound, str(ctx.exception))
+        self.assertIn(refreshed["digest"], str(ctx.exception))
         self.assertNotIn("\n", str(ctx.exception))
         self.assertEqual(status.read(self.root, TID)["status"], "review")
+        self.evidence(results=results_record(head=self.head, deviations=["again"]))  # re-acceptance appends
+        self.assertEqual(status.transition(self.root, TID, "done", "qa")["status"], "done")
+
+    def test_done_refuses_a_record_whose_head_is_not_an_ancestor_of_head(self):
+        self.to_review()
+        self.evidence(results=results_record(head="c" * 40), source_commit="c" * 40)
+        self.refused(f"head {'c' * 40} is not an ancestor of HEAD", TID, "done", "qa")
 
     def test_done_refuses_missing_or_malformed_acceptance_and_missing_results(self):
         self.to_review()
-        acceptance = self.evidence()
-        folder = self.root / "program" / "evidence" / TID
-        (folder / "acceptance.json").write_text("not json", encoding="utf-8")
-        self.refused("invalid JSON", TID, "done", "qa", evidence=[acceptance])
-        write_json(folder / "acceptance.json", {"verdict": "ok"})
-        self.refused("evidence_sha256", TID, "done", "qa", evidence=[acceptance])
-        write_json(folder / "acceptance.json", ["x"])
-        self.refused("evidence_sha256", TID, "done", "qa", evidence=[acceptance])
         self.evidence()
-        (folder / "results.json").unlink()
-        self.refused("results.json", TID, "done", "qa", evidence=[acceptance])
-        (folder / "acceptance.json").unlink()
-        self.refused("acceptance.json", TID, "done", "qa", evidence=[acceptance])
+        raw_record(self.root, TID, "acceptance", b"not json")
+        self.refused("is not valid JSON", TID, "done", "qa")
+        store.record(self.root, TID, "acceptance", {"verdict": "ok"})
+        self.refused("evidence_sha256", TID, "done", "qa")
+        raw_record(self.root, TID, "acceptance", b'["x"]')
+        self.refused("not a JSON object", TID, "done", "qa")
+        self.evidence()
+        results = store.latest(store.read_index(self.root), TID, "results")["path"]
+        (self.root / results).chmod(0o644)
+        (self.root / results).unlink()
+        self.refused(f"{results} is missing", TID, "done", "qa")
 
     def test_done_refuses_an_acceptance_that_does_not_accept(self):
         self.to_review()
@@ -187,77 +216,83 @@ class StatusTests(unittest.TestCase):
                  "not text": dict(decision=True), "missing": dict(drop=("decision",))}
         for name, how in cases.items():
             with self.subTest(case=name):
-                acceptance = self.evidence(**how)
+                self.evidence(**how)
                 with self.assertRaises(KitError) as ctx:
-                    status.transition(self.root, TID, "done", "qa", evidence=[acceptance])
+                    status.transition(self.root, TID, "done", "qa")
                 self.assertIn("decision", str(ctx.exception))
                 self.assertNotIn("\n", str(ctx.exception))
                 self.assertEqual(status.read(self.root, TID)["status"], "review")
-        self.refused("accepted_development", TID, "done", "qa", evidence=[self.evidence(decision="rejected")])
-        self.refused("task_id", TID, "done", "qa", evidence=[self.evidence(task_id="P1-M01-S01-T02")])
-        self.refused("role", TID, "done", "qa", evidence=[self.evidence(role="implementer")])
-        self.refused("source_commit", TID, "done", "qa", evidence=[self.evidence(drop=("source_commit",))])
-        self.assertEqual(status.transition(self.root, TID, "done", "qa", evidence=[self.evidence()])["status"], "done")
+        self.evidence(decision="rejected")
+        self.refused("accepted_development", TID, "done", "qa")
+        self.evidence(task_id="P1-M01-S01-T02")
+        self.refused("task_id", TID, "done", "qa")
+        self.evidence(role="implementer")
+        self.refused("role", TID, "done", "qa")
+        self.evidence(drop=("source_commit",))
+        self.refused("source_commit", TID, "done", "qa")
+        self.evidence()
+        self.assertEqual(status.transition(self.root, TID, "done", "qa")["status"], "done")
 
     def test_done_refuses_an_acceptance_of_another_commit_than_the_results_name(self):
         self.to_review()
         for wrong in ("not-a-commit", "b" * 40, "a" * 39, None, ["a" * 40]):
             with self.subTest(source_commit=wrong):
-                acceptance = self.evidence(source_commit=wrong)
+                self.evidence(source_commit=wrong)
                 with self.assertRaises(KitError) as ctx:
-                    status.transition(self.root, TID, "done", "qa", evidence=[acceptance])
-                self.assertIn("acceptance.json: source_commit is ", str(ctx.exception))
-                self.assertIn("a" * 40, str(ctx.exception))  # the commit the results name
+                    status.transition(self.root, TID, "done", "qa")
+                self.assertIn(": source_commit is ", str(ctx.exception))
+                self.assertIn(self.head, str(ctx.exception))  # the commit the results name
                 self.assertNotIn("\n", str(ctx.exception))
                 self.assertEqual(status.read(self.root, TID)["status"], "review")
-        rec = status.transition(self.root, TID, "done", "qa", evidence=[self.evidence()])
-        self.assertEqual(rec["status"], "done")
-        self.evidence(source_commit="b" * 40)  # rewritten after done: validate reports it
+        self.evidence()
+        self.assertEqual(status.transition(self.root, TID, "done", "qa")["status"], "done")
+        self.evidence(source_commit="b" * 40)  # appended after done: validate reports it
         self.assertEqual(len(status.validate(self.root)), 1)
         self.assertIn("source_commit is ", status.validate(self.root)[0])
 
     def test_done_refuses_a_one_field_rejection_over_empty_results(self):
         self.to_review()
-        folder = self.root / "program" / "evidence" / TID
-        folder.mkdir(parents=True)
-        (folder / "results.json").write_text("{}", encoding="utf-8")
-        write_json(folder / "acceptance.json", {"decision": "rejected", "findings": [{"n": 1, "severity": "critical"}],
-                                                "evidence_sha256": sha256_file(folder / "results.json")})
-        acceptance = f"program/evidence/{TID}/acceptance.json"
+        digest = store.record(self.root, TID, "results", {})["digest"]
+        store.record(self.root, TID, "acceptance", {"decision": "rejected", "evidence_sha256": digest,
+                                                    "findings": [{"n": 1, "severity": "critical"}]})
         with self.assertRaises(KitError) as ctx:
-            status.transition(self.root, TID, "done", "qa", evidence=[acceptance])
+            status.transition(self.root, TID, "done", "qa")
         self.assertNotIn("\n", str(ctx.exception))
         self.assertEqual(status.read(self.root, TID)["status"], "review")
-        self.evidence(results="{}")  # a complete, accepting acceptance of a record that is not evidence
-        self.refused("results.json: missing key", TID, "done", "qa", evidence=[acceptance])
+        self.evidence(results={})  # a complete, accepting acceptance of a record that is not evidence
+        self.refused("missing key", TID, "done", "qa")
 
     def test_done_refuses_results_the_gate_would_not_pass(self):
         self.to_review()
-        survivor = results_record(planted_bugs_all_killed=False)
+        survivor = results_record(head=self.head, planted_bugs_all_killed=False)
         survivor["planted_bugs"][0].update(killed=False, kill_reason="not killed")
-        unexpected = results_record(all_commands_as_expected=False)
+        unexpected = results_record(head=self.head, all_commands_as_expected=False)
         unexpected["commands"][0].update(exit=1, as_expected=False)
+        derived = results_record(head=self.head)
+        derived["inputs"][f"program/status/{TID}.json"] = "0" * 64
         cases = {"planted_bugs_all_killed": survivor, "all_commands_as_expected": unexpected,
-                 "task_id": results_record("P1-M01-S01-T02"), "commands": results_record(commands=[]),
-                 "head": results_record(head="abc"), "JSON object": []}
+                 "task_id": results_record("P1-M01-S01-T02", head=self.head),
+                 "commands": results_record(head=self.head, commands=[]),
+                 "head": results_record(head="abc"), "JSON object": [],
+                 "binds a derived output": derived}
         for pattern, record in cases.items():
             with self.subTest(case=pattern):
-                acceptance = self.evidence(results=record)
-                self.refused(f"results.json: .*{pattern}", TID, "done", "qa", evidence=[acceptance])
+                self.evidence(results=record)
+                self.refused(pattern, TID, "done", "qa")
 
     def test_validate_reports_a_done_record_whose_acceptance_rejects_or_whose_results_are_empty(self):
         self.to_review()
-        acceptance = self.evidence()
-        status.transition(self.root, TID, "done", "qa", evidence=[acceptance])
+        self.evidence()
+        status.transition(self.root, TID, "done", "qa")
         self.assertEqual(status.validate(self.root), [])
         self.evidence(decision="rejected")
         problems = status.validate(self.root)
         self.assertEqual(len(problems), 1, problems)
         self.assertIn("decision", problems[0])
-        self.evidence(results="{}")
+        self.evidence(results={})
         problems = status.validate(self.root)
         self.assertEqual(len(problems), 1, problems)
-        self.assertIn("results.json: missing key", problems[0])
+        self.assertIn("missing key", problems[0])
 
     def test_task_not_in_the_register_is_refused(self):
         self.refused("P9-M01-S01-T01.*not a task in program/register.yaml", "P9-M01-S01-T01", "in_progress",
@@ -403,11 +438,11 @@ class StatusTests(unittest.TestCase):
         self.to_review()
         status.transition(self.root, TID, "done", "qa", evidence=[self.evidence()])
         self.assertEqual(status.validate(self.root), [])
-        (self.root / "program" / "evidence" / TID / "results.json").write_text("changed", encoding="utf-8")
+        store.record(self.root, TID, "results", results_record(head=self.head, deviations=["later"]))
         problems = status.validate(self.root)
         self.assertEqual(len(problems), 1, problems)
         self.assertIn(TID, problems[0])
-        self.assertIn("evidence_sha256", problems[0])
+        self.assertIn("acceptance does not bind the latest results record", problems[0])
 
     def test_validate_reports_shape_problems_without_raising(self):
         folder = self.root / "program" / "status"
@@ -504,8 +539,8 @@ class StatusCliTests(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.root = Path(self._tmp.name).resolve()
-        (self.root / ".git").mkdir()
         write_register(self.root)
+        self.head = git_repo(self.root)
         old = os.getcwd()
         os.chdir(self.root)
         self.addCleanup(os.chdir, old)
@@ -594,20 +629,19 @@ class StatusCliTests(unittest.TestCase):
     def test_done_with_a_rejecting_acceptance_is_one_error_line(self):
         for argv in (("in_progress", "--role", "controller"), ("review", "--role", "implementer")):
             self.assertEqual(self.run_pk("status", "set", TID, *argv)[0], 0)
-        folder = self.root / "program" / "evidence" / TID
-        write_json(folder / "results.json", results_record())
-        acceptance = {"task_id": TID, "decision": "rejected", "evidence_sha256": sha256_file(folder / "results.json"),
-                      "source_commit": "a" * 40, "accepted_at": "2026-01-01T00:00:00Z", "role": "qa", "commands": [],
+        digest = store.record(self.root, TID, "results", results_record(head=self.head))["digest"]
+        acceptance = {"task_id": TID, "decision": "rejected", "evidence_sha256": digest,
+                      "source_commit": self.head, "accepted_at": "2026-01-01T00:00:00Z", "role": "qa", "commands": [],
                       "planted_bugs": [], "findings": [{"n": 1, "severity": "critical", "location": "x", "fix": "y"}],
                       "blocked_by": []}
-        write_json(folder / "acceptance.json", acceptance)
-        argv = ("status", "set", TID, "done", "--role", "qa", "--evidence", f"program/evidence/{TID}/acceptance.json")
+        rejected = store.record(self.root, TID, "acceptance", acceptance)["path"]
+        argv = ("status", "set", TID, "done", "--role", "qa")
         rc, out, err = self.run_pk(*argv)
         self.assertEqual((rc, out), (1, ""))
-        self.assertEqual(err, f"error: {TID}: program/evidence/{TID}/acceptance.json: decision is 'rejected', not "
+        self.assertEqual(err, f"error: {TID}: latest acceptance {rejected}: decision is 'rejected', not "
                               "'accepted_development'\n")
         self.assertEqual(self.run_pk("status", "validate"), (0, "status: ok\n", ""))
-        write_json(folder / "acceptance.json", dict(acceptance, decision="accepted_development", findings=[]))
+        store.record(self.root, TID, "acceptance", dict(acceptance, decision="accepted_development", findings=[]))
         self.assertEqual(self.run_pk(*argv), (0, f"{TID}: done\n", ""))
         self.assertEqual(self.run_pk("status", "validate"), (0, "status: ok\n", ""))
 
