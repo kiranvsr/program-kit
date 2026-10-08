@@ -373,9 +373,14 @@ def integrity(root, base: str | None = None, uncommitted: set[str] | frozenset =
         tracked = set()
     for task, kind, entry in entries:
         try:
-            load(root, entry["path"], entry["digest"])
-        except KitError as exc:
-            problems.append(f"{INDEX}: {task} {kind}: {exc}")
+            raw = (root / entry["path"]).read_bytes()
+        except OSError as exc:
+            problems.append(f"{INDEX}: {task} {kind}: evidence record {entry['path']} is missing: "
+                            f"{exc.strerror or exc}")
+            continue
+        if sha256_bytes(raw) != entry["digest"]:
+            problems.append(f"{INDEX}: {task} {kind}: immutable record altered: {entry['path']} hashes to "
+                            f"{sha256_bytes(raw)}, not the indexed {entry['digest']}")
             continue
         if entry["path"] not in tracked and entry["path"] not in uncommitted:
             problems.append(f"{INDEX}: {task} {kind}: {entry['path']} is not committed")

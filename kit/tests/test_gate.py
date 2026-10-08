@@ -165,11 +165,9 @@ class GitBase(unittest.TestCase):
         self.addCleanup(patcher.stop)
         for var in ("PK_NO_COMMANDS", "PK_SURVIVOR", "PK_STRAY"):
             os.environ.pop(var, None)
-        os.environ.pop(store.ENV, None)  # the store is the repository's sibling, inside the temporary directory
         sh(self.root, "git", "init", "-q", "-b", "main")
         sh(self.root, "git", "config", "user.name", "Test")
         sh(self.root, "git", "config", "user.email", "test@example.com")
-        self.store, _ = store.init(self.root)
 
     def trial_dirs(self):
         return sorted(self.tmpdir.glob("pk-trial-*"))
@@ -429,9 +427,10 @@ class HandbackTests(HandbackBase):
         self.assertEqual(match.groups(), (BRANCH, self.sha))
         self.assertEqual([ln for ln in lines if ln.startswith("OK: ")], [lines[-1]])
         entry, results = self.latest()
-        self.assertEqual(lines[-3:-1], ["stale: 1 record(s)", entry["path"]])
+        self.assertEqual(lines[-3:-1], ["drift: 1 of 1 record(s) drifted from main",
+                                        f"{TASK} drifted since {self.sha}: calc.py"])  # the branch's own change
         self.assertEqual((results["head"], results["task_id"]), (self.sha, TASK))
-        self.assertEqual(sh(self.wt, "git", "status", "--porcelain"), f"?? {store.INDEX}\n")  # the record is outside
+        self.assertEqual(sorted(gate._changes(self.wt)), sorted([store.INDEX, entry["path"]]))  # left uncommitted
         self.assertTrue(self.fake_log.exists())
         self.assert_no_trial_left()
 
@@ -448,7 +447,7 @@ class HandbackTests(HandbackBase):
         self.assertFalse([ln for ln in lines if ln.startswith("OK: ")])
         self.assertFalse(self.fake_log.exists(), "scan ran after test failed")
         self.assertFalse((self.wt / store.INDEX).exists())
-        self.assertEqual(list((self.store / "records").iterdir()), [])
+        self.assertFalse((self.wt / store.BASE / TASK / "results").exists())
         self.assert_no_trial_left()
 
     def test_handback_fails_on_merge_conflict(self):
@@ -803,16 +802,36 @@ class HandbackTests(HandbackBase):
         self.assertEqual(out.splitlines()[-1], TAIL + forged)
         self.assertFalse([ln for ln in out.splitlines() if ln.startswith("OK: ")])
 
-    def test_results_committed_earlier_with_a_no_op_produce_fails(self):
+    def test_a_fresh_record_needs_no_refresh_but_a_changed_own_input_does(self):
         rc, out = self.handback()
         self.assertEqual(rc, 0, out)
         commit(self.wt, "commit the evidence")
         put(self.wt, f"program/evidence/{TASK}/produce.py", "# produces nothing\n")
-        commit(self.wt, "no-op produce")
+        put(self.wt, "notes.txt", "a file no record binds\n")
+        no_op = commit(self.wt, "no-op produce, an unbound change")
+        rc, out = self.handback()
+        self.assertEqual(rc, 0, out)  # the latest record still holds for every input it binds
+        self.assertEqual(out.splitlines()[-1], f"OK: {BRANCH} passes the hand-back gate at {no_op}")
+        put(self.wt, "calc.py", CALC + "\n\ndef mul(a, b):\n    return b * a\n")
+        commit(self.wt, "the task's own source changes")  # the planted defect: no refresh after it
         rc, out = self.handback()
         self.assertEqual(rc, 1)
-        self.assertEqual(out.splitlines()[-2:], ["FAILED: evidence", f"program/evidence/{TASK}/produce.py appended "
-                                                 f"no new results record of {TASK} to the evidence store"])
+        self.assertEqual(out.splitlines()[-2:], ["FAILED: evidence", f"the task's own inputs changed since {self.sha} "
+                                                 f"(calc.py): program/evidence/{TASK}/produce.py must append a new "
+                                                 "results record"])
+
+    def test_a_commit_that_rewrites_a_record_fails_the_evidence_step(self):
+        rc, out = self.handback()
+        self.assertEqual(rc, 0, out)
+        commit(self.wt, "commit the evidence")
+        entry = self.latest()[0]
+        path = self.wt / entry["path"]
+        path.chmod(0o644)
+        sh(self.wt, "git", "rm", "-q", entry["path"])  # the planted defect: a committed record deleted
+        removed = commit(self.wt, "drop a record")
+        rc, out = self.handback()
+        self.assertEqual(rc, 1)
+        self.assertIn(f"evidence history rewritten: {entry['path']} deleted in {removed}", out.splitlines())
 
     def test_tag_named_like_the_branch_changes_nothing(self):
         sh(self.root, "git", "tag", BRANCH, "main")  # an ambiguous name pointing at main
@@ -1343,7 +1362,7 @@ class ClaimsTests(ClaimsBase):
     def test_an_altered_record_withdraws_the_evidenced_state(self):
         self.accept()
         entry = store.latest(store.read_index(self.root), TASK_OF[REC_DEV], "results")
-        path = self.store / entry["path"]
+        path = self.root / entry["path"]
         path.chmod(0o644)
         path.write_text('{"task_id": "changed"}\n')  # the planted defect: a record edited in the store
         gate.claims(self.root, "G-P0")
@@ -1581,20 +1600,17 @@ class BindingTests(HandbackBase):
 
     def forge(self, **changes):
         """Append a copy of the latest record with `changes` (a hand-made record) and point the index at it."""
-        data = dict(self.latest()[1], **changes)
-        return store.record(self.wt, TASK, "results", data)
+        return store.record(self.wt, TASK, "results", dict(self.latest()[1], **changes))
 
-    def holds(self, head, later):
+    def holds(self, head, state="fresh at the tip"):
         digest = self.latest()[0]["digest"][:12]
-        return f"binding holds: results record {digest} at {head} bound, {later} later commit(s) touch only " \
-               "evidence and status\n"
+        return f"binding holds: results record {digest} at {head} bound; {state}\n"
 
     def test_binding_holds_for_evidence_and_status_commits(self):
         self.produce_and_commit()
         problems, out = self.bind()
-        self.assertEqual((problems, out), ([], self.holds(self.sha, 1)))
+        self.assertEqual((problems, out), ([], self.holds(self.sha)))
         put(self.wt, f"program/evidence/{TASK}/report.md", "report\n")
-        commit(self.wt, "report")
         entry, data = self.latest()
         evidence.accept(self.wt, TASK, {"task_id": TASK, "decision": "accepted_development",
                                         "evidence_sha256": entry["digest"], "source_commit": data["head"],
@@ -1602,69 +1618,46 @@ class BindingTests(HandbackBase):
                                         "planted_bugs": [], "findings": [], "blocked_by": []})
         put(self.wt, f"program/status/{TASK}.json", "{}\n")
         commit(self.wt, "acceptance and status")
-        problems, out = self.bind()
-        self.assertEqual((problems, out), ([], self.holds(self.sha, 3)))
+        self.assertEqual(self.bind(), ([], self.holds(self.sha)))
 
     def test_binding_ignores_the_working_tree(self):
         self.produce_and_commit()
         (self.wt / store.INDEX).write_text("{ nope")  # an uncommitted edit changes nothing
         self.assertEqual(self.bind()[0], [])
 
-    def test_binding_fails_when_a_later_commit_touches_source(self):
+    def test_a_later_source_change_is_reported_as_drift_never_a_failure(self):
         self.produce_and_commit()
         put(self.wt, "calc.py", CALC + "\n# later edit\n")
-        put(self.wt, f"program/status/{TASK}.json", "{}\n")
-        put(self.wt, "program/status/OTHER.json", "{}\n")
-        commit(self.wt, "source after the evidence")
-        problems, out = self.bind()
-        self.assertEqual(out, "")
-        self.assertEqual(len(problems), 1, problems)
-        self.assertTrue(problems[0].startswith("calc.py: changed in commit "), problems)
-
-    def test_binding_fails_for_an_edit_that_a_later_commit_reverts(self):
-        self.produce_and_commit()
-        put(self.wt, "calc.py", CALC + "\n# edit\n")
-        edit = commit(self.wt, "edit source")
-        put(self.wt, "calc.py", CALC + "\n\ndef mul(a, b):\n    return a * b\n")  # back to the bound content
-        commit(self.wt, "revert it")
-        problems, out = self.bind()
-        self.assertEqual(out, "")
-        self.assertEqual(len(problems), 1, problems)
-        self.assertTrue(problems[0].startswith(f"calc.py: changed in commit {edit} after "), problems)
-
-    def test_binding_fails_for_paths_that_only_look_like_evidence_or_status(self):
-        for path in (f"program/evidence/OTHER/x", f"program/evidence/{TASK}x/file", f"program/status/{TASK}.json.bak",
-                     f"program/status/{TASK}/x.json", f"program/evidence/{TASK}.txt", "program/evidence/index.json.bak"):
-            with self.subTest(path=path):
-                sh(self.wt, "git", "reset", "-q", "--hard", self.sha)
-                self.produce_and_commit()
-                put(self.wt, path, "x\n")
-                commit(self.wt, "lookalike")
-                problems, out = self.bind()
-                self.assertEqual(out, "")
-                self.assertEqual(len(problems), 1, problems)
-                self.assertTrue(problems[0].startswith(f"{path}: changed in commit "), problems)
-                sh(self.wt, "git", "clean", "-fdq")
-
-    def test_binding_fails_when_another_task_entry_changes_after_the_head(self):
-        self.produce_and_commit()
-        other = store.record(self.wt, "OTHER", "results", {"task_id": "OTHER", "inputs": {"calc.py": "0" * 64}})
-        commit(self.wt, "an entry of another task rides along")  # the planted defect
-        problems, out = self.bind()
-        self.assertEqual(out, "")
-        self.assertEqual(problems, [f"{store.INDEX}: entries of other tasks changed after {self.sha}: OTHER"])
-        self.assertTrue(other["file"].is_file())
-
-    def test_binding_fails_for_a_merge_commit_that_brings_in_source(self):
-        self.produce_and_commit()
         put(self.root, "lib.py", "VALUE = 1\n")
         commit(self.root, "main gains source")
+        commit(self.wt, "source after the evidence")
         sh(self.wt, "git", "merge", "-q", "--no-edit", "main")
-        self.assertEqual(len(sh(self.wt, "git", "rev-list", "--parents", "-n", "1", "HEAD").split()), 3)
+        problems, out = self.bind()
+        self.assertEqual((problems, out), ([], self.holds(self.sha, f"drifted since {self.sha} at the tip: calc.py")))
+
+    def test_binding_fails_when_the_record_is_not_committed(self):
+        rc, out = self.handback()
+        self.assertEqual(rc, 0, out)
+        sh(self.wt, "git", "add", store.INDEX)
+        sh(self.wt, "git", "commit", "-q", "-m", "the index without its record")
+        problems, _ = self.bind()
+        self.assertEqual(problems, [f"{self.latest()[0]['path']} is not committed on {BRANCH}"])
+
+    def test_binding_fails_when_a_committed_record_is_rewritten(self):
+        self.produce_and_commit()
+        entry = self.latest()[0]
+        path = self.wt / entry["path"]
+        original = path.read_text()
+        path.chmod(0o644)
+        path.write_text(original.replace('"exit": 0', '"exit": 0 '))  # the planted defect
+        commit(self.wt, "rewrite the record")
         problems, out = self.bind()
         self.assertEqual(out, "")
         self.assertEqual(len(problems), 1, problems)
-        self.assertTrue(problems[0].startswith("lib.py: changed in commit "), problems)
+        self.assertTrue(problems[0].startswith(f"immutable record altered: {entry['path']} "), problems)
+        path.write_text(original)  # the bytes are back, the rewrite stays in the history
+        restored = commit(self.wt, "put the bytes back")
+        self.assertEqual(self.bind(), ([f"evidence history rewritten: {entry['path']} modified in {restored}"], ""))
 
     def test_binding_fails_when_head_is_not_an_ancestor(self):
         self.produce_and_commit()
@@ -1680,8 +1673,7 @@ class BindingTests(HandbackBase):
         self.produce_and_commit()
         put(self.wt, "calc.py", CALC.replace("a + b", "a - b") + "\n\ndef mul(a, b):\n    return a * b\n")
         broken = commit(self.wt, "break add after the evidence")
-        problems, _ = self.bind()
-        self.assertTrue(problems[0].startswith(f"calc.py: changed in commit {broken} after {self.sha}"), problems)
+        self.assertIn("drifted since", self.bind()[1])
         recorded = self.latest()[1]["inputs"]["calc.py"]
         forged = self.forge(head=broken)
         commit(self.wt, "move the recorded head past the edit")
@@ -1698,7 +1690,6 @@ class BindingTests(HandbackBase):
         for name, edit in (("edited", {"calc.py": "0" * 64}), ("made up", {"gone.py": "1" * 64})):
             with self.subTest(case=name):
                 forged = store.record(self.wt, TASK, "results", dict(honest, inputs={**honest["inputs"], **edit}))
-                sh(self.wt, "git", "reset", "-q", "--soft", self.sha)
                 commit(self.wt, "evidence with a hand-edited hash")
                 problems, out = self.bind()
                 self.assertEqual(out, "")
@@ -1706,18 +1697,6 @@ class BindingTests(HandbackBase):
                 path = next(iter(edit))
                 self.assertTrue(problems[0].startswith(f"{forged['path']}: inputs: {path} is recorded as "), problems)
                 self.assertIn(f"the recorded head {self.sha}", problems[0])
-
-    def test_binding_fails_when_the_record_was_not_indexed_on_its_recorded_head(self):
-        evidence_commit = self.produce_and_commit()
-        put(self.wt, f"program/status/{TASK}.json", "{}\n")
-        status_commit = commit(self.wt, "status")
-        self.forge(head=evidence_commit)  # every hashed input is the same there, so only the position gives it away
-        edit = commit(self.wt, "edit the recorded head")
-        problems, out = self.bind()
-        self.assertEqual(out, "")
-        self.assertEqual(problems, [f"{store.INDEX}: the {TASK} results entry was committed in {edit} on top of "
-                                    f"{status_commit}, not on its recorded head {evidence_commit}; the evidence "
-                                    "commit directly follows the gated commit"])
 
     def test_binding_fails_when_the_index_entry_and_the_record_disagree_on_the_head(self):
         self.produce_and_commit()
@@ -1729,29 +1708,16 @@ class BindingTests(HandbackBase):
         self.assertEqual(len(problems), 1, problems)
         self.assertIn(f"results entry names head {'0' * 40}", problems[0])
 
-    def test_binding_fails_when_the_record_is_altered_in_the_store(self):
-        self.produce_and_commit()
-        path = self.store / self.latest()[0]["path"]
-        path.chmod(0o644)
-        path.write_text(path.read_text().replace('"exit": 0', '"exit": 0 '))  # the planted defect
-        problems, out = self.bind()
-        self.assertEqual(out, "")
-        self.assertEqual(len(problems), 1, problems)
-        self.assertTrue(problems[0].startswith("immutable record altered: "), problems)
-
     def test_binding_holds_again_after_a_fix_round_regates(self):
         self.produce_and_commit()
-        put(self.wt, f"program/status/{TASK}.json", '{"rejected": true}\n')
-        commit(self.wt, "QA rejects")
         put(self.wt, "calc.py", CALC + "\n\ndef mul(a, b):\n    return b * a\n")
         fixed = commit(self.wt, "fix the finding")
-        problems, _ = self.bind()
-        self.assertTrue(problems[0].startswith(f"calc.py: changed in commit {fixed} after {self.sha}"), problems)
+        self.assertIn(f"drifted since {self.sha} at the tip: calc.py", self.bind()[1])
         rc, out = self.handback()
         self.assertEqual(rc, 0, out)
         commit(self.wt, "evidence for the fix")
-        problems, out = self.bind()
-        self.assertEqual((problems, out), ([], self.holds(fixed, 1)))
+        self.assertEqual(self.bind(), ([], self.holds(fixed)))
+        self.assertEqual(len(store.history(self.wt, TASK)), 2)
 
     def test_binding_fails_when_results_are_absent(self):
         problems, out = self.bind()
@@ -1773,14 +1739,14 @@ class BindingTests(HandbackBase):
             rc = pk.main(["gate", "binding", TASK, "--branch", BRANCH])
         self.assertEqual((rc, err.getvalue()), (0, ""))
         self.assertTrue(out.getvalue().startswith("binding holds: results record "))
-        put(self.wt, "calc.py", CALC + "\n# later\n")
-        commit(self.wt, "source")
+        self.forge(head="0" * 40)
+        commit(self.wt, "a forged head")
         out, err = io.StringIO(), io.StringIO()
         with mock.patch.object(gate, "find_root", return_value=self.root), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             rc = pk.main(["gate", "binding", TASK, "--branch", BRANCH])
         self.assertEqual((rc, out.getvalue()), (1, ""))
-        self.assertTrue(err.getvalue().startswith("error: calc.py: "), err.getvalue())
+        self.assertTrue(err.getvalue().startswith("error: "), err.getvalue())
 
 
 if __name__ == "__main__":
