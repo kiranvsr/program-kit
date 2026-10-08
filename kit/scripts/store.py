@@ -12,13 +12,15 @@ Immutability is enforced through git, not a file system boundary (`integrity`): 
 to its name is refused as "immutable record altered", and a commit that modifies or deletes a record file is refused
 as "evidence history rewritten".
 
-`program/evidence/index.json` is the only mutable evidence file: for each task it points at the latest `results`
-and the latest `acceptance` record (digest, repository-relative path, and a few fields of the record). Each append
-updates the entry of its own task only, and the index is replaced atomically. Every check reads the latest record
-through the index; older records stay as history (`pk evidence history`).
+Each task has one pointer, `program/evidence/<task_id>/latest.json`, the only mutable evidence file: it names the
+task's latest `results` and latest `acceptance` record (digest, repository-relative path, and a few fields of the
+record). An append replaces its own task's pointer atomically and touches no other task's file, so two task
+branches never edit the same evidence file. Every check reads the latest record through the pointer; older records
+stay as history (`pk evidence history`). In memory the pointers are read together as one mapping
+(`read_index`), task id -> {kind: entry}.
 
-Known limits: records are not signed; a record rewritten consistently together with its name and the index, in a
-history that is itself rewritten, is not detected.
+Known limits: records are not signed; a record rewritten consistently together with its name and its pointer, in
+a history that is itself rewritten, is not detected.
 """
 from __future__ import annotations
 
@@ -33,7 +35,7 @@ from common import KitError, git, new_file, read_json, sha256_bytes, write_json
 SCHEMA_VERSION = 1
 KINDS = ("results", "acceptance")
 BASE = "program/evidence"
-INDEX = f"{BASE}/index.json"
+POINTER = "latest.json"
 RECORD_PATHSPECS = tuple(f":(glob){BASE}/*/{kind}/**" for kind in KINDS)
 _COMPACT = "%Y%m%dT%H%M%S%fZ"
 _NAME = re.compile(r"(\d{8}T\d{12}Z)-([0-9a-f]{12})\.json\Z")
@@ -55,14 +57,9 @@ def _kind(kind) -> str:
     return kind
 
 
-def init(root) -> tuple[Path, bool]:
-    """Create `program/evidence/index.json` when it is absent; (its path, whether it was created now)."""
-    path = Path(root) / INDEX
-    if path.exists():
-        read_index(root)
-        return path, False
-    write_index(root, empty_index())
-    return path, True
+def pointer_path(task_id: str) -> str:
+    """The repository-relative path of a task's pointer file."""
+    return f"{BASE}/{check_task(task_id)}/{POINTER}"
 
 
 # --- records ------------------------------------------------------------------------
@@ -142,7 +139,7 @@ def parse(rel: str, raw: bytes, digest: str | None = None) -> dict:
     check_rel(rel)
     problem = altered(rel, raw)
     if problem is None and digest is not None and sha256_bytes(raw) != digest:
-        problem = f"immutable record altered: {rel} hashes to {sha256_bytes(raw)}, not the indexed {digest}"
+        problem = f"immutable record altered: {rel} hashes to {sha256_bytes(raw)}, not the pointed-at {digest}"
     if problem:
         raise KitError(problem)
     try:
@@ -164,7 +161,7 @@ def load(root, rel: str, digest: str | None = None) -> dict:
     return parse(rel, raw, digest)
 
 
-# --- the index ------------------------------------------------------------------------
+# --- the pointers ---------------------------------------------------------------------
 
 def empty_index() -> dict:
     return {"schema_version": SCHEMA_VERSION, "tasks": {}}
@@ -187,54 +184,58 @@ def _entry_problem(kind: str, entry) -> str | None:
     return None
 
 
-def parse_index(data, where: str = INDEX) -> dict:
-    """A checked index; KitError naming the first problem."""
-    if not isinstance(data, dict) or data.get("schema_version") != SCHEMA_VERSION \
-            or not isinstance(data.get("tasks"), dict) or set(data) != {"schema_version", "tasks"}:
-        raise KitError(f"{where}: not an evidence index (schema_version {SCHEMA_VERSION} and tasks)")
-    for task_id, kinds in data["tasks"].items():
-        if not _TASK.match(task_id) or not isinstance(kinds, dict) or not kinds or not set(kinds) <= set(KINDS):
-            raise KitError(f"{where}: task {task_id!r} must map results and/or acceptance to an entry")
-        for kind, entry in kinds.items():
-            problem = _entry_problem(kind, entry)
-            if problem:
-                raise KitError(f"{where}: {task_id} {kind}: {problem}")
-            if check_rel(entry["path"])[:2] != (task_id, kind):
-                raise KitError(f"{where}: {task_id} {kind}: path names another task or kind")
-    return data
+def parse_pointer(data, task_id: str, where: str) -> dict:
+    """{kind: entry} of a checked pointer of `task_id`; KitError naming the first problem."""
+    kinds = {key: value for key, value in data.items() if key in KINDS} if isinstance(data, dict) else {}
+    if not isinstance(data, dict) or data.get("schema_version") != SCHEMA_VERSION or data.get("task_id") != task_id \
+            or set(data) - set(KINDS) != {"schema_version", "task_id"} or not kinds:
+        raise KitError(f"{where}: not the evidence pointer of {task_id} (schema_version {SCHEMA_VERSION}, task_id, "
+                       "and results and/or acceptance)")
+    for kind, entry in kinds.items():
+        problem = _entry_problem(kind, entry)
+        if problem:
+            raise KitError(f"{where}: {kind}: {problem}")
+        if check_rel(entry["path"])[:2] != (task_id, kind):
+            raise KitError(f"{where}: {kind}: path names another task or kind")
+    return kinds
 
 
-def read_index(root) -> dict:
-    """`program/evidence/index.json` of the checkout at `root`; an empty index when there is none."""
-    path = Path(root) / INDEX
-    if not path.exists():
-        return empty_index()
-    return parse_index(read_json(path))
-
-
-def index_from_text(text: str, where: str) -> dict:
+def pointer_from_text(text: str, task_id: str, where: str) -> dict:
     try:
-        return parse_index(json.loads(text), where)
+        return parse_pointer(json.loads(text), task_id, where)
     except (ValueError, RecursionError) as exc:
         raise KitError(f"{where}: invalid JSON: {exc}") from exc
 
 
-def _sorted(index: dict) -> dict:
-    return {"schema_version": SCHEMA_VERSION,
-            "tasks": {task: {kind: dict(sorted(entry.items())) for kind, entry in sorted(kinds.items())}
-                      for task, kinds in sorted(index["tasks"].items())}}
+def read_pointer(root, task_id: str) -> dict:
+    """{kind: entry} of the task's pointer in the checkout at `root`; {} when the task has none."""
+    rel = pointer_path(task_id)
+    path = Path(root) / rel
+    if not path.exists():
+        return {}
+    return parse_pointer(read_json(path), task_id, rel)
 
 
-def write_index(root, index: dict) -> None:
-    """Replace the index atomically (a temporary file renamed over it), in a stable sorted form."""
-    write_json(Path(root) / INDEX, _sorted(parse_index(index)))
+def read_index(root) -> dict:
+    """Every task pointer of the checkout at `root`, as {schema_version, tasks: {task_id: {kind: entry}}}."""
+    tasks = {}
+    base = Path(root) / BASE
+    for path in sorted(base.glob(f"*/{POINTER}")) if base.is_dir() else []:
+        task_id = path.parent.name
+        if not _TASK.match(task_id):
+            raise KitError(f"{BASE}/{task_id}/{POINTER}: not a usable task directory name")
+        tasks[task_id] = read_pointer(root, task_id)
+    return {"schema_version": SCHEMA_VERSION, "tasks": tasks}
 
 
 def set_entry(root, task_id: str, kind: str, entry: dict) -> None:
-    """Point the index of `task_id` at `entry` for `kind`; every other task's entry is left as it is."""
-    index = read_index(root)
-    index["tasks"].setdefault(check_task(task_id), {})[_kind(kind)] = entry
-    write_index(root, index)
+    """Point the task's pointer at `entry` for `kind`, replacing the file atomically; no other task's file changes."""
+    kinds = dict(read_pointer(root, task_id))
+    kinds[_kind(kind)] = entry
+    data = {"schema_version": SCHEMA_VERSION, "task_id": task_id,
+            **{k: dict(sorted(v.items())) for k, v in sorted(kinds.items())}}
+    parse_pointer(data, task_id, pointer_path(task_id))
+    write_json(Path(root) / pointer_path(task_id), data)
 
 
 def latest(index: dict, task_id: str, kind: str) -> dict | None:
@@ -351,9 +352,17 @@ def integrity(root, base: str | None = None, uncommitted: set[str] | frozenset =
     """Every reason the evidence of the checkout at `root` cannot be trusted; empty when it can.
 
     (1) every record file's sha256 matches the digest in its name; (2) no commit in `base..HEAD` (the whole history
-    when `base` is None) modified or deleted a record file; (3) every index entry resolves to a committed record
-    with its indexed digest (paths in `uncommitted` may be new, not yet committed records).
+    when `base` is None) modified or deleted a record file; (3) every pointer entry resolves to a committed record
+    with its digest (paths in `uncommitted` may be new, not yet committed records).
     """
+    problems, pending = check(root, base)
+    return problems + [f"{path}: not committed (pointed at by {owner})" for path, owner in pending
+                       if path not in uncommitted]
+
+
+def check(root, base: str | None = None) -> tuple[list[str], list[tuple[str, str]]]:
+    """(problems, pending) of the checks of `integrity`: `pending` lists (record path, pointer path) for each record a
+    pointer names that is present with its digest but not committed yet; that alone is no problem here."""
     root = Path(root)
     problems = []
     for rel in _record_files(root):
@@ -362,26 +371,27 @@ def integrity(root, base: str | None = None, uncommitted: set[str] | frozenset =
         if problem:
             problems.append(problem)
     problems.extend(rewritten(root, base))
+    pending: list[tuple[str, str]] = []
     try:
         index = read_index(root)
     except KitError as exc:
-        return problems + [str(exc)]
+        return problems + [str(exc)], pending
     entries = [(task, kind, entry) for task, kinds in sorted(index["tasks"].items()) for kind, entry in kinds.items()]
     try:
         tracked = set(git(root, "ls-files", "-z", "--", BASE).split("\0")) if entries else set()
     except KitError:
         tracked = set()
     for task, kind, entry in entries:
+        where = f"{pointer_path(task)}: {kind}"
         try:
             raw = (root / entry["path"]).read_bytes()
         except OSError as exc:
-            problems.append(f"{INDEX}: {task} {kind}: evidence record {entry['path']} is missing: "
-                            f"{exc.strerror or exc}")
+            problems.append(f"{where}: evidence record {entry['path']} is missing: {exc.strerror or exc}")
             continue
         if sha256_bytes(raw) != entry["digest"]:
-            problems.append(f"{INDEX}: {task} {kind}: immutable record altered: {entry['path']} hashes to "
-                            f"{sha256_bytes(raw)}, not the indexed {entry['digest']}")
+            problems.append(f"{where}: immutable record altered: {entry['path']} hashes to {sha256_bytes(raw)}, not "
+                            f"the pointed-at {entry['digest']}")
             continue
-        if entry["path"] not in tracked and entry["path"] not in uncommitted:
-            problems.append(f"{INDEX}: {task} {kind}: {entry['path']} is not committed")
-    return problems
+        if entry["path"] not in tracked:
+            pending.append((entry["path"], pointer_path(task)))
+    return problems, pending

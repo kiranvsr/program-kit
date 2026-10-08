@@ -6,7 +6,7 @@ controller's independent run before every merge: the guarded-file check, the SPE
 identity check, then the build, the tests and the scans on the trial merge, so a branch whose implementer
 skipped the hand-back gate still cannot reach main. `claims` and `validate_claims` keep
 `program/claims/<GATE>/*.json` equal to a recomputation from `gates.yaml`, the latest results and acceptance
-record of each task the gate names (read from the evidence store through `program/evidence/index.json`) and
+record of each task the gate names (read through each task's pointer `program/evidence/<ID>/latest.json`) and
 `environments.yaml`.
 
 Run it from the main checkout: the task worktree defaults to `<root>/.worktrees/<id lowercased>`.
@@ -17,7 +17,7 @@ task's SPEC.md and PLAN.md, and the spec-QA record review.md, must be byte-ident
 branch is `task/<ID>`. All three must be on main: a task dispatched without its review.md fails both gates.
 The trial merge happens in a temporary worktree of main and never commits or touches the main checkout.
 `binding` is QA's check that the task's latest results record is a true record of its `head`, read from git
-objects only: the record is committed on the branch tip with the digest the index names, validates and passes the
+objects only: the record is committed on the branch tip with the digest its pointer names, validates and passes the
 lint, its `head` is an ancestor of the tip, every recorded input hash is the hash of the blob at `head`, and no
 commit since the branch left main modified or deleted a record. Drift between `head` and the tip is reported,
 never a failure: the record says what was verified at `head`, and that stays true.
@@ -26,14 +26,14 @@ Limits:
 - A produce.py that hand-writes a well-formed record is not detectable by the gate; QA re-runs the
   evidence independently and uses `pk gate binding`.
 - `binding` refuses an edited `head` or an edited input hash, but not a record rewritten consistently,
-  appended under its new digest and indexed; the merge check runs the tests and scans again whatever the record
+  appended under its new digest and pointed at; the merge check runs the tests and scans again whatever the record
   says.
 - Files written to git-ignored paths are invisible to the clean-tree checks.
 - Projects must git-ignore the bytecode and build output their commands write: the evidence step
   needs a clean tree, and a leftover untracked file fails it.
 - Evidence is bound to the commit it was produced at. The gate leaves the new record and the updated
-  `program/evidence/index.json` uncommitted in the task worktree (the only changes it allows). Commit both (the
-  evidence commit) or remove the record and restore the index by exact path before a re-run.
+  task pointer `program/evidence/<ID>/latest.json` uncommitted in the task worktree (the only changes it allows).
+  Commit both (the evidence commit) or remove the record and restore the pointer by exact path before a re-run.
 - A task whose own inputs did not change since its latest record needs no new record: produce.py may append one,
   or leave the fresh record in place. Other tasks' records are never refreshed because a shared input changed.
 """
@@ -445,14 +445,14 @@ def _evidence_step(wt: Path, task_id: str) -> bool:
     nothing, the latest record must still be fresh: its `head` an ancestor of HEAD and none of its inputs changed
     since (a task whose own source changed needs a new record; a shared input changed by another task does not
     make it refresh anything else). The record history must be intact since the branch left main. The new record
-    and the index are the only changes allowed in the worktree.
+    and the task's own pointer (`program/evidence/<ID>/latest.json`) are the only changes allowed in the worktree.
     """
     produce = f"program/evidence/{task_id}/produce.py"
     if not (wt / produce).is_file():
         _out(f"FAILED: evidence {produce} is missing")
         return False
     try:
-        before = store.latest(store.read_index(wt), task_id, "results")
+        before = store.read_pointer(wt, task_id).get("results")
     except KitError as exc:
         _out("FAILED: evidence " + " ".join(str(exc).split()))
         return False
@@ -460,10 +460,10 @@ def _evidence_step(wt: Path, task_id: str) -> bool:
         return False
     head = git(wt, "rev-parse", "HEAD")
     try:
-        entry = store.latest(store.read_index(wt), task_id, "results")
+        entry = store.read_pointer(wt, task_id).get("results")
         if entry is None:
             _out("FAILED: evidence")
-            _out(f"{store.INDEX} names no results record of {task_id}")
+            _out(f"{store.pointer_path(task_id)} names no results record of {task_id}")
             return False
         data = store.load(wt, entry["path"], entry["digest"])
     except KitError as exc:
@@ -487,7 +487,7 @@ def _evidence_step(wt: Path, task_id: str) -> bool:
         for problem in problems:
             _out(problem)
         return False
-    allowed = {store.INDEX, entry["path"]} if new else set()
+    allowed = {store.pointer_path(task_id), entry["path"]} if new else set()
     extra = [path for path in _changes(wt) if path not in allowed]
     for path in extra:
         _out(f"FAILED: evidence unexpected change: {path}")
@@ -495,9 +495,9 @@ def _evidence_step(wt: Path, task_id: str) -> bool:
 
 
 def _stale_step(wt: Path) -> bool:
-    """The drift report against main: information, never a failure; an unreadable record fails."""
-    report = stale_module.drift_report(wt, MAIN)
-    _out(f"drift: {report['drifted']} of {report['checked']} record(s) drifted from {MAIN}")
+    """The drift report against the worktree's HEAD: information, never a failure; an unreadable record fails."""
+    report = stale_module.drift_report(wt, "HEAD")
+    _out(f"drift: {report['drifted']} of {report['checked']} record(s) drifted from HEAD")
     for row in report["tasks"]:
         if row["state"] == "drifted":
             _out(f"{row['task_id']} drifted since {row['head']}: {', '.join(row['changed_inputs'])}")
@@ -691,7 +691,7 @@ def _claim_name(record: str) -> str:
 
 
 def _loaded(root: Path, entry: dict | None) -> dict | None:
-    """The record an index entry points at, or None when there is none or it cannot be trusted."""
+    """The record a pointer entry names, or None when there is none or it cannot be trusted."""
     if entry is None:
         return None
     try:
@@ -704,7 +704,7 @@ def _states(task_id: str | None, own: str, environments: dict[str, bool], index:
     """({environment: state}, latest acceptance digest or None) for one record of a gate.
 
     Evidenced only when the task's latest acceptance accepts, is not blocked there, and binds the task's latest
-    results record, and both records are present with their indexed digests.
+    results record, and both records are present with their pointed-at digests.
     """
     results = store.latest(index, task_id, "results") if task_id else None
     acceptance = store.latest(index, task_id, "acceptance") if task_id else None
@@ -832,39 +832,40 @@ def validate_claims(root, gate_id: str) -> list[str]:
 
 # --- binding ----------------------------------------------------------------------
 
-def _index_at(root: Path, commit: str) -> dict:
-    """The evidence index committed at `commit` (empty when the commit has none); KitError when it is malformed."""
+def _pointer_at(root: Path, commit: str, task_id: str) -> dict:
+    """{kind: entry} of the task's pointer committed at `commit` ({} when it has none); KitError when malformed."""
+    rel = store.pointer_path(task_id)
     try:
-        raw = _git_bytes(root, "show", f"{commit}:{store.INDEX}")
+        raw = _git_bytes(root, "show", f"{commit}:{rel}")
     except KitError:
-        return store.empty_index()
+        return {}
     try:
         text = drop_bom(raw.decode("utf-8"))
     except UnicodeDecodeError as exc:
-        raise KitError(f"{store.INDEX} at {commit} is not UTF-8") from exc
-    return store.index_from_text(text, f"{store.INDEX} at {commit}")
+        raise KitError(f"{rel} at {commit} is not UTF-8") from exc
+    return store.pointer_from_text(text, task_id, f"{rel} at {commit}")
 
 
 def binding(root, task_id: str, branch: str) -> list[str]:
     """Problems that stop the task's latest results record from being a true record of its `head` on the branch
     (empty, with a printed line, when it holds).
 
-    Read from git objects only, never from a working tree: the index on the branch tip points at a results record
-    of the task that is committed there with its indexed digest, validates and passes the lint; the index entry
-    names the record's own `head`; that `head` is an ancestor of the tip; every recorded input hash is the sha256
-    of that path's blob at `head`; and no commit since the branch left main modified or deleted a record file.
-    Drift (inputs changed between `head` and the tip) is reported on the printed line, never a problem.
+    Read from git objects only, never from a working tree: the task's pointer on the branch tip names a results
+    record that is committed there with that digest, validates and passes the lint; the pointer entry names the
+    record's own `head`; that `head` is an ancestor of the tip; every recorded input hash is the sha256 of that
+    path's blob at `head`; and no commit since the branch left main modified or deleted a record file. Drift
+    (inputs changed between `head` and the tip, the branch's HEAD) is reported on the printed line, never a problem.
     """
     root = Path(root).resolve()
     _task_branch(task_id, branch)
     tip = _branch_head(root, branch)
+    pointer = store.pointer_path(task_id)
     try:
-        index = _index_at(root, tip)
+        entry = _pointer_at(root, tip, task_id).get("results")
     except KitError as exc:
         return [_show(exc)]
-    entry = store.latest(index, task_id, "results")
     if entry is None:
-        return [f"{store.INDEX} on {_show(branch)} names no results record of {task_id}"]
+        return [f"{pointer} on {_show(branch)} names no results record of {task_id}"]
     rel = entry["path"]
     try:
         raw = _git_bytes(root, "show", f"{tip}:{rel}")
@@ -879,7 +880,7 @@ def binding(root, task_id: str, branch: str) -> list[str]:
         return [f"{_show(rel)}: {problem}" for problem in problems]
     head = data["head"]
     if entry["head"] != head:
-        return [f"{store.INDEX}: the {task_id} results entry names head {_show(entry['head'])}, but {_show(rel)} "
+        return [f"{pointer}: the results entry names head {_show(entry['head'])}, but {_show(rel)} "
                 f"names {head}"]
     code, _ = run_argv(["git", "-C", str(root), "merge-base", "--is-ancestor", head, tip], root)
     if code != 0:

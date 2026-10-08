@@ -44,7 +44,6 @@ def main():
         run.run_command(" ".join(argv), argv, expect=expect, parse=tests_run if "unittest" in argv else None)
     table = [dict(bug, test_args=TEST_ARGS) for bug in PLANTED_BUGS]
     run.planted_bugs(table, build=BUILD, test=TEST)
-    run.stale()
     run.write()
 
 

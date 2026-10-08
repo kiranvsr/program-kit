@@ -177,7 +177,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         problems.append(branch)
     import store  # lazy, like gate: the evidence checks of `pk evidence validate` over the whole history
 
-    problems.extend(" ".join(problem.split()) for problem in store.integrity(root))
+    found, pending = store.check(root)
+    problems.extend(" ".join(problem.split()) for problem in found)
+    for path, _ in pending:  # present with its digest, not committed yet: the evidence commit is still to come
+        print(f"warning: record pending commit: {path}", file=sys.stderr)
     for problem in problems:
         print("error: " + problem, file=sys.stderr)
     if problems:

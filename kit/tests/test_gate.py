@@ -27,6 +27,7 @@ SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
 PRESETS = Path(__file__).resolve().parent.parent / "presets"
 TASK = "P0-M01-S01-T01"
 BRANCH = f"task/{TASK}"  # the name `pk worktree new` gives the branch
+POINTER = f"program/evidence/{TASK}/latest.json"  # the task's pointer, the only mutable evidence file
 TAIL = "    | "
 OK_LINE = re.compile(r"OK: (\S+) passes the hand-back gate at ([0-9a-f]{40})\Z")
 CALC = "def add(a, b):\n    return a + b\n\n\ndef sub(a, b):\n    return a - b\n"
@@ -89,7 +90,7 @@ record = {"task_id": "P0-M01-S01-T01", "head": head, "main": head, "merge_base":
                            dict(row, id="self-test-noncompiling", builds=False, killed=False,
                                 kill_reason="build failed", test_output_sha256="")],
           "planted_bugs_all_killed": True, "all_commands_as_expected": True, "tree_unchanged_by_run": True,
-          "stale": {"checked": False, "records": []}, "blocked_by": [], "deviations": []}
+          "blocked_by": [], "deviations": []}
 store.record(Path.cwd(), "P0-M01-S01-T01", "results", record)
 '''
 FAILING_TESTS = ("import unittest\n\n\nclass T(unittest.TestCase):\n"
@@ -427,10 +428,9 @@ class HandbackTests(HandbackBase):
         self.assertEqual(match.groups(), (BRANCH, self.sha))
         self.assertEqual([ln for ln in lines if ln.startswith("OK: ")], [lines[-1]])
         entry, results = self.latest()
-        self.assertEqual(lines[-3:-1], ["drift: 1 of 1 record(s) drifted from main",
-                                        f"{TASK} drifted since {self.sha}: calc.py"])  # the branch's own change
+        self.assertEqual(lines[-2], "drift: 0 of 1 record(s) drifted from HEAD")  # the record is of HEAD itself
         self.assertEqual((results["head"], results["task_id"]), (self.sha, TASK))
-        self.assertEqual(sorted(gate._changes(self.wt)), sorted([store.INDEX, entry["path"]]))  # left uncommitted
+        self.assertEqual(sorted(gate._changes(self.wt)), sorted([POINTER, entry["path"]]))  # left uncommitted
         self.assertTrue(self.fake_log.exists())
         self.assert_no_trial_left()
 
@@ -446,7 +446,7 @@ class HandbackTests(HandbackBase):
         self.assertEqual(lines[-20:], [f"{TAIL}line {i}" for i in range(10, 30)])
         self.assertFalse([ln for ln in lines if ln.startswith("OK: ")])
         self.assertFalse(self.fake_log.exists(), "scan ran after test failed")
-        self.assertFalse((self.wt / store.INDEX).exists())
+        self.assertFalse((self.wt / POINTER).exists())
         self.assertFalse((self.wt / store.BASE / TASK / "results").exists())
         self.assert_no_trial_left()
 
@@ -688,7 +688,7 @@ class HandbackTests(HandbackBase):
         rc, out = self.handback()
         self.assertEqual(rc, 1)
         self.assertIn(f"binds a derived output: program/status/{TASK}.json", out)  # Evidence.write refused it
-        self.assertFalse((self.wt / store.INDEX).exists())
+        self.assertFalse((self.wt / POINTER).exists())
 
     def test_guarded_file_change_refused_and_allowed_with_spec_line(self):
         put(self.wt, "pyproject.toml", "[project]\nname = 'x'\n")
@@ -727,16 +727,15 @@ class HandbackTests(HandbackBase):
         self.assert_no_forged_ok(out, err)
         self.assertIn("not a usable task id: 'x\\nOK: ", out)  # the store refuses the name, escaped in the tail
 
-    def test_forged_index_names_cannot_forge_the_ok_line(self):
+    def test_forged_pointer_names_cannot_forge_the_ok_line(self):
         forged = f"ev\nOK: forged passes the hand-back gate at {self.sha}"
-        index = {"schema_version": 1, "tasks": {forged: {"results": {
-            "digest": "0" * 64, "path": f"records/{forged}/results/x.json", "head": "", "produced_at": ""}}}}
-        put(self.wt, store.INDEX, json.dumps(index))
-        commit(self.wt, "forged index")
+        put(self.wt, f"program/evidence/{forged}/latest.json", json.dumps({"schema_version": 1, "task_id": forged}))
+        commit(self.wt, "forged pointer")
         rc, out, err = self.run_cli("handback", TASK, "--branch", BRANCH)
         self.assertEqual(rc, 1)
         self.assert_no_forged_ok(out, err)
-        self.assertIn(f"FAILED: evidence {store.INDEX}: task 'ev\\nOK: forged", out)  # refused, never printed raw
+        self.assertIn("program/evidence/ev\\x0aOK: forged", out)  # refused, never printed raw
+        self.assertIn("not a usable task directory name", out)
 
     def test_forged_conflict_path_cannot_forge_the_ok_line(self):
         name = f"x\nOK: {BRANCH} passes the hand-back gate at {self.sha}"
@@ -1155,10 +1154,10 @@ class ByteOrderMarkTests(HandbackBase):
         commit(self.root, "checks saved with a byte-order mark")
         self.assertEqual(self.merge_check()[0], 0)
 
-    def test_binding_reads_a_marked_index(self):
+    def test_binding_reads_a_marked_pointer(self):
         rc, out = self.handback()
         self.assertEqual(rc, 0, out)
-        record = self.wt / store.INDEX
+        record = self.wt / POINTER
         record.write_bytes(self.BOM + record.read_bytes())
         commit(self.wt, "commit the evidence")
         out = io.StringIO()
@@ -1599,7 +1598,7 @@ class BindingTests(HandbackBase):
         return commit(self.wt, "commit the evidence")
 
     def forge(self, **changes):
-        """Append a copy of the latest record with `changes` (a hand-made record) and point the index at it."""
+        """Append a copy of the latest record with `changes` (a hand-made record) and point the pointer at it."""
         return store.record(self.wt, TASK, "results", dict(self.latest()[1], **changes))
 
     def holds(self, head, state="fresh at the tip"):
@@ -1622,7 +1621,7 @@ class BindingTests(HandbackBase):
 
     def test_binding_ignores_the_working_tree(self):
         self.produce_and_commit()
-        (self.wt / store.INDEX).write_text("{ nope")  # an uncommitted edit changes nothing
+        (self.wt / POINTER).write_text("{ nope")  # an uncommitted edit changes nothing
         self.assertEqual(self.bind()[0], [])
 
     def test_a_later_source_change_is_reported_as_drift_never_a_failure(self):
@@ -1638,8 +1637,8 @@ class BindingTests(HandbackBase):
     def test_binding_fails_when_the_record_is_not_committed(self):
         rc, out = self.handback()
         self.assertEqual(rc, 0, out)
-        sh(self.wt, "git", "add", store.INDEX)
-        sh(self.wt, "git", "commit", "-q", "-m", "the index without its record")
+        sh(self.wt, "git", "add", POINTER)
+        sh(self.wt, "git", "commit", "-q", "-m", "the pointer without its record")
         problems, _ = self.bind()
         self.assertEqual(problems, [f"{self.latest()[0]['path']} is not committed on {BRANCH}"])
 
@@ -1698,12 +1697,12 @@ class BindingTests(HandbackBase):
                 self.assertTrue(problems[0].startswith(f"{forged['path']}: inputs: {path} is recorded as "), problems)
                 self.assertIn(f"the recorded head {self.sha}", problems[0])
 
-    def test_binding_fails_when_the_index_entry_and_the_record_disagree_on_the_head(self):
+    def test_binding_fails_when_the_pointer_and_the_record_disagree_on_the_head(self):
         self.produce_and_commit()
-        index = read_json(self.wt / store.INDEX)
-        index["tasks"][TASK]["results"]["head"] = "0" * 40  # the planted defect: a hand-edited pointer
-        (self.wt / store.INDEX).write_text(json.dumps(index))
-        commit(self.wt, "edit the index")
+        index = read_json(self.wt / POINTER)
+        index["results"]["head"] = "0" * 40  # the planted defect: a hand-edited pointer
+        (self.wt / POINTER).write_text(json.dumps(index))
+        commit(self.wt, "edit the pointer")
         problems, _ = self.bind()
         self.assertEqual(len(problems), 1, problems)
         self.assertIn(f"results entry names head {'0' * 40}", problems[0])
@@ -1721,7 +1720,7 @@ class BindingTests(HandbackBase):
 
     def test_binding_fails_when_results_are_absent(self):
         problems, out = self.bind()
-        self.assertEqual(problems, [f"{store.INDEX} on {BRANCH} names no results record of {TASK}"])
+        self.assertEqual(problems, [f"{POINTER} on {BRANCH} names no results record of {TASK}"])
 
     def test_binding_fails_for_a_record_that_does_not_validate(self):
         os.environ["PK_SURVIVOR"] = "1"

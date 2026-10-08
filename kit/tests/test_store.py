@@ -1,4 +1,4 @@
-"""The evidence store: committed append-only records, the pointer index, history and the integrity checks."""
+"""The evidence store: committed append-only records, the per-task pointers, history and the integrity checks."""
 import _paths  # noqa: F401  (must come first: puts kit/scripts/ on sys.path)
 import contextlib
 import io
@@ -42,12 +42,15 @@ class Base(unittest.TestCase):
 
 
 class InitAndAppend(Base):
-    def test_init_creates_only_the_index_once(self):
-        path, created = store.init(self.root)
-        self.assertEqual((path, created), (self.root / store.INDEX, True))
-        self.assertEqual(read_json(path), {"schema_version": 1, "tasks": {}})
-        self.assertEqual(store.init(self.root), (path, False))
-        self.assertEqual(sorted(p.name for p in path.parent.iterdir()), ["index.json"])
+    def test_a_pointer_appears_with_the_first_record_of_its_task(self):
+        self.assertEqual(store.read_index(self.root), {"schema_version": 1, "tasks": {}})
+        self.assertFalse((self.root / store.BASE).exists())
+        appended = store.record(self.root, "T-1", "results", {"head": "a" * 40, "produced_at": "t"})
+        self.assertEqual(store.pointer_path("T-1"), "program/evidence/T-1/latest.json")
+        self.assertEqual(read_json(self.root / store.pointer_path("T-1")),
+                         {"schema_version": 1, "task_id": "T-1", "results": {
+                             "digest": appended["digest"], "head": "a" * 40, "path": appended["path"],
+                             "produced_at": "t"}})
 
     def test_append_puts_the_record_in_the_task_directory_named_by_time_and_digest(self):
         first = store.append(self.root, "T-1", "results", {"x": 1})
@@ -91,11 +94,11 @@ class Load(Base):
 
     def test_load_refuses_a_digest_other_than_the_indexed_one(self):
         appended = store.append(self.root, "T-1", "results", {"x": 1})
-        with self.assertRaisesRegex(KitError, "not the indexed"):
+        with self.assertRaisesRegex(KitError, "not the pointed-at"):
             store.load(self.root, appended["path"], "0" * 64)
 
     def test_load_refuses_paths_outside_the_record_tree(self):
-        for rel in ("program/evidence/index.json", "program/evidence/T-1/results/../../index.json",
+        for rel in ("program/evidence/T-1/latest.json", "program/evidence/T-1/results/../latest.json",
                     "program/evidence/T-1/notes/x.json", "/etc/x", "program/evidence/T-1/results.json"):
             with self.assertRaises(KitError):
                 store.load(self.root, rel)
@@ -116,36 +119,57 @@ class Index(Base):
                          second["digest"])
         self.assertEqual(store.load_latest(self.root, "T-1", "acceptance")[0]["digest"], accepted["digest"])
 
-    def test_an_append_changes_only_its_own_task_entry(self):
+    def test_an_append_writes_only_its_own_task_pointer(self):
         store.record(self.root, "T-1", "results", {"head": "a" * 40})
-        before = store.read_index(self.root)["tasks"]["T-1"]
+        mine = self.root / store.pointer_path("T-1")
+        before = mine.read_bytes()
+        self.commit("T-1 evidence")
         store.record(self.root, "T-2", "results", {"head": "b" * 40})
-        self.assertEqual(store.read_index(self.root)["tasks"]["T-1"], before)
+        store.record(self.root, "T-2", "acceptance", {"decision": "rejected"})
+        self.assertEqual(mine.read_bytes(), before)
+        changed = sh(self.root, "git", "status", "--porcelain", "--untracked-files=all").split()
+        self.assertEqual(sorted(p for p in changed if p != "??"),
+                         sorted(str(p.relative_to(self.root)) for p in (self.root / "program/evidence/T-2").rglob("*")
+                                if p.is_file()))  # nothing outside T-2's own directory changed
 
-    def test_index_is_written_atomically(self):
+    def test_two_task_branches_merge_without_an_evidence_conflict(self):
+        for task in ("T-1", "T-2"):  # neighbours in sort order, each on its own branch
+            sh(self.root, "git", "checkout", "-q", "-b", f"task/{task}", "main")
+            store.record(self.root, task, "results", {"head": "a" * 40})
+            store.record(self.root, task, "acceptance", {"decision": "accepted_development"})
+            self.commit(f"{task} evidence")
+        sh(self.root, "git", "checkout", "-q", "main")
+        sh(self.root, "git", "merge", "-q", "--no-ff", "-m", "merge T-1", "task/T-1")
+        sh(self.root, "git", "merge", "-q", "--no-ff", "-m", "merge T-2", "task/T-2")  # check=True: no conflict
+        self.assertEqual(sorted(store.read_index(self.root)["tasks"]), ["T-1", "T-2"])
+        self.assertEqual(store.integrity(self.root), [])
+
+    def test_a_pointer_is_written_atomically(self):
         store.record(self.root, "T-1", "results", {"head": "a" * 40})
-        index_file = self.root / store.INDEX
-        before = index_file.read_bytes()
+        pointer = self.root / store.pointer_path("T-1")
+        before = pointer.read_bytes()
         with mock.patch("common.os.replace", side_effect=OSError(28, "No space left on device")):
             with self.assertRaisesRegex(KitError, "cannot write"):
-                store.record(self.root, "T-2", "results", {"head": "b" * 40})
-        self.assertEqual(index_file.read_bytes(), before)  # the old index, whole
-        self.assertEqual([p.name for p in index_file.parent.iterdir() if p.is_file()], ["index.json"])
+                store.record(self.root, "T-1", "results", {"head": "b" * 40})
+        self.assertEqual(pointer.read_bytes(), before)  # the old pointer, whole
+        self.assertEqual([p.name for p in pointer.parent.iterdir() if p.is_file()], ["latest.json"])
 
-    def test_a_malformed_index_is_refused(self):
-        index_file = self.root / store.INDEX
-        index_file.parent.mkdir(parents=True)
-        for text in ('{"tasks": {}}', '{"schema_version": 1, "tasks": {"T-1": {"report": {}}}}',
-                     '{"schema_version": 1, "tasks": {"T-1": {"results": {"digest": "x"}}}}', "{"):
-            index_file.write_text(text)
+    def test_a_malformed_pointer_is_refused(self):
+        pointer = self.root / store.pointer_path("T-1")
+        pointer.parent.mkdir(parents=True)
+        for text in ('{"schema_version": 1, "task_id": "T-1"}', '{"schema_version": 1, "task_id": "T-2", "results": {}}',
+                     '{"schema_version": 1, "task_id": "T-1", "report": {}}',
+                     '{"schema_version": 1, "task_id": "T-1", "results": {"digest": "x"}}', "{"):
+            pointer.write_text(text)
             with self.assertRaises(KitError):
                 store.read_index(self.root)
 
     def test_an_entry_whose_path_does_not_carry_its_digest_is_refused(self):
         store.record(self.root, "T-1", "results", {"head": "a" * 40})
-        index = read_json(self.root / store.INDEX)
-        index["tasks"]["T-1"]["results"]["digest"] = "f" * 64  # the planted defect: a hand-edited pointer
-        (self.root / store.INDEX).write_text(json.dumps(index))
+        pointer = self.root / store.pointer_path("T-1")
+        data = read_json(pointer)
+        data["results"]["digest"] = "f" * 64  # the planted defect: a hand-edited pointer
+        pointer.write_text(json.dumps(data))
         with self.assertRaisesRegex(KitError, "path does not name the record of its digest"):
             store.read_index(self.root)
 
@@ -169,7 +193,7 @@ class History(Base):
 
 
 class Integrity(Base):
-    def test_committed_records_with_matching_names_and_index_are_intact(self):
+    def test_committed_records_with_matching_names_and_pointers_are_intact(self):
         self.assertEqual(store.integrity(self.root), [])
         store.record(self.root, "T-1", "results", {"head": "a" * 40})
         self.commit("evidence")
@@ -200,7 +224,7 @@ class Integrity(Base):
         self.assertEqual(len([p for p in store.integrity(self.root) if p.startswith("evidence history rewritten")]),
                          3)
 
-    def test_the_index_and_other_files_may_change_freely(self):
+    def test_the_pointer_and_other_files_may_change_freely(self):
         store.record(self.root, "T-1", "results", {"head": "a" * 40})
         (self.root / "program" / "evidence" / "T-1" / "produce.py").write_text("# v1\n")
         base = self.commit("evidence")
@@ -209,14 +233,15 @@ class Integrity(Base):
         self.commit("refresh")
         self.assertEqual(store.rewritten(self.root, base), [])
 
-    def test_every_index_entry_must_resolve_to_a_committed_record(self):
+    def test_every_pointer_entry_must_resolve_to_a_committed_record(self):
         appended = store.record(self.root, "T-1", "results", {"head": "a" * 40})
-        self.assertEqual(store.integrity(self.root), [f"{store.INDEX}: T-1 results: {appended['path']} is not "
-                                                      "committed"])
+        self.assertEqual(store.integrity(self.root), [f"{appended['path']}: not committed (pointed at by "
+                                                      f"{store.pointer_path('T-1')})"])
+        self.assertEqual(store.check(self.root), ([], [(appended["path"], store.pointer_path("T-1"))]))
         self.assertEqual(store.integrity(self.root, uncommitted={appended["path"]}), [])
         self.commit("evidence")
         appended["file"].chmod(0o644)
-        appended["file"].unlink()  # the planted defect: the record the index points at is gone
+        appended["file"].unlink()  # the planted defect: the record the pointer names is gone
         problems = store.integrity(self.root)
         self.assertEqual(len(problems), 1, problems)
         self.assertIn("is missing", problems[0])
@@ -240,6 +265,23 @@ class Integrity(Base):
         self.assertEqual((code, out.getvalue()), (1, ""))
         self.assertIn(f"error: immutable record altered: {appended['path']} ", err.getvalue())
 
+
+    def test_doctor_warns_about_a_record_pending_commit_and_passes(self):
+        (self.root / "program" / "checks.yaml").parent.mkdir(parents=True, exist_ok=True)
+        (self.root / "program" / "checks.yaml").write_text(
+            "build:\n  - - 'true'\ntest:\n  - - 'true'\nscan:\n  - - 'true'\n")
+        appended = store.record(self.root, "T-1", "results", {"head": "a" * 40})  # gated, not yet committed
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), contextlib.chdir(self.root):
+            code = pk.main(["doctor"])
+        self.assertEqual((code, out.getvalue(), err.getvalue()),
+                         (0, "doctor: ok\n", f"warning: record pending commit: {appended['path']}\n"))
+        appended["file"].chmod(0o644)
+        appended["file"].write_text("{}\n")  # pending and altered: a failure, not a warning
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err2, \
+                contextlib.chdir(self.root):
+            self.assertEqual(pk.main(["doctor"]), 1)
+        self.assertIn("immutable record altered", err2.getvalue())
 
 if __name__ == "__main__":
     unittest.main()

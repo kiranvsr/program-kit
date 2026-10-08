@@ -4,7 +4,7 @@
 A task with no record is `not_started`. Every transition is checked in full
 before anything is written, so a refusal leaves no file behind, and only a task
 the register lists can be given a status. `done` is terminal and needs the task's
-latest acceptance record (through `program/evidence/index.json`) to accept
+latest acceptance record (through its pointer `program/evidence/<ID>/latest.json`) to accept
 (`decision: accepted_development`), to name this task, and to bind by digest the
 task's latest results record, which the hand-back gate would pass and whose `head`
 is an ancestor of HEAD. The role is a flag the caller passes: the machine checks
@@ -183,23 +183,23 @@ def _registered(root: Path) -> set[str]:
 def _acceptance_problem(root: Path, task_id: str) -> str | None:
     """Why the task's evidence does not accept it, or None.
 
-    None only when the index names a latest acceptance and a latest results record for the task, both present
-    with their indexed digests; the acceptance has every key acceptance.schema.json requires, accepts
+    None only when the task's pointer names a latest acceptance and a latest results record, both present
+    with their pointed-at digests; the acceptance has every key acceptance.schema.json requires, accepts
     (`decision` is `accepted_development`), is QA's and this task's, and binds the latest results record by
     digest; that record passes the checks of the hand-back gate (`evidence.gate_problems`); the acceptance's
     `source_commit` is the `head` the record names; and that `head` is an ancestor of HEAD. Drift since `head`
     does not matter: the record says what was verified there.
     """
     try:
-        index = store.read_index(root)
+        index = {"tasks": {task_id: store.read_pointer(root, task_id)}}
     except KitError as exc:
         return f"{task_id}: {exc}"
     acceptance = store.latest(index, task_id, "acceptance")
     results = store.latest(index, task_id, "results")
     if acceptance is None:
-        return f"{task_id}: done needs an acceptance record in {store.INDEX} (pk evidence accept)"
+        return f"{task_id}: done needs an acceptance record in {store.pointer_path(task_id)} (pk evidence accept)"
     if results is None:
-        return f"{task_id}: done needs a results record in {store.INDEX}"
+        return f"{task_id}: done needs a results record in {store.pointer_path(task_id)}"
     label = f"latest acceptance {acceptance['path']}"
     bound = store.load(root, acceptance["path"], acceptance["digest"])
     missing = [key for key in evidence_module.required_keys("acceptance") if key not in bound]

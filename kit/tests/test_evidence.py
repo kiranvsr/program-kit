@@ -520,7 +520,7 @@ class Write(Base):
         self.assertTrue(data["planted_bugs_all_killed"])
         self.assertTrue(data["all_commands_as_expected"])
         self.assertTrue(data["tree_unchanged_by_run"])
-        self.assertEqual(data["stale"], {"checked": False, "records": []})
+        self.assertNotIn("stale", data)  # a record is never stale; drift is computed when it is read
         self.assertEqual((data["blocked_by"], data["deviations"]), ([], []))
         self.assertEqual(data["head"], ev.head)
         self.assertIsNone(data["supersedes"])
@@ -529,7 +529,8 @@ class Write(Base):
         self.assertEqual(store.latest(index, "T-1", "results"),
                          {"digest": written["digest"], "path": written["path"], "head": ev.head,
                           "produced_at": data["produced_at"]})
-        self.assertEqual(sh(self.root, "git", "status", "--porcelain"), "?? program/\n")  # the index alone
+        self.assertEqual(sorted(sh(self.root, "git", "status", "--porcelain", "--untracked-files=all").split()[1::2]),
+                         sorted([written["path"], store.pointer_path("T-1")]))  # the record and its pointer alone
 
     def test_a_refresh_appends_a_new_record_that_supersedes_the_previous_one(self):
         first = self.ready().write()
@@ -550,7 +551,7 @@ class Write(Base):
         self.assertEqual(self.appended(), [])
 
     def test_write_refuses_a_record_that_binds_a_derived_output(self):
-        for derived in ("program/evidence/T-0/results.json", "program/evidence/index.json",
+        for derived in ("program/evidence/T-0/results.json", "program/evidence/T-0/latest.json",
                         "program/status/T-1.json", "program/claims/G-P0/x.json", "docs/acceptance.json"):
             with self.subTest(derived=derived):
                 path = self.root / derived
@@ -650,27 +651,10 @@ class Write(Base):
         data = read_json(ev.write()["file"])
         self.assertEqual((data["blocked_by"], data["deviations"]), (["ENV-1"], ["skipped scan"]))
 
-    def test_stale_without_stale_module_names_the_missing_file(self):
-        ev = evidence.Evidence(self.root, "T-1")
-        with mock.patch.dict(sys.modules, {"stale": None}):
-            with self.assertRaises(KitError) as ctx:
-                ev.stale("main")
-        self.assertIn("kit/scripts/stale.py is missing", str(ctx.exception))
-        self.assertEqual(ev.stale_result, {"checked": False, "records": []})
-
-    def test_stale_delegates_to_the_drift_report_and_keeps_the_drifted_rows(self):
-        ev = evidence.Evidence(self.root, "T-1")
-        fake = mock.Mock()
-        bad = {"path": "u", "changed_inputs": [], "error": "no inputs mapping"}
-        drifted = {"task_id": "T-2", "path": "p", "head": "h", "state": "drifted", "changed_inputs": ["q"]}
-        fresh = dict(drifted, task_id="T-3", state="fresh", changed_inputs=[])
-        fake.drift_report.return_value = {"ref": "x" * 40, "tasks": [drifted, fresh], "drifted": 1,
-                                          "unreadable": [bad], "checked": 3}
-        with mock.patch.dict(sys.modules, {"stale": fake}):
-            got = ev.stale("main")
-        fake.drift_report.assert_called_once_with(self.root, "main")
-        self.assertEqual(got, {"checked": True, "records": [drifted], "unreadable": [bad]})
-        self.assertEqual(ev.stale_result, got)
+    def test_the_record_has_no_stale_field_and_the_writer_no_stale_step(self):
+        self.assertFalse(hasattr(evidence.Evidence, "stale"))
+        self.assertNotIn("stale", evidence.required_keys("results"))
+        self.assertNotIn("stale", read_json(self.ready().write()["file"]))
 
 
 class Validate(Base):
@@ -713,7 +697,7 @@ class Validate(Base):
             "short merge_base": lambda d: d.update(merge_base="Z" * 40),
             "tree changed": lambda d: d.update(tree_unchanged_by_run=False),
             "expected lie": lambda d: d["commands"][0].update(exit=1),
-            "bad stale": lambda d: d.update(stale={"checked": "yes"}),
+            "bad supersedes": lambda d: d.update(supersedes="abc"),
         }
         original = out.read_text()
         for name, edit in cases.items():
@@ -850,13 +834,13 @@ class Lint(Base):
 
     def test_derived_outputs_are_named_one_line_each(self):
         derived = ["program/evidence/T-2/results.json", "program/evidence/T-2/acceptance.json",
-                   "program/evidence/T-2/report.md", "program/evidence/index.json", "program/claims/G-P1/a.json",
+                   "program/evidence/T-2/report.md", "program/evidence/T-2/latest.json", "program/claims/G-P1/a.json",
                    "program/status/T-2.json", "program/controller-state.json", "program/progress.md",
-                   "program/HANDOFF.md", "program/ledger.yaml", "program/changes/register-log.md",
+                   "program/HANDOFF.md", "program/changes/register-log.md",
                    "program/approvals/stage-6.json", "elsewhere/acceptance.json", "out/results.json"]
         allowed = ["src/app.py", "program/evidence/T-1/produce.py", "program/evidence/T-1/helpers.sh",
                    "program/evidence/tool.toml", "program/tasks/T-1/PLAN.md", "program/checks.yaml", "go.sum",
-                   "program/rulings.md"]
+                   "program/rulings.md", "program/ledger.yaml"]  # the requirements ledger is an input
         self.assertEqual(evidence.lint_record(self.record(derived + allowed)),
                          [f"binds a derived output: {path}" for path in sorted(derived)])
         self.assertEqual(evidence.lint_record(self.record(allowed)), [])
@@ -982,15 +966,18 @@ class StoreCommands(Base):
                           ("superseded", "results", first["digest"])])
         self.assertEqual(lines[0][-1], "decision accepted_development")
 
-    def test_init_command_creates_the_index_once(self):
+    def test_init_command_creates_nothing(self):
         with mock.patch.object(evidence, "find_root", return_value=self.root):
-            self.assertEqual(run_pk("evidence", "init")[1],
-                             f"evidence index created: {self.root / store.INDEX}\n")
-            self.assertEqual(run_pk("evidence", "init")[1],
-                             f"evidence index exists: {self.root / store.INDEX}\n")
+            self.assertEqual(run_pk("evidence", "init"),
+                             (0, "evidence: nothing to create; program/evidence/<ID>/latest.json appears with each "
+                                 "task's first record\n", ""))
+        self.assertFalse((self.root / store.BASE).exists())
 
-    def test_validate_without_a_record_checks_names_history_and_index(self):
+    def test_validate_without_a_record_checks_names_history_and_pointers(self):
         written = self.ready().write()
+        with mock.patch.object(evidence, "find_root", return_value=self.root):  # gated, evidence commit to come
+            self.assertEqual(run_pk("evidence", "validate"),
+                             (0, "evidence intact\n", f"warning: record pending commit: {written['path']}\n"))
         sh(self.root, "git", "add", "-A")
         sh(self.root, "git", "commit", "-q", "-m", "evidence")
         with mock.patch.object(evidence, "find_root", return_value=self.root):
@@ -1016,7 +1003,7 @@ class Import(Base):
                     "source_commit": read_json(written["file"])["head"], "accepted_at": "2026-10-08T00:00:00Z",
                     "role": "qa", "commands": [], "planted_bugs": [], "findings": [], "blocked_by": []}
         (folder / "acceptance.json").write_text(json.dumps(accepted))
-        (self.root / store.INDEX).unlink()  # a 0.1 project has no index
+        (self.root / store.pointer_path("T-1")).unlink()  # a 0.1 project has no pointer
         for path in self.appended():
             path.chmod(0o644)
             path.unlink()
@@ -1051,7 +1038,7 @@ class Import(Base):
         with self.assertRaisesRegex(KitError, "not a results record of task T-9"):
             evidence.import_legacy(self.root)
         self.assertEqual(self.appended(), [])
-        self.assertFalse((self.root / store.INDEX).exists())
+        self.assertFalse((self.root / store.pointer_path("T-1")).exists())
 
 
 if __name__ == "__main__":

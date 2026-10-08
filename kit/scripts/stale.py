@@ -4,7 +4,8 @@
 A results record is a fingerprint: at commit `head` these inputs, with these digests, produced this outcome. That
 claim stays true forever, so a later change never makes a record stale. What a later change does is make the
 record drift: its recorded input digests no longer equal the committed blobs of the tree being looked at. Only the
-latest record of each task counts (the one `program/evidence/index.json` points at); older records are history.
+latest record of each task counts (the one its pointer `program/evidence/<ID>/latest.json` names); older records are
+history. The tree compared with is always the checkout's HEAD (the gate's drift step and `pk stale` alike).
 A record is `fresh` when every input matches, else `drifted` (since its `head`), with the changed inputs listed.
 Drift is information for the reader, never a failure: `pk stale` prints the report and exits 0, unless
 `--strict` is given, when a drifted or unreadable record exits 1. Hashing goes through
@@ -86,7 +87,7 @@ def changed_inputs(root, sha: str, inputs: dict) -> dict[str, str | None]:
 
 
 def drift_report(root, ref: str = "HEAD") -> dict:
-    """Compare the latest results record of every task in the index with the tree of `ref`; return
+    """Compare the latest results record of every task's pointer with the tree of `ref`; return
     {ref, tasks, drifted, unreadable, checked}.
 
     `tasks` rows are {task_id, path, head, state: fresh or drifted, changed_inputs}; `drifted` counts the drifted

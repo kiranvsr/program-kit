@@ -29,7 +29,7 @@ BRANCH = f"task/{TASK}"
 GATE = "G-P1"
 EVIDENCE = f"program/evidence/{TASK}"
 RESULTS = f"{EVIDENCE}/results.json"  # the record's name in gates.yaml (a 0.1 path, which names the task)
-INDEX = store.INDEX
+INDEX = store.pointer_path(TASK)  # the task's pointer, the only mutable evidence file
 REPORT = f"{EVIDENCE}/report.md"
 STATUS = f"program/status/{TASK}.json"
 HANDBACK_OK = re.compile(re.escape(f"OK: {BRANCH} passes the hand-back gate at ") + r"([0-9a-f]{40})\Z")
@@ -173,7 +173,7 @@ class Project:
         assert (repo / "program" / "register.yaml").read_bytes() == (EXAMPLE / "artifacts" / "register.yaml").read_bytes()
         self.pk("briefs", "generate")
         self.pk("briefs", "check")
-        self.pk("evidence", "init")  # the empty pointer index, committed with the kit
+        assert "nothing to create" in self.pk("evidence", "init").stdout  # a pointer comes with its first record
         self.commit("install the kit and replay the recorded discovery")
 
         # Dispatch: SPEC, PLAN, review and the in_progress status go to main as one commit, then the worktree.
@@ -232,7 +232,7 @@ class EndToEndTests(unittest.TestCase):
         record = entry["path"]
         results_file = wt / record
         status = project.run(["git", "status", "--porcelain", "--untracked-files=all"], cwd=wt).stdout.splitlines()
-        self.assertEqual(sorted(status), sorted([f" M {INDEX}", f"?? {record}"]))  # the new record and the index, nothing else
+        self.assertEqual(sorted(status), sorted([f"?? {INDEX}", f"?? {record}"]))  # the record and its pointer alone
         project.pk("evidence", "validate", results_file, cwd=wt)
         self.assertIsNone(results["supersedes"])
         self.assertEqual(results["head"], gated)
@@ -248,7 +248,7 @@ class EndToEndTests(unittest.TestCase):
         self.assertIn("src/tiny_service.py", results["inputs"])
         self.assertIn(f"program/tasks/{TASK}/PLAN.md", results["inputs"])
 
-        # Evidence commit: the record, the index, the report and the status file, nothing else.
+        # Evidence commit: the record, its pointer, the report and the status file, nothing else.
         project.pk("status", "set", TASK, "review", "--role", "implementer", "--evidence", record, cwd=wt)
         report = ["# Report: " + TASK, "## Status", "DONE", "## Gate", lines[-1], "## Commands"]
         report += [f"- {' '.join(c['argv'])}: exit {c['exit']}" for c in results["commands"]]
@@ -264,7 +264,7 @@ class EndToEndTests(unittest.TestCase):
         drift = json.loads(project.pk("stale", "--strict", cwd=wt).stdout)
         self.assertEqual((drift["checked"], drift["drifted"]), (1, 0))
         self.assertEqual(drift["tasks"][0]["state"], "fresh")
-        project.pk("evidence", "validate", cwd=wt)  # names, history and index intact
+        project.pk("evidence", "validate", cwd=wt)  # names, history and pointers intact
         for path, digest in results["inputs"].items():
             self.assertEqual(sha256_bytes(project.run(["git", "show", f"{gated}:{path}"], cwd=wt).stdout.encode()),
                              digest)
@@ -312,7 +312,7 @@ class EndToEndTests(unittest.TestCase):
         project.git("merge", "--no-ff", "-q", "-m", f"Merge {TASK}", BRANCH)
         self.assertEqual(project.git("status", "--porcelain"), "")
         self.assertEqual(json.loads(project.pk("stale").stdout)["drifted"], 0)
-        project.pk("doctor")  # the evidence on main: every record named by its digest, none rewritten, all indexed
+        project.pk("doctor")  # the evidence on main: every record named by its digest, none rewritten, all pointed at
         self.assertIn(f"{TASK}\tdone", project.pk("status", "list").stdout)
         self.assertEqual(project.pk("status", "show", OTHER).stdout.count('"status": "not_started"'), 1)
         project.pk("status", "validate")

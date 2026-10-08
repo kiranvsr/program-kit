@@ -8,7 +8,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import evidence
 import pk
 import stale
 import store
@@ -42,11 +41,11 @@ class Base(unittest.TestCase):
         path.write_text(text)
 
     def record(self, task, inputs, **extra):
-        """Append a results record for `task` and point the index at it; its path."""
+        """Append a results record for `task` and point its pointer at it; its path."""
         return store.record(self.root, task, "results", {"task_id": task, "inputs": inputs, **extra})["path"]
 
     def raw_record(self, task, raw: bytes):
-        """Append bytes that are no usable record, and point the index at them."""
+        """Append bytes that are no usable record, and point the task's pointer at them."""
         appended = store.append(self.root, task, "results", raw)
         store.set_entry(self.root, task, "results", {"digest": appended["digest"], "path": appended["path"],
                                                      "head": "", "produced_at": ""})
@@ -144,7 +143,7 @@ class DriftReport(Base):
         with self.assertRaises(stale.KitError):
             stale.drift_report(self.root, "--all")
 
-    def test_no_index_checks_nothing(self):
+    def test_no_pointer_checks_nothing(self):
         sh(self.root, "git", "rm", "-rq", "program")
         self.commit("no evidence")
         report = stale.drift_report(self.root, "main")
@@ -218,21 +217,6 @@ class Cli(Base):
         code, out, _ = self.run_cli()
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(out)["ref"], sh(self.root, "git", "rev-parse", "HEAD").strip())
-
-
-class EvidenceIntegration(Base):
-    def test_evidence_stale_uses_the_real_module(self):
-        self.put("calc.py", "v2\n")
-        self.commit("change calc")
-        bad = self.raw_record("T-0", b"{not json")
-        self.commit("unreadable record")
-        ev = evidence.Evidence(self.root, "T-9")
-        got = ev.stale()
-        self.assertEqual(got["checked"], True)
-        self.assertEqual(got["records"], [{"task_id": "T-1", "path": self.path_of("T-1"), "head": "",
-                                           "state": "drifted", "changed_inputs": ["calc.py"]}])
-        self.assertEqual([r["path"] for r in got["unreadable"]], [bad])
-        self.assertEqual(ev.stale_result, got)
 
 
 if __name__ == "__main__":

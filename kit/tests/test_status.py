@@ -38,7 +38,7 @@ def git_repo(root) -> str:
 
 
 def raw_record(root, tid, kind, raw: bytes) -> str:
-    """Append bytes that are no usable record and point the index at them; their path."""
+    """Append bytes that are no usable record and point the task's pointer at them; their path."""
     appended = store.append(root, tid, kind, raw)
     entry = ({"digest": appended["digest"], "path": appended["path"], "head": "", "produced_at": ""}
              if kind == "results" else {"digest": appended["digest"], "path": appended["path"], "decision": "",
@@ -61,7 +61,7 @@ def results_record(task_id=TID, **over):
                              dict(row, id="self-test-noncompiling", builds=False, killed=False,
                                   kill_reason="build failed", test_output_sha256="", find="", replace="def (:")],
             "planted_bugs_all_killed": True, "all_commands_as_expected": True, "tree_unchanged_by_run": True,
-            "stale": {"checked": False, "records": []}, "blocked_by": [], "deviations": []}
+            "blocked_by": [], "deviations": []}
     data.update(over)
     return data
 
@@ -157,7 +157,7 @@ class StatusTests(unittest.TestCase):
 
     def test_review_to_done_only_qa_with_bound_acceptance(self):
         self.to_review()
-        self.refused("done needs an acceptance record in program/evidence/index.json", TID, "done", "qa")
+        self.refused(f"done needs an acceptance record in program/evidence/{TID}/latest.json", TID, "done", "qa")
         acceptance = self.evidence()
         for wrong in ("controller", "implementer"):
             self.refused("qa", TID, "done", wrong)

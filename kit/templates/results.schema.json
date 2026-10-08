@@ -1,9 +1,9 @@
 {
   "title": "program/evidence/<ID>/results/<utc>-<sha256[:12]>.json",
-  "description": "Appended by pk's evidence kit (Evidence.write), never modified, named by the sha256 of its bytes, pointed at by program/evidence/index.json while it is the task's latest, and checked by `pk evidence validate`. Its inputs never name a derived output (`pk evidence lint`). Only a gate record carries children. The checker enforces the same shape in code; its list of required keys is read from this file. This is the record the hand-back gate, the binding check and `pk status set ... done` accept: they refuse a planted-bug row without path, find, replace, build_argv or test_argv, where `pk evidence validate` alone checks those five only when a row carries them.",
+  "description": "Appended by pk's evidence kit (Evidence.write), never modified, named by the sha256 of its bytes, named by program/evidence/<ID>/latest.json while it is the task's latest, and checked by `pk evidence validate`. Its inputs never name a derived output (`pk evidence lint`). Only a gate record carries children. The checker enforces the same shape in code; its list of required keys is read from this file. This is the record the hand-back gate, the binding check and `pk status set ... done` accept: they refuse a planted-bug row without path, find, replace, build_argv or test_argv, where `pk evidence validate` alone checks those five only when a row carries them.",
   "type": "object",
   "required": ["task_id", "head", "main", "merge_base", "produced_at", "inputs", "commands", "planted_bugs",
-               "planted_bugs_all_killed", "all_commands_as_expected", "tree_unchanged_by_run", "stale",
+               "planted_bugs_all_killed", "all_commands_as_expected", "tree_unchanged_by_run",
                "blocked_by", "deviations"],
   "properties": {
     "task_id": {"type": "string"},
@@ -60,11 +60,6 @@
     "planted_bugs_all_killed": {"type": "boolean", "description": "over the rows except the self-test row"},
     "all_commands_as_expected": {"type": "boolean"},
     "tree_unchanged_by_run": {"type": "boolean", "description": "clean at the start, clean at the end, same HEAD"},
-    "stale": {
-      "type": "object",
-      "required": ["checked", "records"],
-      "properties": {"checked": {"type": "boolean"}, "records": {"type": "array"}}
-    },
     "blocked_by": {"type": "array", "items": {"type": "string"}},
     "deviations": {"type": "array", "items": {"type": "string"}},
     "supersedes": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$",
