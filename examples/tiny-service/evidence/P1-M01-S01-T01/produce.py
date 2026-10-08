@@ -1,8 +1,9 @@
-"""Produce program/evidence/P1-M01-S01-T01/results.json for this task.
+"""Append a results record for this task to program/evidence/P1-M01-S01-T01/results/.
 
 Run by the hand-back gate from the clean task worktree: python3 program/evidence/P1-M01-S01-T01/produce.py
 It records the head and main commits, the hash of every input, each PLAN command exactly as written with its
-real exit code, and the planted bugs the unit tests must catch.
+real exit code, and the planted bugs the unit tests must catch. The record is named by its digest, never
+rewritten, and program/evidence/<ID>/latest.json then points at it as the task's latest record.
 """
 import re
 import sys
@@ -43,8 +44,7 @@ def main():
         run.run_command(" ".join(argv), argv, expect=expect, parse=tests_run if "unittest" in argv else None)
     table = [dict(bug, test_args=TEST_ARGS) for bug in PLANTED_BUGS]
     run.planted_bugs(table, build=BUILD, test=TEST)
-    run.stale()
-    run.write(Path("program") / "evidence" / TASK / "results.json")
+    run.write()
 
 
 if __name__ == "__main__":

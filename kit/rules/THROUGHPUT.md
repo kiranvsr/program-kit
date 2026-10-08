@@ -7,8 +7,8 @@ Rework and token cost, not coding, are what slow a program down. These rules exi
 - QA starts once the branch's evidence reflects current main.
 - When QA accepts, the controller merges that branch next. No other code merge to main happens in between. Documentation-only hand-off commits are fine.
 - Accepted branches merge one at a time, in the order they were accepted.
-- If main moved without touching a branch's hashed inputs and `git merge-tree --write-tree main <branch>` is clean, the branch does not re-merge or re-produce its evidence. Any overlap means merge main, re-produce, then QA.
-- Stale evidence is never chased one merge at a time. Each merge appends the stale list, and the records are re-bound later in one batch by one runner.
+- If main moved without touching a branch's own hashed inputs and `git merge-tree --write-tree main <branch>` is clean, the branch does not re-merge or re-produce its evidence. Any overlap means merge main, re-run the gate (it appends a new record when the task's own inputs changed), then QA.
+- A record never goes stale: it says what was verified at its head. A merge never starts a re-bind; `pk stale` reports drift for the reader, and each task refreshes only its own record, by appending one, when its own work changes.
 
 ## Hand-back gate before QA
 

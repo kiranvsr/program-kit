@@ -3,21 +3,30 @@
 
 `Evidence(root, task_id)` records HEAD, the main branch and their merge-base, hashes inputs from
 the committed blobs (never the working copy), runs commands as argv lists and records what they
-really did, runs planted bugs on a throwaway mirror of HEAD, and writes `results.json` only when
-every honesty precondition holds. `pk evidence validate <results.json>` re-checks the invariants;
+really did, runs planted bugs on a throwaway mirror of HEAD, and appends a results record to the
+task's committed, append-only record directory (`store.py`) only when every honesty precondition holds; the
+task's pointer `program/evidence/<ID>/latest.json` then names it as the latest record, and the record it replaces
+stays as history (`supersedes` names it). A record is a fingerprint: at commit `head` these inputs produced this
+outcome. A later change never makes it stale; it only drifts from the tree at the checkout's HEAD (`pk stale`), and
+the record carries no stale field. `pk evidence validate <record>` re-checks the invariants;
 `gate_problems` adds what the hand-back gate, the binding check and `done` require on top of them.
 `results.schema.json` describes the record those three accept: its planted-bug rows require ROW_KEYS
 and PLANTED_KEYS, and `validate` refuses a row that lacks any of them.
+`lint_record` keeps the evidence graph acyclic: a record binds only inputs that can change its outcome,
+never a derived output (another record, an acceptance, a gate result, a status snapshot, a ledger, a claim
+document or anything under `program/evidence/` but its tooling); only a gate record binds other records, by
+digest (each child row says whether that child had drifted from the tree the gate ran on), and nothing binds a
+gate record.
 The kit never assumes a language: the caller passes the build and test argv lists.
 
 Known limits:
-- A record edited consistently by hand still validates; binding it to the commit and re-running
-  its commands is the reviewer's job.
+- A record edited consistently by hand, renamed to its new digest and pointed at, still validates;
+  binding it to the commit and re-running its commands is the reviewer's job.
 - Gitignored files written by a command are invisible to the clean-tree check.
 - `write` accepts zero commands and surviving planted bugs; the hand-back gate rejects them.
 - The runner cannot know that a test command is not a test, or that a mutant only failed to import.
   Every planted-bug row therefore records the file, the edit and the build and test argv, so a
-  reviewer can see it in results.json.
+  reviewer can see it in the record.
 """
 from __future__ import annotations
 
@@ -31,7 +40,9 @@ import tempfile
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Callable
 
-from common import KitError, git, read_json, run_argv, sha256_bytes, utc_now, write_json
+import store
+from common import KitError, find_root, git, read_json, run_argv, sha256_bytes, utc_now
+from register import GATE_ID
 
 SELF_TEST_ID = "self-test-noncompiling"
 BROKEN_LINE = "def (:"  # cannot parse (Python) or compile (any compiled language)
@@ -49,6 +60,12 @@ _HEX40 = re.compile(r"[0-9a-f]{40}\Z")
 _HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 _STAMP = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\Z")
 _REF = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._/-]*\Z")
+_TOOLING = (".py", ".sh", ".toml")  # what may be bound under program/evidence/: produce.py and its helpers
+_DERIVED_DIRS = ("program/evidence/", "program/claims/", "program/status/", "program/approvals/")
+_DERIVED_FILES = ("program/controller-state.json", "program/progress.md", "program/HANDOFF.md",
+                  "program/changes/register-log.md")
+_RECORD_NAMES = ("results.json", "acceptance.json")
+DECISIONS = ("accepted_development", "rejected")
 
 
 def required_keys(name: str) -> list[str]:
@@ -131,9 +148,9 @@ class Evidence:
         self.commands: list[dict] = []
         self.planted_bug_rows: list[dict] = []
         self._mirror: Path | None = None  # the mirror this instance created and may restore
-        self.stale_result: dict = {"checked": False, "records": []}
         self.blocked_by: list[str] = []
         self.deviations: list[str] = []
+        self.children: list[dict] = []  # a gate record's child records, by digest
 
     # --- tree ------------------------------------------------------------------
 
@@ -458,38 +475,53 @@ class Evidence:
                 "test_output_sha256": digest if code is not None else "",
                 **self._planted(first["path"], "", BROKEN_LINE, build, argv)}
 
-    # --- stale -----------------------------------------------------------------
+    # --- child records (gate records only) ----------------------------------------
 
-    def stale(self, main: str | None = None) -> dict:
-        """List records whose hashed inputs changed on `main` (delegates to stale.py) and remember the result."""
-        try:
-            import stale as stale_module  # lazy: stale.py arrives with the stale-check task
-        except ModuleNotFoundError as exc:
-            if exc.name not in (None, "stale"):
-                raise KitError(f"stale check unavailable: {exc}") from exc
-            raise KitError("stale check unavailable: kit/scripts/stale.py is missing") from exc
-        except ImportError as exc:
-            raise KitError(f"stale check unavailable: {exc}") from exc
-        report = stale_module.stale_records(self.root, main or self.main)
-        self.stale_result = {"checked": True, "records": list(report.get("stale", [])),
-                             "unreadable": list(report.get("unreadable", []))}
-        return self.stale_result
+    def bind_children(self, task_ids: list[str]) -> list[dict]:
+        """Bind the latest results and acceptance record of each task by digest (a gate record only).
+
+        Each child must have a results record its pointer names; its acceptance is bound when there is one. A record
+        whose bytes no longer match its pointer is refused. Each row records the child's drift at HEAD: `fresh` when
+        every input of its results record is unchanged, else `drifted`. Drift is information for the reader, never
+        a failure. Returns the rows added to `self.children`.
+        """
+        import stale as stale_module  # lazy: stale imports nothing from here, but keep the module graph flat
+
+        if not is_gate(self.task_id):
+            raise KitError(f"{self.task_id} is not a gate: only a gate record binds other records")
+        index = store.read_index(self.root)
+        added = []
+        for task_id in task_ids:
+            if is_gate(task_id):
+                raise KitError(f"binds a gate record: {task_id} (nothing may bind a gate record)")
+            if store.latest(index, task_id, "results") is None:
+                raise KitError(f"{task_id} has no results record in {store.pointer_path(task_id)}")
+            entry = store.latest(index, task_id, "results")
+            inputs = store.load(self.root, entry["path"], entry["digest"]).get("inputs")
+            changed = stale_module.changed_inputs(self.root, self.head, inputs if isinstance(inputs, dict) else {})
+            drift = "drifted" if changed or not isinstance(inputs, dict) else "fresh"
+            for kind in store.KINDS:
+                entry = store.latest(index, task_id, kind)
+                if entry is not None:
+                    store.load(self.root, entry["path"], entry["digest"])
+                    added.append({"task_id": task_id, "kind": kind, "digest": entry["digest"], "drift": drift})
+        self.children = [*self.children, *added]
+        return added
 
     # --- write -----------------------------------------------------------------
 
-    def write(self, path: Path) -> None:
-        """Write results.json, or raise KitError listing every reason it refused (nothing is written).
+    def write(self, path=None) -> dict:
+        """Append the results record to `program/evidence/<task>/results/` and point the task's pointer at it; return
+        {digest, path (relative to the root), file}. Raise KitError listing every reason it refused (nothing is
+        appended and the pointer is untouched).
 
-        The checks run before the file is written, so writing it does not count as dirtying the tree.
+        The checks run before anything is written, so the new record and pointer do not count as dirtying the tree.
+        The record names the task's previous latest results record as `supersedes` (null for the first one).
         """
+        if path is not None:
+            raise KitError("Evidence.write takes no path since program-kit 0.2.0: the record is appended to "
+                           "program/evidence/<ID>/results/ and program/evidence/<ID>/latest.json points at it")
         reasons: list[str] = []
-        out = Path(path)
-        if not out.is_absolute():
-            out = self.root / out
-        try:
-            Path(os.path.realpath(out)).relative_to(Path(os.path.realpath(self.root)))
-        except ValueError:
-            reasons.append(f"output path is outside the root: {path}")
         now_dirty = self._dirty_paths()
         head_now = git(self.root, "rev-parse", "HEAD")
         if self.start_dirty:
@@ -511,6 +543,13 @@ class Evidence:
                 reasons.append(f"self-test row {SELF_TEST_ID} is missing")
         if not self.inputs:
             reasons.append("no inputs hashed (call hash_inputs)")
+        previous = None
+        try:
+            store.check_task(self.task_id)
+            entry = store.read_pointer(self.root, self.task_id).get("results")
+            previous = entry["digest"] if entry is not None else None
+        except KitError as exc:
+            reasons.append(str(exc))
         if reasons:
             raise KitError("; ".join(reasons))
         data = {
@@ -519,13 +558,18 @@ class Evidence:
             "planted_bugs": list(self.planted_bug_rows),
             "planted_bugs_all_killed": all(row["killed"] for row in bugs),
             "all_commands_as_expected": all(cmd["as_expected"] for cmd in self.commands),
-            "tree_unchanged_by_run": True, "stale": dict(self.stale_result),
+            "tree_unchanged_by_run": True,
             "blocked_by": list(self.blocked_by), "deviations": list(self.deviations),
+            "supersedes": previous,
         }
-        problems = validate_results(data)  # last line of defence: never write what validate would refuse
+        if self.children:
+            data["children"] = [dict(child) for child in self.children]
+        # last line of defence: never append what validate or the lint would refuse
+        problems = validate_results(data) + lint_record(data, self.root)
         if problems:
             raise KitError("; ".join(problems))
-        write_json(out, data)
+        appended = store.record(self.root, self.task_id, "results", data)
+        return {key: appended[key] for key in ("digest", "path", "file")}
 
 
 # --- validation ------------------------------------------------------------------
@@ -581,10 +625,6 @@ def validate_results(data) -> list[str]:
     for key in ("blocked_by", "deviations"):
         if not _str_list(data[key]):
             bad(key, "must be a list of strings")
-    stale = data["stale"]
-    if not (isinstance(stale, dict) and isinstance(stale.get("checked"), bool)
-            and isinstance(stale.get("records"), list)):
-        bad("stale", "must be {checked: bool, records: list}")
 
     commands = data["commands"]
     if not isinstance(commands, list):
@@ -656,19 +696,95 @@ def validate_results(data) -> list[str]:
         bad("planted_bugs_all_killed", "does not match the planted-bug rows (self-test row excluded)")
     if data["tree_unchanged_by_run"] is False:
         bad("tree_unchanged_by_run", "is false: the run changed the tree, so this is not valid evidence")
+    supersedes = data.get("supersedes")
+    if supersedes is not None and not (isinstance(supersedes, str) and _HEX64.match(supersedes)):
+        bad("supersedes", "must be the 64-character sha256 of the record it replaces, or null")
+    children = data.get("children", [])
+    if not isinstance(children, list) or not all(
+            isinstance(child, dict) and set(child) == {"task_id", "kind", "digest", "drift"}
+            and isinstance(child["task_id"], str) and child["kind"] in store.KINDS
+            and isinstance(child["digest"], str) and _HEX64.match(child["digest"])
+            and child["drift"] in ("fresh", "drifted") for child in children):
+        bad("children", "must be a list of {task_id, kind: results or acceptance, digest: sha256, "
+                        "drift: fresh or drifted}")
     return problems
 
 
-def gate_problems(data, task_id: str, head: str | None = None) -> list[str]:
+def is_gate(task_id) -> bool:
+    """Whether a record of `task_id` is a gate record: its task is a gate (`G-<NAME>`, as in gates.yaml)."""
+    return isinstance(task_id, str) and GATE_ID.match(task_id) is not None
+
+
+def derived_output(path: str) -> bool:
+    """Whether a hashed input is a derived output that no record may bind (rule 12)."""
+    pure = PurePosixPath(path)
+    if path.startswith("program/evidence/"):
+        return pure.suffix not in _TOOLING
+    return (pure.name in _RECORD_NAMES or path in _DERIVED_FILES
+            or any(path.startswith(prefix) for prefix in _DERIVED_DIRS))
+
+
+def lint_record(data, root=None) -> list[str]:
+    """Why a results record makes the evidence graph cyclic (empty when it does not).
+
+    One `binds a derived output: <path>` line per offending input. Only a gate record binds other records,
+    by digest (`children`), and no record binds a gate record. `root` is accepted for symmetry with the other
+    checks; the rules do not depend on the checkout.
+    """
+    if not isinstance(data, dict):
+        return []
+    inputs = data.get("inputs")
+    problems = [f"binds a derived output: {path}" for path in sorted(inputs)
+                if derived_output(path)] if isinstance(inputs, dict) else []
+    children = data.get("children") or []
+    if not isinstance(children, list):
+        return problems
+    if children and not is_gate(data.get("task_id")):
+        problems.append(f"binds child records but {data.get('task_id')} is not a gate: only a gate record binds "
+                        "other records")
+    for child in children:
+        if isinstance(child, dict) and is_gate(child.get("task_id")):
+            problems.append(f"binds a gate record: {child['task_id']} (nothing may bind a gate record)")
+    return problems
+
+
+def validate_acceptance(data) -> list[str]:
+    """Every problem found in an acceptance record (empty when valid)."""
+    if not isinstance(data, dict):
+        return ["acceptance must be a JSON object"]
+    problems = [f"missing key: {key}" for key in required_keys("acceptance") if key not in data]
+    if problems:
+        return problems
+    if not isinstance(data["task_id"], str) or not data["task_id"]:
+        problems.append("task_id: must be a non-empty string")
+    if data["decision"] not in DECISIONS:
+        problems.append(f"decision: must be one of {', '.join(DECISIONS)}")
+    if not isinstance(data["evidence_sha256"], str) or not _HEX64.match(data["evidence_sha256"]):
+        problems.append("evidence_sha256: must be the 64-character digest of the results record it binds")
+    if not isinstance(data["source_commit"], str) or not _HEX40.match(data["source_commit"]):
+        problems.append("source_commit: must be a 40-character lowercase hex SHA")
+    if not isinstance(data["accepted_at"], str) or not _STAMP.match(data["accepted_at"]):
+        problems.append("accepted_at: must be UTC, YYYY-MM-DDTHH:MM:SSZ")
+    if data["role"] != "qa":
+        problems.append("role: must be qa")
+    for key in ("commands", "planted_bugs", "findings", "blocked_by"):
+        if not isinstance(data[key], list):
+            problems.append(f"{key}: must be a list")
+    return problems
+
+
+def gate_problems(data, task_id: str, head: str | None = None, root=None) -> list[str]:
     """Why a results record does not pass the hand-back gate (empty when it does); `head` None skips the head check.
 
     On top of `validate_results`: the record is this task's, bound to `head`, every command was as expected,
-    it holds at least one command, every planted bug was killed, and every planted-bug row says what was
-    planted and which commands judged it. The binding check and `pk status set ... done` apply the same rules.
+    it holds at least one command, every planted bug was killed, every planted-bug row says what was
+    planted and which commands judged it, and the lint finds no derived output among its inputs. The binding
+    check and `pk status set ... done` apply the same rules.
     """
     problems = validate_results(data)
     if problems:
         return problems
+    problems.extend(lint_record(data, root))
     if data["task_id"] != task_id:
         problems.append(f"task_id: is {data['task_id']}, expected {task_id}")
     if head is not None and data["head"] != head:
@@ -689,23 +805,195 @@ def gate_problems(data, task_id: str, head: str | None = None) -> list[str]:
 
 # --- command -----------------------------------------------------------------------
 
-def cmd_evidence(args: argparse.Namespace) -> int:
-    if getattr(args, "evidence_action", None) != "validate":
-        raise KitError("evidence needs an action: validate")
-    path = Path(args.results)
-    problems = validate_results(read_json(path))
+def _store_kind(path: Path) -> str | None:
+    """`results` or `acceptance` for a file named like a record in a directory of that kind, else None."""
+    if store._NAME.match(path.name) and path.parent.name in store.KINDS:
+        return path.parent.name
+    return None
+
+
+def _errors(problems: list[str]) -> int:
+    print("\n".join("error: " + " ".join(problem.split()) for problem in problems), file=sys.stderr)
+    return 1
+
+
+def _root_or_none():
+    try:
+        return find_root()
+    except KitError:
+        return None
+
+
+def _validate(args) -> int:
+    if args.record is None:  # the whole evidence tree: names, history and pointers
+        root = find_root()
+        problems, pending = store.check(root, args.base)
+        for path, _ in pending:
+            print(f"warning: record pending commit: {path}", file=sys.stderr)
+        if problems:
+            return _errors(problems)
+        print("evidence intact" + (f" since {args.base}" if args.base else ""))
+        return 0
+    path = Path(args.record)
+    kind = _store_kind(path)
+    if kind is not None:
+        try:
+            raw = path.read_bytes()
+        except OSError as exc:
+            raise KitError(f"cannot read {path}: {exc.strerror or exc}") from exc
+        problem = store.altered(path.name, raw)
+        if problem:
+            return _errors([problem.replace(path.name, str(path), 1)])
+    data = read_json(path)
+    problems = validate_acceptance(data) if kind == "acceptance" else validate_results(data)
     if problems:
-        print("\n".join("error: " + problem for problem in problems), file=sys.stderr)
-        return 1
+        return _errors(problems)
     print(f"evidence valid: {path}")
     return 0
 
 
+def _lint(args) -> int:
+    path = Path(args.record)
+    problems = lint_record(read_json(path), _root_or_none())
+    if problems:
+        return _errors(problems)
+    print(f"lint: {path} binds only inputs")
+    return 0
+
+
+def _history(args) -> int:
+    rows = store.history(find_root(), args.task_id)
+    if not rows:
+        print(f"{args.task_id}: no records under program/evidence/{args.task_id}/")
+        return 0
+    for row in rows:
+        state = "current" if row["current"] else "superseded"
+        when = ("produced_at " if row["kind"] == "results" else "accepted_at ") + (row["at"] or "-")
+        fields = [state, row["kind"], row["digest"], f"head {row['head'] or '-'}", when]
+        if row["kind"] == "acceptance":
+            fields.append(f"decision {row['decision'] or '-'}")
+        if row["altered"]:
+            fields.append(row["altered"])
+        print("\t".join(fields))
+    return 0
+
+
+def accept(root, task_id: str, data) -> dict:
+    """Append an acceptance record for `task_id` and point the task's pointer at it; refuse one that does not bind the
+    latest results record (by digest and by its head). A re-acceptance after a refresh appends again; nothing is
+    rewritten. Returns the append result."""
+    problems = validate_acceptance(data)
+    if problems:
+        raise KitError("; ".join(problems))
+    if data["task_id"] != task_id:
+        raise KitError(f"acceptance names task {data['task_id']}, not {task_id}")
+    found = store.load_latest(root, task_id, "results")
+    if found is None:
+        raise KitError(f"{task_id} has no results record in {store.pointer_path(task_id)}")
+    entry, record = found
+    if data["evidence_sha256"] != entry["digest"]:
+        raise KitError(f"acceptance does not bind the latest results record: it binds {data['evidence_sha256']}, "
+                       f"the latest is {entry['digest']}")
+    if data["source_commit"] != record.get("head"):
+        raise KitError(f"acceptance source_commit {data['source_commit']} is not {record.get('head')}, the head "
+                       "the latest results record names")
+    return store.record(root, task_id, "acceptance", data)
+
+
+def _accept(args) -> int:
+    root = find_root()
+    appended = accept(root, args.task_id, read_json(Path(args.acceptance)))
+    print(f"acceptance {appended['digest']} appended: {appended['path']}")
+    return 0
+
+
+def import_legacy(root) -> tuple[list[str], list[str]]:
+    """Copy every 0.1 `program/evidence/<ID>/results.json` and `acceptance.json` into the append-only layout
+    (`program/evidence/<ID>/results/` and `acceptance/`), byte for byte, as the first history entry, and point the
+    task's pointer at them; ([lines describing what was imported], [paths to git rm]).
+
+    A record the pointer already names (same digest) is not copied again. Every file is read and checked
+    before anything is appended. The originals are never deleted.
+    """
+    root = Path(root)
+    index = store.read_index(root)
+    base = root / "program" / "evidence"
+    plan, legacy = [], []
+    for folder in sorted(base.iterdir()) if base.is_dir() else []:
+        if not folder.is_dir():
+            continue
+        for kind in store.KINDS:
+            source = folder / f"{kind}.json"
+            if not source.is_file():
+                continue
+            rel = source.relative_to(root).as_posix()
+            legacy.append(rel)
+            store.check_task(folder.name)
+            raw = source.read_bytes()
+            data = read_json(source)
+            if not isinstance(data, dict) or data.get("task_id") != folder.name:
+                raise KitError(f"{rel}: not a {kind} record of task {folder.name}; nothing was imported")
+            current = store.latest(index, folder.name, kind)
+            if current is not None and current["digest"] == sha256_bytes(raw):
+                continue
+            if current is not None:
+                raise KitError(f"{rel}: {store.pointer_path(folder.name)} already names another {kind} record; "
+                               "nothing was imported")
+            plan.append((folder.name, kind, raw, rel))
+    done = []
+    for task_id, kind, raw, rel in plan:
+        appended = store.record(root, task_id, kind, raw)
+        done.append(f"imported {rel} as {appended['path']}")
+    return done, legacy
+
+
+def _import(args) -> int:
+    root = find_root()
+    done, legacy = import_legacy(root)
+    for line in done:
+        print(line)
+    print(f"{len(done)} record(s) imported; commit them with each task's {store.POINTER}")
+    if legacy:
+        print("the originals stay; remove them from the repository by exact path:")
+        for rel in legacy:
+            print(f"git rm {rel}")
+    return 0
+
+
+def _init(args) -> int:
+    find_root()
+    print(f"evidence: nothing to create; program/evidence/<ID>/{store.POINTER} appears with each task's first record")
+    return 0
+
+
+ACTIONS = {"init": _init, "validate": _validate, "lint": _lint, "history": _history, "accept": _accept,
+           "import": _import}
+
+
+def cmd_evidence(args: argparse.Namespace) -> int:
+    action = ACTIONS.get(getattr(args, "evidence_action", None))
+    if action is None:
+        raise KitError("evidence needs an action: " + ", ".join(ACTIONS))
+    return action(args)
+
+
 def _configure(parser: argparse.ArgumentParser) -> None:
     actions = parser.add_subparsers(dest="evidence_action", metavar="action", parser_class=type(parser))
-    checker = actions.add_parser("validate", help="check a results.json against the schema and its invariants")
-    checker.add_argument("results", metavar="results.json", help="path to the results file")
+    actions.add_parser("init", help="nothing to create: a task's pointer appears with its first record")
+    checker = actions.add_parser("validate", help="check one record against its schema and invariants (and its "
+                                                  "name), or, with no record, every record, the history and the pointers")
+    checker.add_argument("record", metavar="record.json", nargs="?", help="path to one record")
+    checker.add_argument("--base", metavar="REF", help="check the history from REF only (default: all of it)")
+    linter = actions.add_parser("lint", help="refuse a results record that binds a derived output")
+    linter.add_argument("record", metavar="results.json", help="path to the results record")
+    lister = actions.add_parser("history", help="every record of a task, newest first")
+    lister.add_argument("task_id", metavar="ID")
+    accepter = actions.add_parser("accept", help="append QA's acceptance record (it must bind the latest results)")
+    accepter.add_argument("task_id", metavar="ID")
+    accepter.add_argument("acceptance", metavar="acceptance.json", help="the acceptance QA wrote, outside the repo")
+    actions.add_parser("import", help="copy 0.1 program/evidence/<ID>/*.json into the append-only layout and build "
+                                      "the pointers")
 
 
 def register(add_command) -> None:
-    add_command("evidence", cmd_evidence, help="evidence records: validate", configure=_configure)
+    add_command("evidence", cmd_evidence, help="evidence records: " + ", ".join(ACTIONS), configure=_configure)

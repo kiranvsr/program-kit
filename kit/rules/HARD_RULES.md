@@ -12,7 +12,7 @@ These rules hold for every agent in every role, in every stage. If a rule seems 
 
 ## Status, register and frozen artifacts
 
-6. Only QA sets a task `done`, and only through `pk status set <ID> done --role qa --evidence ...`.
+6. Only QA sets a task `done`, and only through `pk status set <ID> done --role qa`, after `pk evidence accept` appended an acceptance of the latest results record.
 7. Record every register edit with `pk register change --note TEXT`, or with `pk change apply CR-NNN --note TEXT` when the edit carries out an approved change request. Never hand-edit status files, approvals or generated briefs.
 8. Briefs are immutable once approved.
 9. A frozen artifact (anything approved at stage 5 or later) changes only through a change request. See `kit/playbooks/10_change.md`.

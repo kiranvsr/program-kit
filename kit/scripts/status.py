@@ -3,11 +3,12 @@
 
 A task with no record is `not_started`. Every transition is checked in full
 before anything is written, so a refusal leaves no file behind, and only a task
-the register lists can be given a status. `done` is terminal and needs an
-acceptance file that accepts (`decision: accepted_development`), names this
-task, and is bound by hash to a current results.json the hand-back gate would
-pass. The role is a flag the caller passes: the machine checks which role may
-make a move, not who is typing.
+the register lists can be given a status. `done` is terminal and needs the task's
+latest acceptance record (through its pointer `program/evidence/<ID>/latest.json`) to accept
+(`decision: accepted_development`), to name this task, and to bind by digest the
+task's latest results record, which the hand-back gate would pass and whose `head`
+is an ancestor of HEAD. The role is a flag the caller passes: the machine checks
+which role may make a move, not who is typing.
 """
 from __future__ import annotations
 
@@ -19,7 +20,8 @@ from pathlib import Path
 
 import evidence as evidence_module
 import register as register_module
-from common import KitError, find_root, read_json, sha256_file, utc_now, write_json
+import store
+from common import KitError, find_root, read_json, run_argv, utc_now, write_json
 
 STATUSES = ("not_started", "in_progress", "review", "done", "blocked", "parked")
 ROLES = ("controller", "implementer", "qa")
@@ -178,43 +180,51 @@ def _registered(root: Path) -> set[str]:
     return found
 
 
-def _acceptance_problem(root: Path, task_id: str, evidence: list[str]) -> str | None:
-    """Why `evidence` does not accept `task_id`, or None.
+def _acceptance_problem(root: Path, task_id: str) -> str | None:
+    """Why the task's evidence does not accept it, or None.
 
-    None only when the acceptance file is listed, has every key acceptance.schema.json requires, accepts
-    (`decision` is `accepted_development`), is QA's and this task's, binds the current results.json by hash,
-    that results.json passes the checks of the hand-back gate (`evidence.gate_problems`), and the acceptance's
-    `source_commit` is the commit that record names as its `head`.
+    None only when the task's pointer names a latest acceptance and a latest results record, both present
+    with their pointed-at digests; the acceptance has every key acceptance.schema.json requires, accepts
+    (`decision` is `accepted_development`), is QA's and this task's, and binds the latest results record by
+    digest; that record passes the checks of the hand-back gate (`evidence.gate_problems`); the acceptance's
+    `source_commit` is the `head` the record names; and that `head` is an ancestor of HEAD. Drift since `head`
+    does not matter: the record says what was verified there.
     """
-    acceptance = f"program/evidence/{task_id}/acceptance.json"
-    results = f"program/evidence/{task_id}/results.json"
-    if acceptance not in [_norm(root, item) for item in evidence]:
-        return f"{task_id}: done needs {acceptance} among the evidence paths"
-    bound = read_json(Path(root) / acceptance)
-    missing = [key for key in evidence_module.required_keys("acceptance")
-               if not isinstance(bound, dict) or key not in bound]
+    try:
+        index = {"tasks": {task_id: store.read_pointer(root, task_id)}}
+    except KitError as exc:
+        return f"{task_id}: {exc}"
+    acceptance = store.latest(index, task_id, "acceptance")
+    results = store.latest(index, task_id, "results")
+    if acceptance is None:
+        return f"{task_id}: done needs an acceptance record in {store.pointer_path(task_id)} (pk evidence accept)"
+    if results is None:
+        return f"{task_id}: done needs a results record in {store.pointer_path(task_id)}"
+    label = f"latest acceptance {acceptance['path']}"
+    bound = store.load(root, acceptance["path"], acceptance["digest"])
+    missing = [key for key in evidence_module.required_keys("acceptance") if key not in bound]
     if missing:
-        return f"{task_id}: {acceptance}: missing {', '.join(missing)}"
+        return f"{task_id}: {label}: missing {', '.join(missing)}"
     if bound["decision"] != ACCEPTED:
-        return f"{task_id}: {acceptance}: decision is {bound['decision']!r}, not {ACCEPTED!r}"
+        return f"{task_id}: {label}: decision is {bound['decision']!r}, not {ACCEPTED!r}"
     for key, expected in (("task_id", task_id), ("role", "qa")):
         if bound[key] != expected:
-            return f"{task_id}: {acceptance}: {key} is {bound[key]!r}, not {expected!r}"
+            return f"{task_id}: {label}: {key} is {bound[key]!r}, not {expected!r}"
     claimed = bound["evidence_sha256"]
-    if not isinstance(claimed, str) or not claimed:
-        return f"{task_id}: {acceptance} has no evidence_sha256"
-    actual = sha256_file(Path(root) / results)
-    if claimed != actual:
-        return (f"{task_id}: {acceptance} binds evidence_sha256 {claimed} but {results} hashes to {actual}; "
-                f"acceptance is stale")
-    record = read_json(Path(root) / results)
-    problems = evidence_module.gate_problems(record, task_id)
+    if claimed != results["digest"]:
+        return (f"{task_id}: acceptance does not bind the latest results record: {label} binds {claimed!r}, "
+                f"the latest results record is {results['digest']}")
+    record = store.load(root, results["path"], results["digest"])
+    problems = evidence_module.gate_problems(record, task_id, root=root)
     if problems:
         more = f" (and {len(problems) - 1} more; run pk evidence validate)" if len(problems) > 1 else ""
-        return f"{task_id}: {results}: {problems[0]}{more}"
+        return f"{task_id}: {results['path']}: {problems[0]}{more}"
     if bound["source_commit"] != record["head"]:
-        return (f"{task_id}: {acceptance}: source_commit is {bound['source_commit']!r}, not {record['head']}, "
-                f"the head {results} names")
+        return (f"{task_id}: {label}: source_commit is {bound['source_commit']!r}, not {record['head']}, "
+                f"the head {results['path']} names")
+    code, _ = run_argv(["git", "-C", str(root), "merge-base", "--is-ancestor", record["head"], "HEAD"], Path(root))
+    if code != 0:
+        return f"{task_id}: {results['path']}: head {record['head']} is not an ancestor of HEAD"
     return None
 
 
@@ -250,7 +260,7 @@ def transition(root: Path, task_id: str, to: str, role: str, note: str = "",
         if item and item not in merged:
             merged.append(item)
     if to == "done":
-        problem = _acceptance_problem(root, task_id, merged)
+        problem = _acceptance_problem(root, task_id)
         if problem:
             raise KitError(problem)
     now = utc_now()
@@ -294,7 +304,7 @@ def validate(root: Path) -> list[str]:
             problems.append(f"{name}: blocked without blocked_by")
         if state == "done":
             try:
-                problem = _acceptance_problem(root, name, evidence)
+                problem = _acceptance_problem(root, name)
             except KitError as exc:
                 problem = f"{name}: {exc}"
             if problem:

@@ -24,12 +24,12 @@ $ python3 src/tiny_service.py --port abc # expect 2
 
 - The three commands above end as expected: 0, 0 and 2.
 - Every failure-mode row in the SPEC has a passing test.
-- The hand-back gate prints its OK line; `results.json` has every planted bug killed.
+- The hand-back gate prints its OK line; the results record has every planted bug killed.
 - The report is in `program/evidence/P1-M01-S01-T01/report.md`.
 
 ## Gate Evidence
 
-Feeds G-P1 with `program/evidence/P1-M01-S01-T01/results.json` and QA's `acceptance.json`. It can honestly claim REQ-001 to REQ-005 and NFR-001 in the dev environment. Nothing is claimed for staging, which does not exist.
+Feeds G-P1 with the task's latest results record and QA's acceptance of it. It can honestly claim REQ-001 to REQ-005 and NFR-001 in the dev environment. Nothing is claimed for staging, which does not exist.
 
 ## Rollout And Rollback
 

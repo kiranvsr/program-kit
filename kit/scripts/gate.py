@@ -5,8 +5,9 @@
 controller's independent run before every merge: the guarded-file check, the SPEC, PLAN and review.md
 identity check, then the build, the tests and the scans on the trial merge, so a branch whose implementer
 skipped the hand-back gate still cannot reach main. `claims` and `validate_claims` keep
-`program/claims/<GATE>/*.json` equal to a recomputation from `gates.yaml`, each record's
-`acceptance.json` and `environments.yaml`.
+`program/claims/<GATE>/*.json` equal to a recomputation from `gates.yaml`, the latest results and acceptance
+record of each task the gate names (read through each task's pointer `program/evidence/<ID>/latest.json`) and
+`environments.yaml`.
 
 Run it from the main checkout: the task worktree defaults to `<root>/.worktrees/<id lowercased>`.
 `checks.yaml` (with its guarded files), the `Guarded edit:` lines in the task's SPEC and the PLAN commands
@@ -15,26 +16,30 @@ another branch, so a task branch or a dirty main checkout cannot change the rule
 task's SPEC.md and PLAN.md, and the spec-QA record review.md, must be byte-identical to main's, and a task's
 branch is `task/<ID>`. All three must be on main: a task dispatched without its review.md fails both gates.
 The trial merge happens in a temporary worktree of main and never commits or touches the main checkout.
-`binding` is QA's check that a record's `head` still binds the branch tip, read from git objects only:
-the record was committed directly on `head`, every later commit touches only the task's evidence and
-status, and every recorded input hash is the hash of the blob at `head`.
+`binding` is QA's check that the task's latest results record is a true record of its `head`, read from git
+objects only: the record is committed on the branch tip with the digest its pointer names, validates and passes the
+lint, its `head` is an ancestor of the tip, every recorded input hash is the hash of the blob at `head`, and no
+commit since the branch left main modified or deleted a record. Drift between `head` and the tip is reported,
+never a failure: the record says what was verified at `head`, and that stays true.
 
 Limits:
-- A produce.py that hand-writes a well-formed results.json is not detectable by the gate; QA re-runs the
+- A produce.py that hand-writes a well-formed record is not detectable by the gate; QA re-runs the
   evidence independently and uses `pk gate binding`.
-- `binding` refuses an edited `head` or an edited input hash, but not a record rewritten consistently and
-  committed on the commit it names; the merge check runs the tests and scans again whatever the record says.
+- `binding` refuses an edited `head` or an edited input hash, but not a record rewritten consistently,
+  appended under its new digest and pointed at; the merge check runs the tests and scans again whatever the record
+  says.
 - Files written to git-ignored paths are invisible to the clean-tree checks.
 - Projects must git-ignore the bytecode and build output their commands write: the evidence step
   needs a clean tree, and a leftover untracked file fails it.
-- Evidence is bound to the commit it was produced at, and the produced `results.json` is left
-  uncommitted in the task worktree (the only change the gate allows). Delete or commit it before a re-run.
-- The task's own record shows up in the `stale:` list whenever the branch changed an input of it.
+- Evidence is bound to the commit it was produced at. The gate leaves the new record and the updated
+  task pointer `program/evidence/<ID>/latest.json` uncommitted in the task worktree (the only changes it allows).
+  Commit both (the evidence commit) or remove the record and restore the pointer by exact path before a re-run.
+- A task whose own inputs did not change since its latest record needs no new record: produce.py may append one,
+  or leave the fresh record in place. Other tasks' records are never refreshed because a shared input changed.
 """
 from __future__ import annotations
 
 import argparse
-import json
 import re
 import shlex
 import shutil
@@ -45,8 +50,9 @@ from pathlib import Path, PurePosixPath
 
 import evidence as evidence_module
 import stale as stale_module
+import store
 import miniyaml
-from common import KitError, drop_bom, find_root, git, read_json, read_yaml, run_argv, sha256_file, write_json
+from common import KitError, drop_bom, find_root, git, read_json, read_yaml, run_argv, write_json
 from register import GATE_ID
 
 MAIN = "main"  # the primary branch; fixed, so no caller can choose where the rules are read from
@@ -399,13 +405,13 @@ def _guarded_changes(root: Path, task_id: str, branch: str, main: str, guarded: 
     return [path for path, entry in touched if path not in allowed and entry not in allowed]
 
 
-def _results_problems(data, task_id: str, head: str | None) -> list[str]:
-    """Why a results.json does not pass the hand-back gate (empty when it does); `head` None skips the head check.
+def _results_problems(data, task_id: str, head: str | None, root=None) -> list[str]:
+    """Why a results record does not pass the hand-back gate (empty when it does); `head` None skips the head check.
 
-    The rules live in `evidence.gate_problems` (the status machine applies them too); here every problem is
-    escaped, because it quotes values the record controls.
+    The rules live in `evidence.gate_problems` (the status machine applies them too), the derived-output lint
+    included; here every problem is escaped, because it quotes values the record controls.
     """
-    return [_show(problem) for problem in evidence_module.gate_problems(data, task_id, head)]
+    return [_show(problem) for problem in evidence_module.gate_problems(data, task_id, head, root)]
 
 
 def _changes(wt: Path) -> list[str]:
@@ -433,35 +439,68 @@ def _unexpected_changes(wt: Path, allowed: str) -> list[str]:
 
 
 def _evidence_step(wt: Path, task_id: str) -> bool:
-    base = f"program/evidence/{task_id}"
-    produce, results_rel = f"{base}/produce.py", f"{base}/results.json"
+    """Run produce.py, then judge the task's latest results record.
+
+    A record appended by this run must pass the gate's checks at the worktree HEAD. When produce.py appended
+    nothing, the latest record must still be fresh: its `head` an ancestor of HEAD and none of its inputs changed
+    since (a task whose own source changed needs a new record; a shared input changed by another task does not
+    make it refresh anything else). The record history must be intact since the branch left main. The new record
+    and the task's own pointer (`program/evidence/<ID>/latest.json`) are the only changes allowed in the worktree.
+    """
+    produce = f"program/evidence/{task_id}/produce.py"
     if not (wt / produce).is_file():
         _out(f"FAILED: evidence {produce} is missing")
         return False
+    try:
+        before = store.read_pointer(wt, task_id).get("results")
+    except KitError as exc:
+        _out("FAILED: evidence " + " ".join(str(exc).split()))
+        return False
     if not _run_commands("evidence", [(["python3", produce], 0)], wt):
         return False
+    head = git(wt, "rev-parse", "HEAD")
     try:
-        data = read_json(wt / results_rel)
+        entry = store.read_pointer(wt, task_id).get("results")
+        if entry is None:
+            _out("FAILED: evidence")
+            _out(f"{store.pointer_path(task_id)} names no results record of {task_id}")
+            return False
+        data = store.load(wt, entry["path"], entry["digest"])
     except KitError as exc:
         _out("FAILED: evidence " + " ".join(str(exc).replace(str(wt) + "/", "").split()))
         return False
-    problems = _results_problems(data, task_id, git(wt, "rev-parse", "HEAD"))
+    new = entry != before
+    problems = _results_problems(data, task_id, head if new else None, wt)
+    if not problems and not new:
+        recorded = data["head"]
+        code, _ = run_argv(["git", "-C", str(wt), "merge-base", "--is-ancestor", recorded, head], wt)
+        changed = stale_module.changed_inputs(wt, head, data["inputs"]) if code == 0 else {}
+        if code != 0:
+            problems = [f"head: {recorded} of the latest record is not an ancestor of {head}"]
+        elif changed:
+            problems = [f"the task's own inputs changed since {recorded} ({_show(', '.join(changed))}): "
+                        f"{produce} must append a new results record"]
+    base = git(wt, "merge-base", MAIN, head)
+    problems += [_show(p) for p in store.integrity(wt, base, {entry["path"]} if new else set())]
     if problems:
         _out("FAILED: evidence")
         for problem in problems:
             _out(problem)
         return False
-    extra = _unexpected_changes(wt, results_rel)
+    allowed = {store.pointer_path(task_id), entry["path"]} if new else set()
+    extra = [path for path in _changes(wt) if path not in allowed]
     for path in extra:
         _out(f"FAILED: evidence unexpected change: {path}")
     return not extra
 
 
 def _stale_step(wt: Path) -> bool:
-    report = stale_module.stale_records(wt, MAIN)
-    _out(f"stale: {len(report['stale'])} record(s)")
-    for row in report["stale"]:
-        _out(row["path"])
+    """The drift report against the worktree's HEAD: information, never a failure; an unreadable record fails."""
+    report = stale_module.drift_report(wt, "HEAD")
+    _out(f"drift: {report['drifted']} of {report['checked']} record(s) drifted from HEAD")
+    for row in report["tasks"]:
+        if row["state"] == "drifted":
+            _out(f"{row['task_id']} drifted since {row['head']}: {', '.join(row['changed_inputs'])}")
     for row in report["unreadable"]:
         _out(f"FAILED: stale unreadable record {row['path']}: {row['error']}")
     return not report["unreadable"]
@@ -611,8 +650,25 @@ def _record_path(value, gate_id: str) -> str:
     return pure.as_posix()
 
 
-def _gate(root: Path, gate_id: str) -> tuple[str, list[str]]:
-    """(environment, record paths) of a gate; KitError when it is unknown or malformed."""
+def _record_task(item: dict, gate_id: str) -> tuple[str, str | None]:
+    """(the record's name in claim documents, the task whose latest records it means, or None).
+
+    A record names its task as `task: <ID>`; a 0.1 entry `path: program/evidence/<ID>/results.json` still names
+    task <ID>. Any other path names no task, so nothing can evidence it.
+    """
+    if "task" in item:
+        task_id = item.get("task")
+        if not isinstance(task_id, str) or not _TASK.match(task_id):
+            raise KitError(f"gate {_show(gate_id)}: record task must be a task or gate ID: {_show(repr(task_id))}")
+        return task_id, task_id
+    path = _record_path(item.get("path"), gate_id)
+    parts = PurePosixPath(path).parts
+    named = parts[2] if len(parts) == 4 and parts[:2] == ("program", "evidence") and _TASK.match(parts[2]) else None
+    return path, named
+
+
+def _gate(root: Path, gate_id: str) -> tuple[str, list[tuple[str, str | None]]]:
+    """(environment, [(record name, task)]) of a gate; KitError when it is unknown or malformed."""
     if not isinstance(gate_id, str) or not GATE_ID.match(gate_id):
         raise KitError(f"not a valid gate id (expected G-<NAME>): {_show(gate_id)}")
     gates = _mapping(read_yaml(root / "program" / "gates.yaml"), "program/gates.yaml", "gates")
@@ -626,7 +682,7 @@ def _gate(root: Path, gate_id: str) -> tuple[str, list[str]]:
         raise KitError(f"gate {_show(gate_id)}: records must be a list of {{path, acceptance}} mappings")
     if not records:  # nothing to evidence: never "0 documents written" and never "consistent"
         raise KitError(f"gate {_show(gate_id)}: records is empty; a gate with no records claims nothing")
-    return entry["environment"], [_record_path(item.get("path"), gate_id) for item in records]
+    return entry["environment"], [_record_task(item, gate_id) for item in records]
 
 
 def _claim_name(record: str) -> str:
@@ -634,20 +690,26 @@ def _claim_name(record: str) -> str:
     return name if name.endswith(".json") else name + ".json"
 
 
-def _states(root: Path, record: str, own: str, environments: dict[str, bool]):
-    """({environment: state}, acceptance sha256 or None) for one record."""
-    path = root / record
-    record_sha = sha256_file(path) if path.is_file() else None
-    acceptance_path = path.parent / "acceptance.json"
-    acceptance_sha = sha256_file(acceptance_path) if acceptance_path.is_file() else None
-    accepted = None
-    if acceptance_sha is not None:
-        try:
-            accepted = read_json(acceptance_path)
-        except KitError:
-            accepted = None
-    if not isinstance(accepted, dict):
-        accepted = {}
+def _loaded(root: Path, entry: dict | None) -> dict | None:
+    """The record a pointer entry names, or None when there is none or it cannot be trusted."""
+    if entry is None:
+        return None
+    try:
+        return store.load(root, entry["path"], entry["digest"])
+    except KitError:
+        return None
+
+
+def _states(task_id: str | None, own: str, environments: dict[str, bool], index: dict, source: Path):
+    """({environment: state}, latest acceptance digest or None) for one record of a gate.
+
+    Evidenced only when the task's latest acceptance accepts, is not blocked there, and binds the task's latest
+    results record, and both records are present with their pointed-at digests.
+    """
+    results = store.latest(index, task_id, "results") if task_id else None
+    acceptance = store.latest(index, task_id, "acceptance") if task_id else None
+    accepted = _loaded(source, acceptance) or {}
+    results_ok = results is not None and _loaded(source, results) is not None
     blocked_by = accepted.get("blocked_by")
     states = {}
     for name, exists in environments.items():
@@ -656,10 +718,10 @@ def _states(root: Path, record: str, own: str, environments: dict[str, bool]):
             if isinstance(blocked_by, list) and name in blocked_by:
                 state = BLOCKED
             elif (isinstance(blocked_by, list) and accepted.get("decision") == "accepted_development"
-                  and record_sha is not None and accepted.get("evidence_sha256") == record_sha):
+                  and results_ok and accepted.get("evidence_sha256") == results["digest"]):
                 state = EVIDENCED
         states[name] = state
-    return states, acceptance_sha
+    return states, acceptance["digest"] if acceptance is not None else None
 
 
 def _expected_claims(root: Path, gate_id: str) -> dict[str, dict]:
@@ -668,12 +730,14 @@ def _expected_claims(root: Path, gate_id: str) -> dict[str, dict]:
     if own not in environments:
         raise KitError(f"gate {_show(gate_id)}: environment {_show(own)} is not named in program/environments.yaml")
     commit = git(root, "rev-parse", "HEAD")
+    index = store.read_index(root)
+    source = root
     docs: dict[str, dict] = {}
-    for record in records:
+    for record, task_id in records:
         name = _claim_name(record)
         if name in docs:
             raise KitError(f"gate {_show(gate_id)}: records collide on the claim file {_show(name)}")
-        states, acceptance_sha = _states(root, record, own, environments)
+        states, acceptance_sha = _states(task_id, own, environments, index, source)
         docs[name] = {"gate": gate_id, "record": record, "environment": states,
                       "acceptance_sha256": acceptance_sha, "generated_from_commit": commit}
     return docs
@@ -768,56 +832,71 @@ def validate_claims(root, gate_id: str) -> list[str]:
 
 # --- binding ----------------------------------------------------------------------
 
-def binding(root, task_id: str, branch: str) -> list[str]:
-    """Problems that stop a branch's results.json from binding its tip (empty, with a printed line, when it holds).
+def _pointer_at(root: Path, commit: str, task_id: str) -> dict:
+    """{kind: entry} of the task's pointer committed at `commit` ({} when it has none); KitError when malformed."""
+    rel = store.pointer_path(task_id)
+    try:
+        raw = _git_bytes(root, "show", f"{commit}:{rel}")
+    except KitError:
+        return {}
+    try:
+        text = drop_bom(raw.decode("utf-8"))
+    except UnicodeDecodeError as exc:
+        raise KitError(f"{rel} at {commit} is not UTF-8") from exc
+    return store.pointer_from_text(text, task_id, f"{rel} at {commit}")
 
-    Holds only when `program/evidence/<ID>/results.json` on the branch tip validates and all of these are true:
-    its `head` is an ancestor of the tip; the commit that last wrote the record is the direct child of `head`
-    (the evidence commit follows the gated commit, so a `head` edited afterwards does not pass); every commit
-    after `head` up to the tip (merge commits against each parent) changes only paths under
-    `program/evidence/<ID>/` or exactly `program/status/<ID>.json`; and every recorded input hash is the sha256
-    of that path's blob at `head`. A commit that edits other paths and a later one that reverts them therefore
-    still fails. Everything is read from git objects, never from a working tree. At most one problem is
-    reported for the commits and one for the inputs: the first offender.
+
+def binding(root, task_id: str, branch: str) -> list[str]:
+    """Problems that stop the task's latest results record from being a true record of its `head` on the branch
+    (empty, with a printed line, when it holds).
+
+    Read from git objects only, never from a working tree: the task's pointer on the branch tip names a results
+    record that is committed there with that digest, validates and passes the lint; the pointer entry names the
+    record's own `head`; that `head` is an ancestor of the tip; every recorded input hash is the sha256 of that
+    path's blob at `head`; and no commit since the branch left main modified or deleted a record file. Drift
+    (inputs changed between `head` and the tip, the branch's HEAD) is reported on the printed line, never a problem.
     """
     root = Path(root).resolve()
     _task_branch(task_id, branch)
     tip = _branch_head(root, branch)
-    rel = f"program/evidence/{task_id}/results.json"
+    pointer = store.pointer_path(task_id)
     try:
-        data = json.loads(drop_bom(_git_bytes(root, "show", f"{tip}:{rel}").decode("utf-8")))
+        entry = _pointer_at(root, tip, task_id).get("results")
+    except KitError as exc:
+        return [_show(exc)]
+    if entry is None:
+        return [f"{pointer} on {_show(branch)} names no results record of {task_id}"]
+    rel = entry["path"]
+    try:
+        raw = _git_bytes(root, "show", f"{tip}:{rel}")
     except KitError:
-        return [f"{_show(rel)} is absent on {_show(branch)}"]
-    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
-        return [f"{_show(rel)} on {_show(branch)} is not valid JSON: {_show(exc)}"]
-    problems = _results_problems(data, task_id, None)
+        return [f"{_show(rel)} is not committed on {_show(branch)}"]
+    try:
+        data = store.parse(rel, raw, entry["digest"])
+    except KitError as exc:
+        return [_show(exc)]
+    problems = _results_problems(data, task_id, None, root)
     if problems:
         return [f"{_show(rel)}: {problem}" for problem in problems]
     head = data["head"]
+    if entry["head"] != head:
+        return [f"{pointer}: the results entry names head {_show(entry['head'])}, but {_show(rel)} "
+                f"names {head}"]
     code, _ = run_argv(["git", "-C", str(root), "merge-base", "--is-ancestor", head, tip], root)
     if code != 0:
         return [f"{_show(rel)}: head {_show(head)} is not an ancestor of {_show(branch)} ({tip})"]
-    wrote = git(root, "log", "-1", "--format=%H %P", tip, "--", rel).split()  # the commit, then its parents
-    if wrote[1:] != [head]:
-        return [f"{_show(rel)}: committed in {wrote[0] if wrote else 'no commit'} on top of "
-                f"{' and '.join(wrote[1:]) or 'no commit'}, not on its recorded head {head}; the evidence commit "
-                "directly follows the gated commit"]
-    prefix, status = f"program/evidence/{task_id}/", f"program/status/{task_id}.json"
-    commits = git(root, "rev-list", "--topo-order", "--reverse", f"{head}..{tip}").split()
-    for commit in commits:
-        for path in _git_fields(root, "diff-tree", "--no-commit-id", "--name-only", "-r", "-m", "--root",
-                                "--no-renames", "-z", commit):
-            if not path.startswith(prefix) and path != status:
-                return [f"{_show(path)}: changed in commit {commit} after {head}, outside {_show(prefix)} "
-                        f"and {_show(status)}"]
     changed = stale_module.changed_inputs(root, head, data["inputs"])
     if changed:
         path, actual = next(iter(changed.items()))
         found = (f"its blob at the recorded head {head} hashes to {actual}" if actual is not None
                  else f"it is not a file at the recorded head {head}")
         return [f"{_show(rel)}: inputs: {_show(path)} is recorded as {data['inputs'][path]} but {found}"]
-    _out(f"binding holds: results.json at {head} bound, {len(commits)} later commit(s) touch only evidence "
-         "and status")
+    rewritten = store.rewritten(root, git(root, "merge-base", MAIN, tip), tip)
+    if rewritten:
+        return [_show(rewritten[0])]
+    drift = stale_module.changed_inputs(root, tip, data["inputs"])
+    state = (f"drifted since {head} at the tip: {_show(', '.join(drift))}" if drift else "fresh at the tip")
+    _out(f"binding holds: results record {entry['digest'][:12]} at {head} bound; {state}")
     return []
 
 
@@ -864,7 +943,8 @@ def _configure(parser: argparse.ArgumentParser) -> None:
                                                    "SPEC, PLAN and review.md, then build, test and scan on a "
                                                    "trial merge")
     merge.add_argument("--branch", required=True, help="the task branch to merge, task/<ID>")
-    bind = actions.add_parser("binding", help="QA check: the branch's results.json still binds its tip")
+    bind = actions.add_parser("binding", help="QA check: the task's latest results record is a true record of its "
+                                              "head; drift to the tip is reported")
     bind.add_argument("task_id", metavar="ID", help="task ID, for example P0-M01-S01-T01")
     bind.add_argument("--branch", required=True, help="the task branch")
     make = actions.add_parser("claims", help="write the claim documents of a gate")
