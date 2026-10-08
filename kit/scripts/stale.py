@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Which evidence records are stale against main (standard library only).
 
-A record (`program/evidence/*/results.json`) is stale when any hashed input no longer matches
-the committed blob on `main`, or when that path no longer exists there. Hashing goes through
+Only the latest results record of each task counts: the one `program/evidence/index.json` points at, read
+from the evidence store. A superseded record is history, never stale. The latest record is stale when any
+hashed input no longer matches the committed blob on `main`, or when that path no longer exists there; a gate
+record is also stale when a child record it binds by digest is no longer its task's latest. Hashing goes through
 git (`ls-tree` once for path -> blob id, then `cat-file blob` once per distinct blob), so the
 working copy never matters and a large evidence set does not spawn a process per input.
 `pk stale` always exits 0 and prints the report; only a repository with no `main` branch is an error.
@@ -16,7 +18,8 @@ import json
 import subprocess
 from pathlib import Path
 
-from common import KitError, find_root, git, read_json, sha256_bytes
+import store
+from common import KitError, find_root, git, sha256_bytes
 
 
 def _blob_bytes(root: Path, blob: str) -> bytes:
@@ -47,23 +50,29 @@ def _one_line(text) -> str:
     return " ".join(str(text).split()) or "unreadable"
 
 
-def _inputs(path: Path, rel: str):
-    """(inputs mapping, None) for a usable record, else (None, one-line reason).
-
-    The reason names the record by its root-relative path, so reports match across machines.
-    """
-    try:
-        data = read_json(path)
-    except KitError as exc:
-        return None, _one_line(str(exc).replace(str(path), rel))
-    if not isinstance(data, dict):
-        return None, "results.json is not a JSON object"
+def _inputs(data: dict):
+    """(inputs mapping, None) for a usable record, else (None, one-line reason)."""
     inputs = data.get("inputs")
     if not isinstance(inputs, dict):
         return None, "no inputs mapping"
     if not inputs:
         return None, "inputs mapping is empty"
     return inputs, None
+
+
+def _superseded_children(data: dict, index: dict) -> list[str]:
+    """`<task> <kind>` for each child record a gate record binds that is no longer its task's latest."""
+    children = data.get("children")
+    if not isinstance(children, list):
+        return []
+    found = []
+    for child in children:
+        if not isinstance(child, dict):
+            continue
+        entry = store.latest(index, str(child.get("task_id")), str(child.get("kind")))
+        if entry is None or entry["digest"] != child.get("digest"):
+            found.append(f"{child.get('task_id')} {child.get('kind')}")
+    return sorted(found)
 
 
 def _hasher(root: Path, sha: str):
@@ -90,30 +99,41 @@ def changed_inputs(root, sha: str, inputs: dict) -> dict[str, str | None]:
 
 
 def stale_records(root, main: str = "main") -> dict:
-    """Compare every record's inputs with `main`; return {main, stale, unreadable, checked}.
+    """Compare the latest results record of every task in the index with `main`; return
+    {main, stale, unreadable, checked}.
 
-    `stale` rows are {path, changed_inputs}; `unreadable` rows are {path, changed_inputs: [], error}.
-    Both are sorted by root-relative posix path, and `checked` counts every record examined.
+    `stale` rows are {task_id, path, changed_inputs, superseded_children}; `unreadable` rows are
+    {task_id, path, changed_inputs: [], error} (a record missing from the store, altered, or unusable). `path`
+    is the record's path in the store. Both lists are sorted by task, and `checked` counts every record examined.
     """
     root = Path(root)
     if not isinstance(main, str) or not main or main.startswith("-"):
         raise KitError(f"not a usable branch name: {main}")
     sha = git(root, "rev-parse", "--verify", main + "^{commit}")
     current = _hasher(root, sha)  # shared by every record of this run
+    index = store.read_index(root)
+    entries = [(task, entry) for task in sorted(index["tasks"])
+               if (entry := store.latest(index, task, "results")) is not None]
+    source = store.store_dir(root) if entries else None
 
     stale_rows, unreadable = [], []
-    records = sorted((root / "program" / "evidence").glob("*/results.json"))
-    for record in records:
-        rel = record.relative_to(root).as_posix()
-        inputs, error = _inputs(record, rel)
+    for task, entry in entries:
+        rel = entry["path"]
+        try:
+            data = store.load(source, rel, entry["digest"])
+        except KitError as exc:
+            unreadable.append({"task_id": task, "path": rel, "changed_inputs": [], "error": _one_line(exc)})
+            continue
+        inputs, error = _inputs(data)
         if inputs is None:
-            unreadable.append({"path": rel, "changed_inputs": [], "error": error})
+            unreadable.append({"task_id": task, "path": rel, "changed_inputs": [], "error": error})
             continue
         changed = sorted(path for path, digest in inputs.items() if current(path) != digest)
-        if changed:
-            stale_rows.append({"path": rel, "changed_inputs": changed})
-    # `records` is already sorted by path, so both lists are too.
-    return {"main": sha, "stale": stale_rows, "unreadable": unreadable, "checked": len(records)}
+        children = _superseded_children(data, index)
+        if changed or children:
+            stale_rows.append({"task_id": task, "path": rel, "changed_inputs": changed,
+                               "superseded_children": children})
+    return {"main": sha, "stale": stale_rows, "unreadable": unreadable, "checked": len(entries)}
 
 
 # --- command -----------------------------------------------------------------------

@@ -3,14 +3,17 @@ import contextlib
 import hashlib
 import io
 import json
+import os
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import evidence
 import pk
 import stale
+import store
 
 
 def sh(cwd, *argv):
@@ -25,12 +28,18 @@ class Base(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        self.root = Path(tmp.name).resolve()
+        self.root = Path(tmp.name).resolve() / "repo"  # the evidence store is its sibling
+        self.root.mkdir()
+        env = mock.patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop(store.ENV, None)
         sh(self.root, "git", "init", "-q", "-b", "main")
         sh(self.root, "git", "config", "user.name", "Test")
         sh(self.root, "git", "config", "user.email", "test@example.com")
         self.put("calc.py", "v1\n")
         self.put("lib.py", "lib1\n")
+        self.store, _ = store.init(self.root)
         self.record("T-1", {"calc.py": digest("v1\n"), "lib.py": digest("lib1\n")})
         self.record("T-2", {"lib.py": digest("lib1\n")})
         self.commit("init")
@@ -40,8 +49,19 @@ class Base(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text)
 
-    def record(self, task, inputs):
-        self.put(f"program/evidence/{task}/results.json", json.dumps({"task_id": task, "inputs": inputs}))
+    def record(self, task, inputs, **extra):
+        """Append a results record for `task` and point the index at it; its store path."""
+        return store.record(self.root, task, "results", {"task_id": task, "inputs": inputs, **extra})["path"]
+
+    def raw_record(self, task, raw: bytes):
+        """Append bytes that are no usable record, and point the index at them."""
+        appended = store.append(self.root, task, "results", raw)
+        store.set_entry(self.root, task, "results", {"digest": appended["digest"], "path": appended["path"],
+                                                     "head": "", "produced_at": ""})
+        return appended["path"]
+
+    def path_of(self, task):
+        return store.latest(store.read_index(self.root), task, "results")["path"]
 
     def commit(self, message):
         sh(self.root, "git", "add", "-A")
@@ -54,8 +74,8 @@ class StaleRecords(Base):
         self.commit("change calc")
         report = stale.stale_records(self.root, "main")
         self.assertEqual(report["main"], sh(self.root, "git", "rev-parse", "main").strip())
-        self.assertEqual(report["stale"], [{"path": "program/evidence/T-1/results.json",
-                                            "changed_inputs": ["calc.py"]}])
+        self.assertEqual(report["stale"], [{"task_id": "T-1", "path": self.path_of("T-1"),
+                                            "changed_inputs": ["calc.py"], "superseded_children": []}])
         self.assertEqual(report["unreadable"], [])
         self.assertEqual(report["checked"], 2)
 
@@ -68,24 +88,41 @@ class StaleRecords(Base):
         sh(self.root, "git", "rm", "-q", "lib.py")
         self.commit("drop lib")
         report = stale.stale_records(self.root, "main")
-        self.assertEqual([(r["path"], r["changed_inputs"]) for r in report["stale"]],
-                         [("program/evidence/T-1/results.json", ["lib.py"]),
-                          ("program/evidence/T-2/results.json", ["lib.py"])])
+        self.assertEqual([(r["task_id"], r["changed_inputs"]) for r in report["stale"]],
+                         [("T-1", ["lib.py"]), ("T-2", ["lib.py"])])
+
+    def test_only_the_latest_record_counts_and_a_superseded_one_is_never_stale(self):
+        old = self.path_of("T-1")
+        self.put("calc.py", "v2\n")
+        self.commit("change calc")
+        self.assertEqual([r["path"] for r in stale.stale_records(self.root, "main")["stale"]], [old])
+        fresh = self.record("T-1", {"calc.py": digest("v2\n"), "lib.py": digest("lib1\n")})  # the refresh
+        report = stale.stale_records(self.root, "main")
+        self.assertEqual((report["stale"], report["checked"]), ([], 2))
+        self.assertTrue((self.store / old).is_file())  # still in the history
+        self.assertNotEqual(fresh, old)
+
+    def test_a_gate_record_is_stale_when_a_child_it_binds_is_no_longer_the_latest(self):
+        child = store.latest(store.read_index(self.root), "T-2", "results")["digest"]
+        self.record("G-P0", {"lib.py": digest("lib1\n")},
+                    children=[{"task_id": "T-2", "kind": "results", "digest": child}])
+        self.assertEqual(stale.stale_records(self.root, "main")["stale"], [])
+        self.record("T-2", {"lib.py": digest("lib1\n")}, refreshed=True)
+        report = stale.stale_records(self.root, "main")
+        self.assertEqual([(r["task_id"], r["changed_inputs"], r["superseded_children"]) for r in report["stale"]],
+                         [("G-P0", [], ["T-2 results"])])
 
     def test_working_copy_edits_do_not_count_only_main_does(self):
         (self.root / "calc.py").write_text("dirty\n")
         self.assertEqual(stale.stale_records(self.root, "main")["stale"], [])
 
     def test_unreadable_records_are_reported_never_fresh_never_raised(self):
-        self.put("program/evidence/A-bad/results.json", "{not json")
-        self.put("program/evidence/B-list/results.json", "[]")
-        self.put("program/evidence/C-noinputs/results.json", json.dumps({"task_id": "x"}))
-        self.put("program/evidence/D-empty/results.json", json.dumps({"inputs": {}}))
+        paths = [self.raw_record("A-bad", b"{not json"), self.raw_record("B-list", b"[]"),
+                 self.record("C-noinputs", None), self.record("D-empty", {})]
         self.commit("bad records")
         report = stale.stale_records(self.root, "main")
         self.assertEqual(report["stale"], [])
-        self.assertEqual([r["path"] for r in report["unreadable"]],
-                         [f"program/evidence/{n}/results.json" for n in ("A-bad", "B-list", "C-noinputs", "D-empty")])
+        self.assertEqual([r["path"] for r in report["unreadable"]], paths)
         for item in report["unreadable"]:
             self.assertEqual(item["changed_inputs"], [])
             self.assertEqual(len(item["error"].splitlines()), 1)
@@ -110,30 +147,40 @@ class StaleRecords(Base):
         with self.assertRaises(stale.KitError):
             stale.stale_records(self.root, "--all")
 
-    def test_no_evidence_directory_checks_nothing(self):
+    def test_no_index_checks_nothing(self):
         sh(self.root, "git", "rm", "-rq", "program")
         self.commit("no evidence")
         report = stale.stale_records(self.root, "main")
         self.assertEqual((report["stale"], report["unreadable"], report["checked"]), ([], [], 0))
 
+    def test_a_record_missing_or_altered_in_the_store_is_unreadable(self):
+        path = self.store / self.path_of("T-1")
+        path.chmod(0o644)
+        path.write_text("{}\n")  # the planted defect: an edited record
+        (self.store / self.path_of("T-2")).unlink()
+        report = stale.stale_records(self.root, "main")
+        self.assertEqual(report["stale"], [])
+        errors = {row["task_id"]: row["error"] for row in report["unreadable"]}
+        self.assertTrue(errors["T-1"].startswith("immutable record altered: "), errors)
+        self.assertIn("is missing from the store", errors["T-2"])
+
 
 class Robustness(Base):
     def test_deeply_nested_record_is_unreadable_and_the_rest_are_reported(self):
-        self.put("program/evidence/A-deep/results.json", "[" * 100000)
+        deep = self.raw_record("A-deep", b"[" * 100000)
         self.put("calc.py", "v2\n")
         self.commit("deep record, changed calc")
         report = stale.stale_records(self.root, "main")
-        self.assertEqual([r["path"] for r in report["unreadable"]], ["program/evidence/A-deep/results.json"])
-        self.assertIn("nested too deeply", report["unreadable"][0]["error"])
-        self.assertEqual([r["path"] for r in report["stale"]], ["program/evidence/T-1/results.json"])
+        self.assertEqual([r["path"] for r in report["unreadable"]], [deep])
+        self.assertEqual(len(report["unreadable"][0]["error"].splitlines()), 1)
+        self.assertEqual([r["task_id"] for r in report["stale"]], ["T-1"])
         self.assertEqual(report["checked"], 3)
 
-    def test_unreadable_errors_are_root_relative(self):
-        self.put("program/evidence/A-bad/results.json", "{not json")
-        self.put("program/evidence/B-deep/results.json", "[" * 100000)
+    def test_unreadable_errors_name_the_record_by_its_store_path(self):
+        self.raw_record("A-bad", b"{not json")
         self.commit("bad records")
         report = stale.stale_records(self.root, "main")
-        self.assertEqual(len(report["unreadable"]), 2)
+        self.assertEqual(len(report["unreadable"]), 1)
         for item in report["unreadable"]:
             self.assertNotIn(str(self.root), item["error"])
             self.assertIn(item["path"], item["error"])
@@ -142,7 +189,7 @@ class Robustness(Base):
         self.record("T-3", {"calc.py": 5, "lib.py": None, "sub/x": ["a"]})
         self.commit("odd hashes")
         report = stale.stale_records(self.root, "main")
-        row = [r for r in report["stale"] if r["path"].endswith("T-3/results.json")]
+        row = [r for r in report["stale"] if r["task_id"] == "T-3"]
         self.assertEqual(row[0]["changed_inputs"], ["calc.py", "lib.py", "sub/x"])
         self.assertEqual(report["unreadable"], [])
 
@@ -198,14 +245,14 @@ class EvidenceIntegration(Base):
     def test_evidence_stale_uses_the_real_module(self):
         self.put("calc.py", "v2\n")
         self.commit("change calc")
-        self.put("program/evidence/T-0/results.json", "{not json")
+        bad = self.raw_record("T-0", b"{not json")
         self.commit("unreadable record")
         ev = evidence.Evidence(self.root, "T-9")
         got = ev.stale()
         self.assertEqual(got["checked"], True)
-        self.assertEqual(got["records"], [{"path": "program/evidence/T-1/results.json",
-                                           "changed_inputs": ["calc.py"]}])
-        self.assertEqual([r["path"] for r in got["unreadable"]], ["program/evidence/T-0/results.json"])
+        self.assertEqual(got["records"], [{"task_id": "T-1", "path": self.path_of("T-1"),
+                                           "changed_inputs": ["calc.py"], "superseded_children": []}])
+        self.assertEqual([r["path"] for r in got["unreadable"]], [bad])
         self.assertEqual(ev.stale_result, got)
 
 
