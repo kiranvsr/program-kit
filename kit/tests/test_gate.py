@@ -18,6 +18,7 @@ from unittest import mock
 import evidence
 import gate
 import pk
+import store
 from common import KitError, read_json, read_yaml, sha256_file, write_yaml
 
 PY = os.path.realpath(sys.executable)
@@ -58,8 +59,7 @@ else:
            "test_args": ["test_calc"]}
 ev.planted_bugs([bug], build=[sys.executable, "-m", "compileall", "-q", "."],
                 test=[sys.executable, "-m", "unittest", "-q"])
-out = root / "program" / "evidence" / "P0-M01-S01-T01" / "results.json"
-ev.write(out)
+ev.write()
 if os.environ.get("PK_STRAY"):
     stray = root / os.environ["PK_STRAY"]
     stray.parent.mkdir(parents=True, exist_ok=True)
@@ -68,9 +68,13 @@ if os.environ.get("PK_TOUCH"):
     (root / os.environ["PK_TOUCH"]).write_text("changed by produce\\n")
 '''
 HAND_MADE = '''import hashlib
-import json
+import os
 import subprocess
+import sys
 from pathlib import Path
+
+sys.path.insert(0, os.environ["PK_SCRIPTS"])
+import store
 
 head = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
 empty = hashlib.sha256(b"").hexdigest()
@@ -86,7 +90,7 @@ record = {"task_id": "P0-M01-S01-T01", "head": head, "main": head, "merge_base":
                                 kill_reason="build failed", test_output_sha256="")],
           "planted_bugs_all_killed": True, "all_commands_as_expected": True, "tree_unchanged_by_run": True,
           "stale": {"checked": False, "records": []}, "blocked_by": [], "deviations": []}
-Path("program/evidence/P0-M01-S01-T01/results.json").write_text(json.dumps(record))
+store.record(Path.cwd(), "P0-M01-S01-T01", "results", record)
 '''
 FAILING_TESTS = ("import unittest\n\n\nclass T(unittest.TestCase):\n"
                  "    def test_one(self):\n        self.fail('one')\n\n"
@@ -161,9 +165,11 @@ class GitBase(unittest.TestCase):
         self.addCleanup(patcher.stop)
         for var in ("PK_NO_COMMANDS", "PK_SURVIVOR", "PK_STRAY"):
             os.environ.pop(var, None)
+        os.environ.pop(store.ENV, None)  # the store is the repository's sibling, inside the temporary directory
         sh(self.root, "git", "init", "-q", "-b", "main")
         sh(self.root, "git", "config", "user.name", "Test")
         sh(self.root, "git", "config", "user.email", "test@example.com")
+        self.store, _ = store.init(self.root)
 
     def trial_dirs(self):
         return sorted(self.tmpdir.glob("pk-trial-*"))
@@ -203,6 +209,10 @@ class HandbackBase(GitBase):
 
     def cleanup_worktrees(self):
         subprocess.run(["git", "-C", str(self.root), "worktree", "prune"], capture_output=True)
+
+    def latest(self, kind="results", where=None):
+        """(index entry, record) of the task's latest record in the worktree's index (or `where`'s)."""
+        return store.load_latest(where or self.wt, TASK, kind)
 
     def check_ok_lines(self, rc, out):
         """A failed gate never prints an `OK: ` line; a passing one prints exactly one, last."""
@@ -418,9 +428,10 @@ class HandbackTests(HandbackBase):
         self.assertTrue(match, lines[-1])
         self.assertEqual(match.groups(), (BRANCH, self.sha))
         self.assertEqual([ln for ln in lines if ln.startswith("OK: ")], [lines[-1]])
-        self.assertEqual(lines[-3:-1], ["stale: 1 record(s)", f"program/evidence/{TASK}/results.json"])
-        results = read_json(self.wt / "program" / "evidence" / TASK / "results.json")
+        entry, results = self.latest()
+        self.assertEqual(lines[-3:-1], ["stale: 1 record(s)", entry["path"]])
         self.assertEqual((results["head"], results["task_id"]), (self.sha, TASK))
+        self.assertEqual(sh(self.wt, "git", "status", "--porcelain"), f"?? {store.INDEX}\n")  # the record is outside
         self.assertTrue(self.fake_log.exists())
         self.assert_no_trial_left()
 
@@ -436,7 +447,8 @@ class HandbackTests(HandbackBase):
         self.assertEqual(lines[-20:], [f"{TAIL}line {i}" for i in range(10, 30)])
         self.assertFalse([ln for ln in lines if ln.startswith("OK: ")])
         self.assertFalse(self.fake_log.exists(), "scan ran after test failed")
-        self.assertFalse((self.wt / "program" / "evidence" / TASK / "results.json").exists())
+        self.assertFalse((self.wt / store.INDEX).exists())
+        self.assertEqual(list((self.store / "records").iterdir()), [])
         self.assert_no_trial_left()
 
     def test_handback_fails_on_merge_conflict(self):
@@ -631,7 +643,7 @@ class HandbackTests(HandbackBase):
     def test_results_for_another_head_or_task_fails(self):
         rc, out = self.handback()
         self.assertEqual(rc, 0, out)
-        data = read_json(self.wt / "program" / "evidence" / TASK / "results.json")
+        data = self.latest()[1]
         self.assertEqual(gate._results_problems(data, TASK, self.sha), [])
         self.assertTrue(any(p.startswith("task_id") for p in gate._results_problems(data, "P9-M01-S01-T01", self.sha)))
         self.assertTrue(any(p.startswith("head") for p in gate._results_problems(data, TASK, "0" * 40)))
@@ -645,15 +657,39 @@ class HandbackTests(HandbackBase):
         self.assertNotIn("OK: ", out)
 
     def test_unreadable_stale_record_fails(self):
-        put(self.wt, "program/evidence/OTHER/results.json", "{ not json")
+        broken = store.append(self.wt, "OTHER", "results", b"{ not json")
+        store.set_entry(self.wt, "OTHER", "results", {"digest": broken["digest"], "path": broken["path"],
+                                                       "head": "", "produced_at": ""})
         commit(self.wt, "broken record")
         rc, out = self.handback()
         self.assertEqual(rc, 1)
         line = [ln for ln in out.splitlines() if ln.startswith("FAILED: stale unreadable record ")]
         self.assertEqual(len(line), 1, out)
-        self.assertIn("program/evidence/OTHER/results.json: ", line[0])
+        self.assertIn(f"{broken['path']}: ", line[0])
         self.assertNotIn("OK: ", out)
         self.assert_no_trial_left()
+
+    def test_a_record_altered_in_the_store_fails_the_evidence_step(self):
+        script = self.wt / f"program/evidence/{TASK}/produce.py"
+        script.write_text(PRODUCE.replace("ev.write()\n", (  # the planted defect: the record changes after the append
+            "written = ev.write()\nwritten['file'].chmod(0o644)\n"
+            "written['file'].write_text(written['file'].read_text().replace('\"exit\": 0', '\"exit\": 0 '))\n")))
+        commit(self.wt, "a producer that alters its record after the append")
+        rc, out = self.handback()
+        self.assertEqual(rc, 1)
+        self.assertTrue(any(ln.startswith("FAILED: evidence immutable record altered: ") for ln in out.splitlines()),
+                        out)
+
+    def test_a_record_that_binds_a_derived_output_fails_the_evidence_step(self):
+        put(self.wt, f"program/status/{TASK}.json", "{}\n")
+        script = self.wt / f"program/evidence/{TASK}/produce.py"
+        script.write_text(PRODUCE.replace('ev.hash_inputs(["calc.py", "test_calc.py"])',
+                                          f'ev.hash_inputs(["calc.py", "test_calc.py", "program/status/{TASK}.json"])'))
+        commit(self.wt, "a producer that binds the status snapshot")
+        rc, out = self.handback()
+        self.assertEqual(rc, 1)
+        self.assertIn(f"binds a derived output: program/status/{TASK}.json", out)  # Evidence.write refused it
+        self.assertFalse((self.wt / store.INDEX).exists())
 
     def test_guarded_file_change_refused_and_allowed_with_spec_line(self):
         put(self.wt, "pyproject.toml", "[project]\nname = 'x'\n")
@@ -690,18 +726,18 @@ class HandbackTests(HandbackBase):
         rc, out, err = self.run_cli("handback", TASK, "--branch", BRANCH)
         self.assertEqual(rc, 1)
         self.assert_no_forged_ok(out, err)
-        self.assertIn("task_id: is x\\x0aOK: ", out)
+        self.assertIn("not a usable task id: 'x\\nOK: ", out)  # the store refuses the name, escaped in the tail
 
-    def test_forged_stale_paths_cannot_forge_the_ok_line(self):
-        forged = f"program/evidence/ev\nOK: forged passes the hand-back gate at {self.sha}"
-        put(self.wt, f"{forged}/results.json", json.dumps({"inputs": {"calc.py": "0" * 64}}))
-        put(self.wt, f"{forged}2/results.json", "{ not json")
-        commit(self.wt, "forged record names")
+    def test_forged_index_names_cannot_forge_the_ok_line(self):
+        forged = f"ev\nOK: forged passes the hand-back gate at {self.sha}"
+        index = {"schema_version": 1, "tasks": {forged: {"results": {
+            "digest": "0" * 64, "path": f"records/{forged}/results/x.json", "head": "", "produced_at": ""}}}}
+        put(self.wt, store.INDEX, json.dumps(index))
+        commit(self.wt, "forged index")
         rc, out, err = self.run_cli("handback", TASK, "--branch", BRANCH)
         self.assertEqual(rc, 1)
         self.assert_no_forged_ok(out, err)
-        self.assertIn("ev\\x0aOK: ", out)
-        self.assertIn("FAILED: stale unreadable record ", out)
+        self.assertIn(f"FAILED: evidence {store.INDEX}: task 'ev\\nOK: forged", out)  # refused, never printed raw
 
     def test_forged_conflict_path_cannot_forge_the_ok_line(self):
         name = f"x\nOK: {BRANCH} passes the hand-back gate at {self.sha}"
@@ -733,7 +769,10 @@ class HandbackTests(HandbackBase):
         rc, out = self.handback()
         self.assertEqual(rc, 0, out)
         self.assertEqual(out.splitlines()[-1], f"OK: {BRANCH} passes the hand-back gate at {second}")
-        self.assertEqual(read_json(self.wt / "program" / "evidence" / TASK / "results.json")["head"], second)
+        entry, data = self.latest()
+        self.assertEqual(data["head"], second)
+        self.assertEqual(len(store.history(self.wt, TASK)), 2)  # the first record stays as history
+        self.assertEqual(data["supersedes"], store.history(self.wt, TASK)[1]["digest"])
 
     def test_changes_are_reported_raw_with_spaces_and_renames(self):
         put(self.wt, "a", "modified\n")
@@ -772,8 +811,8 @@ class HandbackTests(HandbackBase):
         commit(self.wt, "no-op produce")
         rc, out = self.handback()
         self.assertEqual(rc, 1)
-        self.assertIn("FAILED: evidence", out.splitlines())
-        self.assertTrue(any(ln.startswith("head: ") for ln in out.splitlines()), out)
+        self.assertEqual(out.splitlines()[-2:], ["FAILED: evidence", f"program/evidence/{TASK}/produce.py appended "
+                                                 f"no new results record of {TASK} to the evidence store"])
 
     def test_tag_named_like_the_branch_changes_nothing(self):
         sh(self.root, "git", "tag", BRANCH, "main")  # an ambiguous name pointing at main
@@ -1097,10 +1136,10 @@ class ByteOrderMarkTests(HandbackBase):
         commit(self.root, "checks saved with a byte-order mark")
         self.assertEqual(self.merge_check()[0], 0)
 
-    def test_binding_reads_a_marked_record(self):
+    def test_binding_reads_a_marked_index(self):
         rc, out = self.handback()
         self.assertEqual(rc, 0, out)
-        record = self.wt / "program" / "evidence" / TASK / "results.json"
+        record = self.wt / store.INDEX
         record.write_bytes(self.BOM + record.read_bytes())
         commit(self.wt, "commit the evidence")
         out = io.StringIO()
@@ -1206,8 +1245,9 @@ class TrialMergeTests(HandbackBase):
 
 # --- claims --------------------------------------------------------------------------
 
-REC_DEV = "program/evidence/P0-M01-S01-T01/results.json"
+REC_DEV = "program/evidence/P0-M01-S01-T01/results.json"  # a 0.1 record path: it names task P0-M01-S01-T01
 REC_TWO = "program/evidence/P0-M01-S01-T02/results.json"
+TASK_OF = {REC_DEV: "P0-M01-S01-T01", REC_TWO: "P0-M01-S01-T02"}
 
 
 def digest(path):
@@ -1227,21 +1267,22 @@ class ClaimsBase(GitBase):
                                              {"path": REC_TWO, "acceptance": "all pass"}]},
                         "G-LIVE": {"title": "Live", "claims": ["serves traffic"], "environment": "prod",
                                    "records": [{"path": REC_DEV, "acceptance": "all pass"}]}})
-        put(self.root, REC_DEV, '{"task_id": "one"}\n')
-        put(self.root, REC_TWO, '{"task_id": "two"}\n')
+        store.record(self.root, TASK_OF[REC_DEV], "results", {"task_id": "one"})
+        store.record(self.root, TASK_OF[REC_TWO], "results", {"task_id": "two"})
         commit(self.root, "init")
 
     def set_gates(self, gates):
         write_yaml(self.root / "program" / "gates.yaml", {"gates": gates})
 
     def accept(self, record=REC_DEV, **over):
-        path = (self.root / record).parent / "acceptance.json"
-        data = {"task_id": "x", "decision": "accepted_development", "evidence_sha256": digest(self.root / record),
+        """Append an acceptance of the record's latest results record; its digest."""
+        task_id = TASK_OF[record]
+        latest = store.latest(store.read_index(self.root), task_id, "results")["digest"]
+        data = {"task_id": "x", "decision": "accepted_development", "evidence_sha256": latest,
                 "source_commit": "a" * 40, "accepted_at": "2026-10-06T00:00:00Z", "role": "qa", "commands": [],
                 "planted_bugs": [], "findings": [], "blocked_by": []}
         data.update(over)
-        path.write_text(json.dumps(data))
-        return path
+        return store.record(self.root, task_id, "acceptance", data)["digest"]
 
     def claim(self, gate_id, record):
         name = record.replace("/", "__")
@@ -1256,7 +1297,7 @@ class ClaimsTests(ClaimsBase):
         doc = self.claim("G-LIVE", REC_DEV)
         self.assertEqual(doc["environment"], {"dev": "not_evaluated", "staging": "not_evaluated",
                                               "prod": "not_evaluated"})
-        self.assertEqual(doc["acceptance_sha256"], digest(acceptance))
+        self.assertEqual(doc["acceptance_sha256"], acceptance)
         self.assertEqual((doc["gate"], doc["record"]), ("G-LIVE", REC_DEV))
         self.assertEqual(doc["generated_from_commit"], sh(self.root, "git", "rev-parse", "HEAD").strip())
         self.accept(blocked_by=["prod"])  # a missing environment is not even "blocked"
@@ -1281,15 +1322,44 @@ class ClaimsTests(ClaimsBase):
                 gate.claims(self.root, "G-P0")
                 state = self.claim("G-P0", REC_DEV)["environment"]["dev"]
                 self.assertEqual(state, "blocked" if name == "blocked" else "not_evaluated")
-        (self.root / "program" / "evidence" / "P0-M01-S01-T01" / "acceptance.json").write_text("{ nope")
+        broken = store.append(self.root, TASK_OF[REC_DEV], "acceptance", b"{ nope")
+        store.set_entry(self.root, TASK_OF[REC_DEV], "acceptance", {
+            "digest": broken["digest"], "path": broken["path"], "decision": "", "accepted_at": "",
+            "results_digest": ""})
         gate.claims(self.root, "G-P0")
         self.assertEqual(self.claim("G-P0", REC_DEV)["environment"]["dev"], "not_evaluated")
 
-    def test_changed_record_withdraws_the_evidenced_state(self):
+    def test_a_refreshed_record_withdraws_the_evidenced_state_until_it_is_accepted_again(self):
         self.accept()
-        (self.root / REC_DEV).write_text('{"task_id": "changed"}\n')
+        gate.claims(self.root, "G-P0")
+        self.assertEqual(self.claim("G-P0", REC_DEV)["environment"]["dev"], "evidenced")
+        store.record(self.root, TASK_OF[REC_DEV], "results", {"task_id": "refreshed"})  # a newer results record
         gate.claims(self.root, "G-P0")
         self.assertEqual(self.claim("G-P0", REC_DEV)["environment"]["dev"], "not_evaluated")
+        self.accept()  # re-acceptance appends; it binds the latest results record
+        gate.claims(self.root, "G-P0")
+        self.assertEqual(self.claim("G-P0", REC_DEV)["environment"]["dev"], "evidenced")
+
+    def test_an_altered_record_withdraws_the_evidenced_state(self):
+        self.accept()
+        entry = store.latest(store.read_index(self.root), TASK_OF[REC_DEV], "results")
+        path = self.store / entry["path"]
+        path.chmod(0o644)
+        path.write_text('{"task_id": "changed"}\n')  # the planted defect: a record edited in the store
+        gate.claims(self.root, "G-P0")
+        self.assertEqual(self.claim("G-P0", REC_DEV)["environment"]["dev"], "not_evaluated")
+
+    def test_a_record_can_name_its_task_directly(self):
+        self.set_gates({"G-P0": {"title": "Phase 0", "claims": ["it works"], "environment": "dev",
+                                 "records": [{"task": TASK_OF[REC_DEV], "acceptance": "all pass"}]}})
+        self.accept()
+        written = gate.claims(self.root, "G-P0")
+        self.assertEqual([p.name for p in written], ["P0-M01-S01-T01.json"])
+        self.assertEqual(read_json(written[0])["environment"]["dev"], "evidenced")
+        self.set_gates({"G-P0": {"title": "Phase 0", "claims": ["it works"], "environment": "dev",
+                                 "records": [{"task": "../x", "acceptance": "all pass"}]}})
+        with self.assertRaisesRegex(KitError, "record task must be a task or gate ID"):
+            gate.claims(self.root, "G-P0")
 
     def test_stale_claim_files_are_removed_only_inside_the_gate_directory(self):
         gate.claims(self.root, "G-P0")
@@ -1498,8 +1568,6 @@ class CommandRunTests(HandbackBase):
 
 
 class BindingTests(HandbackBase):
-    RESULTS = f"program/evidence/{TASK}/results.json"
-
     def bind(self):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
@@ -1511,22 +1579,35 @@ class BindingTests(HandbackBase):
         self.assertEqual(rc, 0, out)
         return commit(self.wt, "commit the evidence")
 
+    def forge(self, **changes):
+        """Append a copy of the latest record with `changes` (a hand-made record) and point the index at it."""
+        data = dict(self.latest()[1], **changes)
+        return store.record(self.wt, TASK, "results", data)
+
+    def holds(self, head, later):
+        digest = self.latest()[0]["digest"][:12]
+        return f"binding holds: results record {digest} at {head} bound, {later} later commit(s) touch only " \
+               "evidence and status\n"
+
     def test_binding_holds_for_evidence_and_status_commits(self):
         self.produce_and_commit()
         problems, out = self.bind()
-        self.assertEqual((problems, out), ([], f"binding holds: results.json at {self.sha} bound, 1 later "
-                                               "commit(s) touch only evidence and status\n"))
-        put(self.wt, f"program/evidence/{TASK}/acceptance.json", "{}\n")
-        commit(self.wt, "acceptance")
+        self.assertEqual((problems, out), ([], self.holds(self.sha, 1)))
+        put(self.wt, f"program/evidence/{TASK}/report.md", "report\n")
+        commit(self.wt, "report")
+        entry, data = self.latest()
+        evidence.accept(self.wt, TASK, {"task_id": TASK, "decision": "accepted_development",
+                                        "evidence_sha256": entry["digest"], "source_commit": data["head"],
+                                        "accepted_at": "2026-10-08T00:00:00Z", "role": "qa", "commands": [],
+                                        "planted_bugs": [], "findings": [], "blocked_by": []})
         put(self.wt, f"program/status/{TASK}.json", "{}\n")
-        commit(self.wt, "status")
+        commit(self.wt, "acceptance and status")
         problems, out = self.bind()
-        self.assertEqual(problems, [])
-        self.assertIn("3 later commit(s)", out)
+        self.assertEqual((problems, out), ([], self.holds(self.sha, 3)))
 
     def test_binding_ignores_the_working_tree(self):
         self.produce_and_commit()
-        (self.wt / self.RESULTS).write_text("{ nope")  # an uncommitted edit changes nothing
+        (self.wt / store.INDEX).write_text("{ nope")  # an uncommitted edit changes nothing
         self.assertEqual(self.bind()[0], [])
 
     def test_binding_fails_when_a_later_commit_touches_source(self):
@@ -1553,7 +1634,7 @@ class BindingTests(HandbackBase):
 
     def test_binding_fails_for_paths_that_only_look_like_evidence_or_status(self):
         for path in (f"program/evidence/OTHER/x", f"program/evidence/{TASK}x/file", f"program/status/{TASK}.json.bak",
-                     f"program/status/{TASK}/x.json", f"program/evidence/{TASK}.txt"):
+                     f"program/status/{TASK}/x.json", f"program/evidence/{TASK}.txt", "program/evidence/index.json.bak"):
             with self.subTest(path=path):
                 sh(self.wt, "git", "reset", "-q", "--hard", self.sha)
                 self.produce_and_commit()
@@ -1564,6 +1645,15 @@ class BindingTests(HandbackBase):
                 self.assertEqual(len(problems), 1, problems)
                 self.assertTrue(problems[0].startswith(f"{path}: changed in commit "), problems)
                 sh(self.wt, "git", "clean", "-fdq")
+
+    def test_binding_fails_when_another_task_entry_changes_after_the_head(self):
+        self.produce_and_commit()
+        other = store.record(self.wt, "OTHER", "results", {"task_id": "OTHER", "inputs": {"calc.py": "0" * 64}})
+        commit(self.wt, "an entry of another task rides along")  # the planted defect
+        problems, out = self.bind()
+        self.assertEqual(out, "")
+        self.assertEqual(problems, [f"{store.INDEX}: entries of other tasks changed after {self.sha}: OTHER"])
+        self.assertTrue(other["file"].is_file())
 
     def test_binding_fails_for_a_merge_commit_that_brings_in_source(self):
         self.produce_and_commit()
@@ -1580,9 +1670,7 @@ class BindingTests(HandbackBase):
         self.produce_and_commit()
         put(self.root, "later.txt", "x\n")
         elsewhere = commit(self.root, "main moves on")
-        data = read_json(self.wt / self.RESULTS)
-        data["head"] = elsewhere
-        (self.wt / self.RESULTS).write_text(json.dumps(data))
+        self.forge(head=elsewhere)
         commit(self.wt, "results for a foreign head")
         problems, out = self.bind()
         self.assertEqual(len(problems), 1, problems)
@@ -1594,47 +1682,62 @@ class BindingTests(HandbackBase):
         broken = commit(self.wt, "break add after the evidence")
         problems, _ = self.bind()
         self.assertTrue(problems[0].startswith(f"calc.py: changed in commit {broken} after {self.sha}"), problems)
-        data = read_json(self.wt / self.RESULTS)
-        recorded = data["inputs"]["calc.py"]
-        data["head"] = broken
-        (self.wt / self.RESULTS).write_text(json.dumps(data))
+        recorded = self.latest()[1]["inputs"]["calc.py"]
+        forged = self.forge(head=broken)
         commit(self.wt, "move the recorded head past the edit")
         problems, out = self.bind()
         self.assertEqual(out, "")
         actual = hashlib.sha256((self.wt / "calc.py").read_bytes()).hexdigest()
-        self.assertEqual(problems, [f"{self.RESULTS}: inputs: calc.py is recorded as {recorded} but its blob at the "
-                                    f"recorded head {broken} hashes to {actual}"])
+        self.assertEqual(problems, [f"{forged['path']}: inputs: calc.py is recorded as {recorded} but its blob at "
+                                    f"the recorded head {broken} hashes to {actual}"])
 
     def test_binding_fails_for_an_edited_or_made_up_input_hash(self):
         rc, out = self.handback()
         self.assertEqual(rc, 0, out)
-        honest = read_json(self.wt / self.RESULTS)
+        honest = self.latest()[1]
         for name, edit in (("edited", {"calc.py": "0" * 64}), ("made up", {"gone.py": "1" * 64})):
             with self.subTest(case=name):
-                data = dict(honest, inputs={**honest["inputs"], **edit})
-                (self.wt / self.RESULTS).write_text(json.dumps(data))
+                forged = store.record(self.wt, TASK, "results", dict(honest, inputs={**honest["inputs"], **edit}))
                 sh(self.wt, "git", "reset", "-q", "--soft", self.sha)
                 commit(self.wt, "evidence with a hand-edited hash")
                 problems, out = self.bind()
                 self.assertEqual(out, "")
                 self.assertEqual(len(problems), 1, problems)
                 path = next(iter(edit))
-                self.assertTrue(problems[0].startswith(f"{self.RESULTS}: inputs: {path} is recorded as "), problems)
+                self.assertTrue(problems[0].startswith(f"{forged['path']}: inputs: {path} is recorded as "), problems)
                 self.assertIn(f"the recorded head {self.sha}", problems[0])
 
-    def test_binding_fails_when_the_record_was_not_committed_on_its_recorded_head(self):
+    def test_binding_fails_when_the_record_was_not_indexed_on_its_recorded_head(self):
         evidence_commit = self.produce_and_commit()
         put(self.wt, f"program/status/{TASK}.json", "{}\n")
         status_commit = commit(self.wt, "status")
-        data = read_json(self.wt / self.RESULTS)
-        data["head"] = evidence_commit  # every hashed input is the same there, so only the position gives it away
-        (self.wt / self.RESULTS).write_text(json.dumps(data))
+        self.forge(head=evidence_commit)  # every hashed input is the same there, so only the position gives it away
         edit = commit(self.wt, "edit the recorded head")
         problems, out = self.bind()
         self.assertEqual(out, "")
-        self.assertEqual(problems, [f"{self.RESULTS}: committed in {edit} on top of {status_commit}, not on its "
-                                    f"recorded head {evidence_commit}; the evidence commit directly follows the "
-                                    "gated commit"])
+        self.assertEqual(problems, [f"{store.INDEX}: the {TASK} results entry was committed in {edit} on top of "
+                                    f"{status_commit}, not on its recorded head {evidence_commit}; the evidence "
+                                    "commit directly follows the gated commit"])
+
+    def test_binding_fails_when_the_index_entry_and_the_record_disagree_on_the_head(self):
+        self.produce_and_commit()
+        index = read_json(self.wt / store.INDEX)
+        index["tasks"][TASK]["results"]["head"] = "0" * 40  # the planted defect: a hand-edited pointer
+        (self.wt / store.INDEX).write_text(json.dumps(index))
+        commit(self.wt, "edit the index")
+        problems, _ = self.bind()
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn(f"results entry names head {'0' * 40}", problems[0])
+
+    def test_binding_fails_when_the_record_is_altered_in_the_store(self):
+        self.produce_and_commit()
+        path = self.store / self.latest()[0]["path"]
+        path.chmod(0o644)
+        path.write_text(path.read_text().replace('"exit": 0', '"exit": 0 '))  # the planted defect
+        problems, out = self.bind()
+        self.assertEqual(out, "")
+        self.assertEqual(len(problems), 1, problems)
+        self.assertTrue(problems[0].startswith("immutable record altered: "), problems)
 
     def test_binding_holds_again_after_a_fix_round_regates(self):
         self.produce_and_commit()
@@ -1648,12 +1751,11 @@ class BindingTests(HandbackBase):
         self.assertEqual(rc, 0, out)
         commit(self.wt, "evidence for the fix")
         problems, out = self.bind()
-        self.assertEqual((problems, out), ([], f"binding holds: results.json at {fixed} bound, 1 later commit(s) "
-                                               "touch only evidence and status\n"))
+        self.assertEqual((problems, out), ([], self.holds(fixed, 1)))
 
     def test_binding_fails_when_results_are_absent(self):
         problems, out = self.bind()
-        self.assertEqual(problems, [f"{self.RESULTS} is absent on {BRANCH}"])
+        self.assertEqual(problems, [f"{store.INDEX} on {BRANCH} names no results record of {TASK}"])
 
     def test_binding_fails_for_a_record_that_does_not_validate(self):
         os.environ["PK_SURVIVOR"] = "1"
@@ -1670,7 +1772,7 @@ class BindingTests(HandbackBase):
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             rc = pk.main(["gate", "binding", TASK, "--branch", BRANCH])
         self.assertEqual((rc, err.getvalue()), (0, ""))
-        self.assertTrue(out.getvalue().startswith(f"binding holds: results.json at {self.sha} bound"))
+        self.assertTrue(out.getvalue().startswith("binding holds: results record "))
         put(self.wt, "calc.py", CALC + "\n# later\n")
         commit(self.wt, "source")
         out, err = io.StringIO(), io.StringIO()
