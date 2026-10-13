@@ -1,6 +1,6 @@
 # Contract: ID and title
 
-*Committed first, before either side is built, by the engineer of the serving side. The client side builds against this file, not against the server's code, so both sides proceed in parallel.*
+*Written first, before either side is built, and committed to main by the controller in the dispatch commit, so that every worktree sees it. The client side builds against this file, not against the server's code, so both sides proceed in parallel. A branch never edits it: the gates hold it identical to main's. A change is appended on main, with its reason.*
 
 ## Operations
 

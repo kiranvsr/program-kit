@@ -13,7 +13,7 @@ tiny-service is a small HTTP service with `GET /health` and `POST /echo`, built 
 | `tasks/P1-M01-S01-T01/` | The task's SPEC, PLAN and spec-QA review: the dispatch commit. |
 | `src/` | The service and its unit tests, the work of that task. |
 | `evidence/P1-M01-S01-T01/produce.py` | The evidence producer the hand-back gate runs. |
-| `HANDOFF.md`, `controller-state.json` | The hand-written part of the hand-off and the controller's state: the queue, and the ad-hoc tasks and follow-ups that `pk record`, `pk adhoc` and `pk followups` write. |
+| `HANDOFF.md`, `controller-state.json` | The hand-written part of the hand-off and the controller's state: the queue (`pk record --queued <ID>=TEXT`), and the ad-hoc tasks and follow-ups that `pk record`, `pk adhoc` and `pk followups` write. |
 | `.gitignore` | Ignores bytecode and worktrees; without it the clean-tree check of the evidence step fails. |
 
 The register has one phase, one milestone, one step and two tasks, both on the full tier: `checks.yaml` lists no `tiers.full_paths`, so no lower tier is switched on. `P1-M01-S01-T01` (health and echo) is built and accepted; `P1-M01-S01-T02` (access log) stays `not_started`, and the hand-off lists it as next.
@@ -30,9 +30,9 @@ The environment matrix has `dev` (exists) and `staging` (does not exist). So `CL
 4. Dispatch: copy the task's SPEC, PLAN and spec-QA `review.md`, `pk status set P1-M01-S01-T01 in_progress --role controller`, commit the four together to main, `pk worktree new P1-M01-S01-T01`. The gates refuse a task whose `review.md` is not on main.
 5. The implementer puts `src/` and `produce.py` in the worktree and commits. The controller answers a question with `pk rulings add`.
 6. `pk gate handback P1-M01-S01-T01 --branch task/P1-M01-S01-T01` from main. Its last line is `OK: task/P1-M01-S01-T01 passes the hand-back gate at <sha>`. It needs `gitleaks` on the PATH. The test puts a stand-in `gitleaks` that always succeeds there: it proves the gate calls the scanner and fails without it, not that secrets are found.
-7. Evidence commit (`pk status set ... review`), then `pk worktree review P1-M01-S01-T01`: QA gets a detached worktree at the reviewed commit and the diff as a file.
-8. QA (`pk gate binding`, `pk evidence accept`, `pk status set ... done --role qa`), committed on the task branch.
-9. `pk merge P1-M01-S01-T01`: the merge check, the merge with `--no-ff`, the claims of G-P1, the hand-off and one bookkeeping commit. Then `pk worktree finish P1-M01-S01-T01` removes the worktrees and the merged branch.
+7. Evidence commit (`pk status set ... review`), then `pk worktree review P1-M01-S01-T01`: QA gets a detached worktree at the reviewed commit, the diff as a file and a stat file that says what the diff leaves out.
+8. QA (`pk gate binding`, `pk evidence accept`, `pk status set ... done --role qa`), committed on the task branch. The task is full-tier, so the acceptance lists the commands QA re-ran and its own planted bugs.
+9. `pk merge P1-M01-S01-T01`: the acceptance derived from the branch's evidence, the merge check, the merge with `--no-ff`, the claims of G-P1, the hand-off and one bookkeeping commit. Then `pk worktree finish P1-M01-S01-T01 --drop-ignored` removes the worktrees (with the `__pycache__` folders the test runs left in them) and the merged branch.
 10. One change request (`pk change create`, `impact`, `approve`, `apply`), `pk gate claims G-P1` and `validate`, `pk handoff update` and `check`.
 11. `pk record --ruling TEXT --followup AREA=ITEM`: the next ruling, a follow-up, the regenerated hand-off and their commit, in one step.
 

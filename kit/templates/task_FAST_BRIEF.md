@@ -1,6 +1,6 @@
 # Fast brief: ID and title
 
-*The fast path: this one file and the ruling it names replace SPEC, PLAN and spec QA for small bounded work the user asked for directly. It is never used for the full tier. It goes to main in the dispatch commit as `program/tasks/<ID>/BRIEF.md`; the gates read it from there and fail a branch that changes it.*
+*The fast path: this one file and the ruling it names replace SPEC, PLAN and spec QA for small bounded work the user asked for directly. It is never used for the full tier. It goes to main in the dispatch commit as `program/tasks/<ID>/BRIEF.md`; the gates read it from there and fail a branch that changes it, a brief without the four sections Scope, Assumptions checked, Decided and Stop and report when, and a `Ruling:` or `Tier:` line that does not say what the task's status record says.*
 
 Ruling: R
 

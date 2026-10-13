@@ -296,6 +296,25 @@ READING_0_2_KB = {"Controller or successor": 54.7, "Implementer, full or standar
                   "Implementer, light tier": 19.6, "QA": 20.0, "Spec QA": 17.9}
 
 
+class RuleFilePointerTests(unittest.TestCase):
+    """Every `kit/rules/<FILE>.md` a shipped document or script points to is a file of the kit."""
+
+    def test_no_document_points_to_a_rules_file_that_is_gone(self):
+        repo = KIT.parent
+        texts = [path for folder in (KIT, repo / "docs", repo / "examples") for path in sorted(folder.rglob("*"))
+                 if path.suffix in (".md", ".py", ".yaml", ".json") and "tests" not in path.parts
+                 and "__pycache__" not in path.parts]
+        texts += [repo / "README.md", repo / "CHANGELOG.md"]
+        self.assertGreater(len(texts), 60)
+        named = {}
+        for path in texts:
+            for name in re.findall(r"kit/rules/([A-Za-z_]+\.md)", read(path)):
+                named.setdefault(name, path)
+        self.assertEqual(sorted(named), sorted(RULES))  # both are pointed at, and nothing else is
+        for name, path in named.items():
+            self.assertTrue((RULES_DIR / name).is_file(), f"{path} points to kit/rules/{name}, which does not exist")
+
+
 class ReadingSizeTests(unittest.TestCase):
     """A role reads only what its role needs, the hand-off playbook says which files and how big, and it is true."""
 
