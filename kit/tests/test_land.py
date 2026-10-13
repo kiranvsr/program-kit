@@ -470,6 +470,34 @@ class MergeTests(LandBase):
         self.assertTrue((self.root / "backdoor.py").is_file())  # reviewed now, so it lands
         self.assertEqual(status.validate(self.root), [])
 
+    def late_evidence_file(self, name):
+        """The re-review's N3: after QA's acceptance, a file under the task's evidence folder is committed."""
+        self.standard()
+        put(self.wt, f"program/evidence/{TASK}/{name}", "import os\n")
+        late = commit(self.wt, f"late {name}")
+        before = self.head()
+        code, out, err = self.pk("merge", TASK)
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn(f"{late[:12]} was committed after the reviewed commit", err)
+        self.assertIn(f"changes program/evidence/{TASK}/{name}:", err)
+        self.untouched(before)
+
+    def test_a_conftest_added_to_the_evidence_folder_after_the_review_does_not_reach_main(self):
+        self.late_evidence_file("conftest.py")
+
+    def test_a_test_file_added_to_the_evidence_folder_after_the_review_does_not_reach_main(self):
+        self.late_evidence_file("test_late.py")
+
+    def test_a_late_file_under_results_is_one_the_kit_writes_and_lands(self):
+        self.standard()
+        entry, _ = store.load_latest(self.wt, TASK, "results")
+        raw = (self.wt / entry["path"]).read_bytes()  # an older-named copy: the pointer still names the latest
+        put(self.wt, f"program/evidence/{TASK}/results/20000101T000000000000Z-{entry['digest'][:12]}.json",
+            raw.decode("utf-8"))
+        commit(self.wt, "a late results file")
+        code, out, err = self.pk("merge", TASK)
+        self.assertEqual((code, err), (0, ""), out)
+
     def test_a_merge_commit_that_carries_a_change_of_its_own_does_not_reach_main(self):
         self.standard()
         put(self.root, "main-only.txt", "x\n")

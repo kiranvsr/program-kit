@@ -82,8 +82,14 @@ def _tip_status(root: Path, task_id: str, sha: str) -> str:
 
 
 def _own_path(path: str, task_id: str) -> bool:
-    """Whether `path` is one of the task's own evidence or status files: all a branch may add after its review."""
-    return path == f"program/status/{task_id}.json" or path.startswith(f"program/evidence/{task_id}/")
+    """Whether `path` is one the kit writes for the task after its review: all a branch may add then.
+
+    The status file, and under `program/evidence/<ID>/` the pointer `latest.json`, `results/`, `acceptance/` and
+    the implementer's `report.md`. Anything else there (`produce.py`, a `conftest.py`, a test file) is work.
+    """
+    folder = f"program/evidence/{task_id}/"
+    return (path in (f"program/status/{task_id}.json", f"{folder}latest.json", f"{folder}report.md")
+            or path.startswith((f"{folder}results/", f"{folder}acceptance/")))
 
 
 def _names(root: Path, *args: str) -> list[str]:
@@ -122,8 +128,8 @@ def _late_work(root: Path, task_id: str, head: str, sha: str) -> str | None:
             late, what = ["(a merge of more than two parents)"], "was made after"
         if late:
             return (f"{task_id}: {commit[:12]} {what} the reviewed commit {head[:12]} and changes "
-                    f"{', '.join(late)}: after the commit QA accepted, a branch adds only its own evidence and "
-                    f"status files; {again}")
+                    f"{', '.join(late)}: after the commit QA accepted, a branch adds only its status file and, under "
+                    f"program/evidence/{task_id}/, latest.json, results/, acceptance/ and report.md; {again}")
     return None
 
 
