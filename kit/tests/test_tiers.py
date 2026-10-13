@@ -212,6 +212,60 @@ class TierStatusTests(unittest.TestCase):
                      inspected=tip)
         self.assertIn("outside tiers.light_paths: server/api.py", self.by_hand(inspected=tip))
 
+    def test_a_full_tier_file_added_inside_the_merge_commit_is_never_recorded_merged(self):
+        """The re-review's N1 (a): the branch is light-only, the hand-made merge commit adds auth/policy.py."""
+        self.light_task()
+        tip = self.light_branch("web/page.txt")
+        self.git("merge", "-q", "--no-ff", "--no-commit", f"task/{TID}")
+        (self.root / "auth").mkdir()
+        (self.root / "auth" / "policy.py").write_text("ALLOW_ALL = True\n")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", f"Merge task/{TID}")
+        self.refused("changed full-tier paths: auth/policy.py", TID, "merged", "controller", inspected=tip)
+        self.assertIn("changed full-tier paths: auth/policy.py", self.by_hand(inspected=tip))
+        self.git("branch", "-D", f"task/{TID}")
+        self.assertIn("changed full-tier paths: auth/policy.py", self.by_hand(inspected=tip))
+
+    def test_merged_names_the_tip_of_the_task_branch_not_an_earlier_commit_or_a_decoy(self):
+        """The re-review's N1 (b) and (c): a light-only first commit, or a decoy branch, named as inspected."""
+        self.light_task()
+        self.git("checkout", "-q", "-b", "decoy")
+        (self.root / "web").mkdir()
+        (self.root / "web" / "other.txt").write_text("x\n")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "decoy")
+        decoy = self.git("rev-parse", "HEAD").strip()
+        self.git("checkout", "-q", "main")
+        first = self.light_branch("web/page.txt")
+        self.git("checkout", "-q", f"task/{TID}")
+        (self.root / "auth").mkdir()
+        (self.root / "auth" / "policy.py").write_text("ALLOW_ALL = True\n")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "more")
+        tip = self.git("rev-parse", "HEAD").strip()
+        self.git("checkout", "-q", "main")
+        self.git("merge", "-q", "--no-ff", "-m", "decoy", "decoy")
+        self.git("merge", "-q", "--no-ff", "-m", "first", first)
+        self.git("merge", "-q", "--no-ff", "-m", "rest", f"task/{TID}")
+        for named in (first, decoy):
+            self.refused(f"--inspected {named} is not the tip of task/{TID} \\({tip}\\)", TID, "merged",
+                         "controller", inspected=named)
+        self.refused("changed full-tier paths: auth/policy.py", TID, "merged", "controller", inspected=tip)
+        for named in (first, decoy):  # and a record written by hand, while the branch exists
+            self.assertIn(f"is not the tip of task/{TID}", self.by_hand(inspected=named))
+
+    def test_a_light_merge_with_main_moved_first_is_recorded_merged_and_validates(self):
+        self.light_task()
+        tip = self.light_branch("web/page.txt")
+        (self.root / "notes.txt").write_text("main moved\n")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "main moves")
+        self.git("merge", "-q", "--no-ff", "-m", "merge", f"task/{TID}")
+        self.assertEqual(status.transition(self.root, TID, "merged", "controller", inspected=tip)["status"], "merged")
+        self.assertEqual(status.validate(self.root), [])
+        self.git("branch", "-d", f"task/{TID}")
+        self.assertEqual(status.validate(self.root), [])
+
     def test_a_merged_record_written_by_hand_for_a_task_that_was_not_light_does_not_validate(self):
         self.checks(full_paths=["auth/"], light_paths=["web/"], light_ruling="R1")
         self.ruling()

@@ -298,8 +298,10 @@ def _merged_problem(root: Path, task_id: str, inspected: str) -> str | None:
 
     Worked out from main's history, so it holds after the branch is deleted: main's first-parent history has
     a merge whose second parent is `inspected`; on main just before that merge the task's status record said
-    light; and under the tiers of main's `checks.yaml` at that point the merge brought in no full-tier path
-    and nothing outside the light paths. This is the light path's guard of the merge check, run again.
+    light; and under the tiers of main's `checks.yaml` at that point the merge brought in (`<merge>^1..<merge>`)
+    no full-tier path and nothing outside the light paths. This is the light path's guard of the merge check,
+    run again. While `task/<ID>` exists, `inspected` must be its tip; after the branch is deleted nothing ties
+    `inspected` to the task (a Known limit of 0.3.0).
     """
     import gate  # lazy: gate imports this module
 
@@ -315,6 +317,11 @@ def _merged_problem(root: Path, task_id: str, inspected: str) -> str | None:
         return (f"{task_id}: {PRIMARY_BRANCH} has no merge of {inspected}: merged is recorded after "
                 f"git merge --no-ff of the inspected commit (pk merge {task_id} --inspected <sha> does both)")
     merge, before = landed[0], landed[1]
+    code, tip = run_argv(["git", "-C", str(root), "rev-parse", "--verify", "--quiet",
+                          f"refs/heads/task/{task_id}^{{commit}}"], Path(root))
+    if code == 0 and tip.strip() != inspected:
+        return (f"{task_id}: --inspected {inspected} is not the tip of task/{task_id} ({tip.strip()}): merged "
+                f"records the branch tip the controller read")
     try:
         meta = gate.task_meta(root, task_id, ref=before)
         tiers = gate.load_checks_at(root, before)["tiers"]
@@ -325,8 +332,7 @@ def _merged_problem(root: Path, task_id: str, inspected: str) -> str | None:
                 f"is for a task that was light-tier at its merge, and a {meta['tier']}-tier task ends at done")
     if not tiers["full_paths"] or not tiers["light_paths"]:
         return f"{task_id}: the light tier was not switched on in checks.yaml when {merge[:12]} merged it"
-    base = git(root, "merge-base", before, inspected)
-    changed = sorted(gate._git_fields(root, "diff", "--name-only", "--no-renames", "-z", f"{base}..{inspected}"))
+    changed = sorted(gate._git_fields(root, "diff", "--name-only", "--no-renames", "-z", f"{before}..{merge}"))
     full = [path for path in changed if gate._under(path, (*gate.BUILTIN_FULL, *tiers["full_paths"]))]
     if full:
         return (f"{task_id}: the merge {merge[:12]} of this light-tier task changed full-tier paths: "
