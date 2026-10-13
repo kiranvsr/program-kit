@@ -115,7 +115,8 @@ def _out(text, stream=None) -> None:
 
 def _print_ok(kind: str, branch, sha) -> None:
     """Print the final `OK:` line: nothing but a validated branch name and a 40-hex sha."""
-    ending = {"handback": "passes the hand-back gate", "merge": "merges into main"}[kind]
+    ending = {"handback": "passes the hand-back gate", "merge": "merges into main",
+              "round": "passes the combined check"}[kind]
     if not (isinstance(branch, str) and _REF.match(branch) and isinstance(sha, str) and _HEX40.match(sha)):
         raise KitError("refusing to print an OK line for an unvalidated branch or sha")
     print(f"OK: {branch} {ending} at {sha}")
@@ -795,7 +796,7 @@ def handback(root, task_id: str, branch: str, worktree=None) -> int:
     return 0
 
 
-def merge_check(root, branch: str, inspected: str | None = None) -> int:
+def merge_check(root, branch: str, inspected: str | None = None, suite: bool = True) -> int:
     """The controller's independent gate run before a merge; 0 and a final `OK:` line only when all of it passed.
 
     It does not rely on the hand-back gate having been run: the guarded-file check and the tier check, then on
@@ -804,6 +805,10 @@ def merge_check(root, branch: str, inspected: str | None = None) -> int:
     `task/<ID>` names; any other branch is refused. A light-tier task runs only the build, the compile check
     and the scans, and only when `inspected` names the branch tip: the controller's statement that it read the
     diff at that commit, which is the review a light task gets.
+
+    `suite=False` is for a member of an integration round whose combined tree already passed every command
+    (`land.py` checks that before it asks): the guarded-file, tier, inspection and identity checks and the trial
+    merge still run, the commands do not, and no `OK:` line is printed, because this is not a merge check.
     """
     root = Path(root).resolve()
     task_id = _branch_task(branch)
@@ -825,6 +830,8 @@ def merge_check(root, branch: str, inspected: str | None = None) -> int:
     def steps() -> int:
         if _definition(root, trial, task_id, meta) is None or not _tier_unchanged(trial, task_id, meta):
             return 1
+        if not suite:
+            return 0
         if meta["tier"] == "light":
             return _run_light(checks, trial)
         for step in ("build", "compile_check", "test", "scan", "extra_gate"):
@@ -838,6 +845,9 @@ def merge_check(root, branch: str, inspected: str | None = None) -> int:
     if _branch_head(root, branch) != sha:
         _out(f"FAILED: {branch} moved during the merge check")
         return 1
+    if not suite:
+        _out(f"round member {branch}: guarded files, tier, definition and trial merge hold at {sha}")
+        return 0
     _print_ok("merge", branch, sha)
     return 0
 
