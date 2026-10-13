@@ -610,11 +610,11 @@ class SourceManifestTests(InstallCase):
         source = self.source()
         (source / "kit" / "extra.txt").write_text("x\n")
         (source / "kit" / "VERSION.bak").write_text("x\n")
-        (source / "kit" / "rules" / "THROUGHPUT.md").unlink()
+        (source / "kit" / "rules" / "RULES.md").unlink()
         target = self.repo()
         result = self.install(target, script=source / "install.sh")
         self.assert_one_line(result, "added: extra.txt")
-        self.assertIn("missing: rules/THROUGHPUT.md", result.stderr)
+        self.assertIn("missing: rules/RULES.md", result.stderr)
 
     def test_a_stale_manifest_is_refused_on_upgrade_and_the_installed_kit_is_untouched(self):
         target = self.repo()

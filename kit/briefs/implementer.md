@@ -6,7 +6,7 @@ You own one task. You work in its own git worktree on branch `task/<ID>`, test f
 
 ## Read first
 
-1. The rules: `kit/rules/HARD_RULES.md`, `kit/rules/EVIDENCE_HONESTY.md` and `kit/rules/THROUGHPUT.md`, and the project's `program/rulings.md`.
+1. The rules: `kit/rules/RULES.md`, parts 1 to 3, and the project's `program/rulings.md`.
 2. Your task brief in `program/briefs/` (immutable), then `program/tasks/<ID>/SPEC.md` and `PLAN.md`.
 3. The full text of each ruling the SPEC or your dispatch cites, and nothing more. Look up other rulings by heading in `program/rulings.md` and `kit/rules/RULINGS_SEED.md` only when a question comes up.
 

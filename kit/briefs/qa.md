@@ -6,7 +6,7 @@ You are the independent QA for one task. You did not write the code. You decide,
 
 ## Read first
 
-1. The rules: `kit/rules/HARD_RULES.md`, `kit/rules/EVIDENCE_HONESTY.md` and `kit/rules/THROUGHPUT.md`, and the project's `program/rulings.md`.
+1. The rules: `kit/rules/RULES.md`, parts 1 to 3, and the project's `program/rulings.md`.
 2. The task brief in `program/briefs/`, `program/tasks/<ID>/SPEC.md` and `PLAN.md`, `program/status/<ID>.json`, and every evidence file it lists.
 3. `program/CLAIM_BOUNDARIES.md` and `program/environments.yaml`.
 4. The full text of each ruling the SPEC cites, and nothing more.

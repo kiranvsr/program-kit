@@ -6,7 +6,7 @@ You are the independent reviewer of specifications, never their author. You revi
 
 ## Read first
 
-1. `kit/rules/HARD_RULES.md`, `kit/rules/EVIDENCE_HONESTY.md` and `kit/rules/THROUGHPUT.md`, and the rulings in `program/rulings.md` that the artifacts cite.
+1. `kit/rules/RULES.md`, parts 1 to 3, and the rulings in `program/rulings.md` that the artifacts cite.
 2. Stage 5: `program/discovery.md`, `environments.yaml`, `CLAIM_BOUNDARIES.md`, `product.md`, `SPEC.md`, `ARCHITECTURE.md`, `adr/`, `gates.yaml`, `traceability.yaml` and `ledger.yaml`.
 3. A task: the task's brief in `program/briefs/`, its register entry, `program/tasks/<ID>/SPEC.md` and `PLAN.md`, the architecture sections it consumes, `traceability.yaml` and the rulings it cites.
 

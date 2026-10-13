@@ -1,12 +1,14 @@
 # Seed rulings
 
-These are the starting rulings of a program, numbered K1 to K33. They come from earlier programs run with this process. Read the ones your task's SPEC cites. Do not read all of them up front.
+These are the starting rulings of a program, numbered K1 to K33. They come from earlier programs run with this process. Read the ones your task's SPEC cites, by heading. Do not read all of them up front.
+
+The rules themselves are stated once, in `kit/rules/RULES.md`. Where a seed ruling is one of those rules, its **Rule.** line names the rule and this file keeps only what the rule file does not: why the ruling was made and how to apply it. A K number never changes its meaning.
 
 Your own program records its rulings in `program/rulings.md` with `pk rulings add`, numbered R1 onward. A ruling never contradicts an earlier one silently: it supersedes it by name. A K ruling can be superseded the same way.
 
 ## K1. Merge queue: QA only on evidence that reflects current main, merge right after acceptance
 
-**Rule.** QA starts once the branch's evidence reflects current main. Once QA accepts, the controller merges that branch next. No other code merge to main happens between the start of QA and that merge. Accepted branches merge one at a time, in acceptance order. Documentation-only hand-off commits are fine.
+**Rule.** Controller rule C1 of `kit/rules/RULES.md`.
 
 **Why.** Every merge to main makes every waiting branch re-merge, re-produce evidence and re-run QA. Rework, not coding, was the bottleneck.
 
@@ -14,7 +16,7 @@ Your own program records its rulings in `program/rulings.md` with `pk rulings ad
 
 ## K2. Hand-back gate before any QA round
 
-**Rule.** An implementer hands work back only after `pk gate handback <ID> --branch task/<ID>` ends with its OK line. A hand-back without that line is returned without QA.
+**Rule.** Working rule W2 of `kit/rules/RULES.md`.
 
 **Why.** QA rejected work for mechanical misses that a script finds in minutes. Each rejection cost a full QA round.
 
@@ -22,7 +24,7 @@ Your own program records its rulings in `program/rulings.md` with `pk rulings ad
 
 ## K3. Decide, do not ask
 
-**Rule.** An agent decides anything that follows an existing ruling or pattern and records the decision as a deviation that cites the precedent. It stops with NEEDS_CONTEXT only for a new dependency, a security boundary with no precedent, a change to user scope, or two conflicting rulings.
+**Rule.** Working rule W1 of `kit/rules/RULES.md`.
 
 **Why.** Questions cost a round trip and the controller's context. Most questions had an answer already written down.
 
@@ -30,7 +32,7 @@ Your own program records its rulings in `program/rulings.md` with `pk rulings ad
 
 ## K4. Fix rounds return a finding-to-fix table and get a scoped re-check
 
-**Rule.** QA sends findings to the same implementer, each with severity, location and the exact fix expected. The implementer hands back a table mapping each finding to the commit that fixes it. The re-check covers only those findings, plus the binding check. The implementer re-runs the hand-back gate after the fix (K2); QA does not.
+**Rule.** Working rule W3 of `kit/rules/RULES.md`.
 
 **Why.** The implementer already holds the context, and a full second review repeats work that was already accepted.
 
@@ -38,7 +40,7 @@ Your own program records its rulings in `program/rulings.md` with `pk rulings ad
 
 ## K5. Concurrency limit: three implementers, four agents
 
-**Rule.** At most three implementer branches are in flight, and at most four agents run at once (implementers, fix rounds and QA together). Work closest to merge goes first.
+**Rule.** Controller rule C5 of `kit/rules/RULES.md`.
 
 **Why.** More parallel work produced more stale branches and hit session and rate limits.
 
@@ -46,7 +48,7 @@ Your own program records its rulings in `program/rulings.md` with `pk rulings ad
 
 ## K6. A gate passes on its OK line, not on its exit code
 
-**Rule.** Whoever runs a gate or merge check (the implementer for the hand-back gate, the controller for the merge check) requires the final OK line, not only exit code 0. For the hand-back gate that line is `OK: <branch> passes the hand-back gate at <sha>`; for the merge check it is `OK: <branch> merges into main at <sha>`.
+**Rule.** Working rule W2 of `kit/rules/RULES.md`. For the hand-back gate the line is `OK: <branch> passes the hand-back gate at <sha>`; for the merge check it is `OK: <branch> merges into main at <sha>`.
 
 **Why.** A merge check once exited 0 without checking anything, because a setup file was missing and an exit trap hid the failure.
 
@@ -54,7 +56,7 @@ Your own program records its rulings in `program/rulings.md` with `pk rulings ad
 
 ## K7. PLAN commands run literally
 
-**Rule.** Every command in the PLAN's `## Exact Commands` section is run exactly as written. No placeholder, no added flags. If one cannot run as written, fix the code or record a named deviation. Never substitute.
+**Rule.** Evidence rule 1 of `kit/rules/RULES.md`.
 
 **Why.** Evidence that ran a different command proves a different claim.
 
@@ -62,7 +64,7 @@ Your own program records its rulings in `program/rulings.md` with `pk rulings ad
 
 ## K8. Derived fields are parsed and asserted
 
-**Rule.** Every field a producer derives from another tool's output (a scanner status, a count, an OK line) is parsed from the real output and asserted. No field reads "unparseable" or "unknown" in a run marked as expected.
+**Rule.** Evidence rule 2 of `kit/rules/RULES.md`.
 
 **Why.** A run marked as expected with an unparsed field claimed more than it checked.
 
@@ -70,7 +72,7 @@ Your own program records its rulings in `program/rulings.md` with `pk rulings ad
 
 ## K9. Every new guard has a cheapest-defeat planted bug
 
-**Rule.** Every detector or guard a task adds or edits gets a planted bug that defeats it in the cheapest way (dead code, a comment, a copied field, a pass-through). The gate's own test must catch it.
+**Rule.** Evidence rule 3 of `kit/rules/RULES.md`.
 
 **Why.** A unit test that passes with the guard removed shows the guard is not what protects the behaviour.
 
@@ -78,7 +80,7 @@ Your own program records its rulings in `program/rulings.md` with `pk rulings ad
 
 ## K10. A planted bug counts only on a test failure
 
-**Rule.** A planted bug is caught only when a test fails in code that builds (or, for code that is not compiled, loads). Planted bugs must build. The runner records `builds` and `kill_reason` per row and always carries one deliberately non-building row recorded as not caught.
+**Rule.** Evidence rule 4 of `kit/rules/RULES.md`. The runner records `builds` and `kill_reason` per row and always carries one deliberately non-building row recorded as not caught.
 
 **Why.** Counting build failures as catches made a broken edit look like a strong test suite. The self-test row makes a runner that does this visible.
 
@@ -86,7 +88,7 @@ Your own program records its rulings in `program/rulings.md` with `pk rulings ad
 
 ## K11. Cross-boundary tests for every access policy
 
-**Rule.** Every new access policy (tenancy, roles, permissions, row filters) gets an eligible-record positive control, a cross-boundary negative test that acts as another principal (reads see nothing, writes of foreign records fail, updates change nothing), and a committed planted bug that replaces the policy with an allow-everything one, which the test must catch.
+**Rule.** Evidence rule 5 of `kit/rules/RULES.md`.
 
 **Why.** A policy nobody tried to cross can be wrong in both directions without any test noticing.
 
@@ -110,7 +112,7 @@ Your own program records its rulings in `program/rulings.md` with `pk rulings ad
 
 ## K14. Read only the rules and the rulings your SPEC cites
 
-**Rule.** Read `kit/rules/HARD_RULES.md`, `EVIDENCE_HONESTY.md` and `THROUGHPUT.md`, plus the full text of each ruling your SPEC, PLAN or dispatch prompt cites. Do not read the whole ruling log.
+**Rule.** Working rule W7 of `kit/rules/RULES.md`.
 
 **Why.** The log grows without limit, and reading all of it costs more than the rest of the task.
 
@@ -118,7 +120,7 @@ Your own program records its rulings in `program/rulings.md` with `pk rulings ad
 
 ## K15. After an interruption, void and resume; never restart
 
-**Rule.** After a session or rate limit, void partial evidence by exact path and resume each agent at the step it was on. Tell it: resume from the last commit, re-run only the interrupted step. Never restart a task from scratch.
+**Rule.** Working rule W8 and evidence rule 8 of `kit/rules/RULES.md`.
 
 **Why.** Restarting repeats accepted work, and a half-written evidence file left in place looks like a real record.
 
@@ -126,7 +128,7 @@ Your own program records its rulings in `program/rulings.md` with `pk rulings ad
 
 ## K16. A branch need not re-merge when main moved without touching its inputs
 
-**Rule.** When main moved after a branch's evidence was produced, the branch does not re-merge and re-produce if none of its hashed inputs changed between the evidence's main base and current main, and `git merge-tree --write-tree main <branch>` reports no conflict. The controller records the overlap check. QA runs the checks against current main, and the controller's merge check before `git merge --no-ff` is the final integration check. Any overlap or conflict means merge main, re-produce, then QA.
+**Rule.** Controller rule C2 of `kit/rules/RULES.md`.
 
 **Why.** Most main moves are unrelated to a given branch, and re-producing evidence for them is pure cost.
 
@@ -142,7 +144,7 @@ Your own program records its rulings in `program/rulings.md` with `pk rulings ad
 
 ## K18. Model tiers are roles, never names
 
-**Rule.** Tier 1, your most capable model, does the controller's work, first-pass implementation, first-pass QA, spec writing and spec review, and any re-check that escalates. Tier 2, a cheaper model, does only scoped re-checks of exact fixes, mechanical re-runs with a checklist and resume-only work. A Tier 2 agent reports ESCALATE for anything outside its checklist and never accepts on judgement. Never use Tier 2 for first-pass work, a security ruling, or accepting a task with an open important finding. With one capable model, use it for everything. Nothing in the kit names a model.
+**Rule.** Controller rule C4 of `kit/rules/RULES.md`.
 
 **Why.** Cheap models are good at following a checklist and poor at judgement, and the session budget was the binding limit.
 
@@ -158,7 +160,7 @@ Your own program records its rulings in `program/rulings.md` with `pk rulings ad
 
 ## K20. No polling and no tailing
 
-**Rule.** Run a long command in the background with its output redirected to a file, and wait for its completion. Never use sleep or wait loops. Never wait on `tail -f` or `tail -F`: they never exit, so nothing wakes the agent.
+**Rule.** Working rule W5 of `kit/rules/RULES.md`.
 
 **Why.** Wait loops burned session budget, and an agent once sat idle for half an hour after its command had finished.
 
@@ -166,7 +168,7 @@ Your own program records its rulings in `program/rulings.md` with `pk rulings ad
 
 ## K21. Reports are short and fixed in shape
 
-**Rule.** A report follows the fixed headings in the role's brief and stays under 25 lines. It holds the finding-to-fix table, the gate results, deviations and the stale-list summary. It does not restate the SPEC.
+**Rule.** Working rule W6 of `kit/rules/RULES.md`.
 
 **Why.** The controller reads many reports, and long ones hid the facts that mattered.
 
@@ -198,7 +200,7 @@ Your own program records its rulings in `program/rulings.md` with `pk rulings ad
 
 ## K25. Consumed-input hashes are complete
 
-**Rule.** Hash everything the recorded commands consume: tracked unchanged source, tests, fixtures, embedded data, local dependency closure, generated-file sources, migrations, tool helpers, configuration and lock files. A list of changed files is not enough. Exclude lifecycle or generated outputs only with a written reason. Show that a representative formerly unhashed consumed file is now detected when edited.
+**Rule.** Evidence rule 6 of `kit/rules/RULES.md`. Exclude lifecycle or generated outputs only with a written reason, and show that a representative formerly unhashed consumed file is now detected when edited.
 
 **Why.** Stale detection sees only what was hashed, so an incomplete list let stale evidence look current.
 
@@ -222,7 +224,7 @@ Your own program records its rulings in `program/rulings.md` with `pk rulings ad
 
 ## K28. Refreshing an older record re-runs everything it holds
 
-**Rule.** When an older evidence record is refreshed, every command entry it already holds is re-run with its own command text, and a new record is appended with each entry's real result in the same shape (the older record stays, untouched). Entries are never dropped to the PLAN subset and stale entries are never kept. An entry that fails only on a known environmental cause is a named deviation (K27), never a pass. QA re-accepts by appending a new acceptance that binds the new record.
+**Rule.** Evidence rule 9 of `kit/rules/RULES.md`.
 
 **Why.** A refresh that kept old numbers or dropped awkward entries made a snapshot look current.
 
@@ -230,7 +232,7 @@ Your own program records its rulings in `program/rulings.md` with `pk rulings ad
 
 ## K29. An acceptance lives where the code reads it
 
-**Rule.** When a record has acceptance fields that a validator or a test reads, accept by setting those fields, after QA verifies the record's hashes. A side acceptance file that leaves the read fields pending is not an acceptance.
+**Rule.** Hard rule 4 of `kit/rules/RULES.md`.
 
 **Why.** A side file left the repo-wide suite failing on main while the acceptance looked complete.
 
@@ -246,7 +248,7 @@ Your own program records its rulings in `program/rulings.md` with `pk rulings ad
 
 ## K31. Validators never download inline
 
-**Rule.** A validator or gate step never downloads. Anything fetched from the network is cached by content digest in a durable per-host cache and fetched once per host by `pk fetch`, run in the background at session setup. A verify step that finds its input missing fails and names the fetch command. Receipts stay digest-bound. Every guard of the fetch step (strict names, exclusive temporary file with cleanup in a finally block, size and digest check before rename, no symlink following, read errors refused rather than raised) has its own test and planted bug.
+**Rule.** Evidence rule 10 of `kit/rules/RULES.md`.
 
 **Why.** An inline download made a check slow and flaky, and it made what was checked depend on the network.
 
@@ -262,8 +264,8 @@ Your own program records its rulings in `program/rulings.md` with `pk rulings ad
 
 ## K33. Nothing else merges while a gate that reads every record is producing evidence
 
-**Rule.** While a phase gate or a re-bind batch that reads almost every record is running, merge nothing else to main, because any merge voids it. Merge the feature tasks first in one window. Then run the gates and the re-bind batch back to back on a quiet main, merging each before the next starts.
+**Rule.** Controller rule C8 of `kit/rules/RULES.md`.
 
 **Why.** A merge during a gate run voided the run, and the whole gate had to start again.
 
-**How to apply.** The controller announces the quiet window, drains the merge queue, runs the gates one after another, and only then reopens the queue.
+**How to apply.** The controller announces the quiet window, drains the merge queue, runs the gates one after another on a quiet main, and only then reopens the queue.

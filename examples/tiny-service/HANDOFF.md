@@ -4,7 +4,7 @@ This is the hand-off of the tiny-service example. The part between the markers i
 
 ## How the program works
 
-Every `pk` command is `python3 kit/scripts/pk.py <command>`, run from the repository root or a task worktree. Discovery (stages 1 to 6) is approved and frozen. Each task then goes through `kit/playbooks/07_task_specs.md` and `08_execute.md`: spec and plan, a dispatch commit on main, a worktree, the hand-back gate, independent QA, merge. Rules live in `kit/rules/HARD_RULES.md`, `EVIDENCE_HONESTY.md`, `THROUGHPUT.md` and `program/rulings.md`.
+Every `pk` command is `python3 kit/scripts/pk.py <command>`, run from the repository root or a task worktree. Discovery (stages 1 to 6) is approved and frozen. Each task then goes through `kit/playbooks/07_task_specs.md` and `08_execute.md`: spec and plan, a dispatch commit on main, a worktree, the hand-back gate, independent QA, merge. Rules live in `kit/rules/RULES.md` and `program/rulings.md`.
 
 ## Environment setup
 

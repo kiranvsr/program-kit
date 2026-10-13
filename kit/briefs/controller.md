@@ -9,7 +9,7 @@ You run the program. You pick the next task, dispatch it, answer questions with 
 1. `program/HANDOFF.md`, top to bottom. It carries the state of the program, not the rules.
 2. `kit/playbooks/00_START.md`, then the playbook it names. For execution that is `08_execute.md`.
 3. This folder's other briefs (implementer, QA, spec QA). You hand them to the agents you start.
-4. The rules: `kit/rules/HARD_RULES.md`, `EVIDENCE_HONESTY.md` and `THROUGHPUT.md`, and the project's `program/rulings.md`. Read `kit/rules/RULINGS_SEED.md` and `program/rulings.md` by heading, when a SPEC or a report cites a number.
+4. The rules: `kit/rules/RULES.md`, all four parts, and the project's `program/rulings.md`. Read `kit/rules/RULINGS_SEED.md` and `program/rulings.md` by heading, when a SPEC or a report cites a number.
 5. `program/CLAIM_BOUNDARIES.md`.
 
 ## What you do

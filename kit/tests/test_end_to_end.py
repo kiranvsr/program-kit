@@ -351,7 +351,7 @@ class EndToEndTests(unittest.TestCase):
         self.assertIn(OTHER, handoff)
         self.assertIn("- done: 1", handoff)
         self.assertIn("- not_started: 1", handoff)
-        self.assertIn("kit/rules/HARD_RULES.md", handoff)
+        self.assertIn("kit/rules/RULES.md", handoff)
 
         # The gate document and its validation: dev has evidence, staging does not exist.
         project.pk("gate", "claims", GATE)

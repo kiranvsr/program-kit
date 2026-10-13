@@ -12,7 +12,7 @@ Keep one document, `program/HANDOFF.md`, current enough that a different agent, 
 ## Steps
 
 1. Outgoing controller: finish or park the step you are on. Void any partial evidence by exact path. Leave no dirty worktree.
-2. Update the maintained sections of `program/HANDOFF.md` (they start empty): how the program works, current environment setup, new gotchas and the ordered next steps. Keep one line under Where the rules live that names `kit/rules/HARD_RULES.md`, `EVIDENCE_HONESTY.md`, `THROUGHPUT.md` and `program/rulings.md`. HANDOFF carries state, not rules. Record your model-tier mapping under Model tiers (which model you used as Tier 1, which as Tier 2, or that you had one model). A ruling that changes the process changes the playbook or rule file in the same commit.
+2. Update the maintained sections of `program/HANDOFF.md` (they start empty): how the program works, current environment setup, new gotchas and the ordered next steps. Keep one line under Where the rules live that names `kit/rules/RULES.md` and `program/rulings.md`. HANDOFF carries state, not rules. Record your model-tier mapping under Model tiers (which model you used as Tier 1, which as Tier 2, or that you had one model). A ruling that changes the process changes the playbook or rule file in the same commit.
 3. Run `pk handoff update`, then `pk handoff check`. It exits 1 while the generated part is stale. Commit `program/` only when it exits 0.
 4. Give the successor the prompt below, and tell the user who is taking over.
 5. Successor: follow the prompt. Do the state check before anything else. Record your own tier mapping in HANDOFF, and use your own attribution line on commits.
@@ -28,8 +28,8 @@ repository. Another agent ran it until now. Keep delivering the remaining tasks 
 at the same quality bar, with the least rework. All state is in the repository.
 
 1. Read program/HANDOFF.md top to bottom. Then read kit/briefs/controller.md,
-   implementer.md, qa.md and spec_qa.md. Read kit/rules/HARD_RULES.md,
-   EVIDENCE_HONESTY.md and THROUGHPUT.md. Read program/rulings.md and
+   implementer.md, qa.md and spec_qa.md. Read kit/rules/RULES.md.
+   Read program/rulings.md and
    kit/rules/RULINGS_SEED.md only by heading, for the rulings a SPEC or report cites.
 2. Verify the state before you act:
    - git status on main, and git branch --no-merged main; compare with HANDOFF.

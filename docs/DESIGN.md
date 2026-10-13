@@ -51,7 +51,7 @@ program-kit/
     briefs/
       controller.md, implementer.md, qa.md, spec_qa.md
     rules/
-      HARD_RULES.md, EVIDENCE_HONESTY.md, THROUGHPUT.md, RULINGS_SEED.md
+      RULES.md, RULINGS_SEED.md
     templates/
       BRIEF.md, discovery.md, product.md, SPEC.md, ARCHITECTURE.md, adr.md, roadmap.md
       environments.yaml, gates.yaml, traceability.yaml, register.yaml, ledger.yaml
@@ -221,7 +221,7 @@ A change of meaning to anything approved at stage 5 or later is a change request
 
 **Model tiers.** Roles, never names. Tier 1 is the strongest model available: controller, first-pass implementation and QA, the interviewer and the lens challenge rounds, stage artifacts and specs, freeze review, any re-check that escalates. Tier 2 is a cheaper model, used only for scoped re-checks of exact fixes, re-bind runs and mechanical producer runs with a checklist; it reports ESCALATE instead of judging anything outside the checklist. Never Tier 2 for first-pass work, security rulings, or accepting with an open important finding. A provider with one model uses it for everything. Nothing in the kit names a model; each controller records its mapping in HANDOFF when it takes over. The commit attribution line follows the controller's own session and is not copied from an earlier commit.
 
-## 8. Hard rules (kit/rules/HARD_RULES.md)
+## 8. Hard rules (kit/rules/RULES.md, part 1)
 
 These bind every agent in every role and stage. If a rule seems to block the work, the agent stops and tells the user; it does not look for a way around. The file holds twenty numbered rules; in summary:
 
@@ -229,7 +229,7 @@ These bind every agent in every role and stage. If a rule seems to block the wor
 - **Status, register and frozen artifacts.** Only QA sets `done`, only through `pk status set`. The register changes only through `pk register change`; status files, approvals and generated briefs are never hand-edited. Briefs are immutable once approved. A frozen artifact changes only through a change request. Guarded files (the `guarded_files` list in `checks.yaml`) change only with the user's approval, recorded as a `Guarded edit: <path>` line in the task's SPEC on main before dispatch; a branch cannot approve its own edit.
 - **Git and files.** Never rewrite history: no rebase, reset or force-push; merge main into branches; never a bare `git stash`. Never commit secrets, private keys, licence-restricted artifacts, editor or build leftovers or scratch files. Never push, deploy or apply infrastructure without the user's explicit instruction. Every destructive command uses a literal path; clean up only what you created, by exact name. Commit messages end with the agent's own attribution line.
 - **Permissions and scope.** A denied action is reported to the user, never routed around and never delegated to another agent. An implementer asks the controller only in four cases (a new dependency, a security boundary with no precedent, a change to user scope, two conflicting rulings) and decides everything else itself. A task builds exactly the scope of its SPEC and PLAN; anything else is a follow-up.
-## 9. Evidence honesty (kit/rules/EVIDENCE_HONESTY.md) and the evidence kit
+## 9. Evidence honesty (kit/rules/RULES.md, part 3) and the evidence kit
 
 ### 9.1 Rules
 1. PLAN commands run literally, as written.
@@ -303,7 +303,7 @@ guarded_files:
   - program/checks.yaml
 ```
 Presets fill these for Go, Node/TypeScript and Python. Commands are argv lists; `pk gate` runs them without a shell. `build`, `test` and `scan` must each list a command. A guarded file is an exact path, or a directory when the entry ends in a slash. The gate reads `checks.yaml` from main, never from the task branch or a dirty checkout, so a branch cannot change the rules it is judged by. Unclaimable environments come from `environments.yaml`, not from here. `pk doctor` applies the same rules to a project's `checks.yaml` and reports each problem on its own line, and runs the evidence integrity checks of section 9.2.
-## 10. Throughput rules (kit/rules/THROUGHPUT.md)
+## 10. Working rules and the controller's rules (kit/rules/RULES.md, parts 2 and 4)
 
 Rework and token cost, not coding, are what slow a program down. These rules exist to remove rework.
 

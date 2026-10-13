@@ -71,7 +71,7 @@ Evidence records are committed, append-only files named by their own digest unde
 
 ## Where the rules live
 
-The rules are in `kit/rules/`: `HARD_RULES.md`, `EVIDENCE_HONESTY.md` and `THROUGHPUT.md` bind every agent, and `RULINGS_SEED.md` holds the starting rulings K1 to K33. Your own decisions go in `program/rulings.md` with `pk rulings add`; a ruling never contradicts an earlier one silently, it supersedes it by name. `program/HANDOFF.md` carries the state of the program and points at the rules rather than copying them. The design and the reasons behind each rule are in `docs/DESIGN.md`; `docs/FAQ.md` answers common questions.
+The rules are stated once, in `kit/rules/RULES.md` (hard rules, working rules, evidence honesty and the controller's rules, read by role), and `kit/rules/RULINGS_SEED.md` holds the starting rulings K1 to K33 with the reason for each. Your own decisions go in `program/rulings.md` with `pk rulings add`; a ruling never contradicts an earlier one silently, it supersedes it by name. `program/HANDOFF.md` carries the state of the program and points at the rules rather than copying them. The design and the reasons behind each rule are in `docs/DESIGN.md`; `docs/FAQ.md` answers common questions.
 
 ## What the kit will not do
 

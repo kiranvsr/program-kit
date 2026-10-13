@@ -16,7 +16,7 @@ This is the entry point. You are an agent that has just opened this project. In 
 2. Check the hand-off is current: run `pk handoff check`. If it exits 1, run `pk handoff update`, then commit the result.
 3. Find the stage: run `pk interview next`. It prints `next stage: N (name)` and how many topics are closed, and when the stage was approved and then modified it lists the changed files. Stage 7 is never approved: once stages 1 to 6 are approved and current, `next` prints stage 7 and stays there. Seeing 7 is normal and means discovery is complete. Act on discovery only when it names stage 6 or lower.
 4. Open the playbook for that result from the table below. Playbooks 01 to 06 are the interviewer's brief: stages 1 to 6 are an interview with the user. Playbooks 07 and 08 are the build loop and run once per task.
-5. Open the brief for your role in `kit/briefs/` (controller, implementer, qa or spec_qa) and read it. Read `kit/rules/HARD_RULES.md`. They bind you in every playbook.
+5. Open the brief for your role in `kit/briefs/` (controller, implementer, qa or spec_qa) and read it. Read `kit/rules/RULES.md`, the parts its table names for your role. They bind you in every playbook.
 6. If you are taking over from another agent, read `program/HANDOFF.md` top to bottom and follow `09_handoff.md` before you do anything else.
 7. If the user asks to change something that is already approved at stage 5 or later, stop and follow `10_change.md`. Do not edit the artifact.
 

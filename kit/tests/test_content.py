@@ -17,7 +17,9 @@ PLAYBOOKS = ["00_START.md", "01_discover.md", "02_define_product.md", "03_specif
              "10_change.md"]
 LENS_PLAYBOOKS = PLAYBOOKS[1:7]  # stages 1 to 6 are interview stages and name the lenses that are active
 BRIEFS = ["controller.md", "implementer.md", "qa.md", "spec_qa.md"]
-RULES = ["HARD_RULES.md", "EVIDENCE_HONESTY.md", "THROUGHPUT.md", "RULINGS_SEED.md"]
+RULES = ["RULES.md", "RULINGS_SEED.md"]  # one canonical rules file, and the seed rulings that point to it
+RULE_PARTS = ["Part 1. Hard rules", "Part 2. Working rules", "Part 3. Evidence honesty",
+              "Part 4. The controller's rules"]
 
 PLAYBOOK_SECTIONS = ["Purpose", "Inputs", "Steps", "Outputs", "Done when", "Next playbook"]
 BRIEF_SECTIONS = ["Role", "Read first", "What you do", "Needs context", "Report shape", "Never"]
@@ -56,6 +58,26 @@ def sections(text: str) -> dict:
     if name is not None:
         found[name] = "\n".join(body)
     return found
+
+
+def rule_part(number: int) -> str:
+    """The text of one part of the canonical rules file."""
+    found = sections(read(RULES_DIR / "RULES.md"))
+    return next(body for name, body in found.items() if name.startswith(RULE_PARTS[number - 1]))
+
+
+HARD_RULE_LINES = (
+    "1. Never fabricate evidence, test results, CI results, gate passes or human approvals.",
+    "6. Only QA sets a task `done`, and only through `pk status set <ID> done --role qa`, after `pk evidence accept` "
+    "appended an acceptance of the latest results record.",
+    "11. Never rewrite history: no rebase, no reset, no force-push. Merge main into your branch with a merge commit.",
+    "14. Never push, deploy or apply infrastructure unless the user explicitly tells you to.",
+    "18. If an action is denied, stop and report it to the user. Never route around a denial, and never ask another "
+    "agent to do what was denied.",
+    "21. Accepted branches merge into main one at a time.",
+    "22. Never force-remove a worktree that holds work.",
+    "23. A ruling is never rewritten, renumbered or deleted.",
+)
 
 
 def all_files() -> list:
@@ -122,7 +144,7 @@ class PlaybookTests(unittest.TestCase):
         self.assertIn("pk gate binding", text)
         self.assertIn("Guarded edit:", text)
         self.assertIn("## Exact Commands", text)
-        self.assertIn("git-ignore", read(RULES_DIR / "HARD_RULES.md"))
+        self.assertIn("git-ignore", rule_part(1))
 
     def test_handoff_playbook_has_successor_prompt_with_fetch_and_main_suite(self):
         text = read(PLAYBOOK_DIR / "09_handoff.md")
@@ -216,17 +238,30 @@ class RulesTests(unittest.TestCase):
         self.assertIn("program/HANDOFF.md", block_titled("controller documents"))
         self.assertRegex(block_titled("nothing else merges"), r"(?i)quiet main")
 
+    def test_there_is_one_rules_file_with_four_parts_and_nothing_restates_it(self):
+        self.assertEqual(sorted(p.name for p in RULES_DIR.iterdir()), sorted(RULES))
+        found = [name for name in sections(read(RULES_DIR / "RULES.md")) if name.startswith("Part ")]
+        self.assertEqual([name.split(" (")[0] for name in found], RULE_PARTS)
+
+    def test_the_hard_rules_keep_their_numbers_and_their_text(self):
+        text = rule_part(1)
+        numbers = [int(n) for n in re.findall(r"^(\d+)\. ", text, re.M)]
+        self.assertEqual(numbers, list(range(1, len(numbers) + 1)))
+        self.assertGreaterEqual(len(numbers), 23)
+        for line in HARD_RULE_LINES:  # the rules that must never change, word for word
+            self.assertIn(line, text)
+
     def test_evidence_honesty_has_twelve_rules(self):
-        text = read(RULES_DIR / "EVIDENCE_HONESTY.md")
+        text = rule_part(3)
         self.assertEqual([int(n) for n in re.findall(r"^(\d+)\. ", text, re.M)], list(range(1, 13)))
         self.assertIn("the per-task latest.json is the only mutable evidence file", text)  # rule 11
         self.assertIn("A record binds only its inputs, never a derived output", text)  # rule 12
 
     def test_throughput_covers_required_topics(self):
-        text = read(RULES_DIR / "THROUGHPUT.md").lower()
+        text = (rule_part(2) + rule_part(4)).lower()
         for topic in ("merge queue", "hand-back gate", "decide, don't ask", "finding-to-fix", "tier 1", "tier 2",
                       "escalate", "three implementers", "four agents", "polling", "interrupt", "quiet main"):
-            self.assertIn(topic, text, f"THROUGHPUT.md does not cover '{topic}'")
+            self.assertIn(topic, text, f"RULES.md parts 2 and 4 do not cover '{topic}'")
 
 
 class StageSevenTests(unittest.TestCase):

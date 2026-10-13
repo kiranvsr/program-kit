@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Build the register's tasks one at a time with an implementer, independent QA and commit-bound evidence, merging one accepted branch at a time. Three roles, each a separate agent session: the controller picks, dispatches, answers, merges and keeps state, and never writes product code; an implementer owns one task in its own worktree; QA never wrote the code and is the only role that sets `done`. Read `kit/briefs/controller.md`, `implementer.md` and `qa.md`, and `kit/rules/THROUGHPUT.md`.
+Build the register's tasks one at a time with an implementer, independent QA and commit-bound evidence, merging one accepted branch at a time. Three roles, each a separate agent session: the controller picks, dispatches, answers, merges and keeps state, and never writes product code; an implementer owns one task in its own worktree; QA never wrote the code and is the only role that sets `done`. Read `kit/briefs/controller.md`, `implementer.md` and `qa.md`, and `kit/rules/RULES.md`.
 
 ## Inputs
 
