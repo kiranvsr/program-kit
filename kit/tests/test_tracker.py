@@ -100,6 +100,35 @@ class FollowupTests(TrackerBase):
         self.assertLess(block.index("F-0003 a: three"), block.index("F-0001 a: one"))
         self.assertNotIn("F-0002", block)
 
+    def test_a_follow_up_deleted_from_the_file_is_noticed_and_its_number_is_never_reused(self):
+        """L13, the reviewer's run: drop F-0002 from the file; then drop F-0003, the newest, as well."""
+        for item in ("one", "two", "three"):
+            self.cli("tracker", "followups", "add", "--area", "a", "--item", item)
+        self.assertEqual(self.state()["followups_issued"], 3)
+        path = self.root / STATE
+        whole = read_json(path)
+        write_json(path, dict(whole, followups=[item for item in whole["followups"] if item["id"] != "F-0002"]))
+        with self.assertRaisesRegex(KitError, "follow-up\\(s\\) F-0002 are in neither the open nor the closed list"):
+            ctlstate.load(self.root)
+        code, _, err = self.cli("handoff", "handoff", "check")
+        self.assertEqual(code, 1)
+        self.assertIn("never deleted", err)
+        write_json(path, dict(whole, followups=whole["followups"][:1]))  # F-0002 and F-0003 gone: no gap is left
+        with self.assertRaisesRegex(KitError, "F-0002, F-0003 are in neither"):
+            ctlstate.load(self.root)
+        code, out, err = self.cli("tracker", "followups", "add", "--area", "a", "--item", "four")
+        self.assertEqual((code, out), (1, ""))  # and so F-0002 is not given out a second time
+        write_json(path, whole)
+        self.assertEqual(self.cli("tracker", "followups", "add", "--area", "a", "--item", "four")[1], "F-0004\n")
+
+    def test_a_file_written_before_the_counter_reads_as_it_is_and_fails_on_a_gap(self):
+        write_json(self.root / STATE, {"followups": [{"id": "F-0001", "area": "a", "item": "one"},
+                                                     {"id": "F-0003", "area": "a", "item": "three"}]})
+        with self.assertRaisesRegex(KitError, "F-0002 are in neither"):
+            ctlstate.load(self.root)
+        write_json(self.root / STATE, {"followups": [{"area": "a", "item": "one"}, {"area": "a", "item": "two"}]})
+        self.assertEqual(self.state()["followups_issued"], 2)  # a 0.2 file: ids in file order
+
     def test_a_long_follow_up_list_is_cut_with_a_pointer(self):
         state = self.state()
         for number in range(handoff.FOLLOWUPS_SHOWN + 5):
@@ -119,8 +148,36 @@ class AdhocTests(TrackerBase):
         self.cli("tracker", "adhoc", "set", "AH-0002", "closed", "--note", "merged")
         block = handoff.render(self.root)
         self.assertIn("- AH-0001 export button (ad hoc, progress): asked today", block)
-        self.assertIn("#### Ad-hoc tasks closed (newest 10 of 1)\n- AH-0002 fix typo: merged", block)
+        self.assertIn("#### Ad-hoc tasks closed (newest 10 of 1)\n- AH-0002 fix typo (no status record): merged",
+                      block)
         self.assertNotIn("not in register", block)
+
+    def test_an_ad_hoc_task_with_work_in_flight_is_never_out_of_sight(self):
+        """L3: closed in the tracking state while its status record or its branch says the work is not over."""
+        self.cli("tracker", "adhoc", "add", "--title", "export button")
+        self.cli("tracker", "adhoc", "set", "AH-0001", "closed")  # closed first, dispatched afterwards
+        status.transition(self.root, "AH-0001", "in_progress", "controller")
+        now = handoff.render(self.root).split("#### Tasks by status")[0]
+        self.assertIn("- [full] AH-0001 (in_progress, ad hoc, tracked as closed): (no stage text)", now)
+        self.assertIn("- AH-0001 export button (status in_progress)", handoff.render(self.root))
+        self.cli("tracker", "adhoc", "set", "AH-0001", "progress")
+        status.transition(self.root, "AH-0001", "blocked", "controller", blocked_by=["staging-env"])
+        code, _, err = self.cli("tracker", "adhoc", "set", "AH-0001", "closed")
+        self.assertEqual(code, 1)
+        self.assertIn("its status record is blocked", err)
+        # no status record in flight, but a branch that never merged
+        self.cli("tracker", "adhoc", "add", "--title", "fix typo")
+        commit_all(self.root, "state")
+        sh(self.root, "git", "branch", "task/AH-0002")
+        sh(self.root, "git", "checkout", "-q", "task/AH-0002")
+        (self.root / "typo.txt").write_text("fixed\n")
+        commit_all(self.root, "work")
+        sh(self.root, "git", "checkout", "-q", "main")
+        code, _, err = self.cli("tracker", "adhoc", "set", "AH-0002", "closed")
+        self.assertEqual(code, 1)
+        self.assertIn("its branch task/AH-0002 is not merged into main", err)
+        sh(self.root, "git", "merge", "-q", "--no-ff", "-m", "merge", "task/AH-0002")
+        self.assertEqual(self.cli("tracker", "adhoc", "set", "AH-0002", "closed")[0], 0)
 
     def test_only_the_newest_ten_closed_ad_hoc_tasks_are_listed(self):
         state = self.state()
@@ -188,6 +245,83 @@ class RecordTests(TrackerBase):
         self.assertEqual(message.splitlines()[0], "R1: Use one local stack")
         self.assertEqual(message.strip().splitlines()[-1], "Co-Authored-By: Test Agent")
 
+    def test_the_hand_off_says_why_a_task_is_blocked_or_parked(self):
+        """L2, the reviewer's run: T1 blocked by an environment, T2 parked on a decision of the user."""
+        status.transition(self.root, TID, "blocked", "controller", blocked_by=["staging-env"], note="no cluster yet")
+        status.transition(self.root, "P1-M01-S01-T02", "parked", "controller",
+                          note="waits on the user's decision about pricing tiers")
+        block = handoff.render(self.root)
+        self.assertIn(f"- [full] {TID} (blocked by staging-env): no cluster yet", block)
+        self.assertIn("#### Parked\n- P1-M01-S01-T02: waits on the user's decision about pricing tiers", block)
+        self.assertIn("- parked: 1", block)
+
+    def test_the_queued_and_parked_lists_and_the_now_line_have_a_writer(self):
+        code, out, err = self.record("--ruling", "Order of the next tasks.", "--now", "waiting for QA of T1",
+                                     "--note", f"{TID}=QA round 2", "--queued", "P1-M01-S01-T02=after T1 merges",
+                                     "--parked", "P1-M01-S01-T02=the user picks a payment provider")
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertIn("queued: P1-M01-S01-T02", out.splitlines())
+        text = (self.root / "program" / "HANDOFF.md").read_text()
+        for needle in ("- waiting for QA of T1", "#### Queued\n- P1-M01-S01-T02: after T1 merges",
+                       "#### Parked\n- P1-M01-S01-T02: the user picks a payment provider"):
+            self.assertIn(needle, text)
+        code, out, err = self.record("--ruling", "T2 is dispatched.", "--queued", "P1-M01-S01-T02=")
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertIn("queued: P1-M01-S01-T02 removed", out.splitlines())
+        self.assertIn("#### Queued\n- none", (self.root / "program" / "HANDOFF.md").read_text())
+        for argv, needle in ((("--queued", "P9-M99-S99-T99=x"), "is not a task in program/register.yaml"),
+                             (("--note", "P9-M99-S99-T99=stage text"), "is not a task in program/register.yaml"),
+                             (("--parked", "P1-M01-S01-T01="), "has no parked line to remove"),
+                             (("--queued", "AH-0001=x"), "is an ad-hoc task"),
+                             (("--queued", "nothing"), "takes ID=TEXT")):
+            with self.subTest(argv=argv):
+                code, _, err = self.record("--ruling", "A step.", *argv)
+                self.assertEqual(code, 1)
+                self.assertIn(needle, err)
+        self.assertEqual(len(rulings.read(self.root)), 2)
+        self.assertEqual(self.dirty(), [])
+
+    def test_a_rewritten_ruling_is_never_committed(self):
+        """L4: change R1's decision in the working tree, then record the next step."""
+        self.assertEqual(self.record("--ruling", "Use port 8080.")[0], 0)
+        log = self.root / "program" / "rulings.md"
+        kept = log.read_text()
+        log.write_text(kept.replace("8080", "9090"))
+        code, out, err = self.record("--ruling", "Another step.")
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("hard rule 23", err)
+        self.assertEqual(len(rulings.read(self.root)), 1)  # no R2
+        self.assertIn("8080", sh(self.root, "git", "show", "HEAD:program/rulings.md"))
+        code, out, err = self.cli("rulings", "rulings", "validate")
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("the rulings committed at HEAD are no longer the beginning of the file", err)
+        log.write_text("# Rulings\n")  # deleted, not rewritten: the same answer
+        self.assertIn("hard rule 23", " ".join(rulings.validate(self.root)))
+        log.write_text(kept)
+        self.assertEqual(rulings.validate(self.root), [])
+        rulings.add(self.root, "controller", "q", "appended, not yet committed")
+        self.assertEqual(rulings.validate(self.root), [])  # appending is what the log is for
+
+    def test_a_step_whose_commit_fails_is_put_back(self):
+        """L16: no ruling without its state change, nothing left staged, and a re-run is R1 again."""
+        hook = self.root / ".git" / "hooks" / "pre-commit"
+        hook.parent.mkdir(exist_ok=True)
+        hook.write_text("#!/bin/sh\necho 'hook says no' >&2\nexit 1\n")
+        hook.chmod(0o755)
+        before = {name: (self.root / name).read_bytes() if (self.root / name).exists() else None
+                  for name in tracker.RECORD_FILES}
+        code, _, err = self.record("--ruling", "A step.", "--followup", "ui=empty state", "--now", "busy")
+        self.assertEqual(code, 1)
+        self.assertEqual({name: (self.root / name).read_bytes() if (self.root / name).exists() else None
+                          for name in tracker.RECORD_FILES}, before)
+        self.assertEqual(self.dirty(), [])
+        self.assertEqual(sh(self.root, "git", "diff", "--cached", "--name-only"), "")
+        hook.unlink()
+        code, out, err = self.record("--ruling", "A step.", "--followup", "ui=empty state", "--now", "busy")
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertEqual(out.splitlines()[0], "R1 recorded")
+        self.assertEqual([item["id"] for item in self.state()["followups"]], ["F-0001"])
+
     def test_no_commit_leaves_the_three_files_for_the_controller(self):
         code, out, _ = self.record("--ruling", "Wait for the user.", "--no-commit")
         self.assertEqual(code, 0)
@@ -219,10 +353,12 @@ class RecordTests(TrackerBase):
         self.assertIn("unstage what is staged", err)
         sh(self.root, "git", "reset", "-q")
         sh(self.root, "git", "checkout", "-q", "-b", "side")
-        code, _, err = self.record("--ruling", "A step.")
-        self.assertEqual(code, 1)
-        self.assertIn("main checkout", err)
-        self.assertEqual(rulings.read(self.root), [])
+        for argv in ((), ("--no-commit",)):  # L15: without a commit too, or the branch gets an R1 of its own
+            code, _, err = self.record("--ruling", "A step.", *argv)
+            self.assertEqual(code, 1)
+            self.assertIn("main checkout", err)
+            self.assertEqual(rulings.read(self.root), [])
+            self.assertEqual(self.dirty(), ["notes.txt"])
 
     def test_the_hand_off_shows_the_newest_fifteen_rulings_and_where_the_rest_are(self):
         for number in range(1, 19):
@@ -245,10 +381,25 @@ class BudgetTests(TrackerBase):
         code, _, err = self.cli("handoff", "handoff", "check")
         self.assertEqual(code, 1)
         self.assertIn("over its budget of 60000", err)
-        state = self.state()
-        state["handoff_budget_bytes"] = 200_000
-        ctlstate.save(self.root, state)
+        commit_all(self.root, "a hand-off that grew")
+        # L14: the budget is raised by a ruling, through the command, and the hand-off says so
+        code, out, err = self.cli("tracker", "record", "--ruling", "Raise the hand-off budget until history moves.",
+                                  "--handoff-budget", "200000")
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertIn("hand-off budget: 200000 bytes", out.splitlines())
+        self.assertEqual(self.state()["handoff_budget_bytes"], 200_000)
         self.assertEqual(self.cli("handoff", "handoff", "check")[0], 0)
+        self.assertIn("Size budget: 200000 bytes, set in the controller state in place of the default 60000",
+                      handoff.render(self.root))
+        code, out, err = self.cli("tracker", "record", "--ruling", "Back to the default budget.",
+                                  "--handoff-budget", "0")
+        self.assertEqual(code, 1)  # committed, then the reason: the file is over the default again
+        self.assertIn("over its budget of 60000", err)
+        self.assertNotIn("handoff_budget_bytes", self.state())
+        self.assertNotIn("Size budget:", handoff.render(self.root))
+        self.assertEqual(self.dirty(), [])
+        self.assertIn("--handoff-budget takes a number of bytes",
+                      self.cli("tracker", "record", "--ruling", "x", "--handoff-budget", "-5")[2])
 
     def test_check_fails_when_the_next_steps_section_is_over_two_kilobytes(self):
         handoff.update(self.root)

@@ -11,7 +11,7 @@ from unittest import mock
 import miniyaml
 import pk
 import trace as trace_module  # kit/scripts/trace.py (it shadows the standard library module of that name)
-from common import KitError, read_yaml, write_json, write_yaml
+from common import KitError, read_json, read_yaml, write_json, write_yaml
 from test_register import reg, task
 
 KIT = Path(__file__).resolve().parent.parent
@@ -313,7 +313,14 @@ class ImpactTests(TraceBase):
         self.put_status(T3, "done")
         result = trace_module.impact(self.root, ["J1"])
         self.assertEqual(result, {"requirements": ["REQ-001"], "components": ["C1"], "gates": ["G-P0"],
-                                  "tasks": {"done": [T1], "in_flight": [T2], "not_started": ["P1-M01-S01-T05"]}})
+                                  "tasks": {"done": [T1], "merged": [], "in_flight": [T2],
+                                            "not_started": ["P1-M01-S01-T05"]}})
+        # a light task that landed is terminal: listed as merged, never as not started (it evidences nothing)
+        path = self.root / "program" / "status" / "P1-M01-S01-T05.json"
+        write_json(path, dict(read_json(path), status="merged", tier="light"))
+        tasks = trace_module.impact(self.root, ["J1"])["tasks"]
+        self.assertEqual((tasks["merged"], tasks["not_started"]), (["P1-M01-S01-T05"], []))
+        self.put_status("P1-M01-S01-T05", "parked")
         for state in ("review", "blocked"):
             self.put_status(T2, state)
             self.assertEqual(trace_module.impact(self.root, ["J1"])["tasks"]["in_flight"], [T2], state)
@@ -325,7 +332,7 @@ class ImpactTests(TraceBase):
         self.assertEqual(result["requirements"], ["NFR-001"])
         self.assertEqual(result["components"], ["C2"])
         self.assertEqual(result["gates"], ["G-P1"])  # via the record path; C10 in G-P1 claims is not C1
-        self.assertEqual(result["tasks"], {"done": [], "in_flight": [], "not_started": [T3]})
+        self.assertEqual(result["tasks"], {"done": [], "merged": [], "in_flight": [], "not_started": [T3]})
         self.assertEqual(trace_module.impact(self.root, ["C1"])["gates"], ["G-P0"])  # C1 is not C10
 
     def test_impact_refuses_a_gate_entry_of_the_wrong_shape_naming_it(self):
@@ -371,7 +378,7 @@ class ImpactTests(TraceBase):
         self.assertEqual(result["tasks"]["not_started"], [T3, "P1-M01-S01-T04"])
         self.assertEqual(trace_module.impact(self.root, ["G-P2"]),
                          {"requirements": [], "components": [], "gates": ["G-P2"],
-                          "tasks": {"done": [], "in_flight": [], "not_started": []}})
+                          "tasks": {"done": [], "merged": [], "in_flight": [], "not_started": []}})
 
     def test_impact_reads_gates_yaml_and_dedupes(self):
         self.put(GATES, "gates.yaml")
@@ -427,7 +434,8 @@ class CliTests(TraceBase):
         code, out, err = self.run_cli("trace", "impact", "J1", "REQ-001")
         self.assertEqual((code, err), (0, ""))
         self.assertEqual(json.loads(out), {"requirements": ["REQ-001"], "components": ["C1"], "gates": ["G-P0"],
-                                           "tasks": {"done": [], "in_flight": [], "not_started": [T1, T2]}})
+                                           "tasks": {"done": [], "merged": [], "in_flight": [],
+                                                     "not_started": [T1, T2]}})
         self.assertEqual(out, json.dumps(json.loads(out), indent=2, sort_keys=True) + "\n")
 
     def test_impact_unknown_id_is_one_error_line(self):

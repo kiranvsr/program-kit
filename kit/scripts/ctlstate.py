@@ -7,13 +7,17 @@ The file holds what the controller tracks outside the status records:
     adhoc                    [{id, title, state, note, ruling, updated}]   work that is not in the register
     followups                [{id, area, item, added, tags}]     open follow-ups, F-0001 onward
     closed_followups         the same plus {closed, reason, by, duplicate_of}
+    followups_issued         how many follow-up ids were ever given out: the next one is that plus one
     now                      one short line: what the controller is doing
-    handoff_budget_bytes     optional override of the hand-off size budget
+    handoff_budget_bytes     optional override of the hand-off size budget (`pk record --handoff-budget`)
 
 `load` validates and normalises: a 0.2 file (follow-ups as bare {area, item} pairs, no ad-hoc list) reads as
 the new shape, with ids given in file order and the added date `unknown`; nothing is written until a command
 changes the state. An ad-hoc task's state is the controller's tracking word, never an acceptance: it ends at
 `closed`, and `done` stays the word only QA can write, in the status record.
+
+A follow-up is closed, never deleted, and its number is never given out twice: `load` refuses a file in which
+any id from F-0001 to the last one issued is in neither list.
 """
 from __future__ import annotations
 
@@ -28,7 +32,8 @@ ADHOC_ID = re.compile(r"AH-(\d{4})\Z")
 FOLLOWUP_ID = re.compile(r"F-(\d{4})\Z")
 TAG = re.compile(r"[a-z0-9][a-z0-9._-]*\Z")
 UNKNOWN_DATE = "unknown"
-_KEYS = ("stage", "queued", "parked", "adhoc", "followups", "closed_followups", "now", "handoff_budget_bytes")
+_KEYS = ("stage", "queued", "parked", "adhoc", "followups", "closed_followups", "followups_issued", "now",
+         "handoff_budget_bytes")
 
 
 def _mapping(data: dict, key: str) -> dict[str, str]:
@@ -100,6 +105,14 @@ def load(root: Path) -> dict:
             number = max(taken, default=0) + 1
             taken.add(number)
             entry["id"] = f"F-{number:04d}"
+    issued = data.get("followups_issued", max(taken, default=0))
+    if not isinstance(issued, int) or isinstance(issued, bool) or issued < max(taken, default=0):
+        raise KitError(f"{STATE_FILE}: 'followups_issued' must be the number of the last follow-up id given out")
+    gone = [f"F-{number:04d}" for number in range(1, issued + 1) if number not in taken]
+    if gone:
+        raise KitError(f"{STATE_FILE}: follow-up(s) {', '.join(gone[:5])}{' and more' if len(gone) > 5 else ''} "
+                       f"are in neither the open nor the closed list ({issued} were issued): a follow-up is "
+                       "closed with a reason (pk followups close), never deleted; restore the file from git")
     now = data.get("now", "")
     budget = data.get("handoff_budget_bytes")
     if not isinstance(now, str):
@@ -108,7 +121,7 @@ def load(root: Path) -> dict:
         raise KitError(f"{STATE_FILE}: 'handoff_budget_bytes' must be a positive whole number")
     state = {"stage": _mapping(data, "stage"), "queued": _mapping(data, "queued"),
              "parked": _mapping(data, "parked"), "adhoc": _adhoc(data), "followups": followups,
-             "closed_followups": closed, "now": now}
+             "closed_followups": closed, "followups_issued": issued, "now": now}
     if budget is not None:
         state["handoff_budget_bytes"] = budget
     return state
@@ -120,8 +133,10 @@ def save(root: Path, state: dict) -> None:
 
 
 def next_followup_id(state: dict) -> str:
+    """Give out the next follow-up id and count it as issued, so the number is never used again."""
     numbers = [int(FOLLOWUP_ID.match(item["id"]).group(1)) for item in state["followups"] + state["closed_followups"]]
-    return f"F-{max(numbers, default=0) + 1:04d}"
+    state["followups_issued"] = max([state.get("followups_issued", 0), *numbers]) + 1
+    return f"F-{state['followups_issued']:04d}"
 
 
 def next_adhoc_id(state: dict) -> str:

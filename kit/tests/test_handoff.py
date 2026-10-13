@@ -6,7 +6,7 @@ from unittest import mock
 
 import handoff
 import worktree
-from common import KitError, write_json, write_yaml
+from common import KitError, read_json, write_json, write_yaml
 from test_change import put_cr
 from test_register import reg, task
 from test_trace import T1, T2, T3
@@ -44,6 +44,16 @@ class HandoffBase(unittest.TestCase):
 
 
 class RenderTests(HandoffBase):
+    def test_done_tasks_are_counted_by_the_tier_they_were_accepted_under(self):
+        for task_id, tier in ((T1, None), (T2, "standard"), (T3, "standard")):
+            self.put_status(task_id, "done")
+            if tier:
+                path = self.root / "program" / "status" / f"{task_id}.json"
+                write_json(path, dict(read_json(path), tier=tier))
+        block = handoff.render(self.root)
+        self.assertIn("- done: 3 (full 1, standard 2)", block)  # a record without a tier is full
+        self.assertIn("- merged: 0\n", block)
+
     def test_render_lists_in_flight_and_dirty_worktrees(self):
         self.put_status(T1, "in_progress")
         self.put_status(T2, "done")
@@ -56,7 +66,7 @@ class RenderTests(HandoffBase):
         (dirty / "scratch.txt").write_text("x")
         block = handoff.render(self.root)
         self.assertTrue(block.endswith("\n"))
-        for needle in ("in_progress: 1", "done: 1", "blocked: 1", "not_started: 0",
+        for needle in ("in_progress: 1", "done: 1 (full 1)", "blocked: 1", "not_started: 0",
                        f"{T1} (in_progress): round 2, fixes pending",
                        f"{T3} (blocked): (no stage text)",
                        f"task/{T1}", f"task/{T2}",

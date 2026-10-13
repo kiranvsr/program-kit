@@ -3,13 +3,22 @@
 
 `pk followups` and `pk adhoc` edit `program/controller-state.json` through `ctlstate` and nothing else; they do
 not commit. `pk record` is one controller step in one command: it appends a ruling, applies any state changes
-given with it, regenerates the hand-off block, checks the hand-off budget and commits exactly the files it
-wrote (`program/rulings.md`, `program/controller-state.json`, `program/HANDOFF.md`, and the cost log when it
-has new lines), with a message taken from the ruling's first sentence. Everything is checked before anything is written, so a refusal leaves no half
-step behind. It runs in the main checkout only.
+given with it (ad-hoc tasks, stage text, the queued and parked notes, follow-ups, the now line, the hand-off
+budget), regenerates the hand-off block, checks the hand-off budget and commits exactly the files it wrote
+(`program/rulings.md`, `program/controller-state.json`, `program/HANDOFF.md`, and the cost log when it has new
+lines), with a message taken from the ruling's first sentence. It runs in the main checkout only, with or
+without `--no-commit`.
+
+What a refusal leaves behind. Everything that can be checked before the first write is: the arguments, the
+state changes, that the hand-off can be regenerated, and that no committed ruling was rewritten (hard rule
+23). If a write or the commit then fails, the three files are put back as they were and nothing stays staged.
+One check can only be made afterwards: the size budget is measured on the hand-off as rewritten, so a step
+that takes it over budget is committed and the command then exits 1 with the reason. A process killed between
+the writes is not undone: `git status` shows the files, and `git checkout -- <path>` restores them.
 
 What it never does: set the status of a task. A register task's state is its status record (`pk status`), and
-an ad-hoc task's tracking state ends at `closed`, which is refused while its status record is still in flight.
+an ad-hoc task's tracking state ends at `closed`, which is refused while its status record is still in flight
+or its branch is not merged.
 """
 from __future__ import annotations
 
@@ -21,7 +30,7 @@ import ctlstate
 import handoff as handoff_module
 import rulings as rulings_module
 import status as status_module
-from common import KitError, PRIMARY_BRANCH, find_root, git, utc_now
+from common import KitError, PRIMARY_BRANCH, find_root, git, run_argv, utc_now
 
 RECORD_FILES = ("program/rulings.md", ctlstate.STATE_FILE, "program/HANDOFF.md", "program/costs.jsonl")
 NOW_CHARS = 200
@@ -107,10 +116,17 @@ def set_adhoc(root: Path, state: dict, task_id: str, task_state: str | None = No
                            "(done is a status only QA sets: pk status)")
         if task_state == "closed":
             held = status_module.read(root, task_id)["status"]
-            if held in ("in_progress", "review"):
+            if held in ("in_progress", "review", "blocked"):
                 raise KitError(f"{task_id}: its status record is {held}; an ad-hoc task with work in flight is "
                                "closed only after QA set it done or, on the light tier, the controller recorded "
                                "it merged")
+            branch = f"refs/heads/task/{task_id}"
+            if run_argv(["git", "-C", str(root), "rev-parse", "--verify", "--quiet", branch], Path(root))[0] == 0 \
+                    and run_argv(["git", "-C", str(root), "merge-base", "--is-ancestor", branch, PRIMARY_BRANCH],
+                                 Path(root))[0] != 0:
+                raise KitError(f"{task_id}: its branch task/{task_id} is not merged into {PRIMARY_BRANCH}; merge "
+                               f"it, or abandon it first (pk worktree finish {task_id} --keep-branch, then delete "
+                               "the branch yourself)")
         item["state"] = task_state
     if note is not None:
         item["note"] = " ".join(note.split())
@@ -151,13 +167,34 @@ def commit_paths(root: Path, paths, subject: str, trailers=()) -> str | None:
     return git(root, "rev-parse", "--short", "HEAD")
 
 
+def _table_entry(planned: dict, table: str, text: str, registered: set[str]) -> str:
+    """Set (`ID=TEXT`) or remove (`ID=`) one line of the queued or parked table; the line to print."""
+    task_id, sep, note = (part.strip() for part in text.partition("="))
+    if not sep or not task_id:
+        raise KitError(f"--{table} takes ID=TEXT (ID= alone removes the line), not {text!r}")
+    if ctlstate.ADHOC_ID.match(task_id):
+        raise KitError(f"--{table}: {task_id} is an ad-hoc task; its tracking state is set with --task "
+                       f"{task_id}=queued or =paused, and its note with --note")
+    if not note:
+        if task_id not in planned[table]:
+            raise KitError(f"--{table}: {task_id} has no {table} line to remove")
+        del planned[table][task_id]
+        return f"{table}: {task_id} removed"
+    if task_id not in registered:
+        raise KitError(f"--{table}: {task_id} is not a task in program/register.yaml")
+    planned[table][task_id] = ctlstate.one_line(note, f"a {table} line", NOW_CHARS)
+    return f"{table}: {task_id}"
+
+
 def record(root: Path, ruling: str, question: str = "", precedent: str = "", role: str = "controller",
            tasks=(), notes=(), adhoc=(), start: bool = False, followups=(), closes=(), now: str | None = None,
-           commit: bool = True, trailers=()) -> list[str]:
-    """One controller step; returns the lines to print (under ten). Nothing is written when anything is refused."""
+           commit: bool = True, trailers=(), queued=(), parked=(), budget: int | None = None) -> list[str]:
+    """One controller step; returns the lines to print (under ten). See the module text for what a refusal leaves."""
     root = Path(root)
-    if commit:
-        _require_main(root)
+    _require_main(root)  # with --no-commit too: a ruling written on a task branch would number against main's
+    problem = rulings_module.rewritten(root)
+    if problem:
+        raise KitError(problem)
     state = ctlstate.load(root)
     number = max((entry["number"] for entry in rulings_module.read(root)), default=0) + 1
     name = f"R{number}"
@@ -173,12 +210,25 @@ def record(root: Path, ruling: str, question: str = "", precedent: str = "", rol
                            f"record (pk status set). Use --note {task_id}=TEXT for its stage text")
         set_adhoc(root, planned, task_id, task_state=task_state)
         lines.append(f"{task_id}: {task_state}")
+    registered = status_module._registered(root) if notes or queued or parked else set()
     for text in notes:
         task_id, note = _pair(text, "--note")
         if ctlstate.ADHOC_ID.match(task_id):
             set_adhoc(root, planned, task_id, note=note)
+        elif task_id not in registered:
+            raise KitError(f"--note: {task_id} is not a task in program/register.yaml")
         else:
             planned["stage"][task_id] = " ".join(note.split())
+    lines += [_table_entry(planned, "queued", text, registered) for text in queued]
+    lines += [_table_entry(planned, "parked", text, registered) for text in parked]
+    if budget is not None:
+        if isinstance(budget, bool) or not isinstance(budget, int) or budget < 0:
+            raise KitError("--handoff-budget takes a number of bytes (0 goes back to the default)")
+        planned.pop("handoff_budget_bytes", None)
+        if budget:
+            planned["handoff_budget_bytes"] = budget
+        lines.append(f"hand-off budget: {budget or handoff_module.BUDGET_BYTES} bytes"
+                     + ("" if budget else " (the default)"))
     added = [add_followup(planned, *_pair(text, "--followup")) for text in followups]
     closed = []
     for text in closes:
@@ -193,19 +243,29 @@ def record(root: Path, ruling: str, question: str = "", precedent: str = "", rol
         planned["now"] = ctlstate.one_line(now, "the now line", NOW_CHARS) if now.strip() else ""
     handoff_module._split(handoff_module._read(root)[1])  # a hand-off that cannot be regenerated stops the step here
     handoff_module.render(root)
-    rulings_module.add(root, role, question or "Controller step.", ruling, precedent)
-    if planned != state:
-        ctlstate.save(root, planned)
-    changed = handoff_module.update(root)
-    problems = handoff_module.budget_problems(root)
-    size = len(handoff_module._read(root)[1].encode("utf-8"))
-    budget = planned.get("handoff_budget_bytes", handoff_module.BUDGET_BYTES)
-    lines.append(f"hand-off: {'updated' if changed else 'unchanged'} ({size} of {budget} bytes)")
-    if commit:
-        sha = commit_paths(root, RECORD_FILES, _subject(number, ruling), trailers)
-        lines.append(f"committed {sha}: {_subject(number, ruling)}" if sha else "nothing to commit")
-    else:
-        lines.append("not committed (--no-commit): " + ", ".join(RECORD_FILES))
+    before = {name: (root / name).read_bytes() if (root / name).is_file() else None for name in RECORD_FILES}
+    try:
+        rulings_module.add(root, role, question or "Controller step.", ruling, precedent)
+        if planned != state:
+            ctlstate.save(root, planned)
+        changed = handoff_module.update(root)
+        problems = handoff_module.budget_problems(root)
+        size = len(handoff_module._read(root)[1].encode("utf-8"))
+        limit = planned.get("handoff_budget_bytes", handoff_module.BUDGET_BYTES)
+        lines.append(f"hand-off: {'updated' if changed else 'unchanged'} ({size} of {limit} bytes)")
+        if commit:
+            sha = commit_paths(root, RECORD_FILES, _subject(number, ruling), trailers)
+            lines.append(f"committed {sha}: {_subject(number, ruling)}" if sha else "nothing to commit")
+        else:
+            lines.append("not committed (--no-commit): " + ", ".join(RECORD_FILES))
+    except BaseException:  # a failed write or commit: no ruling without its state change, nothing left staged
+        for name, data in before.items():
+            run_argv(["git", "-C", str(root), "restore", "--staged", "--", name], root)
+            if data is None:
+                (root / name).unlink(missing_ok=True)
+            elif (root / name).read_bytes() != data:
+                (root / name).write_bytes(data)
+        raise
     if problems:
         raise KitError("; ".join([*lines, *problems]))
     return lines
@@ -269,7 +329,8 @@ def cmd_adhoc(args: argparse.Namespace) -> int:
 def cmd_record(args: argparse.Namespace) -> int:
     lines = record(find_root(), args.ruling, question=args.question, precedent=args.precedent, role=args.role,
                    tasks=args.task, notes=args.note, adhoc=args.adhoc, start=args.start, followups=args.followup,
-                   closes=args.close, now=args.now, commit=not args.no_commit, trailers=args.trailer)
+                   closes=args.close, now=args.now, commit=not args.no_commit, trailers=args.trailer,
+                   queued=args.queued, parked=args.parked, budget=args.handoff_budget)
     print("\n".join(lines))
     return 0
 
@@ -323,6 +384,12 @@ def _configure_record(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--followup", action="append", default=[], metavar="AREA=ITEM")
     parser.add_argument("--close", action="append", default=[], metavar="ID=REASON", help="close a follow-up")
     parser.add_argument("--now", help="the one line that says what the controller is doing")
+    parser.add_argument("--queued", action="append", default=[], metavar="ID=TEXT",
+                        help="a register task's line in the hand-off's Queued list (ID= removes it)")
+    parser.add_argument("--parked", action="append", default=[], metavar="ID=TEXT",
+                        help="a register task's line in the Parked list, beside its parked status (ID= removes it)")
+    parser.add_argument("--handoff-budget", dest="handoff_budget", type=int, metavar="BYTES",
+                        help="raise the hand-off size budget, by this ruling (0: back to the default)")
     parser.add_argument("--no-commit", action="store_true", dest="no_commit")
     parser.add_argument("--trailer", action="append", default=[], metavar="LINE",
                         help="a line to end the commit message with: your own attribution line")

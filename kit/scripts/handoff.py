@@ -16,7 +16,9 @@ The main checkout is not listed among the worktrees: its dirty state changes whe
 file is rewritten, which would make the block unstable.
 
 The block is compact on purpose. It opens with a "Now" list (the controller's one line, every task in
-flight with its verification tier, the ad-hoc tasks that are open), and it shows the open follow-ups that are
+flight with its verification tier and, when blocked, what it waits on, the ad-hoc tasks that are open, the
+integration rounds that are not closed), it counts the done tasks by tier, lists a parked task with the
+decision it waits on, and it shows the open follow-ups that are
 not deferred by a tag (newest first, counted, at most FOLLOWUPS_SHOWN), the newest RULINGS_SHOWN rulings on one
 line each with the next free number, the newest ADHOC_CLOSED_SHOWN closed ad-hoc tasks and the agents past
 the fresh-agent threshold of the cost log. History is never copied in: it lives in `program/rulings.md`.
@@ -147,9 +149,15 @@ def render(root: Path, main: str = "main") -> str:
     unregistered = [task for task in unregistered if task not in adhoc]
     by_id = {record["task_id"]: record for record in records}
     now = [_line(state["now"])] if state["now"].strip() else []
-    now += [f"[{_tier(r)}] {_line(r['task_id'])} ({r['status']}): "
-            f"{_line(state['stage'].get(r['task_id'], '')) or '(no stage text)'}"
-            for r in records if r["status"] in IN_FLIGHT and r["task_id"] not in adhoc]
+    listed = {item["id"] for item in state["adhoc"] if item["state"] != "closed"}  # the loop below prints these
+    for r in records:
+        if r["status"] not in IN_FLIGHT or r["task_id"] in listed:
+            continue
+        held = r["status"] + (f" by {', '.join(r['blocked_by'])}" if r["status"] == "blocked" and r["blocked_by"]
+                              else "")
+        held += ", ad hoc, tracked as closed" if r["task_id"] in adhoc else ""
+        text = "; ".join(part for part in (state["stage"].get(r["task_id"], ""), r["note"]) if part.strip())
+        now.append(f"[{_tier(r)}] {_line(r['task_id'])} ({_line(held)}): {_line(text) or '(no stage text)'}")
     for wanted in ("progress", "review", "paused", "queued"):
         for item in state["adhoc"]:
             if item["state"] != wanted:
@@ -157,9 +165,19 @@ def render(root: Path, main: str = "main") -> str:
             record = by_id.get(item["id"])
             held = f"; status {record['status']}, tier {_tier(record)}" if record else ""
             now.append(_line(f"{item['id']} {item['title']} (ad hoc, {wanted}{held}): {item['note'] or '(no note)'}"))
+    now += _round_lines(root)
     closed = [item for item in reversed(state["adhoc"]) if item["state"] == "closed"]
-    closed_lines = [_line(f"{item['id']} {item['title']}" + (f": {item['note']}" if item["note"] else ""))
+    closed_lines = [_line(f"{item['id']} {item['title']} ("
+                          + (f"status {by_id[item['id']]['status']}" if item["id"] in by_id else "no status record")
+                          + ")" + (f": {item['note']}" if item["note"] else ""))
                     for item in closed[:ADHOC_CLOSED_SHOWN]]
+    parked = dict(state["parked"])
+    for r in records:
+        if r["status"] == "parked":
+            parked[r["task_id"]] = "; ".join(part for part in (r["note"], parked.get(r["task_id"], "")) if part.strip())
+    done = [status_module.tier_of(r) for r in records if r["status"] == "done"]
+    by_tier = ", ".join(f"{tier} {done.count(tier)}" for tier in status_module.TIERS if tier in done)
+    budget = state.get("handoff_budget_bytes")
     problem = primary_branch_problem(root, main, need_commit=True)
     if problem:
         raise KitError(problem)
@@ -176,13 +194,17 @@ def render(root: Path, main: str = "main") -> str:
         return [f"{_line(task)}: {_line(text)}" for task, text in sorted(table.items())]
 
     lines = ["### Generated state", "", f"{COMMIT_PREFIX}{_commit(root)}", "",
+             *([f"Size budget: {budget} bytes, set in the controller state in place of the default "
+                f"{BUDGET_BYTES} (pk record --handoff-budget)", ""] if budget is not None else []),
              "#### Now", *_bullets(now), "",
-             "#### Tasks by status", *[f"- {name}: {number}" for name, number in counts.items()],
+             "#### Tasks by status",
+             *[f"- {name}: {number}" + (f" ({by_tier})" if name == "done" and number else "")
+               for name, number in counts.items()],
              *([f"- not in register: {', '.join(_line(t) for t in unregistered)}"] if unregistered else []), "",
              f"#### Branches not merged into {main}", *_bullets(branches), "",
              "#### Task worktrees", *_bullets(trees), "",
              "#### Queued", *_bullets(tasks(state["queued"])), "",
-             "#### Parked", *_bullets(tasks(state["parked"])), "",
+             "#### Parked", *_bullets(tasks(parked)), "",
              f"#### Ad-hoc tasks closed (newest {ADHOC_CLOSED_SHOWN} of {len(closed)})", *_bullets(closed_lines), "",
              followups_heading, *_bullets(followups), "",
              "#### Open change requests", *_bullets(requests), "",
@@ -192,6 +214,25 @@ def render(root: Path, main: str = "main") -> str:
     if any(line.strip() in (START, END) for line in block.splitlines()):  # belt and braces: state text is escaped
         raise KitError("the generated block would contain a marker line; check controller-state.json")
     return block
+
+
+def _round_lines(root: Path) -> list[str]:
+    """One Now line per integration round that is not closed: checked or not, how many members landed."""
+    folder = Path(root) / "program" / "rounds"
+    lines = []
+    for path in sorted(folder.glob("*.json")) if folder.is_dir() else []:
+        try:
+            data = read_json(path)
+        except KitError:
+            data = None
+        if not isinstance(data, dict) or not isinstance(data.get("members"), list):
+            lines.append(_line(f"round {path.stem}: its record program/rounds/{path.name} does not read"))
+        elif not data.get("closed_at"):
+            merged = data.get("merged") if isinstance(data.get("merged"), list) else []
+            lines.append(_line(
+                f"round {path.stem} (open): {'checked' if data.get('tree') else 'not checked yet'}, {len(merged)} of "
+                f"{len(data['members'])} members merged; close it after the last one: pk integrate close {path.stem}"))
+    return lines
 
 
 def _comparable(block: str) -> str:

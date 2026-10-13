@@ -12,12 +12,15 @@ Each ruling is one block:
     **Precedent.** ...
 
 `add` only ever appends; earlier bytes are never rewritten. A ruling supersedes
-an earlier one by writing `supersedes R<n>` anywhere in its decision.
+an earlier one by writing `supersedes R<n>` anywhere in its decision. `rewritten` says when the
+file no longer begins with the bytes committed at HEAD; `validate`, `pk record` and `pk merge`
+refuse such a log, so a rewritten ruling is never committed by a command of the kit.
 """
 from __future__ import annotations
 
 import argparse
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -128,13 +131,30 @@ def add(root: Path, role: str, question: str, decision: str, precedent: str = ""
     return number
 
 
+def rewritten(root: Path) -> str | None:
+    """Why the log in the working tree is not the committed log with rulings appended, or None (hard rule 23).
+
+    The bytes of `program/rulings.md` at HEAD must be the beginning of the file as it is now. A log that is
+    not committed yet, or a folder that is not a repository, has nothing to compare with.
+    """
+    try:
+        held = subprocess.run(["git", "-C", str(root), "show", "HEAD:./program/rulings.md"], capture_output=True)
+    except OSError:
+        return None
+    if held.returncode != 0 or _load(root).startswith(held.stdout):
+        return None
+    return ("program/rulings.md: the rulings committed at HEAD are no longer the beginning of the file. A ruling "
+            "is never rewritten, renumbered or deleted (hard rule 23): put the committed text back (git diff "
+            "program/rulings.md shows what changed) and record a new ruling that supersedes the old one")
+
+
 def validate(root: Path) -> list[str]:
     """Problems with the log, one line each; empty when all is well."""
     try:
         found = _parse(_load(root))
     except KitError as exc:
         return [str(exc)]
-    problems: list[str] = []
+    problems: list[str] = [problem for problem in [rewritten(root)] if problem]
     seen: set[int] = set()
     expected, previous = 1, 0
     for ruling, line in found:
@@ -186,7 +206,7 @@ def _configure(parser: argparse.ArgumentParser) -> None:
     adder.add_argument("--decision", required=True, help="what was decided (may say 'supersedes R<n>')")
     adder.add_argument("--precedent", default="", help="the rule this generalises")
     actions.add_parser("list", help="one line per ruling")
-    actions.add_parser("validate", help="check numbering and supersedes links")
+    actions.add_parser("validate", help="check numbering, supersedes links and that no committed ruling changed")
 
 
 def register(add_command) -> None:
