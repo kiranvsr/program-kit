@@ -4,5 +4,8 @@
     "P1-M01-S01-T02": "access log line per request; its dependency P1-M01-S01-T01 is done, spec and plan not written yet"
   },
   "parked": {},
-  "followups": []
+  "adhoc": [],
+  "followups": [],
+  "closed_followups": [],
+  "now": ""
 }

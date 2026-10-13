@@ -2,9 +2,19 @@
 
 Throughout, `pk` means `python3 kit/scripts/pk.py`. `docs/DESIGN.md` has the full design; this page answers the questions people ask first.
 
-## Why is there only a strict process? Where is the lite mode?
+## Is there a lighter process for small or low-risk tasks?
 
-Every task, however small, goes through the same lifecycle: a SPEC and PLAN accepted by a second reader, an isolated branch, a hand-back gate, commit-bound evidence, independent QA and a one-at-a-time merge. The strict process looks heavy for a one-line change, but most of its checks are scripts, and the expensive part (a second human or agent reading) is spent only where a second reader catches things the author cannot. A lite path is where trust leaks: the first task that "doesn't need" independent QA is the one nobody can vouch for later, and a program that mixes two standards cannot say what "done" means. If a task really is trivial, the strict process makes it a small task, not an exempt one.
+Yes, since 0.3.0, and it is bounded by scripts rather than by judgement. Every task has a verification tier. `full` is the whole lifecycle and the default: anything touching access control, tenancy, data migrations, cryptography, release or the kit's own gates is full, and so is anything you are unsure about. `standard` keeps the gate, the evidence record and independent QA, but QA does one scoped review instead of re-running the suite and planting its own bugs. `light` runs the build, the compile check and the scans and has the controller read the diff: no tests, no evidence, no QA. A fast path replaces SPEC, PLAN and spec QA with one brief and a ruling for small work you ask for directly.
+
+What stops the light paths from becoming where trust leaks: a new program has no lower tier at all until `tiers.full_paths` in `program/checks.yaml` says which paths are always full; the gates read a task's tier from main and fail a task below full that touches one of those paths; a branch cannot lower its own tier or switch one on; the fast path is refused for the full tier; and a light-tier task is recorded `merged`, never `done`, so "done" still means one thing: QA accepted it, with evidence. What the scripts cannot know is whether your `full_paths` list is complete. Keep it wide.
+
+## What is a ruling, and why does a tier change need one?
+
+A ruling is a numbered, dated decision in `program/rulings.md` that is never rewritten. A lower tier is a decision to check less, so it has to be findable later: the light tier is switched on by a ruling that names the kinds of change it covers, the fast path names the ruling that allowed it, and `pk status tier` refuses without one. `pk record --ruling TEXT` writes the ruling, updates the controller's state, regenerates the hand-off and commits, in one step.
+
+## What does each agent have to read, and how much is it?
+
+Its own brief, its parts of `kit/rules/RULES.md` and `program/COMMON.md`, plus the task's definition; `kit/playbooks/09_handoff.md` has the table with sizes, and a test keeps the table true. In 0.2 a controller read about 55 KB of kit files before the hand-off and an implementer about 20 KB plus the whole ruling log; in 0.3 the controller reads about 43 KB and a hand-off capped at 60 KB, an implementer about 19 KB (13 KB on the light tier), and nobody reads the ruling log top to bottom. The larger saving is in what no longer comes back: a subagent's final message is four things (status, commits, one test line, concerns) and its report is a file.
 
 ## Why does the kit never name a model, vendor or agent tool?
 
@@ -24,7 +34,7 @@ A preset is a starting `checks.yaml`. If you only need it for your own project, 
 
 ## How do I take over a program someone else was running?
 
-Open `kit/playbooks/09_handoff.md`; it contains the successor prompt to give the incoming agent. In short: read `program/HANDOFF.md` top to bottom, then the role briefs in `kit/briefs/` and the three rule files in `kit/rules/`. Verify the state before acting: `git status` and `git branch --no-merged main`, `pk worktree list` with `git status --short` in each worktree (an uncommitted `results.json` or claim file is partial evidence: void it by exact path, never commit it), leftover processes and disk, and that the project's own test commands pass on a clean main. Run `pk handoff check` (and `pk handoff update` if it exits 1). Record your own model-tier mapping in the hand-off, then resume at its next steps. Never restart an accepted task, and never resume an agent whose task has already merged.
+Open `kit/playbooks/09_handoff.md`; it contains the successor prompt to give the incoming agent. In short: read `program/HANDOFF.md` top to bottom (it is kept under 60 KB), then `kit/rules/RULES.md`, `kit/briefs/controller.md` and `program/COMMON.md`. Verify the state before acting: `git status` and `git branch --no-merged main`, `pk worktree list` with `git status --short` in each worktree (an uncommitted `results.json` or claim file is partial evidence: void it by exact path, never commit it), leftover processes and disk, and that the project's own test commands pass on a clean main. Run `pk handoff check` (and `pk handoff update` if it exits 1). Write your own model mapping into `program/COMMON.md`, then resume at the hand-off's Now list and next steps. Never restart an accepted task, and never resume an agent whose task has already merged.
 
 ## `kit/scripts/trace.py` has the same name as a standard-library module. Is that a problem?
 
@@ -67,6 +77,10 @@ Because the record never claimed the code would stay the same. It claims: at com
 ## How do I move a 0.1 project to 0.2?
 
 Upgrade the kit (`sh install.sh <repo> --upgrade`), then run `pk evidence import` in the project. It copies every `program/evidence/<ID>/results.json` and `acceptance.json` into the new layout byte for byte, as each task's first history entry (an acceptance's `evidence_sha256` therefore still binds), builds `program/evidence/<ID>/latest.json`, and prints a `git rm` line for each original. It never deletes them itself: check the import, run the printed `git rm` lines, and commit the new records, the pointers and the removals together. Producers call `Evidence.write()` with no path now. A `gates.yaml` record may keep its old `path: program/evidence/<ID>/results.json` (it names task `<ID>`) or say `task: <ID>`.
+
+## How do I move a 0.2 project to 0.3?
+
+Run `sh install.sh /path/to/your-repo --upgrade`. Nothing in `program/` has to change: a status record without a tier reads as `full`, a 0.2 `controller-state.json` reads as it is (follow-ups get IDs the first time a command writes the file), and the evidence store is untouched. Then, to use what is new: copy `kit/templates/COMMON.md` to `program/COMMON.md` and fill it; add a `tiers` section to `program/checks.yaml` (it is a guarded file, so the controller edits it on main) listing your full-tier paths; rename the Known gotchas heading of your hand-off to Known hazards if you like; and tell your agents that `kit/rules/RULES.md` replaces `HARD_RULES.md`, `EVIDENCE_HONESTY.md` and `THROUGHPUT.md`. If `pk handoff check` now fails on the size budget, move history into rulings and close or tag follow-ups; `handoff_budget_bytes` in the controller state raises the budget while you do.
 
 ## What are the known limits?
 

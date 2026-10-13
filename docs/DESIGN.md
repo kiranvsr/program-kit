@@ -56,6 +56,7 @@ program-kit/
       BRIEF.md, discovery.md, product.md, SPEC.md, ARCHITECTURE.md, adr.md, roadmap.md
       environments.yaml, gates.yaml, traceability.yaml, register.yaml, ledger.yaml
       task_SPEC.md, task_PLAN.md, freeze_review.md, signoff.md
+      task_FAST_BRIEF.md, CONTRACT.md, COMMON.md    the fast-path brief, the contract-first file, the program's common rules
       phase_brief.md, milestone_brief.md, step_brief.md, task_brief.md     the generated brief shapes
       results.schema.json, acceptance.schema.json, status.schema.json
       checks.yaml, CLAIM_BOUNDARIES.md, HANDOFF.md, controller-state.json, rulings.md
@@ -79,8 +80,12 @@ program-kit/
       fetch.py              fetches and caches network inputs by digest; the only script that downloads
       stale.py              drift report: is each task's latest record fresh against the current tree
       rulings.py            appends a numbered ruling; validates the log
-      handoff.py            regenerates the generated block of HANDOFF.md; check
-      worktree.py           creates and lists task worktrees
+      handoff.py            regenerates the generated block of HANDOFF.md; check, with the size budget
+      worktree.py           task worktrees: new, list, the detached review worktree, the safe finish
+      ctlstate.py           the one reader and writer of controller-state.json
+      tracker.py            follow-ups, ad-hoc tasks and `pk record`, one controller step in one command
+      cost.py               the append-only cost log and the fresh-agent threshold
+      land.py               `pk merge` (the per-merge chain) and integration rounds
       change.py             change requests: create, impact, approve, apply
       manifest.py           writes and checks kit/MANIFEST.sha256
     tests/                  unit tests for every script (standard-library unittest) and the neutrality test
@@ -111,8 +116,8 @@ program/
                             digest of the ledger entries that touch a topic of stages 1 to 5
                             and of whether each of those topics applies)
   briefs/                   generated phase/milestone/step/task briefs
-  tasks/<ID>/SPEC.md, PLAN.md
-  status/<ID>.json
+  tasks/<ID>/SPEC.md, PLAN.md, review.md    or, on the fast path, BRIEF.md alone; CONTRACT.md when contract first
+  status/<ID>.json          status, verification tier, fast path and ruling
   evidence/<ID>/latest.json the task's pointer: its latest results and acceptance record (the only mutable
                             evidence file)
   evidence/<ID>/produce.py, report.md
@@ -122,7 +127,10 @@ program/
   rulings.md                append-only, numbered R1..
   changes/CR-NNN.md         change requests after approval
   changes/register-log.md   one line per register change after approval
-  checks.yaml
+  checks.yaml               commands, guarded files and the `tiers` section
+  COMMON.md                 run commands, constraints, model mapping, report contract, known failures on main
+  costs.jsonl               append-only, one line per subagent run
+  rounds/<NAME>.json        integration rounds: members, tested tree, what merged
   HANDOFF.md, controller-state.json, progress.md
 ```
 ## 4. Stage flow: from a few lines to a frozen spec and a task register
@@ -176,14 +184,19 @@ The interview is not a scripted questionnaire. Questions are generated from the 
 - `review → done` (QA only: the task's latest acceptance record accepts, `decision: accepted_development`, names the task and binds the task's latest results record by digest; that record passes the gate's results checks and its `head` is an ancestor of HEAD)
 - `not_started|in_progress → blocked` (controller, with `blocked_by`) and `blocked → not_started|in_progress`
 - `not_started → parked` (controller, with the user decision it waits on) and `parked → not_started`
+- `in_progress → merged` (controller, light tier only, in the main checkout, after the task's branch is merged into main)
 
-`done` is terminal; a later change request creates a new task. A task with no status file is `not_started`. Every transition is checked in full before anything is written, so a refusal leaves no file behind.
+Every record carries the task's verification tier (`full`, `standard`, `light`), whether it runs on the fast path, and the ruling that allowed either (section 10.1). They are set at dispatch and change only through `pk status tier <ID> <tier> --ruling R<n>`; a record written before 0.3.0 has none and reads as `full`. The fast path is refused for the full tier, here and by the record reader. A light-tier task has no QA, so `review` and `done` are refused for it: `merged` is its terminal status, it carries no acceptance, and a gate claim never counts it as evidenced. Work outside the register (an ad-hoc task `AH-<nnnn>` listed in the controller state) can be given a status like a register task.
+
+`done` and `merged` are terminal; a later change request creates a new task. A task with no status file is `not_started`. Every transition is checked in full before anything is written, so a refusal leaves no file behind.
 ## 5. Execution loop (playbook 08)
 
 **Roles.** Three roles, each a separate agent session:
 - The **controller** picks the next task, dispatches it, answers questions with recorded rulings, merges, and keeps the state current. It never writes product code.
 - An **implementer** owns one task in its own worktree and branch, builds test-first against SPEC and PLAN.
 - **QA** never wrote the code. It decides acceptance with evidence. Only QA, through `pk status set ... done --role qa`, can mark a task done.
+
+The steps below are the full tier, which is the default. Section 10.1 says what the standard and light tiers leave out and what guards each of them; section 10.2 covers parallel review and the integration round. A reviewer works in its own detached worktree at the reviewed commit (`pk worktree review <ID>`) and is handed the diff as a file.
 
 **Per task.**
 1. **Dispatch.** The gate reads the task's SPEC, its PLAN, the `Guarded edit:` lines and `checks.yaml` from main, so they must be on main before work starts. The controller sets the task `in_progress`, commits the SPEC, the PLAN and that status file to main together as one commit (the dispatch commit), and only then runs `pk worktree new <ID>`, which creates `.worktrees/<id>` on branch `task/<ID>` from main (the project must git-ignore `.worktrees/`, or every worktree makes main look dirty). The implementer receives its role brief, the task brief, the SPEC, the PLAN, the rules and the rulings the SPEC cites. From here on the status record changes only on the task branch.
@@ -192,9 +205,9 @@ The interview is not a scripted questionnaire. Questions are generated from the 
 4. **Hand-back gate.** `pk gate handback <ID> --branch task/<ID>`, run from the main checkout, runs in order: the guarded-file check; the check that the branch did not change its own SPEC or PLAN or the spec-QA `review.md` of its dispatch (the SPEC and the PLAN must be byte-identical to main's; the review record must be as main has it, so a branch can neither rewrite nor remove it, nor add one main lacks, and main must hold the task's spec-QA `review.md` at all: a task dispatched without one is refused with `FAILED: review <path> is missing on main`); a trial merge of the branch into main in a temporary worktree; the project's build and compile checks on the trial merge; the project's test, scan and extra gate commands from `checks.yaml`; the PLAN's exact commands; `produce.py` (a task whose own inputs changed since its latest record must append a new one; the record history must be intact since the branch left main); the drift report. The rules are always read from `main`; no option names another branch. It prints a final `OK: <branch> passes the hand-back gate at <sha>` line only if every step passed. Exit code alone is not a pass; the line is. Failing the gate returns the work to the implementer without a QA round.
 5. **Evidence commit.** The results record, produced only from a clean tree and appended to `program/evidence/<ID>/results/`, binds the work to one commit: head and main SHAs, the sha256 of every consumed input (source, tests, fixtures, dependency closure, config, lock files, tool helpers), every command with its literal text, real exit code, parsed derived fields and `as_expected`, and the planted-bug table. The gate leaves the new record and the updated pointer uncommitted. The implementer then sets the task `review`, writes its report to `program/evidence/<ID>/report.md`, and makes one commit of the record, the pointer, the report and the status file. That is the evidence commit.
 6. **QA.** An independent agent runs `pk gate binding <ID> --branch task/<ID>` (the latest record is committed with the digest its pointer names, its `head` is an ancestor of the tip, every recorded input hash is recomputed from the blob at that commit, no record was rewritten since the branch left main; drift to the tip is reported, never a failure), re-runs the PLAN commands, tries to defeat each new guard with its own planted bugs, checks scope in/out against the SPEC, the closed requirement IDs against the traceability matrix, and claims against `CLAIM_BOUNDARIES.md`. QA does not re-run the hand-back gate; the merge check in step 8 is the independent gate run. It either appends an acceptance with `pk evidence accept <ID> <file>` (it must bind the latest results record and its head, with QA's own commands and bugs), sets status done and commits the acceptance record, the pointer and the status as one commit, or rejects with numbered findings, each with severity, location and the exact fix expected.
-7. **Fix rounds.** Fixes go back to the same implementer. The re-check covers only the findings and the binding check (the implementer re-runs the gate after a fix), and may run on a Tier 2 model, which must escalate anything outside its checklist.
-8. **Merge.** The controller runs `pk gate merge-check --branch task/<ID>` from main; its last line must be `OK: <branch> merges into main at <sha>`. The merge check is the controller's own run of the gate's checks and does not rely on the implementer having run it: the guarded-file check, then on a trial merge the SPEC, PLAN and `review.md` identity check (the task's spec-QA `review.md` must be on main) and the build, compile check, test, scan and extra gate commands from main's `checks.yaml`. Then `git merge --no-ff`. Accepted branches merge one at a time, right after acceptance. A merge never re-produces another task's evidence: a record is a fingerprint of what was verified at its `head`, and a later change only makes it drift. `pk stale` reports the drift for the reader; a task refreshes its own record (an append) only when its own work changes.
-9. **Bookkeeping.** After every merge or state change: update `controller-state.json`, append to `progress.md`, run `pk gate claims` and `pk gate validate` for the gates the merge touched, run `pk handoff update` and `pk handoff check`, commit `program/`.
+7. **Fix rounds.** Fixes go back to the same implementer, resumed in the same session, and the re-check to the same reviewer. It covers only the findings and the binding check (the implementer re-runs the gate after a fix). Each run is recorded in the cost log; an agent past 400,000 tokens or three resumes is flagged, and the controller starts a fresh one with a tight fix brief.
+8. **Land.** `pk merge <ID>`, from the main checkout, is the whole per-merge chain for one task. It refuses a branch whose status record is not `done` (set by QA), runs the merge check and requires its last line `OK: <branch> merges into main at <sha>`, merges with `git merge --no-ff`, rewrites the claim documents of the gates that name the task, regenerates the hand-off block and commits exactly the bookkeeping files it wrote. The merge check is the controller's own run of the gate's checks and does not rely on the implementer having run it: the guarded-file check, the tier check, then on a trial merge the SPEC, PLAN and `review.md` identity check and every build, compile-check, test, scan and extra-gate command of main's `checks.yaml`. Merges are one at a time: the command takes one task.
+9. **After the merge.** `pk worktree finish <ID>` removes the task's worktrees and merged branch (section 10.2); the controller triages follow-ups, spot-checks what the reports claimed, and records decisions and state changes with `pk record` (section 10.3).
 
 **Blocked and parked.** A task not yet dispatched that needs an environment which does not exist is set `blocked` on main with `blocked_by` naming it. A task that waits on a user decision is `parked` with the decision named; parked is reachable only from `not_started`. A task already in progress that needs a user decision is set `blocked` on its own branch.
 
@@ -211,39 +224,25 @@ A change of meaning to anything approved at stage 5 or later is a change request
 
 ## 7. Hand-off and takeover (playbook 09)
 
-`program/HANDOFF.md` is the single document a successor needs. It has a maintained part and a generated part:
-- maintained: how the program works, environment setup, known gotchas, ordered next steps, the model-tier mapping, and one line saying where the rules live (`kit/rules/*.md` and `program/rulings.md`). The hand-off carries state, not rules: the rules are cited from where they live so that a copy cannot drift;
-- generated by `pk handoff update`, between markers: counts, in-flight tasks with their stage text, unmerged branches and worktrees, queued and parked tasks, open follow-ups, open change requests.
+`program/HANDOFF.md` is the single document a successor needs. It carries the state of the program, not its rules and not its history, and it has a size budget so that it can always be read whole. It has a maintained part and a generated part:
+- maintained: how the program works, environment setup, known hazards (seeded with the four every program meets), the order of what comes next (2 KB at most), and one line saying where the rules live;
+- generated by `pk handoff update`, between markers: a Now list (the controller's one line, every task in flight with its tier and stage text, the open ad-hoc tasks), counts by status, unmerged branches and worktrees, queued and parked tasks, the newest ten closed ad-hoc tasks, the open follow-ups that are not deferred by a tag (newest first, counted, at most thirty), open change requests, the agents past the fresh-agent threshold, and the newest fifteen rulings on one line each with the next free number.
 
-`pk handoff check` exits 1 when the generated part is stale; the controller runs it before every commit of `program/`. A process ruling changes the playbook or rule file in the same commit.
+`pk handoff check` exits 1 when the generated part is stale, when the file is over its budget (60 KB unless the controller state sets `handoff_budget_bytes`) or when the Next steps section is over 2 KB. History lives in `program/rulings.md`. Writing the block changes `program/HANDOFF.md` and no other tracked file, and nothing when the block is current.
 
-`kit/playbooks/09_handoff.md` includes the successor prompt: read HANDOFF top to bottom, read the role briefs and `kit/rules/*.md`, verify the state (git status, unmerged branches, worktree cleanliness, void partial evidence by exact path, leftover processes and containers, disk, and that the repo-wide suite passes on main, run from the commands in `program/checks.yaml`), then resume at HANDOFF's next steps. A successor never restarts an accepted task and never resumes an agent whose task has since merged.
+`kit/playbooks/09_handoff.md` holds a table of what each role reads at start, with sizes that a test checks against the shipped files, and the successor prompt: read HANDOFF, the rules file, the controller brief and `program/COMMON.md`; verify the state (git status, unmerged branches, worktree cleanliness, void partial evidence by exact path, leftover processes and containers, disk, and that the repo-wide suite passes on main); report to the user what was found and what was verified; resume at the Now list. The prompt points to the rules; it does not restate them.
 
-**Model tiers.** Roles, never names. Tier 1 is the strongest model available: controller, first-pass implementation and QA, the interviewer and the lens challenge rounds, stage artifacts and specs, freeze review, any re-check that escalates. Tier 2 is a cheaper model, used only for scoped re-checks of exact fixes, re-bind runs and mechanical producer runs with a checklist; it reports ESCALATE instead of judging anything outside the checklist. Never Tier 2 for first-pass work, security rulings, or accepting with an open important finding. A provider with one model uses it for everything. Nothing in the kit names a model; each controller records its mapping in HANDOFF when it takes over. The commit attribution line follows the controller's own session and is not copied from an earlier commit.
+**Model classes.** Roles, never names: the kit names no model. Controller rule C4 defines four classes (A for the final review of full-tier work and security rulings, B for the controller and specs, C for implementation and scoped review, D for mechanical work); `program/COMMON.md` maps each class to a model by name, every dispatch names its model, and the cost log refuses a run without one.
 
 ## 8. Hard rules (kit/rules/RULES.md, part 1)
 
-These bind every agent in every role and stage. If a rule seems to block the work, the agent stops and tells the user; it does not look for a way around. The file holds twenty numbered rules; in summary:
+The rules are stated once, in `kit/rules/RULES.md`, and this document does not restate them. Part 1 holds the hard rules, numbered 1 to 23, which bind every agent in every role and stage: evidence and claims (1 to 5), status, register and frozen artifacts (6 to 10), git and files (11 to 17), permissions and scope (18 to 20), and merges, worktrees and rulings (21 to 23: merges one at a time, never force-remove a worktree that holds work, a ruling is never rewritten). If a rule seems to block the work, the agent stops and tells the user. Rules 1 to 20 are word for word those of 0.2.0; 21 to 23 were stated in the playbooks before and are numbered now.
 
-- **Evidence and claims.** Never fabricate evidence, test results, CI results, gate passes or human approvals. Never claim anything about an environment `environments.yaml` marks `exists: false`; work that needs one stays `blocked_by` it. Development acceptance is not production readiness. An acceptance lives where the code reads it: a side file that leaves the read fields unaccepted is not an acceptance. Checks and evidence run from a clean tree, so the project git-ignores the bytecode and build output its commands write.
-- **Status, register and frozen artifacts.** Only QA sets `done`, only through `pk status set`. The register changes only through `pk register change`; status files, approvals and generated briefs are never hand-edited. Briefs are immutable once approved. A frozen artifact changes only through a change request. Guarded files (the `guarded_files` list in `checks.yaml`) change only with the user's approval, recorded as a `Guarded edit: <path>` line in the task's SPEC on main before dispatch; a branch cannot approve its own edit.
-- **Git and files.** Never rewrite history: no rebase, reset or force-push; merge main into branches; never a bare `git stash`. Never commit secrets, private keys, licence-restricted artifacts, editor or build leftovers or scratch files. Never push, deploy or apply infrastructure without the user's explicit instruction. Every destructive command uses a literal path; clean up only what you created, by exact name. Commit messages end with the agent's own attribution line.
-- **Permissions and scope.** A denied action is reported to the user, never routed around and never delegated to another agent. An implementer asks the controller only in four cases (a new dependency, a security boundary with no precedent, a change to user scope, two conflicting rulings) and decides everything else itself. A task builds exactly the scope of its SPEC and PLAN; anything else is a follow-up.
 ## 9. Evidence honesty (kit/rules/RULES.md, part 3) and the evidence kit
 
 ### 9.1 Rules
-1. PLAN commands run literally, as written.
-2. Derived fields are parsed from real output and asserted; never "unparseable" while marked as expected.
-3. Every new guard has a cheapest-defeat planted bug caught by the gate's own test.
-4. A planted bug counts only on a test failure, never a build or setup failure; planted bugs must build.
-5. Every new tenancy or access policy gets a cross-boundary test with a positive eligible-row control and a wide-open planted policy.
-6. Consumed-input hashes are complete: unchanged source, tests, fixtures, dependency closure, generated-file sources, migrations, tool helpers, config and lock files.
-7. Evidence is produced only from a clean tree and binds to one commit; hashes are never hand-edited.
-8. Partial evidence left by an interrupted run is voided by exact path before resuming.
-9. Refreshing an older record re-runs every command it holds and appends a new record with the real result; entries are never dropped or kept stale, and a claim whose output changed is rewritten to what the command now proves. The new record names the one it replaces (`supersedes`); the older one stays in the history untouched.
-10. Validators and gate steps never download inline. Anything fetched from the network (toolchains, pinned archives, fixtures) is cached by content digest under a durable per-host cache (`$PROGRAM_KIT_CACHE`, default `~/.cache/program-kit/fetch`), fetched once per host by a separate `pk fetch --pins <file.json>` step that runs in the background at session setup with a long timeout, and verified locally against the recorded digest with `pk fetch verify`. A pin is `{url, sha256, size, filename}`. A verify step that finds its input missing from the cache fails with the fetch command to run, never by downloading. Receipts stay digest-bound, so caching changes nothing about what is proven. The fetch step accepts https URLs only, validates every cached name against a strict pattern, writes through an exclusively created temporary file of its own in the cache root (created with its mode; the process umask is never read or changed), removes it on any failure, checks size and digest before renaming it into the digest directory, never removes a directory (so two fetches of one digest can run at once), and never follows a symlink for a cache entry or its parent; each of those guards has its own test and planted bug.
-11. Evidence records are committed, append-only and immutable: a record file is never modified or deleted once committed; the per-task latest.json is the only mutable evidence file.
-12. A record binds only its inputs, never a derived output: not another record, an acceptance, a gate result, a status snapshot, an approval or the register change log, a generated claim document, or anything under `program/evidence/` other than the producer and its tooling. Only a gate record binds other records, by digest; nothing binds a gate record.
+
+Part 3 of `kit/rules/RULES.md` holds the twelve evidence honesty rules, word for word those of 0.2.0: literal commands, parsed derived fields, a cheapest-defeat planted bug per guard that counts only on a test failure, cross-boundary tests for access policies, complete input hashes, a clean tree bound to one commit, voided partial evidence, honest refreshes, no inline downloads, and (rules 11 and 12) committed, append-only, immutable records that bind only their inputs. The rest of this section describes the machinery that enforces them. Verification tiers (section 10.1) change how much evidence a task owes, never what a record is: a standard-tier task produces the same record through the same gate, and a light-tier task produces none and can never be `done`.
 
 ### 9.2 The evidence store and evidence.py
 
@@ -305,25 +304,53 @@ guarded_files:
 Presets fill these for Go, Node/TypeScript and Python. Commands are argv lists; `pk gate` runs them without a shell. `build`, `test` and `scan` must each list a command. A guarded file is an exact path, or a directory when the entry ends in a slash. The gate reads `checks.yaml` from main, never from the task branch or a dirty checkout, so a branch cannot change the rules it is judged by. Unclaimable environments come from `environments.yaml`, not from here. `pk doctor` applies the same rules to a project's `checks.yaml` and reports each problem on its own line, and runs the evidence integrity checks of section 9.2.
 ## 10. Working rules and the controller's rules (kit/rules/RULES.md, parts 2 and 4)
 
-Rework and token cost, not coding, are what slow a program down. These rules exist to remove rework.
+Rework and token cost, not coding, are what slow a program down. Part 2 of the rules file holds the working rules every agent follows (W1 to W11: decide don't ask, the OK line, fix rounds, your own folder and worktree, no polling, the return contract, read only what you are pointed at, interruptions, decided means decided, work to your tier, report the cost). Part 4 holds the controller's rules (C1 to C20). This section explains the three mechanisms behind them; the rules themselves are not repeated here.
 
-- Merge queue: QA starts only once the branch's evidence reflects current main; merge immediately after acceptance, one branch at a time, in acceptance order. Only documentation-only hand-off commits may land in between.
-- Hand-back gate: no QA round until the implementer passed every mechanical check and the gate's last line is the OK line.
-- Decide, don't ask: anything with precedent is decided and recorded; questions are reserved for the four cases in section 5.
-- Fix rounds return a finding-to-fix table; the re-check covers only those findings, the binding check and the gate.
-- At most three implementers and four agents at once; each agent has its own scratch folder.
-- No polling: long commands run in the background and the agent waits for completion; never `tail -f`.
-- Short reports, in a fixed shape the briefs define.
-- After an interruption: void partial evidence by exact path, resume at the interrupted step, never restart a task.
-- When two rejections share a cause, the cause becomes a gate check (an `extra_gate` command or a new gate step) and a ruling.
-- Read the three rule files and the rulings a SPEC cites; not the whole ruling log.
-- A gate that reads every record (a phase gate, a re-bind batch) runs on a quiet main: merge the feature tasks first, then run the gates back to back, merging nothing else while one produces evidence.
-- The controller commits hand-off and controller-state updates only after a merge, a ruling or at session end. The one exception is the dispatch commit (SPEC, PLAN and `in_progress` status together, before the worktree is created), because the gate reads them from main.
-- A successor verifies that the repo-wide suite passes on main before it dispatches anything.
-- Session setup runs `pk fetch` in the background once per host so no later gate step waits on a download.
+### 10.1 Verification tiers and the fast path
+
+One process for every task spent the most on the tasks that needed it least. A task therefore has a verification tier, chosen when it is specified (the `Tier:` line of its SPEC, checked by spec QA), recorded in its status record at dispatch, and changed only by a ruling.
+
+| Tier | For | Process | Ends at |
+|---|---|---|---|
+| `full` | access control, tenancy, data migrations, cryptography, release, the kit's own gates; the default when unsure | section 5 as written: spec QA, hand-back gate, QA that re-runs the commands, plants its own bugs and works through the attack questions, merge check | `done`, set by QA |
+| `standard` | ordinary work off the full-tier paths | the same gate and the same evidence record; one independent scoped review (binding, diff against the definition) with no re-run and no planted-bug quota; the suite runs at the hand-back gate and at the merge check | `done`, set by QA |
+| `light` | the kinds of change a ruling of the program names | build, compile check and scans; the controller reads the diff; no tests, no evidence, no QA | `merged`, set by the controller |
+
+The fast path replaces SPEC, PLAN and spec QA with one `program/tasks/<ID>/BRIEF.md` and a ruling, for small bounded work the user asks for directly. It is never available for the full tier.
+
+Each lighter path has a guard that a script enforces, not a sentence:
+- **The tier is read from main.** The gates take tier, fast path and ruling from `main:program/status/<ID>.json`. A branch whose own status record says otherwise fails (`FAILED: tier ... changes the tier`). A record that does not read is an error, never a lighter tier.
+- **Lower tiers are off until switched on.** `pk status set --tier standard|light` and both gates refuse a lower tier while `tiers.full_paths` in main's `checks.yaml` is empty. `checks.yaml` is a guarded file, so a branch cannot switch a tier on for itself.
+- **Full-tier paths stay full.** A task below the full tier fails both gates when its branch changes a path under `tiers.full_paths` or one of the built-in full-tier paths (`kit/`, `program/checks.yaml`, `program/gates.yaml`).
+- **The SPEC and the record agree.** A SPEC-path task below full must carry `Tier: <tier>` in its SPEC on main, equal to its record.
+- **The fast path is never full.** Refused by `pk status set`, by `pk status tier` (unless `--spec` says the SPEC, PLAN and review now exist), by the status record reader, and by both gates. The brief must be on main, byte-identical on the branch, with its Scope, Decided and Stop sections; its ruling must be in main's rulings log; a standard-tier brief must list at least one exact command. A fast-path task cannot change a guarded file, because the approval line lives in a SPEC.
+- **Light is bounded.** It needs `tiers.light_ruling` (a ruling on main) and `tiers.light_paths`; a light branch that changes any path outside them fails. The merge check needs `--inspected <sha>` equal to the branch tip. `review` and `done` are refused: a light task ends at `merged`, set by the controller on main only after the branch is merged, and a claim document never counts it.
+- **Nothing unaccepted merges through the kit.** `pk merge` refuses a full or standard branch whose status record on its tip is not `done`.
+
+What the tiers cannot do: tell whether the `full_paths` list is complete. A program that leaves its access-control code out of the list has switched the guard off for it; spec QA reviews the tier of every SPEC for that reason.
+
+### 10.2 Parallel work, review worktrees and integration rounds
+
+Work is dispatched in parallel, up to three implementers and four agents; merges stay one at a time (hard rule 21).
+
+- **Contract first.** A task with a server part and a client part commits `program/tasks/<ID>/CONTRACT.md` first; both parts build against it, and changes to it are appended.
+- **Review worktree.** `pk worktree review <ID>` creates a detached worktree at the reviewed commit and writes the diff to a file beside it, with evidence, status and excluded paths left out. The implementer can keep committing; reviews of different tasks run at once. The acceptance is still committed on the task branch, and it still must bind the task's latest results record.
+- **Integration round.** For accepted branches below the full tier: `pk integrate start NAME ID...` merges the members' tips onto `round/NAME`; `pk integrate check NAME` runs every command of main's `checks.yaml` once on the combined tree, records the tested tree and ends `OK: round/NAME passes the combined check at <sha>`; `pk merge ID --round NAME` lands each member, one at a time, without a second suite run; `pk integrate close NAME` compares the tested tree with main and fails on any difference outside the controller's documents until `--recheck` has run main's checks over the final tree. Guards: a full-tier task is never a member; a member must be `done` on its tip before the round starts; a member whose tip moved after the check, or a main that gained a commit that is neither a member's merge nor controller documents, voids the round for what is left; every member still passes the guarded-file, tier and definition checks and a trial merge when it lands. A script cannot choose a safe subset of tests, so the re-check is the whole suite once; the listed paths tell the reviewer where to look.
+- **Finish.** `pk worktree finish <ID>` removes the task and review worktrees, the merged branch, the symlinks it is told about and, given the task's exact compose project name, the containers, volumes and images named with that name and a separator. It refuses a worktree with uncommitted or untracked files and an unmerged branch, removes nothing on a refusal, and never passes a force flag.
+
+### 10.3 The controller's tracking commands
+
+The controller state (`program/controller-state.json`) is written by commands, never by hand.
+
+- **Rulings.** One append-only log; the hand-off shows the newest fifteen and the next free number.
+- **Ad-hoc tasks** (`pk adhoc`): work outside the register is a record with an ID, a title, a tracking state (queued, progress, review, paused, closed), a note and the ruling that asked for it, shown in the hand-off like a register task. The tracking state ends at `closed`, never `done`, and `closed` is refused while the task's status record is in flight.
+- **Follow-ups** (`pk followups`): stable IDs, an added date, tags; close with a reason and the ruling or commit that closed it; mark duplicates. A tagged follow-up is deferred: counted by tag, not listed.
+- **`pk record`**: one controller step in one command. It appends the ruling, applies the state changes given with it, regenerates the hand-off, checks the budget and commits exactly the files it wrote, with a subject taken from the ruling's first sentence. Everything is validated before anything is written. It runs in the main checkout and refuses when anything is staged.
+- **Cost log** (`pk cost`): one line per subagent run (task, role, agent, model, tokens, tool calls, seconds, resume). Totals per task; an agent past 400,000 tokens or three resumes is flagged in `pk cost report` and in the hand-off.
+
 ## 11. Rulings
 
-`program/rulings.md` is append-only. `pk rulings add --role ... --question ... --decision ... --precedent ...` writes the next number (R1 onward), the date, the role that decided, the question settled, the decision and the precedent it generalises. A ruling that changes the process also changes the playbook or rule file in the same commit. A ruling never contradicts an earlier one silently; it supersedes it by name, and `pk rulings validate` checks numbering and supersedes links. `kit/rules/RULINGS_SEED.md` holds the starting set, numbered K1..K33, written from the originating program without project names: the rules in sections 8 to 10 are their digest. A K ruling can be superseded in the same way as an R ruling.
+`program/rulings.md` is append-only. `pk rulings add --role ... --question ... --decision ... --precedent ...` writes the next number (R1 onward), the date, the role that decided, the question settled, the decision and the precedent it generalises. A ruling that changes the process also changes the playbook or rule file in the same commit. A ruling never contradicts an earlier one silently; it supersedes it by name, and `pk rulings validate` checks numbering and supersedes links. `kit/rules/RULINGS_SEED.md` holds the starting set, numbered K1..K44, written from the originating program without project names. Where a seed ruling is one of the rules of `kit/rules/RULES.md` it names that rule and keeps only the reason and how to apply it; K34 to K44 record the 0.3.0 rules and supersede K1, K13, K18 and K21 by name, and a superseded ruling keeps its own words. A K ruling can be superseded in the same way as an R ruling.
 ## 12. Error handling
 
 - Every script exits non-zero with a one-line reason on the first invalid input (`error: ...` on stderr); none writes partial output.  `pk register validate` prints `error: register invalid: <N> problem(s)` first, then each problem prefixed `error: `.
@@ -342,11 +369,12 @@ Rework and token cost, not coding, are what slow a program down. These rules exi
 - The shipped content is tested too: every playbook has its required sections, every command a playbook names exists, every playbook file a playbook names exists, and the seed prompts and charters match the coverage map.
 - `kit/tests/test_neutrality.py` scans every file in the repository except version-control, worktree and cache directories. It fails on any forbidden vendor, model or project name (case-insensitively, wherever they occur), on any URL outside `docs/FAQ.md` and the one test file that needs loopback addresses, on a file that is not valid UTF-8, and on a zero-width or invisible character (soft hyphen, direction marks and the like). The names are matched as substrings, in the text of every file and in every file and directory name; the project name also matches with a space or underscore in place of its hyphen. The forbidden names live in `kit/tests/_tokens.py`, assembled from fragments, so no file contains one literally.
 - `examples/tiny-service/` is a worked example with an end-to-end test.
+- Every lighter path is tested by trying to get round its guard: `test_tiers.py` (a lower tier that is not switched on, a full-tier path touched below full, a branch that lowers its own tier, a fast path on the full tier, a light merge nobody inspected, a light task called done), `test_land.py` (an unaccepted branch, a round with a full-tier member, a member or a main that moved, a tested tree that no longer matches, a finish that would lose work) and `test_tracker.py` (a refused step that writes nothing, the hand-off budget, a generator that touches no other tracked file).
 - `install.sh` is tested by installing into a temporary repository with each preset and running `pk doctor`.
 - Run everything with a private temporary directory so leftovers from other runs cannot confuse the leftover checks: `TMPDIR=$(mktemp -d) python3 -W error -m unittest discover -s kit/tests`.
 ## 14. Out of scope for the first version
 
-A web UI or dashboard; a lite process; hosted anything; model selection; language-specific project scaffolding beyond `checks.yaml` presets; migration of an existing non-kit program into the kit's layout; multi-repository programs.
+A web UI or dashboard (the generated hand-off block is the kit's only view of the state); a process lighter than the light tier; hosted anything; model selection; language-specific project scaffolding beyond `checks.yaml` presets; migration of an existing non-kit program into the kit's layout; multi-repository programs.
 
 ## 15. How the kit was built
 

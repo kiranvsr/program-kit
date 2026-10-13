@@ -53,17 +53,38 @@ Stages 1 to 6 are approved one at a time with `pk interview approve N`, and from
 
 ## The execution loop
 
-Each task is built by an implementer in its own worktree, accepted by a different agent, and merged by a controller (`08_execute.md` has every command).
+Tasks are built in parallel, each by an implementer in its own worktree, reviewed by a different agent, and merged by a controller one at a time (`kit/playbooks/08_execute.md` has every command). The steps below are the full tier, the default.
 
-1. Dispatch commit: the controller sets the task `in_progress` and commits its SPEC, PLAN, spec-QA `review.md` and status file to main together, because the gate reads them from main. A task whose review record is not on main fails both gates with `FAILED: review program/tasks/<ID>/review.md is missing on main`.
+1. Dispatch commit: the controller sets the task `in_progress` with its tier (`pk status set <ID> in_progress --role controller --tier <tier>`) and commits its SPEC, PLAN, spec-QA `review.md` and status file to main together, because the gate reads them from main. A task whose review record is not on main fails both gates with `FAILED: review program/tasks/<ID>/review.md is missing on main`.
 2. `pk worktree new <ID>` creates the worktree and branch `task/<ID>`; the implementer builds test first.
 3. The implementer writes an evidence producer, then runs the hand-back gate: `pk gate handback <ID> --branch task/<ID>`.
 4. The gate's last line must be exactly `OK: <branch> passes the hand-back gate at <sha>`. Exit code 0 alone is never accepted; a failed gate returns the work with no QA round.
 5. Evidence commit: the implementer sets the task `review` and commits the new results record (`program/evidence/<ID>/results/<utc>-<digest>.json`), `program/evidence/<ID>/latest.json`, its report and the status file, and nothing else.
-6. Independent QA runs `pk gate binding <ID> --branch task/<ID>`, re-runs the commands, plants its own bugs and checks scope, then accepts with `pk evidence accept <ID> <file>` (the only way a task becomes `done`) or rejects with numbered findings.
-7. Merge check: from main, `pk gate merge-check --branch task/<ID>` must end with `OK: <branch> merges into main at <sha>`. It is the controller's own run of the gate's checks: guarded files, the task's SPEC, PLAN and spec-QA `review.md` on main and unchanged, then the build, the tests and the scans on a trial merge.
-8. Merge with `git merge --no-ff`, one accepted branch at a time.
-9. Hand-off update: `pk handoff update`, `pk handoff check`, and commit `program/`.
+6. Independent QA works in its own detached worktree (`pk worktree review <ID>`, which also writes the diff file it reviews), runs `pk gate binding <ID> --branch task/<ID>`, re-runs the commands, plants its own bugs and checks scope, then accepts with `pk evidence accept <ID> <file>` (the only way a task becomes `done`) or rejects with numbered findings.
+7. Land: from main, `pk merge <ID>` refuses a branch QA has not set `done`, runs the merge check, which must end with `OK: <branch> merges into main at <sha>`, merges with `git merge --no-ff`, rewrites the gate claims, regenerates the hand-off and commits the bookkeeping. The merge check is the controller's own run of the gate's checks: guarded files, the tier, the task's SPEC, PLAN and spec-QA `review.md` on main and unchanged, then the build, the tests and the scans on a trial merge.
+8. `pk worktree finish <ID>` removes the task's worktrees and merged branch; it refuses a worktree that holds work and never forces.
+
+## Verification tiers
+
+Not every task needs all of that, and the careful ones should not be judged by the same process as a typo. Every task has a tier, written in its SPEC, recorded in its status record at dispatch and changed only by a ruling:
+
+| Tier | For | What it leaves out | Ends at |
+|---|---|---|---|
+| `full` | access control, tenancy, data migrations, cryptography, release, the kit's own gates; the default when unsure | nothing | `done`, set by QA |
+| `standard` | ordinary work off those paths | QA's re-run of the suite and its planted-bug quota: one scoped review, the suite once at the gate and once at the merge check | `done`, set by QA |
+| `light` | the kinds of change a ruling of your program names | tests, evidence and QA: build, compile check and scans, then the controller reads the diff | `merged`, set by the controller; never `done` |
+
+A fast path (`--fast --ruling R<n>`) replaces SPEC, PLAN and spec QA with one brief and a ruling for small bounded work you ask for directly; it is never available for the full tier. Several accepted branches below the full tier can be verified together in an integration round (`pk integrate`) and still merge one at a time.
+
+The gates enforce all of this from main, not from the branch. In a new program every task is full-tier: the lower tiers exist only once `tiers.full_paths` in `program/checks.yaml` lists the paths that must always be full, and a task below full that changes one of them fails. `docs/DESIGN.md`, section 10.1, lists every guard.
+
+## Keeping a long program cheap
+
+- One command per controller step: `pk record --ruling TEXT` appends the ruling, updates the state, regenerates the hand-off and commits exactly those files.
+- The hand-off has a size budget (60 KB) that `pk handoff check` enforces; history lives in `program/rulings.md`, and the hand-off shows the newest fifteen rulings.
+- Follow-ups have IDs and are closed, tagged or marked duplicate (`pk followups`); work outside the register is an ad-hoc task (`pk adhoc`) that the hand-off shows like any other.
+- `pk cost add` records each subagent run with the model it ran on; `pk cost report` flags an agent past 400,000 tokens or three resumes, when a fresh agent with a tight brief is cheaper than another resume.
+- Each role reads only its own brief, its parts of the rules file and `program/COMMON.md`. `kit/playbooks/09_handoff.md` lists the files and their sizes.
 
 ## Where evidence lives
 
@@ -71,18 +92,21 @@ Evidence records are committed, append-only files named by their own digest unde
 
 ## Where the rules live
 
-The rules are stated once, in `kit/rules/RULES.md` (hard rules, working rules, evidence honesty and the controller's rules, read by role), and `kit/rules/RULINGS_SEED.md` holds the starting rulings K1 to K33 with the reason for each. Your own decisions go in `program/rulings.md` with `pk rulings add`; a ruling never contradicts an earlier one silently, it supersedes it by name. `program/HANDOFF.md` carries the state of the program and points at the rules rather than copying them. The design and the reasons behind each rule are in `docs/DESIGN.md`; `docs/FAQ.md` answers common questions.
+The rules are stated once, in `kit/rules/RULES.md` (hard rules, working rules, evidence honesty and the controller's rules, read by role); nothing else restates them. `kit/rules/RULINGS_SEED.md` holds the starting rulings K1 to K44 with the reason for each, and `program/COMMON.md` holds what is particular to your program: how to run it, its constraints, which model fills which class, and the failures already known on main. Your own decisions go in `program/rulings.md` with `pk rulings add`; a ruling never contradicts an earlier one silently, it supersedes it by name. `program/HANDOFF.md` carries the state of the program and points at the rules rather than copying them. The design and the reasons behind each rule are in `docs/DESIGN.md`; `docs/FAQ.md` answers common questions.
 
 ## What the kit will not do
 
 - It never pushes, deploys or applies infrastructure; that is always your decision.
 - It never claims anything about an environment that does not exist. Environments are listed in `program/environments.yaml`, and work that needs a missing one stays blocked.
-- It never marks a task `done` unless the latest acceptance record accepts and binds the latest, valid results record, and it refuses that move for any role but QA. The role is a flag the caller passes, so keeping QA a different agent from the implementer is the controller's job, not something the kit can verify. "Accepted for development" is never "ready for production".
+- It never marks a task `done` unless the latest acceptance record accepts and binds the latest, valid results record, and it refuses that move for any role but QA. A light-tier task, which has no QA, is recorded `merged`, never `done`, and no gate claim counts it.
+- It never applies the fast path, the light tier or an integration round to a full-tier task, never force-removes a worktree, and never merges two branches in one command. The role is a flag the caller passes, so keeping QA a different agent from the implementer is the controller's job, not something the kit can verify. "Accepted for development" is never "ready for production".
 - It never writes evidence from a dirty tree, never modifies or deletes an evidence record, never downloads inside a gate, and never rewrites history.
 
 ## Upgrading
 
 Run `sh install.sh /path/to/your-repo --upgrade` from a newer copy of the kit. The installer first checks the new copy against its own manifest and the installed `kit/` against its `kit/MANIFEST.sha256`, and refuses if either does not match (for the installed one, if you changed anything under it, a file you added under `kit/tests` included), then replaces `kit/` wholesale; a `kit/tests` left by an older install goes with the old kit. It also appends `__pycache__/`, `*.pyc` and `.worktrees/` to `.gitignore` if they are missing, exactly as a fresh install does (existing lines are left as they are), and it never reads, writes or lists `program/`. Keep your own changes in `program/`, not in `kit/`.
+
+From 0.2 to 0.3 nothing in `program/` has to change: every existing task reads as full-tier and the 0.2 controller state reads as it is. To use what is new, add `program/COMMON.md` from `kit/templates/COMMON.md`, add a `tiers` section to `program/checks.yaml`, and point your agents at `kit/rules/RULES.md` in place of the three rule files it replaces. `CHANGELOG.md` has the steps.
 
 ## Requirements
 

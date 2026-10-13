@@ -258,6 +258,16 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(sorted(project.git("show", "--name-only", "--format=", "HEAD", cwd=wt).splitlines()),
                          sorted([record, INDEX, REPORT, STATUS]))
 
+        # QA gets its own detached worktree at the reviewed commit and the diff as a file; the implementer's
+        # worktree stays free. The acceptance is committed on the task branch, below.
+        review = project.pk("worktree", "review", TASK, "--exclude", "program/tasks").stdout.splitlines()
+        review_wt = Path(review[0])
+        self.assertEqual(project.git("rev-parse", "HEAD", cwd=review_wt), project.git("rev-parse", BRANCH))
+        diff = Path(review[1].removeprefix("diff: ")).read_text(encoding="utf-8")
+        self.assertIn("src/tiny_service.py", diff)
+        self.assertNotIn("program/evidence", diff)
+        self.assertEqual(project.git("status", "--porcelain"), "")  # nothing tracked was touched on main
+
         # QA: binding, drift, its own commands and planted bugs, then the acceptance.
         bound = project.pk("gate", "binding", TASK, "--branch", BRANCH).stdout
         self.assertIn("fresh at the tip", bound)
@@ -309,8 +319,28 @@ class EndToEndTests(unittest.TestCase):
         # the controller's independent gate run: the build, the tests and the scans, on the trial merge
         self.assertEqual([ln for ln in check if ln.startswith("step ")],
                          ["step build: ok", "step test: ok", "step scan: ok"])
-        project.git("merge", "--no-ff", "-q", "-m", f"Merge {TASK}", BRANCH)
+        # The run is recorded in the cost log with the model it ran on; it is far from the fresh-agent threshold.
+        project.pk("cost", "add", "--task", TASK, "--role", "implementer", "--model", "example-model",
+                   "--tokens", "180000", "--tools", "90", "--seconds", "1500")
+        self.assertEqual(project.pk("cost", "report").stdout.splitlines(),
+                         [f"{TASK}\t180000 tokens\t90 tool calls\t1500 s\t1 run(s)"])
+        # Both tasks are full-tier, so an integration round is refused: a full-tier task merges on its own.
+        refused = project.pk("integrate", "start", "both", TASK, OTHER, expect=1)
+        self.assertIn(f"{TASK} is full-tier", refused.stderr)
+        # one command lands the task: merge check again, merge, claims, hand-off and one bookkeeping commit
+        landed = project.pk("merge", TASK, "--trailer", "Co-Authored-By: Example Agent",
+                            env=project.gate_env).stdout.splitlines()
+        self.assertTrue(MERGE_OK.match(landed[0]), landed)
+        self.assertLess(len(landed), 10)
+        self.assertIn(f"claims: {GATE} rewritten", landed)
         self.assertEqual(project.git("status", "--porcelain"), "")
+        self.assertEqual(project.git("log", "-1", "--format=%s"),
+                         f"chore(program): {TASK} merged (full tier); hand-off and claims")
+        self.assertIn('"tier": "full"', project.pk("status", "show", TASK).stdout)
+        # finish: the task and review worktrees and the merged branch go, and nothing is forced
+        finished = project.pk("worktree", "finish", TASK).stdout
+        self.assertIn(f"removed: branch {BRANCH}", finished)
+        self.assertFalse(wt.exists() or review_wt.exists())
         self.assertEqual(json.loads(project.pk("stale").stdout)["drifted"], 0)
         project.pk("doctor")  # the evidence on main: every record named by its digest, none rewritten, all pointed at
         self.assertIn(f"{TASK}\tdone", project.pk("status", "list").stdout)
@@ -365,6 +395,27 @@ class EndToEndTests(unittest.TestCase):
         project.commit("program state after the merge: hand-off, change request, claims")
         project.pk("handoff", "check")
         self.assertEqual(project.git("status", "--porcelain"), "")
+
+        # Work the user asks for outside the register is an ad-hoc task; a follow-up has an ID and is closed.
+        self.assertEqual(project.pk("adhoc", "add", "--title", "a --port example in the README").stdout.strip(),
+                         "AH-0001")
+        self.assertEqual(project.pk("followups", "add", "--area", "docs", "--item", "say how to stop it").stdout.strip(),
+                         "F-0001")
+        project.pk("followups", "close", "F-0001", "--reason", "covered by the README", "--by", "R1")
+        # One controller step in one command: a ruling, a follow-up, the hand-off and the commit.
+        step = project.pk("record", "--ruling", "The access log task goes next. It stays on the full tier.",
+                          "--followup", "docs=say in the README how to change the port",
+                          "--now", "writing the SPEC of the access log task",
+                          "--trailer", "Co-Authored-By: Example Agent").stdout.splitlines()
+        self.assertEqual(step[0], "R2 recorded")
+        self.assertEqual(project.git("status", "--porcelain"), "")
+        self.assertEqual(project.git("log", "-1", "--format=%s"), "R2: The access log task goes next")
+        handoff = (repo / "program" / "HANDOFF.md").read_text(encoding="utf-8")
+        self.assertIn("- writing the SPEC of the access log task", handoff)
+        self.assertIn("F-0002 docs: say in the README how to change the port", handoff)
+        self.assertIn("AH-0001 a --port example in the README (ad hoc, queued)", handoff)
+        self.assertIn("#### Rulings (2; next R3)", handoff)
+        project.pk("handoff", "check")
 
         # The two remaining commands: a pin file with a local cache entry, and the kit's own manifest.
         payload = b"a tiny pinned file\n"
