@@ -15,7 +15,7 @@ All five. Each lens records its sign-off in the review. The reviewer is a separa
 
 ## Steps
 
-1. Start a spec-QA agent that did not write any stage artifact (Tier 1). Give it `kit/briefs/spec_qa.md` and the paths of every artifact. It runs `pk trace validate --stage 5` and `pk interview validate` first.
+1. Start a spec-QA agent that did not write any stage artifact (a class B model or better, controller rule C4). Give it `kit/briefs/spec_qa.md` and the paths of every artifact. It runs `pk trace validate --stage 5` and `pk interview validate` first.
 2. The reviewer checks for: placeholders; contradictions; ambiguity; every journey covered by requirements; every requirement owned by a component; every quality claim owned by a gate; every non-functional requirement with a target or an owner; every environment claim consistent with `environments.yaml`; a complete product-surface checklist.
 3. The reviewer writes `program/freeze/review.md` as a finding-to-fix table: number, severity, location, problem, exact fix.
 4. The author fixes each finding and replies in the table with the fix. If a fix changes meaning, ask the user first.

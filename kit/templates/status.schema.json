@@ -5,7 +5,12 @@
   "required": ["task_id", "status", "role", "updated_at", "note", "evidence", "blocked_by", "history"],
   "properties": {
     "task_id": {"type": "string"},
-    "status": {"enum": ["not_started", "in_progress", "review", "done", "blocked", "parked"]},
+    "status": {"enum": ["not_started", "in_progress", "review", "done", "blocked", "parked", "merged"],
+               "description": "done is set by QA alone; merged is the light tier's terminal status, set by the controller after the merge, and carries no acceptance"},
+    "tier": {"enum": ["full", "standard", "light"], "description": "the verification tier, set at dispatch and changed only by `pk status tier` with a ruling; absent (a record written before 0.3.0) means full"},
+    "fast": {"type": "boolean", "description": "the fast path: BRIEF.md and a ruling replace SPEC, PLAN and spec QA; never true on the full tier"},
+    "ruling": {"type": "string", "description": "the ruling (R<n>) that allowed the fast path or the last tier change; empty when none was needed"},
+    "inspected": {"type": "string", "pattern": "^[0-9a-f]{40}$", "description": "on a merged record only, and required there: the commit whose diff the controller read. main holds a merge of exactly this commit, and `pk status validate` re-runs the light path's guard on it"},
     "role": {"enum": ["controller", "implementer", "qa"]},
     "updated_at": {"type": "string", "description": "UTC, YYYY-MM-DDTHH:MM:SSZ"},
     "note": {"type": "string"},
@@ -18,9 +23,11 @@
         "additionalProperties": false,
         "required": ["status", "role", "at"],
         "properties": {
-          "status": {"enum": ["not_started", "in_progress", "review", "done", "blocked", "parked"]},
+          "status": {"enum": ["not_started", "in_progress", "review", "done", "blocked", "parked", "merged"]},
           "role": {"enum": ["controller", "implementer", "qa"]},
-          "at": {"type": "string"}
+          "at": {"type": "string"},
+          "tier": {"enum": ["full", "standard", "light"], "description": "present on the dispatch entry (the first move to in_progress) and on the entry a tier change appends; the record's tier must be the last one named here"},
+          "ruling": {"type": "string"}
         }
       }
     }

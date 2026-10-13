@@ -20,3 +20,14 @@ guarded_files:
   - package.json
   - pnpm-lock.yaml
   - program/checks.yaml
+# Verification tiers (kit/rules/RULES.md, part 4). While full_paths is empty every task is full-tier.
+# full_paths: the paths that are always full-tier in this program (access control, tenancy, data migrations,
+# cryptography, release); a standard or light task that changes one fails the gate. The kit's own gates
+# (kit/, program/checks.yaml, program/gates.yaml) are always full-tier and need no entry.
+# light_paths and light_ruling switch the light tier on: the ruling (R<n> in program/rulings.md) names the
+# kinds of change it covers, light_paths says where they live. An entry is an exact path, or a directory
+# when it ends in a slash.
+tiers:
+  full_paths: []
+  light_paths: []
+  light_ruling: ""

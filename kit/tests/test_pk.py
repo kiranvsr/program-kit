@@ -16,7 +16,7 @@ from common import KitError, read_json, read_yaml
 KIT = Path(__file__).resolve().parent.parent
 TEMPLATE_FILES = ["BRIEF.md", "checks.yaml", "environments.yaml", "CLAIM_BOUNDARIES.md", "ledger.yaml",
                   "HANDOFF.md", "controller-state.json", "rulings.md",
-                  "register.yaml", "traceability.yaml", "gates.yaml"]
+                  "register.yaml", "traceability.yaml", "gates.yaml", "COMMON.md"]
 
 
 class PkTests(unittest.TestCase):
@@ -44,7 +44,8 @@ class PkTests(unittest.TestCase):
         for name in TEMPLATE_FILES:
             self.assertEqual((self.tmp / "program" / name).read_bytes(), (KIT / "templates" / name).read_bytes(), name)
         self.assertEqual(read_json(self.tmp / "program" / "controller-state.json"),
-                         {"stage": {}, "queued": {}, "parked": {}, "followups": []})
+                         {"stage": {}, "queued": {}, "parked": {}, "adhoc": [], "followups": [],
+                          "closed_followups": [], "now": ""})
         handoff = (self.tmp / "program" / "HANDOFF.md").read_text()
         self.assertIn("<!-- generated:start -->", handoff)
         self.assertIn("<!-- generated:end -->", handoff)
@@ -62,7 +63,9 @@ class PkTests(unittest.TestCase):
     def test_yaml_templates_have_the_spec_shapes(self):
         checks = read_yaml(KIT / "templates" / "checks.yaml")
         self.assertEqual(sorted(checks), sorted(["build", "test", "scan", "compile_check", "extra_gate",
-                                                 "guarded_files"]))
+                                                 "guarded_files", "tiers"]))
+        # no lower tier is switched on in a new program: every task is full-tier until full_paths is filled
+        self.assertEqual(checks.pop("tiers"), {"full_paths": [], "light_paths": [], "light_ruling": ""})
         for key, value in checks.items():
             self.assertEqual(value, ["program/checks.yaml"] if key == "guarded_files" else [], key)
         self.assertEqual(read_yaml(KIT / "templates" / "environments.yaml"), {"environments": {}})

@@ -26,11 +26,12 @@ MIN_PYTHON = (3, 11)
 PRESETS = ("go", "node", "python")
 TEMPLATE_FILES = ("BRIEF.md", "checks.yaml", "environments.yaml", "CLAIM_BOUNDARIES.md", "ledger.yaml",
                   "HANDOFF.md", "controller-state.json", "rulings.md", "register.yaml", "traceability.yaml",
-                  "gates.yaml")
+                  "gates.yaml", "COMMON.md")
 
 # Modules that register further subcommands (each defines `register(add_command)`).
 COMMAND_MODULES: tuple[str, ...] = ("status", "rulings", "register", "briefs", "trace", "interview", "evidence",
-                                    "stale", "fetch", "gate", "worktree", "handoff", "change", "manifest")
+                                    "stale", "fetch", "gate", "worktree", "handoff", "change", "manifest",
+                                    "cost", "tracker", "land")
 
 COMMANDS: dict[str, Callable[[argparse.Namespace], int]] = {}
 CONFIGURERS: dict[str, tuple[str, Callable[[argparse.ArgumentParser], None] | None]] = {}
@@ -151,6 +152,7 @@ def _checks_problems(data) -> list[str]:
         data = data or {}
         parts = [({key: data.get(key)}, (key,) if key in required else ()) for key in gate.CHECK_KEYS]
         parts.append(({"guarded_files": data.get("guarded_files")}, ()))
+        parts.append(({"tiers": data.get("tiers")}, ()))
         parts.append(({key: value for key, value in data.items() if key not in gate.ALL_KEYS}, ()))
     problems = []
     for part, require in parts:
@@ -159,6 +161,29 @@ def _checks_problems(data) -> list[str]:
         except KitError as exc:
             problems.append(" ".join(str(exc).split()))
     return problems
+
+
+def _tier_path_warnings(root: Path, data) -> list[str]:
+    """One line per `tiers.full_paths` or `tiers.light_paths` entry that covers no tracked file.
+
+    Such an entry guards nothing today: it is a typing mistake, or a directory nobody has added a file to yet.
+    A warning, not an error, because the second case is how a full-tier path is listed ahead of its first file.
+    """
+    import gate  # lazy: gate imports most of the kit
+    from common import run_argv
+
+    try:
+        tiers = gate._parse_tiers(data.get("tiers") if isinstance(data, dict) else None)
+    except KitError:
+        return []  # reported as a problem by _checks_problems
+    warnings = []
+    for key in ("full_paths", "light_paths"):
+        for entry in tiers[key]:
+            code, listed = run_argv(["git", "-C", str(root), "ls-files", "--", entry.rstrip("/")], root)
+            if code == 0 and not listed.strip():
+                warnings.append(f"checks.yaml: tiers.{key} entry {entry!r} covers no tracked file: check the "
+                                "spelling (a directory is written with or without its trailing /)")
+    return warnings
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
@@ -171,7 +196,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     program = root / "program"
     if not program.is_dir():
         raise KitError(f"program/ not found at {root}; run `pk init`")
-    problems = _checks_problems(read_yaml(program / "checks.yaml"))  # a file that does not read raises, naming the line
+    checks = read_yaml(program / "checks.yaml")  # a file that does not read raises, naming the line
+    problems = _checks_problems(checks)
+    for warning in _tier_path_warnings(root, checks):
+        print(f"warning: {warning}", file=sys.stderr)
     branch = primary_branch_problem(root)
     if branch:
         problems.append(branch)

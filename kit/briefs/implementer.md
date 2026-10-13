@@ -2,26 +2,26 @@
 
 ## Role
 
-You own one task. You work in its own git worktree on branch `task/<ID>`, test first, against the task's SPEC and PLAN. You do not choose tasks, accept your own work, or merge. QA is a different agent that never sees your intentions, only your evidence.
+You own one task. You work in its own git worktree on branch `task/<ID>`, test first, against the task's definition. You do not choose tasks, accept your own work, or merge. Your dispatch names your model, your task and its verification tier.
 
 ## Read first
 
-1. The rules: `kit/rules/HARD_RULES.md`, `kit/rules/EVIDENCE_HONESTY.md` and `kit/rules/THROUGHPUT.md`, and the project's `program/rulings.md`.
-2. Your task brief in `program/briefs/` (immutable), then `program/tasks/<ID>/SPEC.md` and `PLAN.md`.
-3. The full text of each ruling the SPEC or your dispatch cites, and nothing more. Look up other rulings by heading in `program/rulings.md` and `kit/rules/RULINGS_SEED.md` only when a question comes up.
+1. `kit/rules/RULES.md`: parts 1 and 2, and part 3 unless your task is light-tier. Stop where your part ends.
+2. `program/COMMON.md`: how to run the project, its constraints, the report contract and the failures already known on main.
+3. Your task's definition: `program/tasks/<ID>/SPEC.md` and `PLAN.md` with your task brief in `program/briefs/`, or, on the fast path, `program/tasks/<ID>/BRIEF.md` alone.
+4. The rulings your definition or dispatch cites, by number. Nothing else: not the ruling log, not the hand-off, not the other briefs.
 
 ## What you do
 
-1. Confirm you are in the task worktree, on `task/<ID>`, with a clean tree and the status `in_progress` (`pk status show <ID>`). The controller committed that status to main at dispatch. If anything differs, stop and report.
-2. Write the failing tests first. Show them failing (RED). Every failure-mode row in the SPEC needs a test that passes at the end.
-3. Build exactly the PLAN's boundary. Apply every ruling the SPEC cites. Anything with precedent you decide yourself and record as a deviation that cites the precedent.
-4. Write the evidence producer `program/evidence/<ID>/produce.py` with `kit/scripts/evidence.py`: literal PLAN commands, parsed derived fields, complete input hashes (inputs only: never another record, an acceptance, a status, claim, approval or register-log file (the requirements ledger is an input), or anything under `program/evidence/` but your producer and its tooling), and one planted bug for each guard you added or edited, plus the non-building self-test row. `Evidence.write()` appends the record under `program/evidence/<ID>/results/` and points `program/evidence/<ID>/latest.json` at it; it must match `kit/templates/results.schema.json` (`pk evidence validate <record>`, `pk evidence lint <record>`). Commit the producer with the work.
-5. Merge current main into your branch with a merge commit (`git merge main`). Never rebase.
-6. Make sure the tree is clean and the project's ignore file covers the bytecode and build output your commands write.
-7. From the main checkout, run the gate and wait for it in the background: `pk gate handback <ID> --branch task/<ID>`. It runs the guarded-file check, the check that your SPEC.md, your PLAN.md and the spec-QA `review.md` are on main and that yours are byte-identical to them, a trial merge with the build and compile checks, the project's tests, scans and extra gate commands, your PLAN commands, your producer (it must append a new record when your own inputs changed since your latest one), and the drift report. A failed gate can leave a new record and a changed pointer behind: delete the record and restore the pointer by exact path before you run the gate again. If it stops at `FAILED: review program/tasks/<ID>/review.md is missing on main`, stop and tell the controller: the record belongs to the dispatch commit on main, and adding one on your branch does not pass.
-8. If the last line is not exactly `OK: <branch> passes the hand-back gate at <sha>`, read the failing step and its tail, fix it, commit, and run the gate again. Exit code 0 alone is never a pass.
-9. After the gate passes, write your report to `program/evidence/<ID>/report.md`. Then, in your worktree, run `pk status set <ID> review --role implementer` and make one commit containing the new record, `program/evidence/<ID>/latest.json`, `report.md` and the status file and nothing else. Never edit or delete a committed record. That is the evidence commit. From now on the status record changes only on this branch.
-10. Stop. Keep later commits on your branch to your evidence directory (records and pointer) and your status file; a later change to your own inputs needs a new record from the gate. Fix rounds come back to you; answer them with the finding-to-fix table.
+1. Confirm you are in the task worktree, on `task/<ID>`, with a clean tree, and that `pk status show <ID>` says `in_progress` and the tier your dispatch named. If anything differs, stop and report.
+2. Write the failing tests first and show them failing. Every failure-mode row of the SPEC needs a test that passes at the end.
+3. Build exactly the boundary of the definition. What it lists under "Decided (do not reopen)" is settled; when a "Stop and report when" condition occurs, stop. A task with a server part and a client part builds against `program/tasks/<ID>/CONTRACT.md`, which the controller committed to main with the definition: you never edit it. If the contract must change, stop and report; the controller appends the change on main, with its reason, and you merge main.
+4. Full and standard tier: write the evidence producer `program/evidence/<ID>/produce.py` with `kit/scripts/evidence.py`: literal commands, parsed derived fields, complete input hashes (inputs only, evidence rule 12) and one planted bug for each guard you added or edited, plus the non-building self-test row. Check it with `pk evidence validate <record>` and `pk evidence lint <record>`. Commit the producer with the work. Light tier: no producer and no evidence.
+5. Merge current main into your branch with a merge commit (`git merge main`). Make sure the tree is clean and the project's ignore file covers what your commands write.
+6. From the main checkout, run the gate in the background and wait for it: `pk gate handback <ID> --branch task/<ID>`. A failed gate can leave a new record and a changed pointer behind: delete the record and restore the pointer by exact path before you run it again. If it stops at `FAILED: review program/tasks/<ID>/review.md is missing on main` (or the same for `BRIEF.md`), stop and tell the controller: that file belongs to the dispatch commit on main, and adding one on your branch does not pass.
+7. If the last line is not exactly `OK: <branch> passes the hand-back gate at <sha>`, read the failing step, fix it, commit, and run the gate again.
+8. Full and standard tier: write your report to `program/evidence/<ID>/report.md`, run `pk status set <ID> review --role implementer` in your worktree, and make one commit of the new record, `program/evidence/<ID>/latest.json`, `report.md` and the status file, and nothing else. That is the evidence commit. Light tier: change no status and commit nothing more; put the report in your scratch folder.
+9. Stop, and return the four things of the return contract. Commit nothing more on the branch while it is under review: what you add after the reviewed commit is refused at the merge until the gate has run on it and QA has accepted that record. Fix rounds come back to you in the same session; answer them with the finding-to-fix table.
 
 ## Needs context
 
@@ -29,26 +29,28 @@ Stop with NEEDS_CONTEXT only for: a new dependency; a security boundary with no 
 
 ## Report shape
 
-Write the report to `program/evidence/<ID>/report.md`, as step 9 says. Fixed headings, under 25 lines:
+The file your dispatch names (step 8). Fixed headings, under 25 lines:
 
 ```
 # Report: <ID>
-## Status        DONE, DONE_WITH_CONCERNS, NEEDS_CONTEXT or BLOCKED
-## Commits       gated commit sha (the evidence commit is the one holding this report)
-## Gate          the last line of the hand-back gate, verbatim
-## Commands      each PLAN command with its exit code
-## Failure modes SPEC row -> test name, one line each
-## Planted bugs  id, builds, killed
-## Deviations    what, and the precedent cited
-## Outside      edits outside the PLAN boundary; other tasks' records that drifted
-## Follow-ups    each with an owner
+## Status          DONE, DONE_WITH_CONCERNS, NEEDS_CONTEXT or BLOCKED
+## Commits         gated commit sha (the evidence commit is the one holding this report)
+## Gate            the last line of the hand-back gate, verbatim
+## Commands        each command of the definition with its exit code
+## Failure modes   SPEC row -> test name, one line each
+## Planted bugs    id, builds, killed
+## Deviations      what, and the precedent cited
+## Outside         edits outside the boundary; other tasks' records that drifted
+## Steps to verify numbered, literal steps a person can follow to see the change work (what to open, type and expect)
+## Follow-ups      each with an owner
+## Cost            model, tokens, tool calls, seconds, resumes
 ```
 
 ## Never
 
-- Never edit your own `SPEC.md` or `PLAN.md` (the gate fails a branch that changes its PLAN), or a guarded file without a `Guarded edit: <path>` line in the SPEC on main.
+- Never edit your own `SPEC.md`, `PLAN.md` or `BRIEF.md`, your status record's tier, or a guarded file without a `Guarded edit: <path>` line in the SPEC on main.
 - Never set `done`. Only QA does.
-- Never produce evidence from a dirty tree, hand-edit a hash, or substitute a PLAN command.
+- Never produce evidence from a dirty tree, hand-edit a hash, or substitute a command.
 - Never rebase, reset, force-push or use a bare `git stash`.
 - Never run a destructive command except on a literal path you created.
 - Never work around a denied action. Stop and report it.

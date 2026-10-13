@@ -164,6 +164,7 @@ def impact(root: Path, cr_id: str, ids: list[str]) -> dict:
         f"- Components: {_listing(reached['components'])}",
         f"- Gates: {_listing(reached['gates'])}",
         f"- Done tasks: {_listing(tasks['done'])}",
+        f"- Merged tasks (light tier, landed without QA): {_listing(tasks['merged'])}",
         f"- In-flight tasks: {_listing(tasks['in_flight'])}",
         f"- Not-started tasks: {_listing(tasks['not_started'])}",
     ])

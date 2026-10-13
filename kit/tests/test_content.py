@@ -17,7 +17,9 @@ PLAYBOOKS = ["00_START.md", "01_discover.md", "02_define_product.md", "03_specif
              "10_change.md"]
 LENS_PLAYBOOKS = PLAYBOOKS[1:7]  # stages 1 to 6 are interview stages and name the lenses that are active
 BRIEFS = ["controller.md", "implementer.md", "qa.md", "spec_qa.md"]
-RULES = ["HARD_RULES.md", "EVIDENCE_HONESTY.md", "THROUGHPUT.md", "RULINGS_SEED.md"]
+RULES = ["RULES.md", "RULINGS_SEED.md"]  # one canonical rules file, and the seed rulings that point to it
+RULE_PARTS = ["Part 1. Hard rules", "Part 2. Working rules", "Part 3. Evidence honesty",
+              "Part 4. The controller's rules"]
 
 PLAYBOOK_SECTIONS = ["Purpose", "Inputs", "Steps", "Outputs", "Done when", "Next playbook"]
 BRIEF_SECTIONS = ["Role", "Read first", "What you do", "Needs context", "Report shape", "Never"]
@@ -29,6 +31,7 @@ NEEDS_CONTEXT = ["a new dependency", "a security boundary with no precedent", "a
                  "two conflicting rulings"]
 HANDBACK_LINE = "`OK: <branch> passes the hand-back gate at <sha>`"
 MERGE_LINE = "`OK: <branch> merges into main at <sha>`"
+ROUND_LINE = "`OK: round/<NAME> passes the combined check at <sha>`"
 
 
 # FORBIDDEN comes from _tokens (assembled from fragments); these further names are fragments too, so this file
@@ -56,6 +59,26 @@ def sections(text: str) -> dict:
     if name is not None:
         found[name] = "\n".join(body)
     return found
+
+
+def rule_part(number: int) -> str:
+    """The text of one part of the canonical rules file."""
+    found = sections(read(RULES_DIR / "RULES.md"))
+    return next(body for name, body in found.items() if name.startswith(RULE_PARTS[number - 1]))
+
+
+HARD_RULE_LINES = (
+    "1. Never fabricate evidence, test results, CI results, gate passes or human approvals.",
+    "6. Only QA sets a task `done`, and only through `pk status set <ID> done --role qa`, after `pk evidence accept` "
+    "appended an acceptance of the latest results record.",
+    "11. Never rewrite history: no rebase, no reset, no force-push. Merge main into your branch with a merge commit.",
+    "14. Never push, deploy or apply infrastructure unless the user explicitly tells you to.",
+    "18. If an action is denied, stop and report it to the user. Never route around a denial, and never ask another "
+    "agent to do what was denied.",
+    "21. Accepted branches merge into main one at a time.",
+    "22. Never force-remove a worktree that holds work.",
+    "23. A ruling is never rewritten, renumbered or deleted.",
+)
 
 
 def all_files() -> list:
@@ -122,7 +145,7 @@ class PlaybookTests(unittest.TestCase):
         self.assertIn("pk gate binding", text)
         self.assertIn("Guarded edit:", text)
         self.assertIn("## Exact Commands", text)
-        self.assertIn("git-ignore", read(RULES_DIR / "HARD_RULES.md"))
+        self.assertIn("git-ignore", rule_part(1))
 
     def test_handoff_playbook_has_successor_prompt_with_fetch_and_main_suite(self):
         text = read(PLAYBOOK_DIR / "09_handoff.md")
@@ -156,7 +179,7 @@ class ReviewRecordTests(unittest.TestCase):
 
     def test_the_merge_check_is_described_with_the_review_record_everywhere(self):
         execute = sections(read(PLAYBOOK_DIR / "08_execute.md"))["Steps"]
-        merge = execute[execute.index("11. Merge"):]
+        merge = execute[execute.index("11. Land"):]
         self.assertIn("SPEC, PLAN and spec-QA `review.md` are main's", merge)
         readme = read(KIT.parent / "README.md")
         self.assertIn("the task's SPEC, PLAN and spec-QA `review.md` on main and unchanged", readme)
@@ -216,17 +239,119 @@ class RulesTests(unittest.TestCase):
         self.assertIn("program/HANDOFF.md", block_titled("controller documents"))
         self.assertRegex(block_titled("nothing else merges"), r"(?i)quiet main")
 
+    def test_there_is_one_rules_file_with_four_parts_and_nothing_restates_it(self):
+        self.assertEqual(sorted(p.name for p in RULES_DIR.iterdir()), sorted(RULES))
+        found = [name for name in sections(read(RULES_DIR / "RULES.md")) if name.startswith("Part ")]
+        self.assertEqual([name.split(" (")[0] for name in found], RULE_PARTS)
+
+    def test_the_hard_rules_keep_their_numbers_and_their_text(self):
+        text = rule_part(1)
+        numbers = [int(n) for n in re.findall(r"^(\d+)\. ", text, re.M)]
+        self.assertEqual(numbers, list(range(1, len(numbers) + 1)))
+        self.assertGreaterEqual(len(numbers), 23)
+        for line in HARD_RULE_LINES:  # the rules that must never change, word for word
+            self.assertIn(line, text)
+
     def test_evidence_honesty_has_twelve_rules(self):
-        text = read(RULES_DIR / "EVIDENCE_HONESTY.md")
+        text = rule_part(3)
         self.assertEqual([int(n) for n in re.findall(r"^(\d+)\. ", text, re.M)], list(range(1, 13)))
         self.assertIn("the per-task latest.json is the only mutable evidence file", text)  # rule 11
         self.assertIn("A record binds only its inputs, never a derived output", text)  # rule 12
 
     def test_throughput_covers_required_topics(self):
-        text = read(RULES_DIR / "THROUGHPUT.md").lower()
-        for topic in ("merge queue", "hand-back gate", "decide, don't ask", "finding-to-fix", "tier 1", "tier 2",
-                      "escalate", "three implementers", "four agents", "polling", "interrupt", "quiet main"):
-            self.assertIn(topic, text, f"THROUGHPUT.md does not cover '{topic}'")
+        text = (rule_part(2) + rule_part(4)).lower()
+        for topic in ("merge queue", "hand-back gate", "decide, don't ask", "finding-to-fix", "class a", "class d",
+                      "escalate", "three implementers", "four agents", "polling", "interrupt", "quiet main",
+                      "verification tiers", "fast path", "integration round", "contract first", "return contract",
+                      "always name the model", "three resumes", "verify, don't relay", "batch", "budget",
+                      "never forces"):
+            self.assertIn(topic, text, f"RULES.md parts 2 and 4 do not cover '{topic}'")
+
+
+def rules_bytes(parts) -> int:
+    """The size of the canonical rules file up to the end of the last part a role reads."""
+    text = read(RULES_DIR / "RULES.md")
+    marks = [text.index(f"## {title}") for title in RULE_PARTS] + [len(text)]
+    return len(text[:marks[max(parts)]].encode("utf-8"))
+
+
+def size(*paths) -> int:
+    return sum(len((KIT / path).read_bytes()) for path in paths)
+
+
+# What each role reads at start (kit files; program/COMMON.md counted as its template), in the row order of
+# the table in 09_handoff.md.
+READING = {
+    "Controller or successor": lambda: rules_bytes((1, 2, 3, 4)) + size(
+        "briefs/controller.md", "playbooks/00_START.md", "playbooks/08_execute.md", "templates/COMMON.md"),
+    "Implementer, full or standard tier": lambda: rules_bytes((1, 2, 3)) + size(
+        "briefs/implementer.md", "templates/COMMON.md"),
+    "Implementer, light tier": lambda: rules_bytes((1, 2)) + size("briefs/implementer.md", "templates/COMMON.md"),
+    "QA": lambda: rules_bytes((1, 2, 3)) + size("briefs/qa.md", "templates/COMMON.md"),
+    "Spec QA": lambda: rules_bytes((1, 2)) + size("briefs/spec_qa.md", "templates/COMMON.md"),
+}
+# What the same roles had to read in 0.2.0: three rule files (14.1 KB) and, for the controller, all four briefs,
+# the start and execute playbooks and the hand-off playbook. The 0.3.0 sets must stay under these.
+READING_0_2_KB = {"Controller or successor": 54.7, "Implementer, full or standard tier": 19.6,
+                  "Implementer, light tier": 19.6, "QA": 20.0, "Spec QA": 17.9}
+
+
+class RuleFilePointerTests(unittest.TestCase):
+    """Every `kit/rules/<FILE>.md` a shipped document or script points to is a file of the kit."""
+
+    def test_no_document_points_to_a_rules_file_that_is_gone(self):
+        repo = KIT.parent
+        texts = [path for folder in (KIT, repo / "docs", repo / "examples") for path in sorted(folder.rglob("*"))
+                 if path.suffix in (".md", ".py", ".yaml", ".json") and "tests" not in path.parts
+                 and "__pycache__" not in path.parts]
+        texts += [repo / "README.md", repo / "CHANGELOG.md"]
+        self.assertGreater(len(texts), 60)
+        named = {}
+        for path in texts:
+            for name in re.findall(r"kit/rules/([A-Za-z_]+\.md)", read(path)):
+                named.setdefault(name, path)
+        self.assertEqual(sorted(named), sorted(RULES))  # both are pointed at, and nothing else is
+        for name, path in named.items():
+            self.assertTrue((RULES_DIR / name).is_file(), f"{path} points to kit/rules/{name}, which does not exist")
+
+
+class ReadingSizeTests(unittest.TestCase):
+    """A role reads only what its role needs, the hand-off playbook says which files and how big, and it is true."""
+
+    def rows(self) -> dict:
+        text = read(PLAYBOOK_DIR / "09_handoff.md")
+        found = {}
+        for line in text.splitlines():
+            cells = [cell.strip() for cell in line.strip("|").split("|")]
+            if line.startswith("|") and len(cells) == 3 and cells[0] in READING:
+                found[cells[0]] = (cells[1], float(cells[2]))
+        return found
+
+    def test_the_table_names_every_role_and_its_sizes_are_the_real_ones(self):
+        rows = self.rows()
+        self.assertEqual(list(rows), list(READING))
+        for role, (_, stated) in rows.items():
+            actual = READING[role]() / 1000
+            self.assertAlmostEqual(stated, actual, delta=0.5, msg=f"{role}: the table says {stated} KB, it is {actual:.1f}")
+
+    def test_every_role_reads_less_than_it_did_and_no_role_reads_another_roles_brief(self):
+        for role, (files, stated) in self.rows().items():
+            self.assertLess(stated, READING_0_2_KB[role], role)
+            briefs = re.findall(r"kit/briefs/(\w+)\.md", files)
+            self.assertEqual(len(briefs), 1, f"{role} reads {briefs}")
+            self.assertIn("program/COMMON.md", files)
+        for name in ("implementer.md", "qa.md", "spec_qa.md"):
+            read_first = sections(read(BRIEF_DIR / name))["Read first"]
+            self.assertNotIn("HANDOFF", read_first, name)
+            self.assertNotRegex(read_first, r"(?<!cites, by number, )`program/rulings\.md`", name)
+        self.assertIn("Do not read the other briefs", read(BRIEF_DIR / "controller.md"))
+
+    def test_the_successor_prompt_points_to_the_rules_instead_of_restating_them(self):
+        prompt = read(PLAYBOOK_DIR / "09_handoff.md").split("```")[1]
+        self.assertIn("kit/rules/RULES.md", prompt)
+        self.assertLess(len(prompt.splitlines()), 30)
+        for restated in ("never fabricate", "only QA sets done", "never rewrite history"):
+            self.assertNotIn(restated, prompt)
 
 
 class StageSevenTests(unittest.TestCase):
@@ -294,7 +419,7 @@ class NeutralityTests(unittest.TestCase):
             for line in text.splitlines():
                 self.assertFalse(line.lstrip().startswith("OK: "), f"{path.name}: line starts with 'OK: '")
             for line in re.findall(r"`(OK: [^`]*)`", text):
-                self.assertIn(f"`{line}`", (HANDBACK_LINE, MERGE_LINE), f"{path.name}: unexpected OK line")
+                self.assertIn(f"`{line}`", (HANDBACK_LINE, MERGE_LINE, ROUND_LINE), f"{path.name}: unexpected OK line")
 
 
 YAML_FENCE = re.compile(r"^```ya?ml\n(.*?)^```", re.M | re.S)

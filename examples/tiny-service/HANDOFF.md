@@ -4,27 +4,28 @@ This is the hand-off of the tiny-service example. The part between the markers i
 
 ## How the program works
 
-Every `pk` command is `python3 kit/scripts/pk.py <command>`, run from the repository root or a task worktree. Discovery (stages 1 to 6) is approved and frozen. Each task then goes through `kit/playbooks/07_task_specs.md` and `08_execute.md`: spec and plan, a dispatch commit on main, a worktree, the hand-back gate, independent QA, merge. Rules live in `kit/rules/HARD_RULES.md`, `EVIDENCE_HONESTY.md`, `THROUGHPUT.md` and `program/rulings.md`.
+Every `pk` command is `python3 kit/scripts/pk.py <command>`, run from the repository root or a task worktree. Discovery (stages 1 to 6) is approved and frozen. Each task then goes through `kit/playbooks/07_task_specs.md` and `08_execute.md`: spec and plan, a dispatch commit on main, a worktree, the hand-back gate, independent QA, merge. Both tasks are full-tier: no lower tier is switched on in `program/checks.yaml`.
 
 ## Environment setup
 
 - Python 3.11 or later and git. `gitleaks` on the PATH for the scan step of the gate. Nothing is installed with pip.
 - Only the `dev` environment exists, a developer machine. `staging` does not exist: nothing is claimed for it (`program/CLAIM_BOUNDARIES.md`).
 
-## Known gotchas
+## Known hazards
 
 - The gate reads SPEC, PLAN and `checks.yaml` from main, so the dispatch commit must be on main before `pk worktree new`.
 - The project git-ignores `__pycache__/`, `*.pyc` and `.worktrees/`. Without the first two the clean-tree check of the evidence step fails.
 - `pk interview next` printing stage 7 is normal: discovery is complete.
+- The service binds a fixed port: stop a running copy before the tests start another.
 
-## Next steps, in order
+## Next steps
 
 1. Write the SPEC and PLAN for P1-M01-S01-T02 (access log line per request), have spec QA review them, then dispatch it.
 2. When T02 is merged, run `pk gate claims G-P1` and `pk gate validate G-P1`: the phase gate then has evidence for both records.
 
-## Model tiers
+## Where the rules live
 
-One model played every role in this example, so there is no Tier 2.
+`kit/rules/RULES.md` (the rules), `program/COMMON.md` (run commands, constraints and the model mapping: one model played every role in this example) and `program/rulings.md`.
 
 <!-- generated:start -->
 <!-- generated:end -->
