@@ -62,7 +62,9 @@ class PkTests(unittest.TestCase):
     def test_yaml_templates_have_the_spec_shapes(self):
         checks = read_yaml(KIT / "templates" / "checks.yaml")
         self.assertEqual(sorted(checks), sorted(["build", "test", "scan", "compile_check", "extra_gate",
-                                                 "guarded_files"]))
+                                                 "guarded_files", "tiers"]))
+        # no lower tier is switched on in a new program: every task is full-tier until full_paths is filled
+        self.assertEqual(checks.pop("tiers"), {"full_paths": [], "light_paths": [], "light_ruling": ""})
         for key, value in checks.items():
             self.assertEqual(value, ["program/checks.yaml"] if key == "guarded_files" else [], key)
         self.assertEqual(read_yaml(KIT / "templates" / "environments.yaml"), {"environments": {}})

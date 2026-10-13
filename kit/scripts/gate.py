@@ -22,6 +22,17 @@ lint, its `head` is an ancestor of the tip, every recorded input hash is the has
 commit since the branch left main modified or deleted a record. Drift between `head` and the tip is reported,
 never a failure: the record says what was verified at `head`, and that stays true.
 
+Verification tiers. The tier of a task, whether it is on the fast path and the ruling that allowed it are read
+from the task's status record on main (`git show main:program/status/<ID>.json`; none, or a record written
+before tiers existed, means `full`), never from the branch. `full` and `standard` run every step above. A task
+that is not `full` fails when its branch changes a full-tier path: the built-in ones (`kit/`, `program/checks.yaml`,
+`program/gates.yaml`) or any path under `tiers.full_paths` of main's `checks.yaml`. A `light` task runs only the
+build, the compile check and the scans, on paths under `tiers.light_paths`, and its merge check needs the
+controller's `--inspected <sha>`; it produces no evidence and can never be `done`. A fast-path task is judged
+by `program/tasks/<ID>/BRIEF.md` on main in place of SPEC, PLAN and review.md, and its ruling must be in main's
+`program/rulings.md`. The fast path is refused for the full tier. A branch whose status record changes the
+tier recorded on main fails the merge check.
+
 Limits:
 - A produce.py that hand-writes a well-formed record is not detectable by the gate; QA re-runs the
   evidence independently and uses `pk gate binding`.
@@ -49,7 +60,9 @@ import tempfile
 from pathlib import Path, PurePosixPath
 
 import evidence as evidence_module
+import rulings as rulings_module
 import stale as stale_module
+import status as status_module
 import store
 import miniyaml
 from common import KitError, drop_bom, find_root, git, read_json, read_yaml, run_argv, write_json
@@ -57,7 +70,11 @@ from register import GATE_ID
 
 MAIN = "main"  # the primary branch; fixed, so no caller can choose where the rules are read from
 CHECK_KEYS = ("build", "test", "scan", "compile_check", "extra_gate")
-ALL_KEYS = CHECK_KEYS + ("guarded_files",)
+ALL_KEYS = CHECK_KEYS + ("guarded_files", "tiers")
+TIER_KEYS = ("full_paths", "light_paths", "light_ruling")
+BUILTIN_FULL = ("kit/", "program/checks.yaml", "program/gates.yaml")  # the kit's own gates: always full-tier
+LIGHT_STEPS = ("build", "compile_check", "scan")
+FAST_BRIEF_HEADINGS = ("## Scope", "## Decided (do not reopen)", "## Stop and report when")
 STEP_TIMEOUT = 3600  # seconds per command
 TAIL_LINES = 20
 TAIL_PREFIX = "    | "
@@ -120,6 +137,37 @@ def _argv_lists(value, key: str) -> list[list[str]]:
     return commands
 
 
+def _parse_tiers(value) -> dict:
+    """`tiers` of checks.yaml as {full_paths: [str], light_paths: [str], light_ruling: str}; absent means none.
+
+    An empty `full_paths` leaves every task on the full tier: the lower tiers are switched on by saying which
+    paths are always full. `light_ruling` names the ruling that switched the light tier on.
+    """
+    if value is None:
+        value = {}
+    if not isinstance(value, dict):
+        raise KitError("checks.yaml: tiers must be a mapping of full_paths, light_paths and light_ruling")
+    unknown = sorted(str(key) for key in value if key not in TIER_KEYS)
+    if unknown:
+        raise KitError(f"checks.yaml: tiers: unknown key {_show(', '.join(unknown))} "
+                       f"(expected {', '.join(TIER_KEYS)})")
+    tiers: dict = {}
+    for key in ("full_paths", "light_paths"):
+        paths = value.get(key)
+        if paths is None:
+            paths = []
+        if not isinstance(paths, list) or not all(isinstance(path, str) and path for path in paths):
+            raise KitError(f"checks.yaml: tiers.{key} must be a list of paths")
+        tiers[key] = [_norm_guard(path) for path in paths]
+    ruling = value.get("light_ruling")
+    if ruling is None:
+        ruling = ""
+    if not isinstance(ruling, str) or (ruling and not re.match(r"R\d+\Z", ruling)):
+        raise KitError("checks.yaml: tiers.light_ruling must name a ruling, R<n>")
+    tiers["light_ruling"] = ruling
+    return tiers
+
+
 def _parse_checks(data, require: tuple[str, ...]) -> dict:
     if data is None:
         data = {}
@@ -135,6 +183,7 @@ def _parse_checks(data, require: tuple[str, ...]) -> dict:
     if not isinstance(guarded, list) or not all(isinstance(path, str) and path for path in guarded):
         raise KitError("checks.yaml: guarded_files must be a list of paths")
     checks["guarded_files"] = list(guarded)
+    checks["tiers"] = _parse_tiers(data.get("tiers"))
     for key in require:
         if not checks[key]:
             raise KitError(f"checks.yaml: {key} must list at least one command")
@@ -405,6 +454,104 @@ def _guarded_changes(root: Path, task_id: str, branch: str, main: str, guarded: 
     return [path for path, entry in touched if path not in allowed and entry not in allowed]
 
 
+def _under(path: str, entries) -> str | None:
+    """The entry of `entries` (an exact path, or a directory when it ends in `/`) that covers `path`, or None."""
+    return next((e for e in entries if path == e or (e.endswith("/") and path.startswith(e))), None)
+
+
+def task_meta(root: Path, task_id: str, ref: str = MAIN) -> dict:
+    """{tier, fast, ruling} of the task as its status record at `ref` says (default main: the authority).
+
+    No record there, or a record written before tiers existed, is the full tier on the SPEC path. A record
+    that does not read is a KitError: an unreadable tier is never taken for a lighter one.
+    """
+    rel = f"program/status/{task_id}.json"
+    try:
+        raw = _git_bytes(root, "show", f"{ref}:{rel}")
+    except KitError:
+        return {"tier": "full", "fast": False, "ruling": ""}
+    try:
+        import json
+        record = json.loads(drop_bom(raw.decode("utf-8")))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise KitError(f"{rel} on {_show(ref)} does not read: {_show(exc)}") from exc
+    problems = status_module._shape_problems(record)
+    if problems:
+        raise KitError(f"{rel} on {_show(ref)}: {_show('; '.join(problems))}")
+    return {"tier": status_module.tier_of(record), "fast": status_module.is_fast(record),
+            "ruling": record.get("ruling", "")}
+
+
+def _ruling_on_main(root: Path, ruling: str) -> bool:
+    """Whether main's `program/rulings.md` holds ruling `R<n>`."""
+    match = re.match(r"R(\d+)\Z", ruling or "")
+    if not match:
+        return False
+    try:
+        data = _git_bytes(root, "show", f"{MAIN}:program/rulings.md")
+        return int(match.group(1)) in {entry["number"] for entry, _ in rulings_module._parse(data)}
+    except KitError:
+        return False
+
+
+def _tier_step(root: Path, task_id: str, branch: str, checks: dict, meta: dict) -> bool:
+    """The guard of every lighter path, judged from main; prints `FAILED: tier ...` and returns False.
+
+    A full-tier task on the SPEC path passes untouched. Any other task must have its lower tier switched on
+    in main's checks.yaml, its ruling on main, no change to a full-tier path and, on the light tier, changes
+    only under the light paths.
+    """
+    tier, fast, ruling = meta["tier"], meta["fast"], meta["ruling"]
+    if tier == "full":
+        if fast:
+            _out(f"FAILED: tier {task_id} is full-tier and the fast path is never available for the full tier")
+        return not fast
+    tiers = checks["tiers"]
+    if not tiers["full_paths"]:
+        _out(f"FAILED: tier {task_id} is {tier} but {MAIN}'s checks.yaml lists no tiers.full_paths: "
+             "the lower tiers are not switched on")
+        return False
+    if fast and not _ruling_on_main(root, ruling):
+        _out(f"FAILED: tier {task_id} is on the fast path by {ruling or 'no ruling'}, "
+             f"which is not a ruling in program/rulings.md on {MAIN}")
+        return False
+    base = git(root, "merge-base", MAIN, f"refs/heads/{branch}")
+    changed = sorted(_git_fields(root, "diff", "--name-only", "--no-renames", "-z", f"{base}..refs/heads/{branch}"))
+    full = [path for path in changed if _under(path, (*BUILTIN_FULL, *tiers["full_paths"]))]
+    if full:
+        _out(f"FAILED: tier {task_id} is {tier} but changes full-tier paths: {', '.join(full)} "
+             f"(raise it on {MAIN}: pk status tier {task_id} full --ruling R<n>)")
+        return False
+    if tier == "light":
+        if not tiers["light_paths"] or not _ruling_on_main(root, tiers["light_ruling"]):
+            _out(f"FAILED: tier {task_id} is light but {MAIN} has not switched the light tier on "
+                 "(tiers.light_ruling must be a ruling on main and tiers.light_paths must list paths)")
+            return False
+        outside = [path for path in changed if not _under(path, tiers["light_paths"])]
+        if outside:
+            _out(f"FAILED: tier {task_id} is light but changes paths outside tiers.light_paths: "
+                 f"{', '.join(outside)}")
+            return False
+    return True
+
+
+def _tier_unchanged(tree: Path, task_id: str, meta: dict) -> bool:
+    """Whether the status record in `tree` (a worktree or a trial merge) still says what main's says."""
+    path = tree / "program" / "status" / f"{task_id}.json"
+    if not path.is_file():
+        return True
+    try:
+        record = read_json(path)
+    except KitError:
+        record = None
+    own = ({"tier": status_module.tier_of(record), "fast": status_module.is_fast(record),
+            "ruling": record.get("ruling", "")} if isinstance(record, dict) else None)
+    if own != meta:
+        _out(f"FAILED: tier program/status/{task_id}.json changes the tier, fast path or ruling recorded on {MAIN}")
+        return False
+    return True
+
+
 def _results_problems(data, task_id: str, head: str | None, root=None) -> list[str]:
     """Why a results record does not pass the hand-back gate (empty when it does); `head` None skips the head check.
 
@@ -506,6 +653,57 @@ def _stale_step(wt: Path) -> bool:
     return not report["unreadable"]
 
 
+_TIER_LINE = re.compile(r"Tier:\s*([a-z]+)\s*\Z")
+
+
+def _frozen_brief(root: Path, tree: Path, task_id: str) -> bytes | None:
+    """Main's BRIEF.md of a fast-path task, when the tree's copy is byte-identical and it has the fast-path headings.
+
+    The brief stands in for SPEC, PLAN and the spec-QA record, so it is held to the same rule: it must be on
+    main (part of the dispatch commit) and a branch may not change it. Prints the failure line and returns None
+    otherwise.
+    """
+    rel = f"program/tasks/{task_id}/BRIEF.md"
+    try:
+        authoritative = _git_bytes(root, "show", f"{MAIN}:{rel}")
+    except KitError:
+        _out(f"FAILED: brief {rel} is missing on {MAIN}")
+        return None
+    own = tree / rel
+    if (own.read_bytes() if own.is_file() else None) != authoritative:
+        _out(f"FAILED: brief {rel} differs from {MAIN}")
+        return None
+    lines = {line.strip() for line in drop_bom(authoritative.decode("utf-8", "replace")).splitlines()}
+    missing = [heading for heading in FAST_BRIEF_HEADINGS if heading not in lines]
+    if missing:
+        _out(f"FAILED: brief {rel} lacks the section(s) {', '.join(missing)}")
+        return None
+    return authoritative
+
+
+def _spec_tier_ok(root: Path, task_id: str, tier: str) -> bool:
+    """A SPEC-path task below the full tier must carry `Tier: <tier>` in its SPEC on main, and it must agree."""
+    try:
+        spec = drop_bom(_git_bytes(root, "show", f"{MAIN}:program/tasks/{task_id}/SPEC.md").decode("utf-8", "replace"))
+    except KitError:
+        return True  # the identity check reports a missing SPEC
+    stated = [m.group(1) for m in map(_TIER_LINE.match, spec.splitlines()) if m]
+    if (tier != "full" and stated != [tier]) or (stated and stated != [tier]):
+        _out(f"FAILED: spec program/tasks/{task_id}/SPEC.md on {MAIN} says "
+             f"{'Tier: ' + ', '.join(stated) if stated else 'no Tier: line'}, the status record says {tier}")
+        return False
+    return True
+
+
+def _definition(root: Path, tree: Path, task_id: str, meta: dict) -> bytes | None:
+    """The bytes the task's commands are read from: main's BRIEF.md on the fast path, else main's PLAN.md."""
+    if meta["fast"]:
+        return _frozen_brief(root, tree, task_id)
+    if not _spec_tier_ok(root, task_id, meta["tier"]):
+        return None
+    return _frozen_plan(root, tree, task_id)
+
+
 def _frozen_plan(root: Path, tree: Path, task_id: str) -> bytes | None:
     """Main's PLAN.md for the task, when the task's SPEC.md, PLAN.md and review.md in `tree` are byte-identical
     to main's.
@@ -535,7 +733,19 @@ def _frozen_plan(root: Path, tree: Path, task_id: str) -> bytes | None:
     return plan
 
 
-def _run_steps(checks: dict, task_id: str, wt: Path, trial: Path, authoritative: bytes) -> int:
+def _run_light(checks: dict, where: Path) -> int:
+    """The light tier's whole gate: build, compile check and scans. No tests, no PLAN commands, no evidence."""
+    for step in LIGHT_STEPS:
+        if not _run_commands(step, _commands(checks[step]), where):
+            return 1
+    return 0
+
+
+def _run_steps(checks: dict, task_id: str, wt: Path, trial: Path, authoritative: bytes, meta: dict) -> int:
+    if not _tier_unchanged(wt, task_id, meta):
+        return 1
+    if meta["tier"] == "light":
+        return _run_light(checks, trial)
     for step in ("build", "compile_check"):
         if not _run_commands(step, _commands(checks[step]), trial):
             return 1
@@ -548,7 +758,7 @@ def _run_steps(checks: dict, task_id: str, wt: Path, trial: Path, authoritative:
         _out(f"FAILED: plan {exc}")
         return 1
     if not plan:
-        _out(f'FAILED: plan no commands under "{PLAN_SECTION}"')
+        _out(f'FAILED: {"brief" if meta["fast"] else "plan"} no commands under "{PLAN_SECTION}"')
         return 1
     if not _run_commands("plan", plan, wt):
         return 1
@@ -568,11 +778,14 @@ def handback(root, task_id: str, branch: str, worktree=None) -> int:
     if guarded:
         _out(f"FAILED: guarded files changed: {', '.join(guarded)}")
         return 1
-    authoritative = _frozen_plan(root, wt, task_id)
+    meta = task_meta(root, task_id)
+    if not _tier_step(root, task_id, branch, checks, meta):
+        return 1
+    authoritative = _definition(root, wt, task_id, meta)
     if authoritative is None:
         return 1
     trial = trial_merge(root, branch)
-    code = _with_trial(root, trial, lambda: _run_steps(checks, task_id, wt, trial, authoritative))
+    code = _with_trial(root, trial, lambda: _run_steps(checks, task_id, wt, trial, authoritative, meta))
     if code:
         return code
     if git(wt, "rev-parse", "HEAD") != sha or _branch_head(root, branch) != sha:
@@ -582,12 +795,15 @@ def handback(root, task_id: str, branch: str, worktree=None) -> int:
     return 0
 
 
-def merge_check(root, branch: str) -> int:
+def merge_check(root, branch: str, inspected: str | None = None) -> int:
     """The controller's independent gate run before a merge; 0 and a final `OK:` line only when all of it passed.
 
-    It does not rely on the hand-back gate having been run: the guarded-file check, then on the trial merge the
-    SPEC, PLAN and review.md identity check and every build, compile_check, test, scan and extra_gate command of main's
-    `checks.yaml`. The task is the one the branch `task/<ID>` names; any other branch is refused.
+    It does not rely on the hand-back gate having been run: the guarded-file check and the tier check, then on
+    the trial merge the SPEC, PLAN and review.md identity check (BRIEF.md on the fast path) and every build,
+    compile_check, test, scan and extra_gate command of main's `checks.yaml`. The task is the one the branch
+    `task/<ID>` names; any other branch is refused. A light-tier task runs only the build, the compile check
+    and the scans, and only when `inspected` names the branch tip: the controller's statement that it read the
+    diff at that commit, which is the review a light task gets.
     """
     root = Path(root).resolve()
     task_id = _branch_task(branch)
@@ -597,11 +813,20 @@ def merge_check(root, branch: str) -> int:
     if guarded:
         _out(f"FAILED: guarded files changed: {', '.join(guarded)}")
         return 1
+    meta = task_meta(root, task_id)
+    if not _tier_step(root, task_id, branch, checks, meta):
+        return 1
+    if meta["tier"] == "light" and inspected != sha:
+        _out(f"FAILED: inspection {task_id} is light-tier: read the diff of {branch} at {sha}, then pass "
+             f"--inspected {sha}")
+        return 1
     trial = trial_merge(root, branch)
 
     def steps() -> int:
-        if _frozen_plan(root, trial, task_id) is None:
+        if _definition(root, trial, task_id, meta) is None or not _tier_unchanged(trial, task_id, meta):
             return 1
+        if meta["tier"] == "light":
+            return _run_light(checks, trial)
         for step in ("build", "compile_check", "test", "scan", "extra_gate"):
             if not _run_commands(step, _commands(checks[step]), trial):
                 return 1
@@ -916,7 +1141,7 @@ def cmd_gate(args: argparse.Namespace) -> int:
     if action == "handback":
         return handback(root, args.task_id, args.branch, worktree=args.worktree)
     if action == "merge-check":
-        return merge_check(root, args.branch)
+        return merge_check(root, args.branch, inspected=args.inspected)
     if action == "binding":
         problems = binding(root, args.task_id, args.branch)
         return _report(problems) if problems else 0
@@ -943,6 +1168,8 @@ def _configure(parser: argparse.ArgumentParser) -> None:
                                                    "SPEC, PLAN and review.md, then build, test and scan on a "
                                                    "trial merge")
     merge.add_argument("--branch", required=True, help="the task branch to merge, task/<ID>")
+    merge.add_argument("--inspected", metavar="SHA", help="light tier only: the branch tip whose diff the "
+                                                          "controller read")
     bind = actions.add_parser("binding", help="QA check: the task's latest results record is a true record of its "
                                               "head; drift to the tip is reported")
     bind.add_argument("task_id", metavar="ID", help="task ID, for example P0-M01-S01-T01")

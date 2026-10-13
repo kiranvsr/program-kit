@@ -151,6 +151,7 @@ def _checks_problems(data) -> list[str]:
         data = data or {}
         parts = [({key: data.get(key)}, (key,) if key in required else ()) for key in gate.CHECK_KEYS]
         parts.append(({"guarded_files": data.get("guarded_files")}, ()))
+        parts.append(({"tiers": data.get("tiers")}, ()))
         parts.append(({key: value for key, value in data.items() if key not in gate.ALL_KEYS}, ()))
     problems = []
     for part, require in parts:

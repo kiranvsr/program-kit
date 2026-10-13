@@ -111,7 +111,7 @@ class StatusTests(unittest.TestCase):
 
     # table
     def test_table_is_exactly_the_spec(self):
-        self.assertEqual(status.STATUSES, ("not_started", "in_progress", "review", "done", "blocked", "parked"))
+        self.assertEqual(status.STATUSES, ("not_started", "in_progress", "review", "done", "blocked", "parked", "merged"))
         self.assertEqual(status.TRANSITIONS, {
             ("not_started", "in_progress"): {"controller"},
             ("in_progress", "review"): {"implementer"},
@@ -123,7 +123,9 @@ class StatusTests(unittest.TestCase):
             ("blocked", "in_progress"): {"controller"},
             ("not_started", "parked"): {"controller"},
             ("parked", "not_started"): {"controller"},
+            ("in_progress", "merged"): {"controller"},  # the light tier's terminal move, never QA's done
         })
+        self.assertEqual(status.TRANSITIONS[("review", "done")], {"qa"})  # hard rule 6: only QA sets done
 
     def test_allowed_transitions_by_role(self):
         self.assertEqual(status.read(self.root, TID)["status"], "not_started")  # no file yet: implicit
@@ -529,7 +531,7 @@ class StatusTests(unittest.TestCase):
         schema = json.loads((Path(__file__).resolve().parent.parent / "templates" / "status.schema.json")
                             .read_text(encoding="utf-8"))
         rec = self.to_review()
-        self.assertEqual(set(schema["required"]), set(rec))
+        self.assertEqual(set(schema["required"]) | {"tier", "fast", "ruling"}, set(rec))  # a 0.2 record has no tier
         self.assertEqual(schema["properties"]["status"]["enum"], list(status.STATUSES))
         self.assertEqual(set(schema["properties"]), set(rec))
 
@@ -561,7 +563,8 @@ class StatusCliTests(unittest.TestCase):
         self.assertEqual(json.loads(out)["note"], "go")
         rc, out, err = self.run_pk("status", "list")
         self.assertEqual((rc, err), (0, ""))
-        self.assertEqual(out.split(), [TID, "in_progress", "controller", json.loads(self.run_pk("status", "show", TID)[1])["updated_at"]])
+        self.assertEqual(out.split(), [TID, "in_progress", "controller", json.loads(self.run_pk("status", "show", TID)[1])["updated_at"],
+                                       "full"])
         rc, out, err = self.run_pk("status", "validate")
         self.assertEqual((rc, err), (0, ""))
         self.assertIn("ok", out)

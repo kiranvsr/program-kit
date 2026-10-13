@@ -258,7 +258,7 @@ class HandbackBase(GitBase):
 
 
 class PresetTests(unittest.TestCase):
-    KEYS = ("build", "test", "scan", "compile_check", "extra_gate", "guarded_files")
+    KEYS = ("build", "test", "scan", "compile_check", "extra_gate", "guarded_files", "tiers")
     EXPECT = {
         "go": {"build": [["go", "build", "./..."]], "compile_check": [["go", "vet", "./..."]],
                "test": [["go", "test", "./..."]],
