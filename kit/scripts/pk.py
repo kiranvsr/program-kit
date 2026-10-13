@@ -26,7 +26,7 @@ MIN_PYTHON = (3, 11)
 PRESETS = ("go", "node", "python")
 TEMPLATE_FILES = ("BRIEF.md", "checks.yaml", "environments.yaml", "CLAIM_BOUNDARIES.md", "ledger.yaml",
                   "HANDOFF.md", "controller-state.json", "rulings.md", "register.yaml", "traceability.yaml",
-                  "gates.yaml")
+                  "gates.yaml", "COMMON.md")
 
 # Modules that register further subcommands (each defines `register(add_command)`).
 COMMAND_MODULES: tuple[str, ...] = ("status", "rulings", "register", "briefs", "trace", "interview", "evidence",

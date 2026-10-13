@@ -1,14 +1,16 @@
 # Seed rulings
 
-These are the starting rulings of a program, numbered K1 to K33. They come from earlier programs run with this process. Read the ones your task's SPEC cites, by heading. Do not read all of them up front.
+These are the starting rulings of a program, numbered K1 to K44. They come from earlier programs run with this process. Read the ones your task's SPEC cites, by heading. Do not read all of them up front.
 
-The rules themselves are stated once, in `kit/rules/RULES.md`. Where a seed ruling is one of those rules, its **Rule.** line names the rule and this file keeps only what the rule file does not: why the ruling was made and how to apply it. A K number never changes its meaning.
+The rules themselves are stated once, in `kit/rules/RULES.md`. Where a seed ruling is one of those rules, its **Rule.** line names the rule and this file keeps only what the rule file does not: why the ruling was made and how to apply it. A K number never changes its meaning: a ruling that a later one supersedes keeps its own words and says which ruling replaced it.
 
 Your own program records its rulings in `program/rulings.md` with `pk rulings add`, numbered R1 onward. A ruling never contradicts an earlier one silently: it supersedes it by name. A K ruling can be superseded the same way.
 
 ## K1. Merge queue: QA only on evidence that reflects current main, merge right after acceptance
 
-**Rule.** Controller rule C1 of `kit/rules/RULES.md`.
+*Superseded in part by K36: QA may run on several branches at once; merges still go one at a time.*
+
+**Rule.** QA starts once the branch's evidence reflects current main. Once QA accepts, the controller merges that branch next. No other code merge to main happens between the start of QA and that merge. Accepted branches merge one at a time, in acceptance order. Documentation-only hand-off commits are fine.
 
 **Why.** Every merge to main makes every waiting branch re-merge, re-produce evidence and re-run QA. Rework, not coding, was the bottleneck.
 
@@ -104,6 +106,8 @@ Your own program records its rulings in `program/rulings.md` with `pk rulings ad
 
 ## K13. QA checks the binding and re-runs the evidence; the merge check re-runs the gate
 
+*Superseded in part by K34: the re-run of the PLAN commands and the three planted bugs are the full tier's.*
+
 **Rule.** QA does not re-run the hand-back gate and does not treat an OK line in a report as evidence: the results record holds the producer's commands and planted bugs, not the gate's output. QA runs `pk gate binding <ID> --branch task/<ID>` (the latest record is committed with the digest its pointer names, names an ancestor of the tip, every hashed input matches the blob at that commit, and no record was rewritten; drift is reported), `pk evidence validate` and, in the task worktree, `pk stale`. QA always re-runs the PLAN commands, the committed planted bugs and at least three of its own, and reviews the diff, scope, claims and security. The independent run of the gate's checks is the controller's `pk gate merge-check` before the merge: the guarded-file check, the SPEC, PLAN and review identity check, and the build, tests and scans on a trial merge. If the binding fails, or main moved with code that overlaps the task's own hashed inputs, QA rejects and the branch merges main and re-produces (K16).
 
 **Why.** Re-running the longest suites on every review burned the session budget for no added assurance, and an OK line somebody typed proves nothing. One independent run at the merge is enough, and no branch can skip it.
@@ -144,7 +148,9 @@ Your own program records its rulings in `program/rulings.md` with `pk rulings ad
 
 ## K18. Model tiers are roles, never names
 
-**Rule.** Controller rule C4 of `kit/rules/RULES.md`.
+*Superseded by K35: four model classes by role, and every dispatch names its model.*
+
+**Rule.** Tier 1, your most capable model, does the controller's work, first-pass implementation, first-pass QA, spec writing and spec review, and any re-check that escalates. Tier 2, a cheaper model, does only scoped re-checks of exact fixes, mechanical re-runs with a checklist and resume-only work. A Tier 2 agent reports ESCALATE for anything outside its checklist and never accepts on judgement. Never use Tier 2 for first-pass work, a security ruling, or accepting a task with an open important finding. With one capable model, use it for everything. Nothing in the kit names a model.
 
 **Why.** Cheap models are good at following a checklist and poor at judgement, and the session budget was the binding limit.
 
@@ -168,7 +174,9 @@ Your own program records its rulings in `program/rulings.md` with `pk rulings ad
 
 ## K21. Reports are short and fixed in shape
 
-**Rule.** Working rule W6 of `kit/rules/RULES.md`.
+*Superseded in part by K37: the final message is four things; the report is a file.*
+
+**Rule.** A report follows the fixed headings in the role's brief and stays under 25 lines. It holds the finding-to-fix table, the gate results, deviations and the stale-list summary. It does not restate the SPEC.
 
 **Why.** The controller reads many reports, and long ones hid the facts that mattered.
 
@@ -269,3 +277,91 @@ Your own program records its rulings in `program/rulings.md` with `pk rulings ad
 **Why.** A merge during a gate run voided the run, and the whole gate had to start again.
 
 **How to apply.** The controller announces the quiet window, drains the merge queue, runs the gates one after another on a quiet main, and only then reopens the queue.
+
+## K34. Verification tiers: the process follows the risk
+
+**Rule.** Controller rule C11 of `kit/rules/RULES.md`. Supersedes K13 in part: QA's re-run of the PLAN commands and its own three planted bugs belong to the full tier; a standard-tier QA checks the binding and reviews the diff, and a light-tier task has no QA.
+
+**Why.** One process for every task ran the longest suite three times and planted bugs against changes that could not hide one. The cost fell on the smallest tasks, and the careful ones got no more care than the trivial ones.
+
+**How to apply.** Choose the tier when the task is specified and write it in the SPEC (`Tier: standard`). Full whenever unsure. The gates read the tier from the status record on main and fail a task that touches a full-tier path below the full tier.
+
+## K35. Model classes by role, and every dispatch names its model
+
+**Rule.** Controller rule C4 of `kit/rules/RULES.md`. Supersedes K18.
+
+**Why.** Two tiers put first-pass implementation on the most expensive model and left nothing between it and a checklist follower. An unnamed model defaulted to the controller's, the dearest one.
+
+**How to apply.** Write the class-to-model mapping in `program/COMMON.md` and name the model in every dispatch. Record each run with `pk cost add --model`.
+
+## K36. Parallel review, one combined round, merges one at a time
+
+**Rule.** Controller rules C1 and C13 of `kit/rules/RULES.md`. Supersedes K1 in part: QA is no longer limited to one branch at a time, and several accepted branches may be verified together in an integration round.
+
+**Why.** Reviewing and merge-checking one branch at a time made the queue the bottleneck while agents idled, and N branches cost N full suite runs.
+
+**How to apply.** Give each reviewer `pk worktree review <ID>`. For branches below the full tier use `pk integrate start`, `check`, `pk merge <ID> --round <NAME>` for each, then `pk integrate close`.
+
+## K37. The final message is four things; the report is a file
+
+**Rule.** Working rule W6 of `kit/rules/RULES.md`. Supersedes K21 in part: the 25-line limit applies to the report file, and the message that returns to the controller is status, commits, one test line and concerns.
+
+**Why.** Every pasted report stayed in the controller's context for the rest of the session.
+
+**How to apply.** Write the report to the path your brief names and return its path. The controller opens it only when a decision needs it.
+
+## K38. A fast path for small bounded work, never for the full tier
+
+**Rule.** Controller rule C12 of `kit/rules/RULES.md`.
+
+**Why.** A one-hour change the user asked for directly waited on a SPEC, a PLAN and a spec review that restated the request.
+
+**How to apply.** Record the ruling, write `program/tasks/<ID>/BRIEF.md` from the template, and dispatch with `--fast --ruling R<n>`. The gate holds the brief to what it held the SPEC and PLAN to: on main, unchanged by the branch.
+
+## K39. A fresh agent after 400,000 tokens or three resumes
+
+**Rule.** Controller rule C16 of `kit/rules/RULES.md`.
+
+**Why.** Resuming keeps the context that makes a fix cheap, until the context itself is the cost: a long-lived agent re-reads everything it has seen on every turn.
+
+**How to apply.** `pk cost report` flags the agent. Give the fresh one only the findings, the files and the commands.
+
+## K40. Verify what a decision rests on
+
+**Rule.** Controller rule C17 of `kit/rules/RULES.md`.
+
+**Why.** Agents reported failures as already present on main, and work as verified, when neither had been checked. The controller relayed both to the user.
+
+**How to apply.** Reproduce a claimed main failure on a clean main worktree; read back what was said to be written. The status message has a Verified and a Not verified heading.
+
+## K41. The hand-off has a size budget, and history lives in the rulings log
+
+**Rule.** Controller rule C19 of `kit/rules/RULES.md`.
+
+**Why.** A hand-off that carried every ruling and every closed item grew until reading it cost more than the work it described.
+
+**How to apply.** `pk handoff check` fails over the budget. Move history into a ruling (`pk record`), close or tag follow-ups, and keep Next steps to the order of what comes next.
+
+## K42. A generator changes only the file it names
+
+**Rule.** Controller rule C9 of `kit/rules/RULES.md`, last sentence.
+
+**Why.** A generated mirror that rewrote a tracked file on every build left the tree dirty after every command and hid real changes.
+
+**How to apply.** Write generated views to ignored paths, or make the write a no-op when nothing changed. Check `git status` after a build on a clean tree.
+
+## K43. Finish a merged task with one command that never forces
+
+**Rule.** Controller rule C20 and hard rule 22 of `kit/rules/RULES.md`.
+
+**Why.** Leftover worktrees, branches and containers filled the disk and held ports; cleaning them by hand invited a forced removal of the wrong one.
+
+**How to apply.** `pk worktree finish <ID>`, naming the symlinks it may remove and the task's exact compose project name.
+
+## K44. Known hazards are written down once, in the hand-off
+
+**Rule.** `program/HANDOFF.md` keeps a Known hazards list, and a hazard met twice is added to it: a shell that drifts into a worktree, fixed ports that allow one local stack, a long-running local stack that degrades, leftovers of an interrupted run.
+
+**Why.** Each successor met the same hazards again and paid for them again.
+
+**How to apply.** Check where you are before you commit or delete (working rule W4). Start one local stack at a time, and restart it rather than debug a stale one.

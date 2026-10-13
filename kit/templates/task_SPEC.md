@@ -6,6 +6,12 @@
 
 *One paragraph: what this task delivers and why, in the words of the register entry.*
 
+## Tier
+
+*The verification tier, on the line below: `full` for anything touching access control, tenancy, data migrations, cryptography, release or the kit's own gates, and whenever unsure; `standard` for ordinary work off those paths; `light` only for the kinds of change this program's ruling names. Spec QA checks it, and the gates compare it with the status record.*
+
+Tier: full
+
 ## Scope In
 
 *What this task changes, as a list a reviewer can check the pull request against.*
@@ -38,9 +44,17 @@
 
 *The paths where the new code lives and the modules that may and may not depend on it.*
 
-## Resolved Questions
+## Assumptions Checked
 
-*Questions raised while writing this spec, each with its answer or the ruling that settled it.*
+*What the feasibility probe confirmed before this spec was written (the route exists, the data is readable, the local environment runs), one line each with the command or file that showed it. A task with a server part and a client part names its contract file here: `program/tasks/<ID>/CONTRACT.md`.*
+
+## Decided (do not reopen)
+
+*The design choices already made, each with its answer or the ruling that settled it. The implementer applies them and does not revisit them.*
+
+## Stop and report when
+
+*The conditions under which the implementer stops instead of deciding, beyond the four NEEDS_CONTEXT cases: a guarded or full-tier path must change, the scope turns out larger than stated.*
 
 ## Closes
 

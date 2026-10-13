@@ -10,11 +10,12 @@ from common import read_json, read_yaml
 
 TEMPLATES = Path(__file__).resolve().parent.parent / "templates"
 NEW_TEMPLATES = ("discovery.md", "product.md", "SPEC.md", "ARCHITECTURE.md", "adr.md", "roadmap.md",
-                 "task_SPEC.md", "task_PLAN.md", "freeze_review.md", "signoff.md")
+                 "task_SPEC.md", "task_PLAN.md", "freeze_review.md", "signoff.md", "COMMON.md",
+                 "task_FAST_BRIEF.md", "CONTRACT.md")
 BANNED = re.compile("|".join([*map(re.escape, FORBIDDEN), "lorem ipsum", "https?://"]), re.I)
-TASK_SPEC_HEADINGS = ["Summary", "Scope In", "Scope Out", "Dependencies", "Consumed Contracts",
+TASK_SPEC_HEADINGS = ["Summary", "Tier", "Scope In", "Scope Out", "Dependencies", "Consumed Contracts",
                       "Security And Tenancy", "Failure Modes And Recovery", "Observability", "Module Placement",
-                      "Resolved Questions", "Closes"]
+                      "Assumptions Checked", "Decided (do not reopen)", "Stop and report when", "Closes"]
 TASK_PLAN_HEADINGS = ["Status And PR Boundary", "Work Breakdown", "Exact Commands", "Definition Of Done",
                       "Gate Evidence", "Rollout And Rollback", "Risks"]
 
@@ -45,6 +46,32 @@ class TemplateTests(unittest.TestCase):
         self.assertIn("without a shell", section)
         # An unedited template must hold zero commands, so the gate fails honestly instead of running a sample.
         self.assertEqual([line for line in text.splitlines() if line.startswith("$ ")], [])
+
+    def test_the_fast_brief_template_has_the_sections_the_gate_requires_and_lists_no_command(self):
+        import gate
+        text = (TEMPLATES / "task_FAST_BRIEF.md").read_text(encoding="utf-8")
+        for heading in (*gate.FAST_BRIEF_HEADINGS, gate.PLAN_SECTION):
+            self.assertIn(heading + "\n", text)
+        self.assertEqual(gate.parse_plan(text), [])  # an unedited template runs nothing
+        self.assertRegex(text, r"(?m)^Tier: standard$")
+        self.assertIn("never used for the full tier", text)
+
+    def test_the_task_spec_template_states_a_tier_the_gate_can_read_and_defaults_to_full(self):
+        import gate
+        lines = (TEMPLATES / "task_SPEC.md").read_text(encoding="utf-8").splitlines()
+        self.assertEqual([m.group(1) for m in map(gate._TIER_LINE.match, lines) if m], ["full"])
+
+    def test_the_common_rules_template_maps_every_model_class_and_stays_small(self):
+        text = (TEMPLATES / "COMMON.md").read_text(encoding="utf-8")
+        self.assertEqual(headings("COMMON.md"), ["Run", "Constraints", "Models", "Report contract",
+                                                 "Known failures on main"])
+        for row in ("| A |", "| B |", "| C |", "| D |"):
+            self.assertIn(row, text)
+        self.assertLess(len(text.encode("utf-8")), 3000)
+
+    def test_the_hand_off_template_seeds_the_known_hazards(self):
+        self.assertIn("Known hazards", headings("HANDOFF.md"))
+        self.assertIn("git rev-parse --show-toplevel", (TEMPLATES / "HANDOFF.md").read_text(encoding="utf-8"))
 
     def test_lens_sections_in_freeze_review(self):
         self.assertEqual(headings("freeze_review.md")[:5],
@@ -150,8 +177,8 @@ class ResultsSchemaTests(unittest.TestCase):
 class HandoffTemplateTests(unittest.TestCase):
     """Lesser 22: the template holds the maintained sections playbook 09 names, outside the generated block."""
 
-    SECTIONS = ["How the program works", "Environment setup", "Known gotchas", "Next steps", "Where the rules live",
-                "Model tiers"]
+    SECTIONS = ["How the program works", "Environment setup", "Known hazards", "Next steps", "Where the rules live"]
+    SEEDED = ("Known hazards", "Where the rules live")  # these start with the lines every program needs
 
     def test_maintained_sections_exist_outside_the_generated_block(self):
         text = (TEMPLATES / "HANDOFF.md").read_text(encoding="utf-8")
@@ -161,13 +188,13 @@ class HandoffTemplateTests(unittest.TestCase):
                          self.SECTIONS)
         self.assertEqual(text[text.index(start) + len(start):text.index(end)].strip(), "")
 
-    def test_each_section_is_empty_and_playbook_09_names_it(self):
+    def test_each_section_is_empty_or_seeded_and_playbook_09_names_it(self):
         text = (TEMPLATES / "HANDOFF.md").read_text(encoding="utf-8")
         playbook = (TEMPLATES.parent / "playbooks" / "09_handoff.md").read_text(encoding="utf-8").lower()
         for heading in self.SECTIONS:
             self.assertIn(heading.lower(), playbook, heading)
             body = text.split(f"## {heading}", 1)[1].split("\n## ", 1)[0].split("<!--", 1)[0]
-            self.assertEqual(body.strip(), "", heading)
+            self.assertEqual(bool(body.strip()), heading in self.SEEDED, heading)
 
 
 if __name__ == "__main__":

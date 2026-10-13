@@ -16,7 +16,7 @@ from common import KitError, read_json, read_yaml
 KIT = Path(__file__).resolve().parent.parent
 TEMPLATE_FILES = ["BRIEF.md", "checks.yaml", "environments.yaml", "CLAIM_BOUNDARIES.md", "ledger.yaml",
                   "HANDOFF.md", "controller-state.json", "rulings.md",
-                  "register.yaml", "traceability.yaml", "gates.yaml"]
+                  "register.yaml", "traceability.yaml", "gates.yaml", "COMMON.md"]
 
 
 class PkTests(unittest.TestCase):
@@ -44,7 +44,8 @@ class PkTests(unittest.TestCase):
         for name in TEMPLATE_FILES:
             self.assertEqual((self.tmp / "program" / name).read_bytes(), (KIT / "templates" / name).read_bytes(), name)
         self.assertEqual(read_json(self.tmp / "program" / "controller-state.json"),
-                         {"stage": {}, "queued": {}, "parked": {}, "followups": []})
+                         {"stage": {}, "queued": {}, "parked": {}, "adhoc": [], "followups": [],
+                          "closed_followups": [], "now": ""})
         handoff = (self.tmp / "program" / "HANDOFF.md").read_text()
         self.assertIn("<!-- generated:start -->", handoff)
         self.assertIn("<!-- generated:end -->", handoff)
