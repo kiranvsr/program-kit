@@ -43,7 +43,7 @@ Design choices, each with its reason:
 - The fast brief is checked as written: its four sections, and a `Tier:` and a `Ruling:` line equal to the status record. A tier is held to the record's own history (the dispatch entry names it, each change names its ruling), so a tier edited by hand does not validate.
 - A `tiers` path covers everything under it with or without its trailing slash, and `pk doctor` warns about an entry that covers no tracked file.
 - `pk record`, `pk merge` and `pk rulings validate` refuse a rulings log that no longer begins with the bytes committed at HEAD (hard rule 23), so no command of the kit commits a rewritten ruling.
-- A round record is re-derived from git when a member lands and when the round closes, so one written by hand covers nothing.
+- A round record is re-derived from git when a member lands and when the round closes, so a record written by hand that does not describe `round/<NAME>` covers nothing. That fixes L11 in part: the record cannot prove that `pk integrate check` ran (see Known limits).
 - No dashboard: the generated hand-off block is the kit's view of the state.
 
 Upgrading a 0.2.0 program:
@@ -66,6 +66,8 @@ Known limits:
 - The removals of `pk worktree finish --compose-project` are tested against a stand-in container tool. Only the listing was tried against a real one, read-only: its label filter matched a value exactly and not by prefix.
 - A follow-up removed from the controller state together with a matching edit of `followups_issued` is not detected; the audit is git history.
 - After `task/<ID>` is deleted, nothing ties a `merged` record's inspected commit to the task: a record set or written then may name a decoy, a light-only merge of another commit (or the branch's own first commit merged on its own), and the audit then checks that merge, not the task's work (re-review N1).
+- A started round's record with the correct tested tree typed into it (the tree of `round/<NAME>`) passes the re-derivation, and its members land through `pk merge --round` with no suite run: nothing short of a signed or recomputed result can show that `pk integrate check` ran (re-review N4; L11 in part).
+- QA's check that the branch tip is the commit it reviewed is in the QA brief only (`qa.md` step 7). After the review, a late commit followed by a re-run of `produce.py` and a commit of its new record moves the record's `head` to the late commit; if QA accepts that record without the tip check, `pk merge` lands the late commit, which no reviewer's diff showed (re-review N5).
 - Seed ruling K18 keeps the words "Tier 1, Tier 2" for model strength, marked superseded by K35: a K number does not change its text.
 
 ## 0.2.0
