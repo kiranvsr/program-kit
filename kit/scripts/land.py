@@ -84,12 +84,18 @@ def _tip_status(root: Path, task_id: str, sha: str) -> str:
 def _own_path(path: str, task_id: str) -> bool:
     """Whether `path` is one the kit writes for the task after its review: all a branch may add then.
 
-    The status file, and under `program/evidence/<ID>/` the pointer `latest.json`, `results/`, `acceptance/` and
-    the implementer's `report.md`. Anything else there (`produce.py`, a `conftest.py`, a test file) is work.
+    The status file, and under `program/evidence/<ID>/` the pointer `latest.json`, a record name
+    (`<utc>-<sha256[:12]>.json`) directly in `results/` or `acceptance/`, and the implementer's `report.md`.
+    Anything else there (`produce.py`, a `conftest.py`, a test file, in those folders too) is work.
     """
     folder = f"program/evidence/{task_id}/"
-    return (path in (f"program/status/{task_id}.json", f"{folder}latest.json", f"{folder}report.md")
-            or path.startswith((f"{folder}results/", f"{folder}acceptance/")))
+    if path.startswith((f"{folder}results/", f"{folder}acceptance/")):
+        try:  # only a record's own name, directly in results/ or acceptance/; its bytes: store.integrity
+            store.check_rel(path)
+        except KitError:
+            return False
+        return True
+    return path in (f"program/status/{task_id}.json", f"{folder}latest.json", f"{folder}report.md")
 
 
 def _names(root: Path, *args: str) -> list[str]:
@@ -129,7 +135,8 @@ def _late_work(root: Path, task_id: str, head: str, sha: str) -> str | None:
         if late:
             return (f"{task_id}: {commit[:12]} {what} the reviewed commit {head[:12]} and changes "
                     f"{', '.join(late)}: after the commit QA accepted, a branch adds only its status file and, under "
-                    f"program/evidence/{task_id}/, latest.json, results/, acceptance/ and report.md; {again}")
+                    f"program/evidence/{task_id}/, latest.json, report.md and records directly in results/ and acceptance/; "
+                    f"{again}")
     return None
 
 
@@ -154,13 +161,14 @@ def _accepted_problem(root: Path, task_id: str, sha: str, tier: str) -> str | No
     except KitError:
         shutil.rmtree(trial, ignore_errors=True)  # git never registered it: this is the empty mkdtemp directory
         raise
-    head = None
+    head, broken = None, []
     on_main = gate.status_at(root, task_id)  # the tier is main's; only a record from before tiers is exempt
     full = tier == "full" and not (on_main is not None and "tier" not in on_main)
     try:
         problem = status_module._acceptance_problem(trial, task_id, full=full)
         if problem is None:
             head = store.load_latest(trial, task_id, "results")[1]["head"]
+            broken = store.integrity(trial, git(root, "merge-base", MAIN, sha))  # what pk evidence validate checks
     except KitError as exc:
         problem = f"{task_id}: {exc}"
     finally:
@@ -170,7 +178,12 @@ def _accepted_problem(root: Path, task_id: str, sha: str, tier: str) -> str | No
     if problem:
         return (f"{' '.join(problem.replace(str(trial) + '/', '').split())}: its branch says done, but the evidence "
                 "committed at its tip does not accept it, and only an accepted task is merged")
-    return _late_work(root, task_id, head, sha)
+    late = _late_work(root, task_id, head, sha)
+    if late or not broken:
+        return late
+    return (f"{task_id}: the evidence at the tip of task/{task_id} fails the store's integrity check: "
+            f"{' '.join(broken[0].replace(str(trial) + '/', '').split())}"
+            + (f" (and {len(broken) - 1} more)" if len(broken) > 1 else ""))
 
 
 def _gates_naming(root: Path, task_id: str) -> list[str]:

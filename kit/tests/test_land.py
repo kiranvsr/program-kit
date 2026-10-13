@@ -498,6 +498,46 @@ class MergeTests(LandBase):
         code, out, err = self.pk("merge", TASK)
         self.assertEqual((code, err), (0, ""), out)
 
+    def test_a_late_acceptance_record_is_one_the_kit_writes_and_lands(self):
+        self.standard()
+        entry, record = store.load_latest(self.wt, TASK, "results")
+        evidence.accept(self.wt, TASK, {  # QA accepts the same record again: a genuine acceptance/ record
+            "task_id": TASK, "decision": "accepted_development", "evidence_sha256": entry["digest"],
+            "source_commit": record["head"], "accepted_at": "2026-10-14T00:00:00Z", "role": "qa",
+            "commands": [], "planted_bugs": [], "findings": [], "blocked_by": []})
+        commit(self.wt, "a late acceptance record")
+        code, out, err = self.pk("merge", TASK)
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertEqual(status.validate(self.root), [])
+
+    def test_a_file_that_is_not_a_record_under_results_or_acceptance_does_not_reach_main(self):
+        """The re-review's R2-1: test files placed in results/ and acceptance/ after the review."""
+        self.standard()
+        names = [f"program/evidence/{TASK}/results/conftest.py", f"program/evidence/{TASK}/results/test_late.py",
+                 f"program/evidence/{TASK}/acceptance/test_also.py",
+                 f"program/evidence/{TASK}/results/sub/20000101T000000000000Z-000000000000.json"]
+        for name in names:
+            put(self.wt, name, "import os\n")
+        late = commit(self.wt, "late files in the record folders")
+        before = self.head()
+        code, out, err = self.pk("merge", TASK)
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn(f"{late[:12]} was committed after the reviewed commit", err)
+        self.assertIn("changes " + ", ".join(sorted(names)) + ":", err)
+        self.untouched(before)
+
+    def test_a_record_shaped_file_whose_bytes_are_not_its_name_does_not_reach_main(self):
+        """The re-review's R2-1, second form: a record name over bytes that do not hash to it."""
+        self.standard()
+        name = f"program/evidence/{TASK}/results/20000101T000000000000Z-000000000000.json"
+        put(self.wt, name, "{}\n")
+        commit(self.wt, "an impostor record")
+        before = self.head()
+        code, out, err = self.pk("merge", TASK)
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn(f"fails the store's integrity check: immutable record altered: {name}", err)
+        self.untouched(before)
+
     def test_a_merge_commit_that_carries_a_change_of_its_own_does_not_reach_main(self):
         self.standard()
         put(self.root, "main-only.txt", "x\n")
