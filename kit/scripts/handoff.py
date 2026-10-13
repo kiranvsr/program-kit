@@ -14,6 +14,17 @@ file alone when nothing else changed, and the commit line names HEAD as of the l
 
 The main checkout is not listed among the worktrees: its dirty state changes whenever this
 file is rewritten, which would make the block unstable.
+
+The block is compact on purpose. It opens with a "Now" list (the controller's one line, every task in
+flight with its verification tier, the ad-hoc tasks that are open), and it shows the open follow-ups that are
+not deferred by a tag (newest first, counted, at most FOLLOWUPS_SHOWN), the newest RULINGS_SHOWN rulings on one
+line each with the next free number, the newest ADHOC_CLOSED_SHOWN closed ad-hoc tasks and the agents past
+the fresh-agent threshold of the cost log. History is never copied in: it lives in `program/rulings.md`.
+`check` also fails when the file is over its size budget (BUDGET_BYTES unless the controller state sets
+`handoff_budget_bytes`) or its hand-written "Next steps" section is over NEXT_STEPS_BYTES: a successor must
+be able to read the hand-off whole.
+
+Writing the block changes `program/HANDOFF.md` and no other file, and nothing at all when the block is current.
 """
 from __future__ import annotations
 
@@ -22,6 +33,9 @@ import re
 from pathlib import Path
 
 import change as change_module
+import cost as cost_module
+import ctlstate
+import rulings as rulings_module
 import status as status_module
 import trace as trace_module
 import worktree as worktree_module
@@ -31,7 +45,12 @@ from common import KitError, find_root, git, primary_branch_problem, read_json, 
 START, END = "<!-- generated:start -->", "<!-- generated:end -->"
 COMMIT_PREFIX = "Commit: "
 IN_FLIGHT = ("in_progress", "review", "blocked")
-_STATE_FILE = "program/controller-state.json"
+BUDGET_BYTES = 60_000  # the whole file; a successor reads it top to bottom
+NEXT_STEPS_BYTES = 2048  # the hand-written "Next steps" section; the generated Now list carries the rest
+RULINGS_SHOWN = 15
+RULING_CHARS = 240
+FOLLOWUPS_SHOWN = 30
+ADHOC_CLOSED_SHOWN = 10
 
 
 def _line(text: str) -> str:
@@ -39,26 +58,48 @@ def _line(text: str) -> str:
     return " ".join(text.split()).replace("<", "&lt;")
 
 
-def _mapping(data: dict, key: str) -> dict[str, str]:
-    value = data.get(key, {})
-    if not (isinstance(value, dict) and all(isinstance(k, str) and isinstance(v, str) for k, v in value.items())):
-        raise KitError(f"{_STATE_FILE}: '{key}' must be a mapping of task ID to text")
-    return value
-
-
 def _state(root: Path) -> dict:
-    """The controller state, validated; a missing file is an empty state."""
-    path = Path(root) / _STATE_FILE
-    data = read_json(path) if path.exists() else {}
-    if not isinstance(data, dict):
-        raise KitError(f"{_STATE_FILE}: expected a mapping with stage, queued, parked and followups")
-    followups = data.get("followups", [])
-    if not (isinstance(followups, list) and all(
-            isinstance(item, dict) and isinstance(item.get("area"), str) and isinstance(item.get("item"), str)
-            for item in followups)):
-        raise KitError(f"{_STATE_FILE}: 'followups' must be a list of {{area, item}} text pairs")
-    return {"stage": _mapping(data, "stage"), "queued": _mapping(data, "queued"),
-            "parked": _mapping(data, "parked"), "followups": followups}
+    """The controller state, validated and in the current shape; a missing file is an empty state."""
+    return ctlstate.load(root)
+
+
+def _clip(text: str, limit: int) -> str:
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[:limit - 3].rstrip() + "..."
+
+
+def _tier(record: dict) -> str:
+    return status_module.tier_of(record) + ("+fast" if status_module.is_fast(record) else "")
+
+
+def _ruling_lines(root: Path) -> tuple[str, list[str]]:
+    """(heading, lines) of the rulings window: the newest RULINGS_SHOWN, newest first, then where the rest are."""
+    found = rulings_module.read(root)
+    total = len(found)
+    next_number = max((ruling["number"] for ruling in found), default=0) + 1
+    lines = [_line(f"R{ruling['number']} ({ruling['date']}): {_clip(ruling['decision'], RULING_CHARS)}")
+             for ruling in reversed(found[-RULINGS_SHOWN:])]
+    if total > RULINGS_SHOWN:
+        lines.append(f"{total - RULINGS_SHOWN} earlier rulings: program/rulings.md, read by number")
+    return f"#### Rulings ({total}; next R{next_number})", lines
+
+
+def _followup_lines(state: dict) -> tuple[str, list[str]]:
+    """(heading, lines) of the open follow-ups: newest first, counted; the tagged ones only counted, by tag."""
+    opened = sorted(state["followups"], key=lambda item: item["id"], reverse=True)
+    shown = [item for item in opened if not item["tags"]]
+    tags: dict[str, int] = {}
+    for item in opened:
+        for tag in item["tags"]:
+            tags[tag] = tags.get(tag, 0) + 1
+    deferred = len(opened) - len(shown)
+    heading = f"#### Open follow-ups ({len(opened)} open"
+    if deferred:
+        heading += f"; {deferred} deferred by tag: " + ", ".join(f"{tag} {n}" for tag, n in sorted(tags.items()))
+    lines = [f"{item['id']} {_line(item['area'])}: {_line(item['item'])}" for item in shown[:FOLLOWUPS_SHOWN]]
+    if len(shown) > FOLLOWUPS_SHOWN:
+        lines.append(f"and {len(shown) - FOLLOWUPS_SHOWN} older: pk followups list")
+    return _line(heading) + ")", lines
 
 
 def _bullets(items: list[str]) -> list[str]:
@@ -102,9 +143,23 @@ def render(root: Path, main: str = "main") -> str:
         recorded = {record["task_id"] for record in records}
         counts["not_started"] += len(in_register - recorded)  # no status record yet means not started
         unregistered = sorted(recorded - in_register)
-    flying = [f"{_line(r['task_id'])} ({r['status']}): "
-              f"{_line(state['stage'].get(r['task_id'], '')) or '(no stage text)'}"
-              for r in records if r["status"] in IN_FLIGHT]
+    adhoc = {item["id"]: item for item in state["adhoc"]}
+    unregistered = [task for task in unregistered if task not in adhoc]
+    by_id = {record["task_id"]: record for record in records}
+    now = [_line(state["now"])] if state["now"].strip() else []
+    now += [f"[{_tier(r)}] {_line(r['task_id'])} ({r['status']}): "
+            f"{_line(state['stage'].get(r['task_id'], '')) or '(no stage text)'}"
+            for r in records if r["status"] in IN_FLIGHT and r["task_id"] not in adhoc]
+    for wanted in ("progress", "review", "paused", "queued"):
+        for item in state["adhoc"]:
+            if item["state"] != wanted:
+                continue
+            record = by_id.get(item["id"])
+            held = f"; status {record['status']}, tier {_tier(record)}" if record else ""
+            now.append(_line(f"{item['id']} {item['title']} (ad hoc, {wanted}{held}): {item['note'] or '(no note)'}"))
+    closed = [item for item in reversed(state["adhoc"]) if item["state"] == "closed"]
+    closed_lines = [_line(f"{item['id']} {item['title']}" + (f": {item['note']}" if item["note"] else ""))
+                    for item in closed[:ADHOC_CLOSED_SHOWN]]
     problem = primary_branch_problem(root, main, need_commit=True)
     if problem:
         raise KitError(problem)
@@ -113,21 +168,26 @@ def render(root: Path, main: str = "main") -> str:
     trees = [line for item in worktree_module.list_all(root) if (line := _worktree_line(root, item))]
     requests = [f"{c['id']}: {_line(c['title'])} ({'approved, not applied' if c['approved'] else 'awaiting approval'})"
                 for c in change_module.open_requests(root)]
-    followups = [f"{_line(f['area'])}: {_line(f['item'])}" for f in state["followups"]]
+    followups_heading, followups = _followup_lines(state)
+    rulings_heading, ruling_lines = _ruling_lines(root)
+    over = [_line(line) for line in cost_module.flagged_lines(root)]
 
     def tasks(table: dict[str, str]) -> list[str]:
         return [f"{_line(task)}: {_line(text)}" for task, text in sorted(table.items())]
 
     lines = ["### Generated state", "", f"{COMMIT_PREFIX}{_commit(root)}", "",
+             "#### Now", *_bullets(now), "",
              "#### Tasks by status", *[f"- {name}: {number}" for name, number in counts.items()],
              *([f"- not in register: {', '.join(_line(t) for t in unregistered)}"] if unregistered else []), "",
-             "#### In flight", *_bullets(flying), "",
              f"#### Branches not merged into {main}", *_bullets(branches), "",
              "#### Task worktrees", *_bullets(trees), "",
              "#### Queued", *_bullets(tasks(state["queued"])), "",
              "#### Parked", *_bullets(tasks(state["parked"])), "",
-             "#### Open follow-ups", *_bullets(followups), "",
-             "#### Open change requests", *_bullets(requests)]
+             f"#### Ad-hoc tasks closed (newest {ADHOC_CLOSED_SHOWN} of {len(closed)})", *_bullets(closed_lines), "",
+             followups_heading, *_bullets(followups), "",
+             "#### Open change requests", *_bullets(requests), "",
+             "#### Agents past the fresh-agent threshold", *_bullets(over), "",
+             rulings_heading, *_bullets(ruling_lines)]
     block = "\n".join(lines) + "\n"
     if any(line.strip() in (START, END) for line in block.splitlines()):  # belt and braces: state text is escaped
         raise KitError("the generated block would contain a marker line; check controller-state.json")
@@ -172,6 +232,25 @@ def check(root: Path) -> bool:
     return _comparable(text[begin:finish]) == _comparable(render(root))
 
 
+def budget_problems(root: Path) -> list[str]:
+    """Why the hand-off is too big to be read whole, one line each (empty when it is within budget)."""
+    _, text = _read(root)
+    budget = _state(root).get("handoff_budget_bytes", BUDGET_BYTES)
+    size = len(text.encode("utf-8"))
+    problems = []
+    if size > budget:
+        problems.append(f"program/HANDOFF.md is {size} bytes, over its budget of {budget}: history belongs in "
+                        "program/rulings.md, closed items in the closed lists; close or tag follow-ups and "
+                        "trim the hand-written sections")
+    section = re.search(r"^## Next steps[^\n]*\n(.*?)(?=^## |^[ \t]*" + re.escape(START) + r"|\Z)", text,
+                        re.MULTILINE | re.DOTALL)
+    if section and len(section.group(1).encode("utf-8")) > NEXT_STEPS_BYTES:
+        problems.append(f"program/HANDOFF.md: the Next steps section is {len(section.group(1).encode('utf-8'))} "
+                        f"bytes, over {NEXT_STEPS_BYTES}: the generated Now list carries what is in flight; keep "
+                        "only the order of what comes next")
+    return problems
+
+
 def update(root: Path) -> bool:
     """Rewrite the text between the markers; return whether the file changed.
 
@@ -195,17 +274,20 @@ def cmd_handoff(args: argparse.Namespace) -> int:
     root = find_root()
     if action == "update":
         print("handoff: updated" if update(root) else "handoff: unchanged")
-    elif check(root):
-        print("handoff: current")
-    else:
+    elif not check(root):
         raise KitError("program/HANDOFF.md is stale; run: pk handoff update")
+    else:
+        problems = budget_problems(root)
+        if problems:
+            raise KitError("; ".join(problems))
+        print("handoff: current")
     return 0
 
 
 def _configure(parser: argparse.ArgumentParser) -> None:
     actions = parser.add_subparsers(dest="handoff_action", metavar="action", parser_class=type(parser))
     actions.add_parser("update", help="rewrite the generated block of program/HANDOFF.md")
-    actions.add_parser("check", help="exit 1 when the generated block is stale")
+    actions.add_parser("check", help="exit 1 when the generated block is stale or the file is over its size budget")
 
 
 def register(add_command) -> None:
