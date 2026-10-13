@@ -20,16 +20,28 @@ from test_status import TID, git_repo, write_register
 from test_worktree import run_cli
 
 FULL_PATHS = {"full_paths": ["auth/"], "light_paths": [], "light_ruling": ""}
-BRIEF = ("# Fast brief\n\n## Scope\n\nAdd mul.\n\n## Decided (do not reopen)\n\n- none\n\n"
-         "## Stop and report when\n\n- a guarded file must change\n\n## Exact Commands\n\n"
-         "$ python3 -c \"import calc; print(calc.add(1, 2))\"\n")
+
+
+def brief(tier="standard", ruling="R1"):
+    """A fast brief whose `Tier:` and `Ruling:` lines say what the task's status record says."""
+    return (f"# Fast brief\n\nRuling: {ruling}\n\nTier: {tier}\n\n## Scope\n\nAdd mul.\n\n"
+            "## Assumptions checked\n\n- calc.py imports\n\n## Decided (do not reopen)\n\n- none\n\n"
+            "## Stop and report when\n\n- a guarded file must change\n\n## Exact Commands\n\n"
+            "$ python3 -c \"import calc; print(calc.add(1, 2))\"\n")
+
+
+BRIEF = brief()
+LIGHT_BRIEF = brief("light")
 
 
 def status_record(task_id, state="in_progress", **over):
+    """A status record as the machine writes it: the first history entry names the tier it was dispatched at."""
     record = {"task_id": task_id, "status": state, "role": "controller", "updated_at": "", "note": "",
               "evidence": [], "blocked_by": [], "history": [{"status": state, "role": "controller", "at": ""}],
               "tier": "full", "fast": False, "ruling": ""}
     record.update(over)
+    record["history"] = [dict(entry) for entry in record["history"]]
+    record["history"][0].setdefault("tier", record["tier"])
     return record
 
 
@@ -128,22 +140,106 @@ class TierStatusTests(unittest.TestCase):
         write_json(self.root / "program" / "status" / f"{TID}.json", status_record(TID, "review", tier="light"))
         self.refused("never done", TID, "done", "qa")
 
-    def test_merged_needs_the_light_tier_the_controller_main_and_a_merged_branch(self):
-        self.light_task()
-        self.refused("for controller", TID, "merged", "qa")
-        self.refused(f"branch task/{TID} not found", TID, "merged", "controller")
+    def light_branch(self, *names):
+        """A branch task/<TID> of the dispatched light task that adds `names`; its tip, with main checked out again."""
         self.git("checkout", "-q", "-b", f"task/{TID}")
-        (self.root / "web.txt").write_text("x\n")
+        for name in names:
+            (self.root / name).parent.mkdir(parents=True, exist_ok=True)
+            (self.root / name).write_text("x\n")
         self.git("add", "-A")
         self.git("commit", "-q", "-m", "work")
-        self.refused("recorded on main", TID, "merged", "controller")  # not in the main checkout
+        tip = self.git("rev-parse", "HEAD").strip()
         self.git("checkout", "-q", "main")
-        self.refused("is not merged into main", TID, "merged", "controller")
+        return tip
+
+    def by_hand(self, **over):
+        write_json(self.root / "program" / "status" / f"{TID}.json",
+                   status_record(TID, "merged", tier="light", **over))
+        return " ".join(status.validate(self.root))
+
+    def test_merged_needs_the_light_tier_the_controller_main_and_a_merge_of_the_inspected_commit(self):
+        self.light_task()
+        tip = self.light_branch("web/page.txt")
+        self.refused("for controller", TID, "merged", "qa", inspected=tip)
+        self.git("checkout", "-q", f"task/{TID}")
+        self.refused("recorded on main", TID, "merged", "controller", inspected=tip)  # not in the main checkout
+        self.git("checkout", "-q", "main")
+        self.refused("merged needs the commit the controller inspected", TID, "merged", "controller")
+        self.refused("merged needs the commit the controller inspected", TID, "merged", "controller", inspected="abc")
+        self.refused(f"main has no merge of {tip}", TID, "merged", "controller", inspected=tip)
         self.git("merge", "-q", "--no-ff", "-m", "merge", f"task/{TID}")
-        record = status.transition(self.root, TID, "merged", "controller")
-        self.assertEqual((record["status"], record["tier"]), ("merged", "light"))
+        self.refused("main has no merge of 0000", TID, "merged", "controller", inspected="0" * 40)
+        self.refused("--inspected belongs to merged", TID, "blocked", "controller", blocked_by=["x"], inspected=tip)
+        record = status.transition(self.root, TID, "merged", "controller", inspected=tip)
+        self.assertEqual((record["status"], record["tier"], record["inspected"]), ("merged", "light", tip))
+        self.assertEqual(status.validate(self.root), [])
+        self.git("branch", "-d", f"task/{TID}")  # the audit works from the merge commit, not from the branch
         self.assertEqual(status.validate(self.root), [])
         self.refused("merged is terminal", TID, "in_progress", "controller")
+
+    def test_a_fast_forward_is_not_a_merge_of_the_inspected_commit(self):
+        self.light_task()
+        tip = self.light_branch("web/page.txt")
+        self.git("merge", "-q", "--ff-only", f"task/{TID}")
+        self.refused(f"main has no merge of {tip}", TID, "merged", "controller", inspected=tip)
+
+    def test_a_hand_merge_round_a_failed_merge_check_is_never_recorded_merged(self):
+        """The reviewer's sequence (M3): the merge check fails on a full-tier path, the branch is merged by hand."""
+        self.light_task()
+        tip = self.light_branch("web/page.txt", "auth/policy.py")
+        self.git("merge", "-q", "--no-ff", "-m", "by hand", f"task/{TID}")
+        self.refused("merged needs the commit the controller inspected", TID, "merged", "controller")
+        self.refused("changed full-tier paths: auth/policy.py; a light path never applies to the full tier",
+                     TID, "merged", "controller", inspected=tip)
+        code, out, err = run_cli("status", self.root, "status", "set", TID, "merged", "--role", "controller")
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("merged needs the commit the controller inspected", err)
+        code, out, err = run_cli("status", self.root, "status", "set", TID, "merged", "--role", "controller",
+                                 "--inspected", tip)
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("changed full-tier paths: auth/policy.py", err)
+        self.assertEqual(status.validate(self.root), [])  # still in_progress: nothing was recorded
+        # and a record somebody writes by hand is found by the audit, with or without the commit
+        self.assertIn("changed full-tier paths: auth/policy.py", self.by_hand(inspected=tip))
+        self.assertIn("merged needs the commit the controller inspected", self.by_hand())
+        self.assertIn("main has no merge of", self.by_hand(inspected="1" * 40))
+
+    def test_a_merge_that_left_the_light_paths_is_never_recorded_merged(self):
+        self.light_task()
+        tip = self.light_branch("web/page.txt", "server/api.py")
+        self.git("merge", "-q", "--no-ff", "-m", "by hand", f"task/{TID}")
+        self.refused("changed paths outside tiers.light_paths: server/api.py", TID, "merged", "controller",
+                     inspected=tip)
+        self.assertIn("outside tiers.light_paths: server/api.py", self.by_hand(inspected=tip))
+
+    def test_a_merged_record_written_by_hand_for_a_task_that_was_not_light_does_not_validate(self):
+        self.checks(full_paths=["auth/"], light_paths=["web/"], light_ruling="R1")
+        self.ruling()
+        status.transition(self.root, TID, "in_progress", "controller")  # dispatched full
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "dispatch")
+        tip = self.light_branch("web/page.txt")
+        self.git("merge", "-q", "--no-ff", "-m", "merge", f"task/{TID}")
+        self.assertIn(f"{TID}: it was full-tier on main when", self.by_hand(inspected=tip))
+        self.assertIn("a full-tier task ends at done", self.by_hand(inspected=tip))
+
+    def test_a_tier_edited_by_hand_does_not_validate(self):
+        self.checks(full_paths=["auth/"])
+        status.transition(self.root, TID, "in_progress", "controller")
+        path = self.root / "program" / "status" / f"{TID}.json"
+        record = read_json(path)
+        self.assertEqual(record["history"][0]["tier"], "full")  # the dispatch entry names the tier
+        write_json(path, dict(record, tier="standard"))
+        self.assertIn(f"{TID}: tier is standard but its history last set full", " ".join(status.validate(self.root)))
+        change = {"status": "in_progress", "role": "controller", "at": "", "tier": "standard", "ruling": "R9"}
+        write_json(path, dict(record, tier="standard", history=[*record["history"], change]))  # the history too
+        self.assertIn("changed to standard by R9, which is not a ruling in program/rulings.md",
+                      " ".join(status.validate(self.root)))
+        bare = [{key: value for key, value in record["history"][0].items() if key != "tier"}]
+        write_json(path, dict(record, tier="standard", history=bare))
+        self.assertIn("tier standard is not in the record's history", " ".join(status.validate(self.root)))
+        write_json(path, record)
+        self.assertEqual(status.validate(self.root), [])
 
     def test_merged_is_refused_for_any_other_tier(self):
         status.transition(self.root, TID, "in_progress", "controller")
@@ -174,7 +270,7 @@ class TierStatusTests(unittest.TestCase):
         self.git("checkout", "-q", "main")
         record = status.set_tier(self.root, TID, "standard", ruling)
         self.assertEqual((record["tier"], record["ruling"], record["status"]), ("standard", "R1", "in_progress"))
-        self.assertEqual(record["history"][-1]["tier"], "standard")
+        self.assertEqual([entry["tier"] for entry in record["history"]], ["full", "standard"])
         self.assertEqual(status.validate(self.root), [])
         with self.assertRaisesRegex(KitError, "already standard"):
             status.set_tier(self.root, TID, "standard", ruling)
@@ -196,6 +292,15 @@ class TierStatusTests(unittest.TestCase):
         self.assertEqual((code, out, err), (0, f"{TID}: in_progress (tier standard, fast path)\n", ""))
         code, out, err = run_cli("status", self.root, "status", "list")
         self.assertEqual(out.split()[-1], "standard+fast")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "dispatch")
+        code, out, err = run_cli("status", self.root, "status", "tier", TID, "full", "--ruling", ruling, "--spec")
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(out.splitlines()[0], f"{TID}: tier full by {ruling}")
+        said = out.splitlines()[1]  # what to do next, so nobody reaches for a hand edit of the status file
+        for needle in ("next: change the `Tier:` line", f"git checkout --theirs program/status/{TID}.json",
+                       "in_progress again at tier full"):
+            self.assertIn(needle, said)
         code, out, err = run_cli("status", self.root, "status", "set", "P1-M01-S01-T02", "in_progress", "--role",
                                  "controller", "--fast", "--ruling", ruling)
         self.assertEqual(code, 1)
@@ -248,6 +353,31 @@ class StandardTierGateTests(TierGateBase):
             rc, out = run()
             self.assertEqual(rc, 1)
             self.assertIn(f"FAILED: tier {TASK} is standard but changes full-tier paths: auth/policy.py", out)
+
+    def test_a_full_path_written_without_its_trailing_slash_still_guards_the_directory(self):
+        self.on_main(status_record(TASK, tier="standard"), dict(FULL_PATHS, full_paths=["auth"]),
+                     files={f"program/tasks/{TASK}/SPEC.md": "# Spec\n\nTier: standard\n"})
+        self.work("auth/policy.py")
+        for run in (self.handback, self.merge_check):
+            rc, out = run()
+            self.assertEqual(rc, 1)
+            self.assertIn(f"FAILED: tier {TASK} is standard but changes full-tier paths: auth/policy.py", out)
+        self.assertEqual(gate._under("auth", ["auth"]), "auth")
+        self.assertEqual(gate._under("auth/a/b.py", ["auth/"]), "auth/")
+        self.assertIsNone(gate._under("authz/policy.py", ["auth"]))  # a name that only begins the same is not under it
+        self.assertIsNone(gate._under("authz/policy.py", ["auth/"]))
+
+    def test_a_branch_that_edits_the_contract_main_holds_fails(self):
+        contract = f"program/tasks/{TASK}/CONTRACT.md"
+        self.on_main(status_record(TASK, tier="standard"), FULL_PATHS,
+                     files={f"program/tasks/{TASK}/SPEC.md": "# Spec\n\nTier: standard\n", contract: "# Contract\n"})
+        rc, out = self.merge_check()
+        self.assertEqual(rc, 0, out)  # the contract is main's: nothing to say
+        self.work(contract, "# Contract\n\nGET /mine\n")
+        for run in (self.handback, self.merge_check):
+            rc, out = run()
+            self.assertEqual(rc, 1)
+            self.assertIn(f"FAILED: contract {contract} differs from main", out)
 
     def test_the_kits_own_gates_are_full_tier_whatever_the_program_lists(self):
         self.on_main(status_record(TASK, tier="standard"), FULL_PATHS,
@@ -338,6 +468,26 @@ class FastPathGateTests(TierGateBase):
         self.assertEqual(rc, 1)
         self.assertIn("lacks the section(s) ## Decided (do not reopen)", out)
 
+    def test_a_brief_whose_tier_or_ruling_line_is_not_the_records_fails(self):
+        for text, said in ((brief(tier="light"), "says Tier: light, the status record says standard"),
+                           (brief(ruling="R2"), "says Ruling: R2, the status record says R1"),
+                           (brief().replace("Tier: standard\n", ""), "says no Tier: line, the status record says"),
+                           (brief().replace("Ruling: R1\n", ""), "says no Ruling: line, the status record says R1"),
+                           (brief() + "\nTier: light\n", "says Tier: light, Tier: standard, the status record")):
+            with self.subTest(said):
+                self.on_main(self.fast(), FULL_PATHS, rulings_count=2, files={f"program/tasks/{TASK}/BRIEF.md": text})
+                for run in (self.handback, self.merge_check):
+                    rc, out = run()
+                    self.assertEqual(rc, 1)
+                    self.assertIn(f"FAILED: brief program/tasks/{TASK}/BRIEF.md on main {said}", out)
+
+    def test_a_brief_without_its_assumptions_section_fails(self):
+        self.on_main(self.fast(), FULL_PATHS, rulings_count=1,
+                     files={f"program/tasks/{TASK}/BRIEF.md": BRIEF.replace("## Assumptions checked", "## Notes")})
+        rc, out = self.merge_check()
+        self.assertEqual(rc, 1)
+        self.assertIn("lacks the section(s) ## Assumptions checked", out)
+
     def test_a_brief_without_commands_fails_the_hand_back_gate(self):
         self.on_main(self.fast(), FULL_PATHS, rulings_count=1,
                      files={f"program/tasks/{TASK}/BRIEF.md": BRIEF.split("## Exact Commands")[0]})
@@ -390,7 +540,7 @@ class LightTierGateTests(TierGateBase):
     def switch_on(self, **kwargs):
         # the test command fails on purpose: a light gate that passes proves it did not run the tests
         self.write_checks(test=[[PY, "-c", "raise SystemExit(9)"]])
-        self.on_main(self.light(), self.LIGHT, rulings_count=1, files={f"program/tasks/{TASK}/BRIEF.md": BRIEF},
+        self.on_main(self.light(), self.LIGHT, rulings_count=1, files={f"program/tasks/{TASK}/BRIEF.md": LIGHT_BRIEF},
                      **kwargs)
         self.write_checks(test=[[PY, "-c", "raise SystemExit(9)"]], tiers=self.LIGHT)
         commit(self.root, "failing tests")
@@ -433,7 +583,7 @@ class LightTierGateTests(TierGateBase):
 
     def test_the_light_tier_needs_its_ruling_on_main(self):
         self.on_main(self.light(), dict(self.LIGHT, light_ruling="R9"), rulings_count=1,
-                     files={f"program/tasks/{TASK}/BRIEF.md": BRIEF})
+                     files={f"program/tasks/{TASK}/BRIEF.md": LIGHT_BRIEF})
         rc, out = self.merge_check(inspected=sh(self.wt, "git", "rev-parse", "HEAD").strip())
         self.assertEqual(rc, 1)
         self.assertIn("has not switched the light tier on", out)
@@ -461,6 +611,22 @@ class ChecksTiersTests(unittest.TestCase):
         self.assertEqual(pk._checks_problems({"build": [["a"]], "test": [["a"]], "scan": [["a"]],
                                               "tiers": {"nope": 1}}),
                          ["checks.yaml: tiers: unknown key nope (expected full_paths, light_paths, light_ruling)"])
+
+
+    def test_doctor_warns_about_a_tier_path_that_covers_no_tracked_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            (root / "auth").mkdir()
+            (root / "auth" / "policy.py").write_text("x\n")
+            git_repo(root)
+            for tiers, expected in (({"full_paths": ["auth"]}, []), ({"full_paths": ["auth/"]}, []),
+                                    ({"full_paths": ["auth/policy.py", "atuh/"], "light_paths": ["web/"]},
+                                     ["checks.yaml: tiers.full_paths entry 'atuh/' covers no tracked file",
+                                      "checks.yaml: tiers.light_paths entry 'web/' covers no tracked file"])):
+                with self.subTest(tiers):
+                    found = pk._tier_path_warnings(root, {"tiers": tiers})
+                    self.assertEqual([line.split(": check the")[0] for line in found], expected)
+            self.assertEqual(pk._tier_path_warnings(root, {"tiers": "nope"}), [])  # an error elsewhere, not a warning
 
 
 if __name__ == "__main__":

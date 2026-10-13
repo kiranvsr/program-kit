@@ -74,7 +74,7 @@ ALL_KEYS = CHECK_KEYS + ("guarded_files", "tiers")
 TIER_KEYS = ("full_paths", "light_paths", "light_ruling")
 BUILTIN_FULL = ("kit/", "program/checks.yaml", "program/gates.yaml")  # the kit's own gates: always full-tier
 LIGHT_STEPS = ("build", "compile_check", "scan")
-FAST_BRIEF_HEADINGS = ("## Scope", "## Decided (do not reopen)", "## Stop and report when")
+FAST_BRIEF_HEADINGS = ("## Scope", "## Assumptions checked", "## Decided (do not reopen)", "## Stop and report when")
 STEP_TIMEOUT = 3600  # seconds per command
 TAIL_LINES = 20
 TAIL_PREFIX = "    | "
@@ -456,8 +456,12 @@ def _guarded_changes(root: Path, task_id: str, branch: str, main: str, guarded: 
 
 
 def _under(path: str, entries) -> str | None:
-    """The entry of `entries` (an exact path, or a directory when it ends in `/`) that covers `path`, or None."""
-    return next((e for e in entries if path == e or (e.endswith("/") and path.startswith(e))), None)
+    """The entry of `entries` that covers `path`, or None: the path itself, or a directory above it.
+
+    The trailing `/` of a directory entry is optional: `auth` and `auth/` both cover `auth/policy.py`, so an
+    entry written without the slash still guards the directory. Neither covers `authz/x.py`.
+    """
+    return next((e for e in entries if path == e or path.startswith(e.rstrip("/") + "/")), None)
 
 
 def task_meta(root: Path, task_id: str, ref: str = MAIN) -> dict:
@@ -655,10 +659,12 @@ def _stale_step(wt: Path) -> bool:
 
 
 _TIER_LINE = re.compile(r"Tier:\s*([a-z]+)\s*\Z")
+_RULING_LINE = re.compile(r"Ruling:\s*(\S*)\s*\Z")
 
 
-def _frozen_brief(root: Path, tree: Path, task_id: str) -> bytes | None:
-    """Main's BRIEF.md of a fast-path task, when the tree's copy is byte-identical and it has the fast-path headings.
+def _frozen_brief(root: Path, tree: Path, task_id: str, meta: dict) -> bytes | None:
+    """Main's BRIEF.md of a fast-path task, when the tree's copy is byte-identical, it has the fast-path headings
+    and its `Tier:` and `Ruling:` lines say what the status record on main says.
 
     The brief stands in for SPEC, PLAN and the spec-QA record, so it is held to the same rule: it must be on
     main (part of the dispatch commit) and a branch may not change it. Prints the failure line and returns None
@@ -679,6 +685,13 @@ def _frozen_brief(root: Path, tree: Path, task_id: str) -> bytes | None:
     if missing:
         _out(f"FAILED: brief {rel} lacks the section(s) {', '.join(missing)}")
         return None
+    for label, pattern, recorded in (("Tier", _TIER_LINE, meta["tier"]), ("Ruling", _RULING_LINE, meta["ruling"])):
+        stated = sorted(m.group(1) for m in map(pattern.match, lines) if m)
+        if stated != [recorded]:
+            _out(f"FAILED: brief {rel} on {MAIN} says "
+                 f"{', '.join(f'{label}: {_show(value)}' for value in stated) if stated else f'no {label}: line'}, "
+                 f"the status record says {recorded or 'none'}")
+            return None
     return authoritative
 
 
@@ -698,11 +711,32 @@ def _spec_tier_ok(root: Path, task_id: str, tier: str) -> bool:
 
 def _definition(root: Path, tree: Path, task_id: str, meta: dict) -> bytes | None:
     """The bytes the task's commands are read from: main's BRIEF.md on the fast path, else main's PLAN.md."""
+    if not _frozen_contract(root, tree, task_id):
+        return None
     if meta["fast"]:
-        return _frozen_brief(root, tree, task_id)
+        return _frozen_brief(root, tree, task_id, meta)
     if not _spec_tier_ok(root, task_id, meta["tier"]):
         return None
     return _frozen_plan(root, tree, task_id)
+
+
+def _frozen_contract(root: Path, tree: Path, task_id: str) -> bool:
+    """Whether the task's CONTRACT.md, when main has one, is byte-identical in `tree`; prints the failure line.
+
+    The contract of a task with a server part and a client part is part of its definition: it goes to main in
+    the dispatch commit, where every worktree sees it, and the controller appends changes to it on main. A
+    branch that edits its own copy has changed the interface the other part is building against.
+    """
+    rel = f"program/tasks/{task_id}/CONTRACT.md"
+    try:
+        authoritative = _git_bytes(root, "show", f"{MAIN}:{rel}")
+    except KitError:
+        return True  # no contract on main: nothing to hold the branch to
+    own = tree / rel
+    if (own.read_bytes() if own.is_file() else None) != authoritative:
+        _out(f"FAILED: contract {rel} differs from {MAIN}")
+        return False
+    return True
 
 
 def _frozen_plan(root: Path, tree: Path, task_id: str) -> bytes | None:

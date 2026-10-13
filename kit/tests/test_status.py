@@ -47,6 +47,17 @@ def raw_record(root, tid, kind, raw: bytes) -> str:
     return appended["path"]
 
 
+def full_review():
+    """What a full-tier acceptance must list (status.FULL_PLANTED): the commands QA re-ran and its own planted bugs."""
+    digest = "0" * 64
+    row = {"builds": True, "killed": True, "kill_reason": "test failed", "test_output_sha256": digest,
+           "path": "calc.py", "find": "a + b", "replace": "a - b", "build_argv": ["make"],
+           "test_argv": ["make", "test"]}
+    return {"commands": [{"label": "unit", "argv": ["make", "test"], "exit": 0, "expected_exit": 0,
+                          "as_expected": True, "derived": {}, "output_sha256": digest, "output_tail": ""}],
+            "planted_bugs": [dict(row, id=f"qa-{number}") for number in (1, 2, 3)]}
+
+
 def results_record(task_id=TID, **over):
     """A results record the hand-back gate would pass (the shape of kit/templates/results.schema.json)."""
     digest = "0" * 64
@@ -93,7 +104,7 @@ class StatusTests(unittest.TestCase):
             digest = store.latest(store.read_index(self.root), tid, "results")["digest"]
         acceptance = {"task_id": tid, "decision": "accepted_development", "evidence_sha256": digest,
                       "source_commit": self.head, "accepted_at": "2026-01-01T00:00:00Z", "role": "qa",
-                      "commands": [], "planted_bugs": [], "findings": [], "blocked_by": []}
+                      **full_review(), "findings": [], "blocked_by": []}
         acceptance.update(over)
         return store.record(self.root, tid, "acceptance",
                             {k: v for k, v in acceptance.items() if k not in drop})["path"]
@@ -533,7 +544,8 @@ class StatusTests(unittest.TestCase):
         rec = self.to_review()
         self.assertEqual(set(schema["required"]) | {"tier", "fast", "ruling"}, set(rec))  # a 0.2 record has no tier
         self.assertEqual(schema["properties"]["status"]["enum"], list(status.STATUSES))
-        self.assertEqual(set(schema["properties"]), set(rec))
+        self.assertEqual(set(schema["properties"]), set(rec) | {"inspected"})  # on a merged record only
+        self.assertEqual(schema["properties"]["inspected"]["pattern"], "^" + status._SHA.pattern.replace("\\Z", "$"))
 
 
 class StatusCliTests(unittest.TestCase):
@@ -629,6 +641,40 @@ class StatusCliTests(unittest.TestCase):
         self.assertEqual(err, "error: P9-M01-S01-T01: not a task in program/register.yaml\n")
         self.assertFalse((self.root / "program" / "status").exists())
 
+    def test_a_full_tier_task_is_not_done_on_an_acceptance_that_records_no_full_tier_review(self):
+        for argv in (("in_progress", "--role", "controller"), ("review", "--role", "implementer")):
+            self.assertEqual(self.run_pk("status", "set", TID, *argv)[0], 0)
+        digest = store.record(self.root, TID, "results", results_record(head=self.head))["digest"]
+        scoped = {"task_id": TID, "decision": "accepted_development", "evidence_sha256": digest,
+                  "source_commit": self.head, "accepted_at": "2026-01-01T00:00:00Z", "role": "qa", "commands": [],
+                  "planted_bugs": [], "findings": [], "blocked_by": []}  # what a standard-tier review records
+        store.record(self.root, TID, "acceptance", scoped)
+        argv = ("status", "set", TID, "done", "--role", "qa")
+        rc, out, err = self.run_pk(*argv)
+        self.assertEqual((rc, out), (1, ""))
+        self.assertIn("a full-tier task is accepted only on the full tier's review", err)
+        self.assertIn("at least 3 planted bugs of its own (it lists 0 and 0)", err)
+        two = dict(scoped, **full_review())
+        two["planted_bugs"] = two["planted_bugs"][:2]
+        store.record(self.root, TID, "acceptance", two)
+        self.assertIn("(it lists 1 and 2)", self.run_pk(*argv)[2])
+        store.record(self.root, TID, "acceptance", dict(scoped, **full_review()))
+        self.assertEqual(self.run_pk(*argv), (0, f"{TID}: done\n", ""))
+        # the audit: a done record whose latest acceptance is the scoped one again does not validate ...
+        store.record(self.root, TID, "acceptance", scoped)
+        rc, _, err = self.run_pk("status", "validate")
+        self.assertEqual(rc, 1)
+        self.assertIn("a full-tier task is accepted only on the full tier's review", err)
+        # ... while a record written before tiers existed (no tier field) is not judged by a quota of a later day
+        path = self.root / "program" / "status" / f"{TID}.json"
+        old = read_json(path)
+        for key in ("tier", "fast", "ruling"):
+            del old[key]
+        for entry in old["history"]:
+            entry.pop("tier", None)
+        write_json(path, old)
+        self.assertEqual(self.run_pk("status", "validate"), (0, "status: ok\n", ""))
+
     def test_done_with_a_rejecting_acceptance_is_one_error_line(self):
         for argv in (("in_progress", "--role", "controller"), ("review", "--role", "implementer")):
             self.assertEqual(self.run_pk("status", "set", TID, *argv)[0], 0)
@@ -644,7 +690,8 @@ class StatusCliTests(unittest.TestCase):
         self.assertEqual(err, f"error: {TID}: latest acceptance {rejected}: decision is 'rejected', not "
                               "'accepted_development'\n")
         self.assertEqual(self.run_pk("status", "validate"), (0, "status: ok\n", ""))
-        store.record(self.root, TID, "acceptance", dict(acceptance, decision="accepted_development", findings=[]))
+        store.record(self.root, TID, "acceptance", dict(acceptance, decision="accepted_development", findings=[],
+                                                          **full_review()))
         self.assertEqual(self.run_pk(*argv), (0, f"{TID}: done\n", ""))
         self.assertEqual(self.run_pk("status", "validate"), (0, "status: ok\n", ""))
 

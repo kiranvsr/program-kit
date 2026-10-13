@@ -266,6 +266,11 @@ class EndToEndTests(unittest.TestCase):
         diff = Path(review[1].removeprefix("diff: ")).read_text(encoding="utf-8")
         self.assertIn("src/tiny_service.py", diff)
         self.assertNotIn("program/evidence", diff)
+        # what the diff leaves out is said, and the stat file still shows every path the branch changed
+        self.assertIn("left out of the diff: program/evidence, program/status, program/tasks", review)
+        stat = Path(review[-1].removeprefix("stat of every path: ")).read_text(encoding="utf-8")
+        self.assertIn(f"commit under review: {project.git('rev-parse', BRANCH)}", stat)
+        self.assertIn(f"program/evidence/{TASK}/report.md", stat)
         self.assertEqual(project.git("status", "--porcelain"), "")  # nothing tracked was touched on main
 
         # QA: binding, drift, its own commands and planted bugs, then the acceptance.
@@ -338,7 +343,13 @@ class EndToEndTests(unittest.TestCase):
                          f"chore(program): {TASK} merged (full tier); hand-off and claims")
         self.assertIn('"tier": "full"', project.pk("status", "show", TASK).stdout)
         # finish: the task and review worktrees and the merged branch go, and nothing is forced
-        finished = project.pk("worktree", "finish", TASK).stdout
+        # (it first names the git-ignored files the worktrees hold, and drops them only when told)
+        (wt / "local.pyc").write_bytes(b"git-ignored, like the bytecode the test runs may have left\n")
+        refused = project.pk("worktree", "finish", TASK, expect=1)
+        self.assertIn("holds git-ignored files that would go with it", refused.stderr)
+        self.assertIn("local.pyc", refused.stderr)
+        self.assertTrue(wt.is_dir() and review_wt.is_dir())
+        finished = project.pk("worktree", "finish", TASK, "--drop-ignored").stdout
         self.assertIn(f"removed: branch {BRANCH}", finished)
         self.assertFalse(wt.exists() or review_wt.exists())
         self.assertEqual(json.loads(project.pk("stale").stdout)["drifted"], 0)

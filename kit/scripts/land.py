@@ -2,10 +2,18 @@
 """Landing work on main: `pk merge` and the integration round, `pk integrate` (standard library only).
 
 `pk merge <ID>` is the whole per-merge chain in one command, for exactly one task: it refuses a branch QA has
-not set `done` (a light-tier task instead needs the controller's `--inspected <tip>`), runs the merge check
-and requires it to pass, merges with `git merge --no-ff`, records a light-tier task `merged`, rewrites the
-claim documents of the gates that name the task, regenerates the hand-off block and commits exactly the
-bookkeeping files it wrote. Merges stay one at a time: the command takes one ID and merges one branch.
+not accepted (a light-tier task instead needs the controller's `--inspected <tip>`), runs the merge check
+and requires it to pass, merges with `git merge --no-ff`, records a light-tier task `merged` with the commit
+that was inspected, rewrites the claim documents of the gates that name the task, regenerates the hand-off
+block and commits exactly the bookkeeping files it wrote. Merges stay one at a time: the command takes one ID
+and merges one branch.
+
+"Accepted" is derived, never read from a word in a file: the branch tip's status record must say `done`, and
+the evidence committed at the tip must hold what `pk status set <ID> done` requires (the latest acceptance
+binds the latest results record, which passes the hand-back checks). The acceptance binds the commit that was
+reviewed: after the `head` that record names, the branch may add only the task's own evidence and status
+files and clean merges of main. A later commit that changes anything else, or a merge commit whose tree is
+not what git makes of its two parents, is refused: it was not reviewed.
 
 An integration round verifies several accepted branches together, once. `pk integrate start NAME ID...`
 merges the members' tips onto a branch `round/NAME` (worktree `.worktrees/round-NAME`); `pk integrate check
@@ -22,13 +30,17 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shutil
+import subprocess
 import tempfile
 from pathlib import Path
 
 import ctlstate
 import gate
 import handoff as handoff_module
+import rulings as rulings_module
 import status as status_module
+import store
 import tracker
 from common import KitError, PRIMARY_BRANCH, find_root, git, read_json, read_yaml, run_argv, utc_now, write_json
 
@@ -69,15 +81,87 @@ def _tip_status(root: Path, task_id: str, sha: str) -> str:
     return record.get("status", "not_started") if isinstance(record, dict) else "not_started"
 
 
+def _own_path(path: str, task_id: str) -> bool:
+    """Whether `path` is one of the task's own evidence or status files: all a branch may add after its review."""
+    return path == f"program/status/{task_id}.json" or path.startswith(f"program/evidence/{task_id}/")
+
+
+def _names(root: Path, *args: str) -> list[str]:
+    return gate._git_fields(root, *args, "--name-only", "--no-renames", "-z")
+
+
+def _late_work(root: Path, task_id: str, head: str, sha: str) -> str | None:
+    """Why the commits after the reviewed commit `head` stop the tip `sha` from landing, or None.
+
+    Every commit of `head..sha` that is not on main is looked at. A commit with one parent may change only the
+    task's own evidence and status files. A merge commit must be what git makes of its two parents (outside
+    those same files): a merge that carries an edit of its own, or a conflict resolved by hand, is work nobody
+    reviewed.
+    """
+    again = (f"re-run the hand-back gate so a new results record names the tip, and have QA review and accept "
+             f"that record (pk worktree review {task_id})")
+    for line in git(root, "rev-list", "--parents", f"{head}..{sha}", "--not", MAIN).splitlines():
+        commit, *parents = line.split()
+        if len(parents) == 1:
+            late = [path for path in _names(root, "diff-tree", "-r", "--no-commit-id", commit)
+                    if not _own_path(path, task_id)]
+            what = "was committed after"
+        elif len(parents) == 2:
+            try:  # exit 1 is a conflict: the tree it still writes holds the conflict markers, so it differs
+                made = subprocess.run(["git", "-C", str(root), "merge-tree", "--write-tree", *parents],
+                                      capture_output=True, text=True)
+            except OSError as exc:
+                raise KitError(f"cannot run git merge-tree: {exc}") from exc
+            tree = made.stdout.split()[0] if made.returncode in (0, 1) and made.stdout.split() else None
+            if tree is None:
+                return (f"{task_id}: cannot re-derive the merge commit {commit[:12]} made after the reviewed commit "
+                        f"{head[:12]} (git merge-tree --write-tree needs git 2.38 or later); {again}")
+            late = [path for path in _names(root, "diff", tree, commit) if not _own_path(path, task_id)]
+            what = "is a merge that is not what git makes of its two parents; it was made after"
+        else:
+            late, what = ["(a merge of more than two parents)"], "was made after"
+        if late:
+            return (f"{task_id}: {commit[:12]} {what} the reviewed commit {head[:12]} and changes "
+                    f"{', '.join(late)}: after the commit QA accepted, a branch adds only its own evidence and "
+                    f"status files; {again}")
+    return None
+
+
 def _accepted_problem(root: Path, task_id: str, sha: str, tier: str) -> str | None:
-    """Why the branch tip is not ready to land, or None: QA set it done, or it is light-tier and still in progress."""
+    """Why the branch tip is not ready to land, or None.
+
+    A light-tier task lands from `in_progress`. Any other task must be accepted, and that is derived here from
+    the evidence committed at the tip (in a temporary detached worktree, removed again), exactly as
+    `pk status set <ID> done` derives it: a status file that says `done` is not an acceptance. Then nothing
+    but the task's own evidence and status files may have changed since the commit that was reviewed.
+    """
     held = _tip_status(root, task_id, sha)
     if tier == "light":
         return None if held == "in_progress" else f"{task_id}: a light-tier task lands from in_progress, not {held}"
     if held != "done":
         return (f"{task_id}: its branch says {held}; only a task QA has set done is merged (pk status set "
                 f"{task_id} done --role qa, after pk evidence accept)")
-    return None
+    trial = Path(tempfile.mkdtemp(prefix="pk-trial-"))
+    try:
+        git(root, "worktree", "add", "--detach", str(trial), sha)
+    except KitError:
+        shutil.rmtree(trial, ignore_errors=True)  # git never registered it: this is the empty mkdtemp directory
+        raise
+    head = None
+    try:
+        problem = status_module._acceptance_problem(trial, task_id)
+        if problem is None:
+            head = store.load_latest(trial, task_id, "results")[1]["head"]
+    except KitError as exc:
+        problem = f"{task_id}: {exc}"
+    finally:
+        leftover = gate._remove_trial(root, trial)
+    if leftover:
+        raise KitError(leftover)
+    if problem:
+        return (f"{' '.join(problem.replace(str(trial) + '/', '').split())}: its branch says done, but the evidence "
+                "committed at its tip does not accept it, and only an accepted task is merged")
+    return _late_work(root, task_id, head, sha)
 
 
 def _gates_naming(root: Path, task_id: str) -> list[str]:
@@ -240,7 +324,38 @@ def _round_member(root: Path, name: str, task_id: str, sha: str) -> dict:
     if strangers:
         raise KitError(f"{MAIN} moved outside round {name} ({strangers[0][:12]}): merge the rest on their own, or "
                        "start a new round")
+    problem = _round_forged(root, name, data)
+    if problem:
+        raise KitError(f"round {name}: {problem}; the record is not what pk integrate start and check wrote: "
+                       "start a new round")
     return data
+
+
+def _round_forged(root: Path, name: str, data: dict) -> str | None:
+    """Why the round record is not a description of the branch `round/<name>`, or None.
+
+    Re-derived from git, so a record written by hand covers nothing: the branch is at the record's `head`, the
+    tested `tree` is that commit's tree, and from `base` the head is one merge per member, in order, each of
+    exactly the member's recorded commit.
+    """
+    try:
+        head = git(root, "rev-parse", "--verify", "--quiet", f"refs/heads/round/{name}^{{commit}}")
+    except KitError:
+        return f"branch round/{name} not found"
+    if head != data.get("head"):
+        return f"branch round/{name} is at {head}, the record says {data.get('head')}"
+    if git(root, "rev-parse", f"{head}^{{tree}}") != data["tree"]:
+        return f"the tested tree {data['tree']} is not the tree of round/{name}"
+    chain = [line.split() for line in git(root, "rev-list", "--first-parent", "--reverse", "--parents",
+                                          f"{data['base']}..{head}").splitlines()]
+    wanted, parent = [member["sha"] for member in data["members"]], data["base"]
+    if len(chain) != len(wanted):
+        return f"round/{name} is {len(chain)} commit(s) from its base, the record lists {len(wanted)} member(s)"
+    for (commit, *parents), sha in zip(chain, wanted):
+        if parents != [parent, sha]:
+            return f"{commit[:12]} of round/{name} is not the merge of the member at {sha[:12]}"
+        parent = commit
+    return None
 
 
 def round_close(root: Path, name: str, recheck: bool = False, commit: bool = True, trailers=()) -> list[str]:
@@ -250,6 +365,9 @@ def round_close(root: Path, name: str, recheck: bool = False, commit: bool = Tru
     data = _round(root, name)
     if not data.get("tree"):
         raise KitError(f"round {name} has not passed its combined check")
+    forged = _round_forged(root, name, data)
+    if forged:
+        raise KitError(f"round {name}: {forged}; the record is not what pk integrate start and check wrote")
     waiting = [m["id"] for m in data["members"] if run_argv(
         ["git", "-C", str(root), "merge-base", "--is-ancestor", m["sha"], MAIN], root)[0] != 0]
     if waiting:
@@ -297,7 +415,7 @@ def merge(root: Path, task_id: str, inspected: str | None = None, round_name: st
     sha = gate._branch_head(root, branch)
     meta = gate.task_meta(root, task_id)
     tier = meta["tier"] + ("+fast" if meta["fast"] else "")
-    problem = _accepted_problem(root, task_id, sha, meta["tier"])
+    problem = rulings_module.rewritten(root) or _accepted_problem(root, task_id, sha, meta["tier"])
     if problem:
         raise KitError(problem)
     data = None
@@ -319,7 +437,8 @@ def merge(root: Path, task_id: str, inspected: str | None = None, round_name: st
     problems = []
     if meta["tier"] == "light":
         try:
-            status_module.transition(root, task_id, "merged", "controller", note=f"inspected at {sha}")
+            status_module.transition(root, task_id, "merged", "controller", note=f"inspected at {sha}",
+                                     inspected=sha)
             wrote.append(f"program/status/{task_id}.json")
             lines.append(f"{task_id}: merged (light tier: no QA, nothing evidenced)")
         except KitError as exc:
@@ -335,6 +454,9 @@ def merge(root: Path, task_id: str, inspected: str | None = None, round_name: st
         data["merged"].append(task_id)
         write_json(_round_path(root, round_name), data)
         wrote.append(f"program/rounds/{round_name}.json")
+        left = [member["id"] for member in data["members"] if member["id"] not in data["merged"]]
+        lines.append(f"round {round_name}: {len(left)} member(s) still to merge ({', '.join(left)})" if left else
+                     f"round {round_name}: every member is merged; close it now: pk integrate close {round_name}")
     try:
         lines.append("hand-off: updated" if handoff_module.update(root) else "hand-off: unchanged")
         problems += handoff_module.budget_problems(root)

@@ -1,25 +1,38 @@
 """Landing work: the review worktree, the safe finish, `pk merge` and the integration round.
 
-Each test of a shortcut tries the thing the shortcut must not allow: merging a branch nobody accepted, a light
-merge nobody inspected, a round with a full-tier member, a member that moved after the combined check, a main
-that moved outside the round, a tested tree that no longer matches main, a finish that would lose work.
+Each test of a shortcut tries the thing the shortcut must not allow: merging a branch nobody accepted, the
+word `done` typed into a status file, a commit made after the reviewed commit, a merge commit that carries a
+change of its own, a light merge nobody inspected, a round with a full-tier member, a member that moved after
+the combined check, a round record written by hand, a main that moved outside the round, a tested tree that
+no longer matches main, a finish that would lose work or reach another project's containers.
+
+An accepted branch here is accepted for real: `produce.py` writes a results record with the kit's evidence
+writer, the implementer's evidence commit follows, and QA's acceptance is appended with `pk evidence accept`
+and `pk status set done`. Nothing in these tests writes `done` into a status file, except the tests of that
+forgery.
 """
 import _paths  # noqa: F401  (must come first: puts kit/scripts on sys.path)
 import contextlib
 import io
 import os
 import shutil
+import subprocess
 from pathlib import Path
 from unittest import mock
 
+import evidence
+import gate
+import handoff
 import land
 import pk
+import rulings
 import status
+import store
 import worktree
 from common import KitError, read_json, write_json, write_yaml
-from test_gate import BRANCH, PLAN, REVIEW, TASK, commit, put, sh
-from test_status import write_register
-from test_tiers import BRIEF, FULL_PATHS, TierGateBase, status_record
+from test_gate import BRANCH, CALC, PLAN, PRODUCE, PY, REVIEW, TASK, commit, put, run_quiet, sh
+from test_status import full_review, write_register
+from test_tiers import FULL_PATHS, LIGHT_BRIEF, TierGateBase, status_record
 
 KIT = Path(__file__).resolve().parent.parent
 T2 = "P0-M01-S01-T02"
@@ -31,6 +44,7 @@ class LandBase(TierGateBase):
         super().setUp()
         shutil.copy(KIT / "templates" / "HANDOFF.md", self.root / "program" / "HANDOFF.md")
         shutil.copy(KIT / "templates" / "controller-state.json", self.root / "program" / "controller-state.json")
+        write_register(self.root, (TASK, T2))
         commit(self.root, "hand-off")
         sh(self.wt, "git", "merge", "-q", "main")
 
@@ -41,12 +55,37 @@ class LandBase(TierGateBase):
         if done:
             self.accept(self.wt, TASK)
 
-    def accept(self, wt, task_id, tier="standard"):
-        write_json(wt / "program" / "status" / f"{task_id}.json",
-                   status_record(task_id, "done", tier=tier, role="qa", note=f"accepted at {self.head(wt)}"))
+    def evidenced(self, wt, task_id):
+        """The implementer's part: a results record at the tip, `review`, and the evidence commit; the record's head."""
+        reviewed = self.head(wt)
+        sh(wt, PY, f"program/evidence/{task_id}/produce.py")
+        if status.read(wt, task_id)["status"] == "in_progress":
+            status.transition(wt, task_id, "review", "implementer")
+        commit(wt, "evidence")
+        return reviewed
+
+    def qa_accepts(self, wt, task_id, **review):
+        """QA's part, in the task worktree: `pk evidence accept`, `done`, one commit; that commit."""
+        entry, record = store.load_latest(wt, task_id, "results")
+        evidence.accept(wt, task_id, {
+            "task_id": task_id, "decision": "accepted_development", "evidence_sha256": entry["digest"],
+            "source_commit": record["head"], "accepted_at": "2026-10-13T00:00:00Z", "role": "qa",
+            "commands": [], "planted_bugs": [], "findings": [], "blocked_by": [], **review})
+        if status.read(wt, task_id)["status"] != "done":
+            status.transition(wt, task_id, "done", "qa")
         return commit(wt, "accepted")
 
-    def second_task(self):
+    def accept(self, wt, task_id):
+        self.evidenced(wt, task_id)
+        return self.qa_accepts(wt, task_id)
+
+    def typed_done(self, wt, task_id, tier="standard"):
+        """The forgery: the word `done` written into the branch's status file by hand, with no evidence behind it."""
+        write_json(wt / "program" / "status" / f"{task_id}.json",
+                   status_record(task_id, "done", tier=tier, role="qa", note=f"accepted at {self.head(wt)}"))
+        return commit(wt, "done, typed")
+
+    def second_task(self, files=None):
         """A second standard-tier task on main with its own accepted branch; its worktree."""
         for name, text in (("SPEC.md", STANDARD_SPEC), ("PLAN.md", PLAN), ("review.md", REVIEW)):
             put(self.root, f"program/tasks/{T2}/{name}", text)
@@ -55,6 +94,9 @@ class LandBase(TierGateBase):
         wt = self.root / ".worktrees" / T2.lower()
         sh(self.root, "git", "worktree", "add", "-q", "-b", f"task/{T2}", str(wt))
         put(wt, "second.py", "VALUE = 2\n")
+        put(wt, f"program/evidence/{T2}/produce.py", PRODUCE.replace(TASK, T2))
+        for name, text in (files or {}).items():
+            put(wt, name, text)
         commit(wt, "T2 work")
         self.accept(wt, T2)
         sh(self.wt, "git", "merge", "-q", "main")
@@ -74,9 +116,15 @@ class LandBase(TierGateBase):
     def scans(self):
         return len(self.fake_log.read_text().splitlines()) if self.fake_log.exists() else 0
 
+    def untouched(self, before):
+        """A refusal merged nothing, wrote nothing and left no temporary worktree behind."""
+        self.assertEqual(self.head(), before)
+        self.assertEqual(sh(self.root, "git", "status", "--porcelain").strip(), "")
+        self.assert_no_trial_left()
+
 
 class ReviewWorktreeTests(LandBase):
-    def test_the_reviewer_gets_a_detached_worktree_and_a_diff_file_while_the_implementer_goes_on(self):
+    def test_the_reviewer_gets_a_detached_worktree_a_diff_file_and_what_the_diff_leaves_out(self):
         put(self.wt, f"program/status/{TASK}.json", "{}\n")
         put(self.wt, "generated.lock", "noise\n")
         reviewed = commit(self.wt, "ready for review")
@@ -91,24 +139,57 @@ class ReviewWorktreeTests(LandBase):
         self.assertIn("def mul(a, b)", diff)
         self.assertNotIn("program/status", diff)  # status and evidence files are left out
         self.assertNotIn("generated.lock", diff)
-        put(self.wt, "more.py", "X = 1\n")  # the implementer keeps committing in its own worktree
-        commit(self.wt, "next work")
-        self.assertEqual(self.head(path), reviewed)
+        # what was left out is said, and the stat of the whole range still shows every path that changed
+        self.assertIn("left out of the diff: program/evidence, program/status, generated.lock", out.splitlines())
+        stat = (self.root / ".worktrees" / f"{TASK.lower()}-review.stat").read_text()
+        self.assertIn(f"commit under review: {reviewed}", stat)
+        self.assertIn("program/evidence, program/status, generated.lock", stat)
+        for name in ("generated.lock", f"program/status/{TASK}.json", "calc.py"):
+            self.assertRegex(stat, rf"(?m)^ {name} +\| ")
         self.assertEqual(sh(self.root, "git", "status", "--porcelain").strip(), "")  # nothing tracked was touched
 
-    def test_a_review_worktree_is_refused_twice_and_for_a_commit_off_the_branch(self):
-        self.assertEqual(self.pk("worktree", "review", TASK)[0], 0)
+    def test_a_second_review_moves_the_clean_worktree_to_the_new_commit(self):
+        """The re-review after a fix round (M1, second form): one command puts the reviewer on the new commit."""
+        first = worktree.review(self.root, TASK)["commit"]
+        path = self.root / ".worktrees" / f"{TASK.lower()}-review"
+        put(self.wt, "fix.py", "FIXED = True\n")
+        second = commit(self.wt, "fix round")
+        self.assertEqual(self.head(path), first)
+        code, out, err = self.pk("worktree", "review", TASK)
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(out.splitlines()[0], f"{path} (moved to the new commit)")
+        self.assertIn(f"commit: {second}", out.splitlines())
+        self.assertEqual(self.head(path), second)
+        with self.assertRaises(Exception):  # still detached
+            sh(path, "git", "symbolic-ref", "HEAD")
+        self.assertIn("FIXED = True", (self.root / ".worktrees" / f"{TASK.lower()}-review.diff").read_text())
+        self.assertIn(second, (self.root / ".worktrees" / f"{TASK.lower()}-review.stat").read_text())
+
+    def test_a_review_worktree_that_holds_a_file_or_a_commit_of_its_own_is_never_moved(self):
+        worktree.review(self.root, TASK)
+        path = self.root / ".worktrees" / f"{TASK.lower()}-review"
+        before = self.head(path)
+        put(self.wt, "fix.py", "FIXED = True\n")
+        commit(self.wt, "fix round")
+        (path / "planted.txt").write_text("a planted bug nobody restored\n")
         code, _, err = self.pk("worktree", "review", TASK)
         self.assertEqual(code, 1)
-        self.assertIn("already exists", err)
+        self.assertIn("holds uncommitted or untracked files: planted.txt", err)
+        self.assertEqual(self.head(path), before)
+        own = commit(path, "the reviewer's own commit, on no branch")
+        code, _, err = self.pk("worktree", "review", TASK)
+        self.assertEqual(code, 1)
+        self.assertIn(f"stands on {own[:12]}, a commit no branch holds", err)
+        self.assertEqual(self.head(path), own)
+
+    def test_a_review_worktree_is_refused_for_an_unknown_branch_and_for_a_commit_off_the_branch(self):
         with self.assertRaisesRegex(KitError, "branch task/P9-M01-S01-T01 not found"):
             worktree.review(self.root, "P9-M01-S01-T01")
         put(self.root, "main-only.txt", "x\n")
         other = commit(self.root, "main moved")
-        shutil.rmtree(self.root / ".worktrees" / f"{TASK.lower()}-review")
-        sh(self.root, "git", "worktree", "prune")
         with self.assertRaisesRegex(KitError, "is not a commit of task/"):
             worktree.review(self.root, TASK, commit=other)
+        self.assertFalse((self.root / ".worktrees" / f"{TASK.lower()}-review").exists())
 
     def test_an_ad_hoc_task_gets_a_worktree_like_any_other(self):
         path = worktree.new(self.root, "AH-0001")
@@ -156,7 +237,9 @@ class FinishTests(LandBase):
         self.assertIn(f"removed: symlink {self.wt / 'node_modules'}", lines)
         self.assertIn(f"removed: worktree {self.wt}", lines)
         self.assertIn(f"removed: branch {BRANCH}", lines)
-        self.assertTrue(any(line.startswith("removed: review diff") for line in lines))
+        for kind in ("diff", "stat"):
+            self.assertTrue(any(line.startswith(f"removed: review {kind}") for line in lines), kind)
+            self.assertFalse((self.root / ".worktrees" / f"{TASK.lower()}-review.{kind}").exists())
         self.assertFalse(self.wt.exists())
         self.assertNotIn(BRANCH, sh(self.root, "git", "branch"))
         self.assertTrue((self.root / "calc.py").is_file())  # the link went, not what it pointed at
@@ -168,24 +251,89 @@ class FinishTests(LandBase):
         self.assertEqual(code, 1)
         self.assertTrue((self.wt / "node_modules").is_file())
 
-    def test_finish_removes_only_the_containers_of_the_exact_compose_project_and_never_forces(self):
+    # What the stand-in container tool holds: four compose projects whose names begin alike, and a container of
+    # project `proj` that carries a name of its own. Asked with the label filter it answers as the real tool
+    # does, with the exact project only; asked without it, it lists everything, so a selection by name would
+    # be seen removing the siblings.
+    TOOL = ('echo "$@" >> "$PK_FAKE_LOG"\n'
+            'case "$*" in\n'
+            '  "ps -a --filter label=com.docker.compose.project=proj --format {{.Names}}")'
+            ' printf "proj-web-1\\nweb\\n";;\n'
+            '  "volume ls --filter label=com.docker.compose.project=proj --format {{.Name}}")'
+            ' printf "proj_data\\n";;\n'
+            '  "ps -a"*) printf "proj-web-1\\nweb\\nproj-dev-db-1\\nproj_e2e_db_1\\nproj2-web-1\\nother\\n";;\n'
+            '  "volume ls"*) printf "proj_data\\nproj-dev_pgdata\\nproj_e2e_pgdata\\nproj2_data\\nshared\\n";;\n'
+            '  "image ls"*) printf "proj-web:latest\\nproj-dev-api:latest\\npostgres:16\\n";;\n'
+            '  "rm web") [ -z "$PK_RM_WEB" ] || { echo "Error: container web is running" >&2; exit 1; };;\n'
+            'esac')
+
+    def test_finish_removes_only_what_carries_the_exact_compose_project_label_and_never_forces(self):
+        """The reviewer's sequence (M4): `proj` beside `proj-dev`, `proj_e2e` and `proj2`."""
         self.merged()
-        self.wrapper("docker", 'echo "$@" >> "$PK_FAKE_LOG"\n'
-                               'case "$1 $2" in\n'
-                               '  "ps -a") printf "t01-web-1\\nt01_db_1\\nt011-web-1\\nother\\n";;\n'
-                               '  "volume ls") printf "t01_data\\nshared\\n";;\n'
-                               '  "image ls") printf "t01-web:latest\\npostgres:16\\n";;\n'
-                               'esac')
-        code, out, err = self.pk("worktree", "finish", TASK, "--compose-project", "t01")
+        self.wrapper("docker", self.TOOL)
+        code, out, err = self.pk("worktree", "finish", TASK, "--compose-project", "proj")
         self.assertEqual((code, err), (0, ""))
         removed = [line for line in out.splitlines() if line.split()[1] in ("container", "volume", "image")]
-        self.assertEqual(removed, ["removed: container t01-web-1", "removed: container t01_db_1",
-                                   "removed: volume t01_data", "removed: image t01-web:latest"])
+        self.assertEqual(removed, ["removed: container proj-web-1", "removed: container web",
+                                   "removed: volume proj_data"])
         calls = self.fake_log.read_text().splitlines()
-        self.assertIn("rm t01-web-1", calls)
-        self.assertFalse([call for call in calls if "-f" in call.split() or "prune" in call or "t011" in call])
+        self.assertEqual(calls, ["ps -a --filter label=com.docker.compose.project=proj --format {{.Names}}",
+                                 "volume ls --filter label=com.docker.compose.project=proj --format {{.Name}}",
+                                 "rm proj-web-1", "rm web", "volume rm proj_data"])
+        for sibling in ("proj-dev", "proj_e2e", "proj2", "image", "prune"):
+            self.assertFalse([call for call in calls if sibling in call], sibling)
+        self.assertFalse([call for call in calls if "-f" in call.split() or "--force" in call.split()])
         with self.assertRaisesRegex(KitError, "not a usable compose project name"):
             worktree.finish(self.root, TASK, compose_project="t")
+
+    def test_finish_asks_the_container_tool_before_it_removes_anything(self):
+        self.merged()
+        self.wrapper("docker", 'echo "Cannot connect to the daemon" >&2\nexit 1')
+        code, out, err = self.pk("worktree", "finish", TASK, "--compose-project", "proj")
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("Cannot connect to the daemon", err)
+        self.assertTrue(self.wt.is_dir())  # nothing went: the listing failed before the first removal
+        self.assertIn(BRANCH, sh(self.root, "git", "branch"))
+
+    def test_a_container_in_use_stops_finish_and_what_went_and_what_stayed_is_said(self):
+        self.merged()
+        self.wrapper("docker", self.TOOL)
+        with mock.patch.dict(os.environ, {"PK_RM_WEB": "1"}):
+            code, out, err = self.pk("worktree", "finish", TASK, "--compose-project", "proj")
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("removed: container proj-web-1", err)
+        self.assertIn("container web is running", err)
+        self.assertIn("not removed: container web, volume proj_data", err)
+        self.assertNotIn("volume rm proj_data", self.fake_log.read_text())  # a volume is not taken from under it
+
+    def test_finish_refuses_to_lose_a_commit_no_branch_holds(self):
+        self.merged()
+        worktree.review(self.root, TASK)
+        review = self.root / ".worktrees" / f"{TASK.lower()}-review"
+        put(review, "finding.py", "X = 1\n")
+        own = commit(review, "a commit made in the review worktree")
+        code, _, err = self.pk("worktree", "finish", TASK)
+        self.assertEqual(code, 1)
+        self.assertIn(f"stands on {own[:12]}, a commit no branch holds", err)
+        self.assertTrue(review.is_dir())
+        self.assertTrue(self.wt.is_dir())
+        self.assertIn(BRANCH, sh(self.root, "git", "branch"))
+        sh(self.root, "git", "branch", "kept", own)  # the way out the message names
+        self.assertEqual(self.pk("worktree", "finish", TASK)[0], 0)
+        self.assertIn(own, sh(self.root, "git", "rev-parse", "kept"))
+
+    def test_finish_names_the_ignored_files_and_drops_them_only_when_told(self):
+        self.merged()
+        (self.wt / "__pycache__").mkdir()
+        (self.wt / "__pycache__" / "local.pyc").write_text("a git-ignored file\n")
+        code, _, err = self.pk("worktree", "finish", TASK)
+        self.assertEqual(code, 1)
+        self.assertIn("holds git-ignored files that would go with it: __pycache__/", err)
+        self.assertTrue((self.wt / "__pycache__" / "local.pyc").is_file())
+        code, out, err = self.pk("worktree", "finish", TASK, "--drop-ignored")
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn(f"dropped: ignored {self.wt / '__pycache__/'}", out.splitlines())
+        self.assertFalse(self.wt.exists())
 
     def test_finish_runs_from_the_main_checkout_only(self):
         self.merged()
@@ -201,7 +349,116 @@ class MergeTests(LandBase):
         code, out, err = self.pk("merge", TASK)
         self.assertEqual(code, 1)
         self.assertIn("only a task QA has set done is merged", err)
-        self.assertEqual(self.head(), before)
+        self.untouched(before)
+
+    def typed_done_is_refused(self, tier):
+        self.typed_done(self.wt, TASK, tier=tier)
+        before = self.head()
+        code, out, err = self.pk("merge", TASK)
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn(f"{TASK}: done needs an acceptance record in program/evidence/{TASK}/latest.json", err)
+        self.assertIn("its branch says done, but the evidence committed at its tip does not accept it", err)
+        self.untouched(before)
+
+    def test_the_word_done_typed_into_the_status_file_is_not_an_acceptance(self):
+        """The reviewer's sequence (M2), full tier: `"status": "done", "role": "qa"` on the branch, no evidence."""
+        self.typed_done_is_refused("full")
+
+    def test_a_typed_done_is_refused_on_the_standard_tier_as_well(self):
+        self.standard(done=False)
+        self.typed_done_is_refused("standard")
+
+    def test_a_typed_done_over_a_results_record_nobody_accepted_is_refused_too(self):
+        self.standard(done=False)
+        self.evidenced(self.wt, TASK)  # a real record, the evidence commit, and no acceptance
+        self.typed_done(self.wt, TASK)
+        before = self.head()
+        code, _, err = self.pk("merge", TASK)
+        self.assertEqual(code, 1)
+        self.assertIn("done needs an acceptance record", err)
+        self.untouched(before)
+
+    def late_commit(self):
+        """The reviewer's sequence (M1) up to QA's acceptance; (the reviewed commit, the late commit)."""
+        self.standard(done=False)
+        rc, out = self.handback()  # the real gate: its OK line, and a results record whose head is the tip
+        self.assertEqual(rc, 0, out)
+        reviewed = self.head(self.wt)
+        status.transition(self.wt, TASK, "review", "implementer")
+        commit(self.wt, "evidence")
+        made = worktree.review(self.root, TASK)  # the review worktree and the diff file QA is handed
+        put(self.wt, "backdoor.py", "OPEN = True\n")  # the implementer goes on, after the diff was written
+        put(self.wt, "calc.py", (self.wt / "calc.py").read_text() + "\n\ndef div(a, b):\n    return a / b\n")
+        late = commit(self.wt, "more work, during the review")
+        self.assertNotIn("backdoor", made["diff"].read_text())
+        problems, said = run_quiet(gate.binding, self.root, TASK, BRANCH)  # qa.md step 2: it holds, and reports drift
+        self.assertEqual(problems, [])
+        self.assertIn("drifted since", said)
+        self.qa_accepts(self.wt, TASK)  # qa.md step 7, in the task worktree, at whatever the tip is by now
+        return reviewed, late
+
+    def test_a_commit_made_after_the_reviewed_commit_does_not_reach_main(self):
+        reviewed, late = self.late_commit()
+        before = self.head()
+        code, out, err = self.pk("merge", TASK)
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn(f"{TASK}: {late[:12]} was committed after the reviewed commit {reviewed[:12]} and changes "
+                      "backdoor.py, calc.py", err)
+        self.assertIn(f"pk worktree review {TASK}", err)
+        self.untouched(before)
+        self.assertFalse((self.root / "backdoor.py").exists())
+
+    def test_reverting_the_late_commit_does_not_make_it_reviewed(self):
+        _, late = self.late_commit()
+        sh(self.wt, "git", "revert", "--no-edit", late)
+        before = self.head()
+        code, _, err = self.pk("merge", TASK)
+        self.assertEqual(code, 1)
+        self.assertIn("after the reviewed commit", err)
+        self.untouched(before)
+
+    def test_late_work_lands_once_the_gate_ran_on_it_and_qa_accepted_that_record(self):
+        self.late_commit()
+        rc, out = self.handback()  # a new results record that names the tip
+        self.assertEqual(rc, 0, out)
+        commit(self.wt, "evidence of the fix round")
+        code, out, err = self.pk("worktree", "review", TASK)  # the reviewer moves to the commit it re-checks
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("backdoor.py", (self.root / ".worktrees" / f"{TASK.lower()}-review.diff").read_text())
+        self.qa_accepts(self.wt, TASK)
+        code, out, err = self.pk("merge", TASK)
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertTrue((self.root / "backdoor.py").is_file())  # reviewed now, so it lands
+        self.assertEqual(status.validate(self.root), [])
+
+    def test_a_merge_commit_that_carries_a_change_of_its_own_does_not_reach_main(self):
+        self.standard()
+        put(self.root, "main-only.txt", "x\n")
+        commit(self.root, "main moves")
+        sh(self.wt, "git", "merge", "-q", "--no-commit", "--no-ff", "main")
+        put(self.wt, "backdoor.py", "OPEN = True\n")
+        merge = commit(self.wt, "Merge main")  # reads like any merge of main; its tree is not what git made
+        before = self.head()
+        code, _, err = self.pk("merge", TASK)
+        self.assertEqual(code, 1)
+        self.assertIn(f"{merge[:12]} is a merge that is not what git makes of its two parents", err)
+        self.assertIn("changes backdoor.py", err)
+        self.untouched(before)
+
+    def test_a_conflict_resolved_by_hand_after_the_review_does_not_reach_main(self):
+        self.standard()
+        put(self.root, "calc.py", CALC + "\n\ndef neg(a):\n    return -a\n")  # where the branch added mul
+        commit(self.root, "main changes calc.py")
+        with self.assertRaises(subprocess.CalledProcessError):
+            sh(self.wt, "git", "merge", "-q", "main")
+        put(self.wt, "calc.py", CALC + "\n\ndef mul(a, b):\n    return a * b * 1\n")  # a resolution nobody reviewed
+        merge = commit(self.wt, "Merge main")
+        before = self.head()
+        code, _, err = self.pk("merge", TASK)
+        self.assertEqual(code, 1)
+        self.assertIn(f"{merge[:12]} is a merge that is not what git makes of its two parents", err)
+        self.assertIn("changes calc.py", err)
+        self.untouched(before)
 
     def test_one_command_checks_merges_and_commits_the_bookkeeping(self):
         self.standard()
@@ -209,7 +466,9 @@ class MergeTests(LandBase):
                    {"gates": {"G-P0": {"environment": "dev", "records": [{"task": TASK}]}}})
         write_yaml(self.root / "program" / "environments.yaml", {"environments": {"dev": {"exists": True}}})
         commit(self.root, "gates")
-        sh(self.wt, "git", "merge", "-q", "main")
+        sh(self.wt, "git", "merge", "-q", "main")  # a clean merge of main after the acceptance is not late work
+        put(self.wt, f"program/evidence/{TASK}/report.md", "# QA report\n")  # nor is the task's own evidence folder
+        commit(self.wt, "the report")
         tip = self.head(self.wt)
         code, out, err = self.pk("merge", TASK, "--trailer", "Co-Authored-By: Test Agent")
         self.assertEqual((code, err), (0, ""), out)
@@ -226,6 +485,8 @@ class MergeTests(LandBase):
         self.assertIn(f"program/claims/G-P0/{TASK}.json",
                       sh(self.root, "git", "show", "--name-only", "--format=", "HEAD"))
         self.assertEqual(status.read(self.root, TASK)["status"], "done")
+        self.assertEqual(status.validate(self.root), [])
+        self.assert_no_trial_left()
 
     def test_a_failed_merge_check_merges_nothing(self):
         self.standard(done=False)
@@ -249,6 +510,23 @@ class MergeTests(LandBase):
             land.merge(self.wt, TASK)
         self.assertEqual(self.pk("merge", TASK, T2)[0], 1)  # merges are one at a time: one ID
 
+    def test_merge_never_commits_a_ruling_somebody_rewrote(self):
+        self.standard()
+        rulings.add(self.root, "controller", "Which port?", "Port 8080.")
+        commit(self.root, "R1")
+        log = self.root / "program" / "rulings.md"
+        log.write_text(log.read_text().replace("Port 8080.", "Port 9090."))  # R1 rewritten in the working tree
+        before = self.head()
+        code, _, err = self.pk("merge", TASK)
+        self.assertEqual(code, 1)
+        self.assertIn("hard rule 23", err)
+        self.assertEqual(self.head(), before)
+        self.assertIn("Port 8080.", sh(self.root, "git", "show", "HEAD:program/rulings.md"))
+        sh(self.root, "git", "checkout", "--", "program/rulings.md")
+        rulings.add(self.root, "controller", "Which port, again?", "Port 9090; supersedes R1.")  # appended: fine
+        code, out, err = self.pk("merge", TASK)
+        self.assertEqual((code, err), (0, ""), out)
+
 
 class LightMergeTests(LandBase):
     LIGHT = {"full_paths": ["auth/"], "light_paths": ["web/"], "light_ruling": "R1"}
@@ -259,30 +537,53 @@ class LightMergeTests(LandBase):
         sh(self.root, "git", "branch", "-D", BRANCH)
         sh(self.root, "git", "worktree", "add", "-q", "-b", BRANCH, str(self.wt))
         self.work("web/page.txt")
-        write_register(self.root, (TASK,))
         self.on_main(status_record(TASK, tier="light", fast=True, ruling="R1"), self.LIGHT, rulings_count=1,
-                     files={f"program/tasks/{TASK}/BRIEF.md": BRIEF})
+                     files={f"program/tasks/{TASK}/BRIEF.md": LIGHT_BRIEF})
         self.tip = self.head(self.wt)
 
     def test_a_light_task_lands_only_after_the_controller_inspected_its_tip_and_is_recorded_merged(self):
         before = self.head()
-        code, _, err = self.pk("merge", TASK)
-        self.assertEqual(code, 1)
-        self.assertIn("FAILED: inspection", err)
-        self.assertEqual(self.head(), before)
+        for argv in ((), ("--inspected", "0" * 40), ("--inspected", self.head(self.wt) + "x")):
+            code, _, err = self.pk("merge", TASK, *argv)
+            self.assertEqual(code, 1, argv)
+            self.assertIn("FAILED: inspection", err)
+            self.assertEqual(self.head(), before)
         code, out, err = self.pk("merge", TASK, "--inspected", self.tip)
         self.assertEqual((code, err), (0, ""), out)
         self.assertIn(f"{TASK}: merged (light tier: no QA, nothing evidenced)", out.splitlines())
         record = read_json(self.root / "program" / "status" / f"{TASK}.json")
         self.assertEqual((record["status"], record["tier"], record["role"]), ("merged", "light", "controller"))
+        self.assertEqual(record["inspected"], self.tip)  # the commit that was read is in the record
         self.assertEqual(sh(self.root, "git", "status", "--porcelain").strip(), "")
         self.assertEqual(status.validate(self.root), [])
+        self.assertEqual(self.pk("worktree", "finish", TASK)[0], 0)
+        self.assertEqual(status.validate(self.root), [])  # the audit of merged outlives the branch
 
     def test_a_light_task_somebody_called_done_does_not_land(self):
-        self.accept(self.wt, TASK, tier="light")
+        self.typed_done(self.wt, TASK, tier="light")
         code, _, err = self.pk("merge", TASK, "--inspected", self.head(self.wt))
         self.assertEqual(code, 1)
         self.assertIn("lands from in_progress, not done", err)
+
+    def test_a_light_branch_merged_by_hand_round_the_merge_check_is_not_recorded_merged(self):
+        """The reviewer's sequence (M3), through the commands: merge-check fails, git merge by hand, status set."""
+        self.work("auth/policy.py")  # a tiers.full_paths path
+        tip = self.head(self.wt)
+        rc, out = self.merge_check(inspected=tip)
+        self.assertEqual(rc, 1)
+        self.assertIn(f"FAILED: tier {TASK} is light but changes full-tier paths: auth/policy.py", out)
+        sh(self.root, "git", "merge", "-q", "--no-ff", "-m", "by hand", BRANCH)
+        with mock.patch.object(status, "find_root", return_value=self.root):
+            code, _, err = self.pk("status", "set", TASK, "merged", "--role", "controller")
+            self.assertEqual(code, 1)
+            self.assertIn("merged needs the commit the controller inspected", err)
+            code, _, err = self.pk("status", "set", TASK, "merged", "--role", "controller", "--inspected", tip)
+            self.assertEqual(code, 1)
+            self.assertIn("changed full-tier paths: auth/policy.py", err)
+        self.assertEqual(status.read(self.root, TASK)["status"], "in_progress")
+        write_json(self.root / "program" / "status" / f"{TASK}.json",
+                   status_record(TASK, "merged", tier="light", fast=True, ruling="R1", inspected=tip))
+        self.assertIn("changed full-tier paths: auth/policy.py", " ".join(status.validate(self.root)))
 
 
 class RoundTests(LandBase):
@@ -303,11 +604,15 @@ class RoundTests(LandBase):
         self.assertEqual(out.splitlines()[-1], f"OK: round/r1 passes the combined check at {round_head}")
         self.assertEqual(out.count("step test: ok"), 1)
         scans = self.scans()
-        for task_id in (TASK, T2):  # one at a time
+        self.assertIn("round r1 (open): checked, 0 of 2 members merged", handoff.render(self.root))
+        for task_id, said in ((TASK, f"round r1: 1 member(s) still to merge ({T2})"),  # one at a time
+                              (T2, "round r1: every member is merged; close it now: pk integrate close r1")):
             code, out, err = self.pk("merge", task_id, "--round", "r1")
             self.assertEqual((code, err), (0, ""), out)
             self.assertNotIn("OK: ", out)  # no merge check ran, and none is claimed
+            self.assertIn(said, out.splitlines())
         self.assertEqual(self.scans(), scans)  # the suite did not run again
+        self.assertIn("round r1 (open): checked, 2 of 2 members merged", handoff.render(self.root))  # until closed
         code, out, err = self.pk("integrate", "close", "r1")
         self.assertEqual((code, err), (0, ""), out)
         tree = read_json(self.root / "program" / "rounds" / "r1.json")["tree"]
@@ -315,6 +620,7 @@ class RoundTests(LandBase):
         self.assertFalse((self.root / ".worktrees" / "round-r1").exists())
         self.assertEqual(sh(self.root, "git", "status", "--porcelain").strip(), "")
         self.assertTrue((self.root / "second.py").is_file())
+        self.assertNotIn("round r1", handoff.render(self.root).split("#### Tasks by status")[0])
 
     def test_a_full_tier_task_is_never_a_member(self):
         sh(self.root, "git", "rm", "-q", f"program/status/{T2}.json")
@@ -332,28 +638,58 @@ class RoundTests(LandBase):
         self.assertEqual(code, 1)
         self.assertIn("only a task QA has set done", err)
 
+    def test_a_member_with_work_after_its_review_does_not_join_a_round(self):
+        put(self.wt2, "second.py", "VALUE = 3\n")
+        late = commit(self.wt2, "a late change")
+        code, _, err = self.pk("integrate", "start", "r1", TASK, T2)
+        self.assertEqual(code, 1)
+        self.assertIn(f"{late[:12]} was committed after the reviewed commit", err)
+        self.assertIn("before it joins a round", err)
+        self.assertFalse((self.root / "program" / "rounds").exists())
+
+    def test_a_round_record_written_by_hand_covers_nothing(self):
+        """L11: a record with a `tree` value typed in, and no branch, no merges and no suite run behind it."""
+        main = self.head()
+        members = [{"id": task_id, "branch": f"task/{task_id}", "sha": self.head(wt), "tier": "standard"}
+                   for task_id, wt in ((TASK, self.wt), (T2, self.wt2))]
+        write_json(self.root / "program" / "rounds" / "x.json", {
+            "name": "x", "base": main, "head": main, "members": members, "checked_at": "2026-10-13T00:00:00Z",
+            "tree": sh(self.root, "git", "rev-parse", "HEAD^{tree}").strip(), "merged": [], "closed_at": "",
+            "rechecked": []})
+        commit(self.root, "a round nobody ran")
+        before, scans = self.head(), self.scans()
+        code, _, err = self.pk("merge", TASK, "--round", "x")
+        self.assertEqual(code, 1)
+        self.assertIn("round x: branch round/x not found", err)
+        self.assertIn("start a new round", err)
+        self.assertEqual((self.head(), self.scans()), (before, scans))
+
+    def test_a_tested_tree_typed_into_a_started_round_is_not_a_combined_check(self):
+        self.assertEqual(self.pk("integrate", "start", "r1", TASK, T2)[0], 0)
+        path = self.root / "program" / "rounds" / "r1.json"
+        data = read_json(path)
+        write_json(path, dict(data, tree="4b825dc642cb6eb9a060e54bf8d69288fbee4904", checked_at="2026-10-13T00:00:00Z"))
+        before = self.head()
+        code, _, err = self.pk("merge", TASK, "--round", "r1")
+        self.assertEqual(code, 1)
+        self.assertIn("the tested tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904 is not the tree of round/r1", err)
+        write_json(path, dict(data, tree=sh(self.root, "git", "rev-parse", "round/r1^{tree}").strip(),
+                              members=data["members"][:1]))  # the right tree, a member dropped from the record
+        code, _, err = self.pk("merge", TASK, "--round", "r1")
+        self.assertEqual(code, 1)
+        self.assertIn("round/r1 is 2 commit(s) from its base, the record lists 1 member(s)", err)
+        self.assertEqual(self.head(), before)
+
     def test_a_member_cannot_land_before_the_combined_check_passed(self):
         self.assertEqual(self.pk("integrate", "start", "r1", TASK, T2)[0], 0)
         code, _, err = self.pk("merge", TASK, "--round", "r1")
         self.assertEqual(code, 1)
         self.assertIn("has not passed its combined check", err)
 
-    def test_a_failing_suite_fails_the_round_and_records_no_tested_tree(self):
-        put(self.wt2, "test_second.py", "import unittest\n\n\nclass T(unittest.TestCase):\n"
-                                        "    def test_it(self):\n        self.fail('combined')\n")
-        commit(self.wt2, "a failing test")
-        self.accept(self.wt2, T2)
-        self.assertEqual(self.pk("integrate", "start", "r1", TASK, T2)[0], 0)
-        code, out, _ = self.pk("integrate", "check", "r1")
-        self.assertEqual(code, 1)
-        self.assertNotIn("OK: ", out)
-        self.assertEqual(read_json(self.root / "program" / "rounds" / "r1.json")["tree"], "")
-
     def test_a_member_that_moved_after_the_check_is_not_covered_by_it(self):
         self.start_and_check()
-        put(self.wt2, "second.py", "VALUE = 3\n")
-        commit(self.wt2, "a late change")
-        self.accept(self.wt2, T2)
+        put(self.wt2, f"program/evidence/{T2}/report.md", "# Report, amended\n")  # its own evidence folder: not
+        commit(self.wt2, "a late change")  # late work, but the tip is no longer the commit the round tested
         before = self.head()
         code, _, err = self.pk("merge", T2, "--round", "r1")
         self.assertEqual(code, 1)
@@ -400,6 +736,23 @@ class RoundTests(LandBase):
         code, _, err = self.pk("integrate", "close", "r1")
         self.assertEqual(code, 1)
         self.assertIn(f"not merged yet: {T2}", err)
+
+
+class RoundCombinedFailureTests(LandBase):
+    def test_a_suite_that_fails_only_on_the_combined_tree_fails_the_round_and_records_no_tested_tree(self):
+        self.standard()  # this branch adds calc.mul; the other one's test passes only while there is none
+        self.second_task(files={"test_second.py": (
+            "import unittest\nimport calc\n\n\nclass T(unittest.TestCase):\n"
+            "    def test_it(self):\n        self.assertFalse(hasattr(calc, 'mul'), 'combined')\n")})
+        self.assertEqual(self.pk("integrate", "start", "r1", TASK, T2)[0], 0)
+        code, out, _ = self.pk("integrate", "check", "r1")
+        self.assertEqual(code, 1)
+        self.assertIn("FAILED: test", out)
+        self.assertNotIn("OK: ", out)
+        self.assertEqual(read_json(self.root / "program" / "rounds" / "r1.json")["tree"], "")
+        code, _, err = self.pk("merge", TASK, "--round", "r1")
+        self.assertEqual(code, 1)
+        self.assertIn("has not passed its combined check", err)
 
 
 if __name__ == "__main__":
