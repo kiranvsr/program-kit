@@ -464,17 +464,13 @@ def _under(path: str, entries) -> str | None:
     return next((e for e in entries if path == e or path.startswith(e.rstrip("/") + "/")), None)
 
 
-def task_meta(root: Path, task_id: str, ref: str = MAIN) -> dict:
-    """{tier, fast, ruling} of the task as its status record at `ref` says (default main: the authority).
-
-    No record there, or a record written before tiers existed, is the full tier on the SPEC path. A record
-    that does not read is a KitError: an unreadable tier is never taken for a lighter one.
-    """
+def status_at(root: Path, task_id: str, ref: str = MAIN) -> dict | None:
+    """The task's status record as committed at `ref`, or None when there is none; KitError when it does not read."""
     rel = f"program/status/{task_id}.json"
     try:
         raw = _git_bytes(root, "show", f"{ref}:{rel}")
     except KitError:
-        return {"tier": "full", "fast": False, "ruling": ""}
+        return None
     try:
         import json
         record = json.loads(drop_bom(raw.decode("utf-8")))
@@ -483,6 +479,18 @@ def task_meta(root: Path, task_id: str, ref: str = MAIN) -> dict:
     problems = status_module._shape_problems(record)
     if problems:
         raise KitError(f"{rel} on {_show(ref)}: {_show('; '.join(problems))}")
+    return record
+
+
+def task_meta(root: Path, task_id: str, ref: str = MAIN) -> dict:
+    """{tier, fast, ruling} of the task as its status record at `ref` says (default main: the authority).
+
+    No record there, or a record written before tiers existed, is the full tier on the SPEC path. A record
+    that does not read is a KitError: an unreadable tier is never taken for a lighter one.
+    """
+    record = status_at(root, task_id, ref)
+    if record is None:
+        return {"tier": "full", "fast": False, "ruling": ""}
     return {"tier": status_module.tier_of(record), "fast": status_module.is_fast(record),
             "ruling": record.get("ruling", "")}
 
@@ -541,7 +549,11 @@ def _tier_step(root: Path, task_id: str, branch: str, checks: dict, meta: dict) 
 
 
 def _tier_unchanged(tree: Path, task_id: str, meta: dict) -> bool:
-    """Whether the status record in `tree` (a worktree or a trial merge) still says what main's says."""
+    """Whether the status record in `tree` (a worktree or a trial merge) still says what main's says.
+
+    A record that dropped the `tier` field main's record names is a change, though it reads as `full`: only a
+    record written before tiers existed is exempt from the full tier's acceptance quota.
+    """
     path = tree / "program" / "status" / f"{task_id}.json"
     if not path.is_file():
         return True
@@ -551,6 +563,8 @@ def _tier_unchanged(tree: Path, task_id: str, meta: dict) -> bool:
         record = None
     own = ({"tier": status_module.tier_of(record), "fast": status_module.is_fast(record),
             "ruling": record.get("ruling", "")} if isinstance(record, dict) else None)
+    if own is not None and "tier" not in record and "tier" in (status_at(tree, task_id) or {}):
+        own = None
     if own != meta:
         _out(f"FAILED: tier program/status/{task_id}.json changes the tier, fast path or ruling recorded on {MAIN}")
         return False

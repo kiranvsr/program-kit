@@ -132,8 +132,9 @@ def _accepted_problem(root: Path, task_id: str, sha: str, tier: str) -> str | No
 
     A light-tier task lands from `in_progress`. Any other task must be accepted, and that is derived here from
     the evidence committed at the tip (in a temporary detached worktree, removed again), exactly as
-    `pk status set <ID> done` derives it: a status file that says `done` is not an acceptance. Then nothing
-    but the task's own evidence and status files may have changed since the commit that was reviewed.
+    `pk status set <ID> done` derives it: a status file that says `done` is not an acceptance. Whether the full
+    tier's quota applies is read from main's record (`tier`), never from the branch's. Then nothing but the
+    task's own evidence and status files may have changed since the commit that was reviewed.
     """
     held = _tip_status(root, task_id, sha)
     if tier == "light":
@@ -148,8 +149,10 @@ def _accepted_problem(root: Path, task_id: str, sha: str, tier: str) -> str | No
         shutil.rmtree(trial, ignore_errors=True)  # git never registered it: this is the empty mkdtemp directory
         raise
     head = None
+    on_main = gate.status_at(root, task_id)  # the tier is main's; only a record from before tiers is exempt
+    full = tier == "full" and not (on_main is not None and "tier" not in on_main)
     try:
-        problem = status_module._acceptance_problem(trial, task_id)
+        problem = status_module._acceptance_problem(trial, task_id, full=full)
         if problem is None:
             head = store.load_latest(trial, task_id, "results")[1]["head"]
     except KitError as exc:

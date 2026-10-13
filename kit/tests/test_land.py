@@ -378,6 +378,45 @@ class MergeTests(LandBase):
         self.assertIn("done needs an acceptance record", err)
         self.untouched(before)
 
+    def tierless_done(self):
+        """The re-review's N2 up to the merge: a standard-depth acceptance, then `done` typed with the tier deleted."""
+        self.evidenced(self.wt, TASK)
+        entry, record = store.load_latest(self.wt, TASK, "results")
+        evidence.accept(self.wt, TASK, {
+            "task_id": TASK, "decision": "accepted_development", "evidence_sha256": entry["digest"],
+            "source_commit": record["head"], "accepted_at": "2026-10-13T00:00:00Z", "role": "qa",
+            "commands": [], "planted_bugs": [], "findings": [], "blocked_by": []})
+        with self.assertRaisesRegex(KitError, "accepted only on the full tier's review"):
+            status.transition(self.wt, TASK, "done", "qa")  # the status machine refuses it
+        path = self.wt / "program" / "status" / f"{TASK}.json"
+        typed = dict(read_json(path), status="done", role="qa")
+        for key in ("tier", "fast", "ruling"):
+            typed.pop(key, None)
+        for item in typed["history"]:
+            item.pop("tier", None)
+        write_json(path, typed)
+        commit(self.wt, "done, typed, without the tier")
+
+    def test_a_full_tier_branch_that_deletes_its_tier_is_not_exempt_from_the_full_review(self):
+        self.on_main(status_record(TASK))  # dispatched on main at the full tier
+        self.tierless_done()
+        before = self.head()
+        code, out, err = self.pk("merge", TASK)
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("a full-tier task is accepted only on the full tier's review", err)
+        self.untouched(before)
+
+    def test_a_record_written_before_tiers_still_lands_and_validates(self):
+        bare = status_record(TASK)
+        for key in ("tier", "fast", "ruling"):
+            del bare[key]
+        bare["history"][0].pop("tier")
+        self.on_main(bare)  # dispatched before tiers existed: main's record names no tier
+        self.tierless_done()
+        code, out, err = self.pk("merge", TASK)
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertEqual(status.validate(self.root), [])
+
     def late_commit(self):
         """The reviewer's sequence (M1) up to QA's acceptance; (the reviewed commit, the late commit)."""
         self.standard(done=False)

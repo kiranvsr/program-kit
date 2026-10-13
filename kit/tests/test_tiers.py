@@ -457,6 +457,24 @@ class StandardTierGateTests(TierGateBase):
             self.assertEqual(rc, 1)
             self.assertIn(f"FAILED: tier program/status/{TASK}.json changes the tier", out)
 
+    def test_a_branch_that_deletes_the_tier_main_names_changes_the_tier(self):
+        """The re-review's N2: no tier field reads as full, but it is the exemption of a record from before tiers."""
+        self.on_main(status_record(TASK), FULL_PATHS)  # main names the full tier
+        bare = status_record(TASK)
+        for key in ("tier", "fast", "ruling"):
+            del bare[key]
+        bare["history"][0].pop("tier")
+        write_json(self.wt / "program" / "status" / f"{TASK}.json", bare)
+        commit(self.wt, "drop the tier fields")
+        for run in (self.handback, self.merge_check):
+            rc, out = run()
+            self.assertEqual(rc, 1)
+            self.assertIn(f"FAILED: tier program/status/{TASK}.json changes the tier", out)
+        self.on_main(bare)  # a record written before tiers existed, on main and on the branch: no change
+        self.assertTrue(gate._tier_unchanged(self.wt, TASK, gate.task_meta(self.root, TASK)))
+        rc, out = self.merge_check()
+        self.assertEqual(rc, 0, out)
+
     def test_a_branch_cannot_switch_a_tier_on_for_itself(self):
         self.on_main(status_record(TASK))
         write_yaml(self.wt / "program" / "checks.yaml", checks_data(tiers=FULL_PATHS))
