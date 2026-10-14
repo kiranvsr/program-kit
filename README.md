@@ -1,5 +1,7 @@
 # program-kit
 
+Imagine handing a few lines describing what you want built to a team of AI agents and getting back not a pile of code, but a finished, checked piece of software with a paper trail you can trust. program-kit is the method that makes that possible: it asks you the questions a good team would ask, writes down every decision, has one agent build each piece and a different one check it, and keeps proof of every test next to the exact version it proved. If the work stops halfway, the next agent, on any model from any provider, reads one page and carries on where the last one left off. Nothing is pushed, deployed or declared finished without a check you can see, so you stay in charge while the agents do the work.
+
 program-kit is a provider-neutral template for running a software program with AI agents at a quality bar that survives hand-offs between sessions, models and providers. You write a short brief; an agent interviews you stage by stage until the product is specified, architected and frozen by an independent review, then builds the tasks one at a time with independent QA and evidence bound to the commit it came from. Everything is plain Markdown and standard-library Python, and the state lives in your repository, so another agent can pick up where the last one stopped.
 
 Throughout, `pk` means `python3 kit/scripts/pk.py`.
