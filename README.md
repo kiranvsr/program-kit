@@ -4,6 +4,32 @@ program-kit is a provider-neutral template for running a software program with A
 
 Throughout, `pk` means `python3 kit/scripts/pk.py`.
 
+## What the kit gives you, and why it helps
+
+The problems the kit is built against are the ones a long program run by agents actually meets: a session ends mid-task and the next one cannot find its place; an agent reports a pass that never ran; a reviewer reviews one commit and a later one lands; cleanup removes the wrong thing; and the bill grows because every step is re-explained from scratch. Each feature below answers one of those.
+
+| Feature | What it does | How it helps |
+|---|---|---|
+| Staged interview with role lenses | Turns a brief of a few lines into discovery, product definition, specification, architecture, a frozen review and a register of tasks with stable IDs, each stage approved by you and challenged by every lens before it closes. | You do not write the spec; you answer questions and approve. What is decided is written down before anything is built, so the build does not re-decide it. |
+| Change requests after the freeze | Once stage 5 is signed, a change to the specification goes through a change request with its own record. | Scope moves on purpose, with a reason and a date, instead of drifting one task at a time. |
+| Rulings log and hand-off | Every decision is a numbered ruling in an append-only log; the hand-off document is regenerated from state, kept under 60 KB, and shows the newest fifteen rulings and what is going on now. | A new session, model or provider picks up in minutes from one file, and nobody has to remember why something was decided. |
+| One command per controller step | `pk record --ruling TEXT` appends the ruling, updates the state, regenerates the hand-off and commits exactly those files. | Bookkeeping cannot be skipped or half-done, and it costs one command instead of five edits. |
+| Worktree per task, merges one at a time | `pk worktree new` gives each task its own branch and directory; `pk merge` lands one accepted branch at a time with a merge commit. | Tasks run in parallel without touching each other, and main only ever moves by one reviewed step. |
+| Gates that read from main | The hand-back gate and the merge check run the project's build, test and scan commands and check the task's SPEC, PLAN and spec-QA review against main, not against the branch. | A branch cannot grade itself. What the gate checks is what was agreed, not what the implementer changed it to. |
+| Evidence bound to the commit | Every gate pass is a record named by its own digest, committed and never edited, that names the commit and the inputs it came from; `latest.json` points at the newest one and the history is kept. | A claim of "tests pass" is a file anyone can re-check against a commit. A later change never alters an old record; `pk stale` reports which records have drifted from the current tree, for information. |
+| Independent QA and `done` | Only QA, in its own detached worktree, can accept a task; it re-runs the commands, plants bugs to see the tests catch them and checks scope. `done` is set by the acceptance record, not by a flag. | The agent that built the work is never the one that says it is finished, and a typed `done` is refused. |
+| Verification tiers and the fast path | Every task is full, standard or light; the lighter tiers skip what a trivial change does not need, a ruling names which kinds of change qualify, and the paths that must always be full are listed in `program/checks.yaml`. | A typo and a tenancy change are not judged by the same process, so the careful process stays affordable where it matters. |
+| Integration rounds | Several accepted branches below the full tier are verified together once, then still merge one at a time. | One combined test run instead of one per branch, without giving up the one-step merge. |
+| Review of the exact commit | `pk worktree review` gives the reviewer a detached worktree at the reviewed commit and a diff file; `pk merge` refuses a branch that changed anything but its own evidence after that commit, and only genuine evidence records may be added there. | What was reviewed is what lands. A commit slipped in after the review is refused, not missed. |
+| Safe finish | `pk worktree finish` removes a task's worktrees and merged branch and, given the exact compose project, the containers and volumes that carry its label. It refuses a worktree that holds work and never forces. | Disks and ports are reclaimed after every merge, and nothing is removed by a name that merely looks right. |
+| Follow-ups and ad-hoc work | Follow-ups have IDs, areas and tags and are closed, tagged or marked duplicate; work outside the register is an ad-hoc task the hand-off shows like any other. | Nothing is lost between sessions, and work you asked for on the side is tracked without a change request. |
+| Cost log | `pk cost add` records each agent run with its model and tokens; `pk cost report` flags an agent past 400,000 tokens or three resumes. | You see what each task cost, and when a fresh agent with a tight brief is cheaper than another resume. |
+| Reading sets by role | Each role reads only its own brief, its part of the one rules file and `program/COMMON.md`; the hand-off playbook lists the files and their sizes, and a test keeps them under a ceiling. | Agents start with what they need and nothing else, which is faster and cheaper on every dispatch. |
+| Provider-neutral, standard library only | Plain Markdown, Python with no dependencies, git. `program/COMMON.md` says which model fills which class in your program. | The same program can move between agents, models and providers, and there is nothing to install that can break or go stale. |
+| Install, manifest and upgrade | `install.sh` copies the kit into an existing repository; a manifest records every kit file; `--upgrade` refuses when either copy has been changed. | You know the kit you run is the kit that was tested, and an upgrade never silently overwrites a local change. |
+
+What it will not do is listed further down; the short version is that it never pushes, deploys, applies infrastructure or claims anything about an environment that does not exist.
+
 ## Five-minute start: a new repository
 
 1. Create a new repository from this template (use the "use this template" feature of your git host, or copy the files into a fresh `git init`) and enter it. The primary branch must be called `main`; if `git init` gave you another name, run `git branch -m main`.
