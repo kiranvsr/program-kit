@@ -182,13 +182,14 @@ The interview is not a scripted questionnaire. Questions are generated from the 
 - `in_progress → review` (implementer, after the hand-back gate prints its OK line)
 - `review → in_progress` (QA, with findings)
 - `review → done` (QA only: the task's latest acceptance record accepts, `decision: accepted_development`, names the task and binds the task's latest results record by digest; that record passes the gate's results checks and its `head` is an ancestor of HEAD)
+- `done → review` or, for QA rejecting, `done → in_progress`, only through `pk status reopen <ID> --reason TEXT [--role qa [--reject]]` (controller or QA): the way back for late work after acceptance or a QA rejection. The reason is kept on the history entry as the audit line; it is refused once main holds the task as done, and the next `done` needs a fresh acceptance of the latest results record
 - `not_started|in_progress → blocked` (controller, with `blocked_by`) and `blocked → not_started|in_progress`
 - `not_started → parked` (controller, with the user decision it waits on) and `parked → not_started`
 - `in_progress → merged` (controller, light tier only, in the main checkout, after the task's branch is merged into main)
 
 Every record carries the task's verification tier (`full`, `standard`, `light`), whether it runs on the fast path, and the ruling that allowed either (section 10.1). They are set at dispatch and change only through `pk status tier <ID> <tier> --ruling R<n>`; a record written before 0.3.0 has none and reads as `full`. The fast path is refused for the full tier, here and by the record reader. A light-tier task has no QA, so `review` and `done` are refused for it: `merged` is its terminal status, it carries no acceptance, and a gate claim never counts it as evidenced. Work outside the register (an ad-hoc task `AH-<nnnn>` listed in the controller state) can be given a status like a register task.
 
-`done` and `merged` are terminal; a later change request creates a new task. Both satisfy a `depends_on`, and `pk trace impact` and `pk change impact` list `merged` tasks in a bucket of their own, never as not started. `pk status validate` re-derives both: a `done` from the task's acceptance, a `merged` from the merge commit of the inspected commit the record names. A task with no status file is `not_started`. Every transition is checked in full before anything is written, so a refusal leaves no file behind.
+`done` and `merged` are terminal for `pk status set`, and `done` once it is on main; a later change request creates a new task. Both satisfy a `depends_on`, and `pk trace impact` and `pk change impact` list `merged` tasks in a bucket of their own, never as not started. `pk status validate` re-derives both: a `done` from the task's acceptance, a `merged` from the merge commit of the inspected commit the record names. A task with no status file is `not_started`. Every transition is checked in full before anything is written, so a refusal leaves no file behind.
 ## 5. Execution loop (playbook 08)
 
 **Roles.** Three roles, each a separate agent session:

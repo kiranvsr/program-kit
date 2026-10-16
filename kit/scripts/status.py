@@ -67,7 +67,7 @@ _OPTIONAL_FIELDS = ("tier", "fast", "ruling", "inspected")  # the first three ar
 _SHA = re.compile(r"[0-9a-f]{40}\Z")  # `inspected`: on a merged record, the commit the controller read
 _TEXT_FIELDS = ("task_id", "role", "updated_at", "note")
 _ENTRY_FIELDS = ("status", "role", "at")
-_ENTRY_OPTIONAL = ("tier", "ruling")  # on the dispatch entry and on each entry `set_tier` appends
+_ENTRY_OPTIONAL = ("tier", "ruling", "reason")  # on the dispatch entry and on each entry `set_tier` appends
 _RULING = re.compile(r"R(\d+)\Z")
 
 
@@ -138,6 +138,8 @@ def _entry_problems(entry) -> list[str]:
         problems.append(f"unknown tier {entry['tier']!r}")
     if "ruling" in entry and not isinstance(entry["ruling"], str):
         problems.append(f"ruling must be text, not {entry['ruling']!r}")
+    if "reason" in entry and not (isinstance(entry["reason"], str) and entry["reason"].strip()):
+        problems.append(f"reason must be non-empty text, not {entry['reason']!r}")
     unknown = sorted(str(key) for key in entry if key not in _ENTRY_FIELDS + _ENTRY_OPTIONAL)
     if unknown:
         problems.append(f"unknown field(s) {', '.join(unknown)}")
@@ -497,6 +499,49 @@ def transition(root: Path, task_id: str, to: str, role: str, note: str = "",
     return updated
 
 
+def reopen(root: Path, task_id: str, reason: str, role: str = "controller", reject: bool = False) -> dict:
+    """Move a task that is `done` on its branch back for another round; returns the new record.
+
+    `done` is terminal for `pk status set`. This is the one documented way out, for late work after QA accepted
+    (the acceptance binds the reviewed commit, so more work needs a new review) and for a QA rejection of
+    something already marked done. The controller or QA moves it back to `review`; QA with `reject` moves it
+    to `in_progress` for the implementer to fix. The reason is required and is kept on the history entry as the
+    audit line. Refused once main holds the task as done (it has landed; new work is a new task). The next
+    `done` needs a new acceptance of the latest results record, as always.
+    """
+    root = Path(root)
+    _check_id(task_id)
+    if role not in ("controller", "qa"):
+        raise KitError(f"{task_id}: reopen is for the controller or qa, not {role}")
+    if reject and role != "qa":
+        raise KitError(f"{task_id}: only qa rejects (--reject)")
+    reason = " ".join(str(reason).split())
+    if not reason:
+        raise KitError(f"{task_id}: reopen needs a reason (--reason TEXT)")
+    if task_id not in _registered(root):
+        raise KitError(f"{task_id}: not a task in program/register.yaml")
+    record = read(root, task_id)
+    if record["status"] != "done":
+        raise KitError(f"{task_id} is {record['status']}, not done; reopen is only for a done task "
+                       f"({'a merged task is terminal and new work is a new task' if record['status'] == 'merged' else 'use pk status set'})")
+    code, shown = run_argv(["git", "-C", str(root), "show", f"{PRIMARY_BRANCH}:program/status/{task_id}.json"], root)
+    if code == 0:
+        try:
+            landed = json.loads(shown).get("status") == "done"
+        except (ValueError, AttributeError):
+            landed = False
+        if landed:
+            raise KitError(f"{task_id} is done on {PRIMARY_BRANCH}: it has landed, and new work is a new task "
+                           "(a change request)")
+    to = "in_progress" if reject else "review"
+    now = utc_now()
+    entry = {"status": to, "role": role, "at": now, "reason": reason}
+    updated = dict(record, status=to, role=role, updated_at=now, note=reason,
+                   history=[*record["history"], entry])
+    write_json(_record_path(root, task_id), updated)
+    return updated
+
+
 def set_tier(root: Path, task_id: str, tier: str, ruling: str, role: str = "controller", spec: bool = False) -> dict:
     """Change a dispatched task's tier on main; needs a ruling. Returns the new record.
 
@@ -622,6 +667,9 @@ def cmd_status(args: argparse.Namespace) -> int:
                             ruling=args.ruling, inspected=args.inspected)
         lower = "" if record["tier"] == "full" else f" (tier {record['tier']}{', fast path' if record['fast'] else ''})"
         print(f"{record['task_id']}: {record['status']}{lower}")
+    elif action == "reopen":
+        record = reopen(_root(), args.task_id, args.reason, role=args.role, reject=args.reject)
+        print(f"{record['task_id']}: {record['status']} (reopened by {record['role']}: {record['note']})")
     elif action == "tier":
         record = set_tier(_root(), args.task_id, args.tier, args.ruling, role=args.role, spec=args.spec)
         print(f"{record['task_id']}: tier {record['tier']}{', fast path' if record['fast'] else ''} "
@@ -641,7 +689,7 @@ def cmd_status(args: argparse.Namespace) -> int:
             return 1
         print("status: ok")
     else:
-        raise KitError("status needs an action: set, tier, show, list or validate")
+        raise KitError("status needs an action: set, reopen, tier, show, list or validate")
     return 0
 
 
@@ -662,6 +710,13 @@ def _configure(parser: argparse.ArgumentParser) -> None:
                                                                    "fast path or the lower tier")
     setter.add_argument("--inspected", default="", metavar="SHA",
                         help="with merged: the full commit whose diff the controller read, now merged into main")
+    reopener = actions.add_parser("reopen", help="move a done task back to review (or, for QA, to in_progress), "
+                                                 "with a reason kept in its history")
+    reopener.add_argument("task_id")
+    reopener.add_argument("--reason", required=True, help="why: late work after acceptance, or QA's rejection")
+    reopener.add_argument("--role", default="controller", help="controller or qa (default controller)")
+    reopener.add_argument("--reject", action="store_true",
+                          help="QA rejects the accepted work: back to in_progress for the implementer")
     changer = actions.add_parser("tier", help="change a dispatched task's tier on main, by a ruling")
     changer.add_argument("task_id")
     changer.add_argument("tier", choices=TIERS)
