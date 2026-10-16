@@ -29,7 +29,7 @@ import rulings
 import status
 import store
 import worktree
-from common import KitError, read_json, write_json, write_yaml
+from common import KitError, read_json, sha256_bytes, write_json, write_yaml
 from test_gate import BRANCH, CALC, PLAN, PRODUCE, PY, REVIEW, TASK, commit, put, run_quiet, sh
 from test_status import full_review, write_register
 from test_tiers import FULL_PATHS, LIGHT_BRIEF, TierGateBase, status_record
@@ -536,6 +536,19 @@ class MergeTests(LandBase):
         code, out, err = self.pk("merge", TASK)
         self.assertEqual((code, out), (1, ""))
         self.assertIn(f"fails the store's integrity check: immutable record altered: {name}", err)
+        self.untouched(before)
+
+    def test_a_digest_named_file_that_is_not_a_record_does_not_reach_main(self):
+        """F-0355: a name that matches its own digest proves the bytes, not that they are a record."""
+        self.standard()
+        body = '{"hello": "world"}\n'
+        name = f"program/evidence/{TASK}/results/20000101T000000000000Z-{sha256_bytes(body.encode())[:12]}.json"
+        put(self.wt, name, body)
+        commit(self.wt, "a file named after its own digest")
+        before = self.head()
+        code, out, err = self.pk("merge", TASK)
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn(f"fails the store's integrity check: {name}: not a valid results record: missing key", err)
         self.untouched(before)
 
     def test_a_merge_commit_that_carries_a_change_of_its_own_does_not_reach_main(self):

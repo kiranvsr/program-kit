@@ -827,7 +827,7 @@ def _root_or_none():
 def _validate(args) -> int:
     if args.record is None:  # the whole evidence tree: names, history and pointers
         root = find_root()
-        problems, pending = store.check(root, args.base)
+        problems, pending = store.check(root, args.base, schema=True)
         for path, _ in pending:
             print(f"warning: record pending commit: {path}", file=sys.stderr)
         if problems:
