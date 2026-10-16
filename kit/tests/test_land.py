@@ -257,10 +257,10 @@ class FinishTests(LandBase):
     # be seen removing the siblings.
     TOOL = ('echo "$@" >> "$PK_FAKE_LOG"\n'
             'case "$*" in\n'
-            '  "ps -a --filter label=com.docker.compose.project=proj --format {{.Names}}")'
-            ' printf "proj-web-1\\nweb\\n";;\n'
-            '  "volume ls --filter label=com.docker.compose.project=proj --format {{.Name}}")'
-            ' printf "proj_data\\n";;\n'
+            '  "ps -a --filter label=com.docker.compose.project=proj --format "*)'
+            ' printf "proj-web-1\\tproj\\nweb\\tproj\\n";;\n'
+            '  "volume ls --filter label=com.docker.compose.project=proj --format "*)'
+            ' printf "proj_data\\tproj\\n";;\n'
             '  "ps -a"*) printf "proj-web-1\\nweb\\nproj-dev-db-1\\nproj_e2e_db_1\\nproj2-web-1\\nother\\n";;\n'
             '  "volume ls"*) printf "proj_data\\nproj-dev_pgdata\\nproj_e2e_pgdata\\nproj2_data\\nshared\\n";;\n'
             '  "image ls"*) printf "proj-web:latest\\nproj-dev-api:latest\\npostgres:16\\n";;\n'
@@ -277,14 +277,33 @@ class FinishTests(LandBase):
         self.assertEqual(removed, ["removed: container proj-web-1", "removed: container web",
                                    "removed: volume proj_data"])
         calls = self.fake_log.read_text().splitlines()
-        self.assertEqual(calls, ["ps -a --filter label=com.docker.compose.project=proj --format {{.Names}}",
-                                 "volume ls --filter label=com.docker.compose.project=proj --format {{.Name}}",
+        label = '{{.Label "com.docker.compose.project"}}'
+        self.assertEqual(calls, ["ps -a --filter label=com.docker.compose.project=proj --format "
+                                 "{{.Names}}\t" + label,
+                                 "volume ls --filter label=com.docker.compose.project=proj --format "
+                                 "{{.Name}}\t" + label,
                                  "rm proj-web-1", "rm web", "volume rm proj_data"])
         for sibling in ("proj-dev", "proj_e2e", "proj2", "image", "prune"):
             self.assertFalse([call for call in calls if sibling in call], sibling)
         self.assertFalse([call for call in calls if "-f" in call.split() or "--force" in call.split()])
         with self.assertRaisesRegex(KitError, "not a usable compose project name"):
             worktree.finish(self.root, TASK, compose_project="t")
+
+    def test_finish_does_not_trust_a_tool_whose_filter_lets_a_similarly_named_project_through(self):
+        """N8: a tool that matches the label by prefix answers with the siblings too; only the exact label is taken."""
+        self.merged()
+        self.wrapper("docker", 'echo "$@" >> "$PK_FAKE_LOG"\n'
+                     'case "$*" in\n'
+                     '  "ps -a"*) printf "proj-web-1\\tproj\\nproj-dev-db-1\\tproj-dev\\nproj2-web-1\\tproj2\\n'
+                     'orphan\\t\\nbare\\n";;\n'
+                     '  "volume ls"*) printf "proj_data\\tproj\\nproj_e2e_pgdata\\tproj_e2e\\n";;\n'
+                     'esac')
+        code, out, err = self.pk("worktree", "finish", TASK, "--compose-project", "proj")
+        self.assertEqual((code, err), (0, ""))
+        removed = [line for line in out.splitlines() if line.split()[1] in ("container", "volume")]
+        self.assertEqual(removed, ["removed: container proj-web-1", "removed: volume proj_data"])
+        calls = self.fake_log.read_text().splitlines()
+        self.assertEqual(calls[2:], ["rm proj-web-1", "volume rm proj_data"])
 
     def test_finish_asks_the_container_tool_before_it_removes_anything(self):
         self.merged()
