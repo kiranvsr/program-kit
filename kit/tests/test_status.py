@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import pk
 import status
@@ -397,6 +398,59 @@ class StatusTests(unittest.TestCase):
         for to in status.STATUSES:
             for role in ("controller", "implementer", "qa"):
                 self.refused("terminal", TID, to, role)
+
+    def done(self):
+        self.to_review()
+        return status.transition(self.root, TID, "done", "qa", evidence=[self.evidence()])
+
+    def test_reopen_moves_a_done_task_back_to_review_with_an_audit_line(self):
+        self.done()
+        rec = status.reopen(self.root, TID, "late work after acceptance:  a hotfix")
+        self.assertEqual((rec["status"], rec["role"]), ("review", "controller"))
+        last = rec["history"][-1]
+        self.assertEqual((last["status"], last["role"], last["reason"]),
+                         ("review", "controller", "late work after acceptance: a hotfix"))
+        self.assertEqual(read_json(self.record_path()), rec)
+        self.assertEqual(status.validate(self.root), [])
+        rec = status.transition(self.root, TID, "done", "qa")  # QA accepts again on the same, still bound, record
+        self.assertEqual(rec["status"], "done")
+        self.assertEqual([e["status"] for e in rec["history"]][-3:], ["done", "review", "done"])
+
+    def test_qa_can_reject_a_task_already_marked_done(self):
+        self.done()
+        rec = status.reopen(self.root, TID, "rejected: finding 1 is critical", role="qa", reject=True)
+        self.assertEqual((rec["status"], rec["role"], rec["history"][-1]["reason"]),
+                         ("in_progress", "qa", "rejected: finding 1 is critical"))
+        self.assertEqual(status.validate(self.root), [])
+        status.transition(self.root, TID, "review", "implementer")  # and it goes round again
+
+    def test_reopen_is_refused_without_a_reason_for_other_roles_and_for_tasks_not_done(self):
+        with self.assertRaisesRegex(KitError, "not done"):
+            status.reopen(self.root, TID, "why")
+        self.done()
+        for kwargs, pattern in (({"reason": "  "}, "needs a reason"),
+                                ({"reason": "x", "role": "implementer"}, "controller or qa"),
+                                ({"reason": "x", "reject": True}, "only qa rejects")):
+            with self.assertRaisesRegex(KitError, pattern):
+                status.reopen(self.root, TID, **kwargs)
+        self.assertEqual(read_json(self.record_path())["status"], "done")
+
+    def test_reopen_is_refused_once_main_holds_the_task_as_done(self):
+        self.done()
+        subprocess.run(["git", "-C", str(self.root), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "-c", "user.name=T", "-c", "user.email=t@e.x", "commit", "-q",
+                        "-m", "landed"], check=True)
+        with self.assertRaisesRegex(KitError, "has landed"):
+            status.reopen(self.root, TID, "too late")
+
+    def test_reopen_command(self):
+        self.done()
+        with mock.patch.object(status, "find_root", return_value=self.root):
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = pk.main(["status", "reopen", TID, "--reason", "late work"])
+        self.assertEqual((rc, err.getvalue()), (0, ""))
+        self.assertIn(f"{TID}: review (reopened by controller: late work)", out.getvalue())
 
     def test_blocked_requires_blocked_by(self):
         self.refused("blocked_by", TID, "blocked", "controller")

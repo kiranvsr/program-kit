@@ -21,9 +21,9 @@ that no branch holds (work that would be lost with the worktree), when the branc
 (unless told to keep the branch), and when the container tool does not answer. Then it removes those symlinks
 by literal path, the task and review worktrees with a plain `git worktree remove`, the merged branch with
 `git branch -d`, and, when given the task's compose project name, the containers and volumes that carry the
-label `com.docker.compose.project=<that name>`, each by its own name and without `-f`. The tool matches a
-label value exactly, so a project whose name merely begins with the same letters is never touched; nothing is
-ever selected by a name prefix. Images are not removed at all: they are rebuilt from the repository, and a
+label `com.docker.compose.project=<that name>`, each by its own name and without `-f`. The listing asks the tool for each
+item's label too and keeps only an exact match, so a project whose name merely begins with the same letters is
+never touched, even when the tool's own filter lets it through; nothing is ever selected by a name prefix. Images are not removed at all: they are rebuilt from the repository, and a
 name is the only way to select them. It prints every thing it removed. A removal the container tool refuses
 (a container still running) stops the command there, after the worktrees and the branch have gone; run the
 tool's own command for what is left.
@@ -276,10 +276,18 @@ def finish(root: Path, task_id: str, symlinks=(), compose_project: str | None = 
     owned = []  # listed before anything is removed: a container tool that does not answer stops the command here
     if compose_project is not None:
         chosen = ("--filter", f"label={COMPOSE_LABEL}={compose_project}")
-        for kind, listing, remover in (("container", ("ps", "-a", *chosen, "--format", "{{.Names}}"), ("rm",)),
-                                       ("volume", ("volume", "ls", *chosen, "--format", "{{.Name}}"),
+        label = '{{.Label "' + COMPOSE_LABEL + '"}}'
+        for kind, listing, remover in (("container", ("ps", "-a", *chosen, "--format", "{{.Names}}\t" + label),
+                                        ("rm",)),
+                                       ("volume", ("volume", "ls", *chosen, "--format", "{{.Name}}\t" + label),
                                         ("volume", "rm"))):
-            owned += [(kind, remover, name) for name in _names(tool, *listing)]
+            # The filter only narrows the listing. Each line also carries the project label it was matched on, and
+            # a name whose label is not exactly the project's (a tool that matches by prefix, a sibling project)
+            # is never taken.
+            for line in _names(tool, *listing):
+                name, _, found = line.partition("\t")
+                if found.strip() == compose_project:
+                    owned.append((kind, remover, name.strip()))
     removed = []
     for path in trees:
         for name in symlinks:

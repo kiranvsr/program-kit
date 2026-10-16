@@ -29,7 +29,7 @@ import rulings
 import status
 import store
 import worktree
-from common import KitError, read_json, write_json, write_yaml
+from common import KitError, read_json, sha256_bytes, write_json, write_yaml
 from test_gate import BRANCH, CALC, PLAN, PRODUCE, PY, REVIEW, TASK, commit, put, run_quiet, sh
 from test_status import full_review, write_register
 from test_tiers import FULL_PATHS, LIGHT_BRIEF, TierGateBase, status_record
@@ -257,10 +257,10 @@ class FinishTests(LandBase):
     # be seen removing the siblings.
     TOOL = ('echo "$@" >> "$PK_FAKE_LOG"\n'
             'case "$*" in\n'
-            '  "ps -a --filter label=com.docker.compose.project=proj --format {{.Names}}")'
-            ' printf "proj-web-1\\nweb\\n";;\n'
-            '  "volume ls --filter label=com.docker.compose.project=proj --format {{.Name}}")'
-            ' printf "proj_data\\n";;\n'
+            '  "ps -a --filter label=com.docker.compose.project=proj --format "*)'
+            ' printf "proj-web-1\\tproj\\nweb\\tproj\\n";;\n'
+            '  "volume ls --filter label=com.docker.compose.project=proj --format "*)'
+            ' printf "proj_data\\tproj\\n";;\n'
             '  "ps -a"*) printf "proj-web-1\\nweb\\nproj-dev-db-1\\nproj_e2e_db_1\\nproj2-web-1\\nother\\n";;\n'
             '  "volume ls"*) printf "proj_data\\nproj-dev_pgdata\\nproj_e2e_pgdata\\nproj2_data\\nshared\\n";;\n'
             '  "image ls"*) printf "proj-web:latest\\nproj-dev-api:latest\\npostgres:16\\n";;\n'
@@ -277,14 +277,33 @@ class FinishTests(LandBase):
         self.assertEqual(removed, ["removed: container proj-web-1", "removed: container web",
                                    "removed: volume proj_data"])
         calls = self.fake_log.read_text().splitlines()
-        self.assertEqual(calls, ["ps -a --filter label=com.docker.compose.project=proj --format {{.Names}}",
-                                 "volume ls --filter label=com.docker.compose.project=proj --format {{.Name}}",
+        label = '{{.Label "com.docker.compose.project"}}'
+        self.assertEqual(calls, ["ps -a --filter label=com.docker.compose.project=proj --format "
+                                 "{{.Names}}\t" + label,
+                                 "volume ls --filter label=com.docker.compose.project=proj --format "
+                                 "{{.Name}}\t" + label,
                                  "rm proj-web-1", "rm web", "volume rm proj_data"])
         for sibling in ("proj-dev", "proj_e2e", "proj2", "image", "prune"):
             self.assertFalse([call for call in calls if sibling in call], sibling)
         self.assertFalse([call for call in calls if "-f" in call.split() or "--force" in call.split()])
         with self.assertRaisesRegex(KitError, "not a usable compose project name"):
             worktree.finish(self.root, TASK, compose_project="t")
+
+    def test_finish_does_not_trust_a_tool_whose_filter_lets_a_similarly_named_project_through(self):
+        """N8: a tool that matches the label by prefix answers with the siblings too; only the exact label is taken."""
+        self.merged()
+        self.wrapper("docker", 'echo "$@" >> "$PK_FAKE_LOG"\n'
+                     'case "$*" in\n'
+                     '  "ps -a"*) printf "proj-web-1\\tproj\\nproj-dev-db-1\\tproj-dev\\nproj2-web-1\\tproj2\\n'
+                     'orphan\\t\\nbare\\n";;\n'
+                     '  "volume ls"*) printf "proj_data\\tproj\\nproj_e2e_pgdata\\tproj_e2e\\n";;\n'
+                     'esac')
+        code, out, err = self.pk("worktree", "finish", TASK, "--compose-project", "proj")
+        self.assertEqual((code, err), (0, ""))
+        removed = [line for line in out.splitlines() if line.split()[1] in ("container", "volume")]
+        self.assertEqual(removed, ["removed: container proj-web-1", "removed: volume proj_data"])
+        calls = self.fake_log.read_text().splitlines()
+        self.assertEqual(calls[2:], ["rm proj-web-1", "volume rm proj_data"])
 
     def test_finish_asks_the_container_tool_before_it_removes_anything(self):
         self.merged()
@@ -536,6 +555,19 @@ class MergeTests(LandBase):
         code, out, err = self.pk("merge", TASK)
         self.assertEqual((code, out), (1, ""))
         self.assertIn(f"fails the store's integrity check: immutable record altered: {name}", err)
+        self.untouched(before)
+
+    def test_a_digest_named_file_that_is_not_a_record_does_not_reach_main(self):
+        """F-0355: a name that matches its own digest proves the bytes, not that they are a record."""
+        self.standard()
+        body = '{"hello": "world"}\n'
+        name = f"program/evidence/{TASK}/results/20000101T000000000000Z-{sha256_bytes(body.encode())[:12]}.json"
+        put(self.wt, name, body)
+        commit(self.wt, "a file named after its own digest")
+        before = self.head()
+        code, out, err = self.pk("merge", TASK)
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn(f"fails the store's integrity check: {name}: not a valid results record: missing key", err)
         self.untouched(before)
 
     def test_a_merge_commit_that_carries_a_change_of_its_own_does_not_reach_main(self):

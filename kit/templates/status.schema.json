@@ -27,7 +27,8 @@
           "role": {"enum": ["controller", "implementer", "qa"]},
           "at": {"type": "string"},
           "tier": {"enum": ["full", "standard", "light"], "description": "present on the dispatch entry (the first move to in_progress) and on the entry a tier change appends; the record's tier must be the last one named here"},
-          "ruling": {"type": "string"}
+          "ruling": {"type": "string"},
+          "reason": {"type": "string", "minLength": 1, "description": "present on an entry `pk status reopen` appends: why a done task was moved back"}
         }
       }
     }

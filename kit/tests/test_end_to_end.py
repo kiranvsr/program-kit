@@ -206,6 +206,20 @@ class Project:
         assert self.git("status", "--porcelain", cwd=wt) == ""
 
 
+def _example_files(example: Path) -> list[Path]:
+    """The example's tracked files: `git ls-files` run in the directory, else (no git checkout) a walk that skips
+    bytecode. A git-ignored file such as a Finder `.DS_Store` is never part of the example. A new file is read
+    once it is tracked or staged (`git add`); an untracked, non-ignored one is skipped until then."""
+    try:
+        done = subprocess.run(["git", "ls-files", "-z", "--", "."], cwd=example, capture_output=True)
+    except OSError:
+        done = None
+    if done is not None and done.returncode == 0 and done.stdout:
+        names = [n for n in done.stdout.decode("utf-8").split("\0") if n]
+        return [example / n for n in names if (example / n).is_file()]
+    return [path for path in example.rglob("*") if path.is_file() and "__pycache__" not in path.parts]
+
+
 class EndToEndTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -577,7 +591,7 @@ class EndToEndTests(unittest.TestCase):
         self.assertLessEqual(len(entries), 40)  # an example people read: as small as the coverage map allows
 
     def test_example_files_are_neutral_and_signoff_hashes_are_current(self):
-        files = [path for path in EXAMPLE.rglob("*") if path.is_file() and "__pycache__" not in path.parts]
+        files = _example_files(EXAMPLE)
         self.assertTrue(files)
         for path in files:
             text = path.read_text(encoding="utf-8")
@@ -594,6 +608,20 @@ class EndToEndTests(unittest.TestCase):
             for relative in interview.load_coverage(ROOT)["stages"][stage]["artifacts"]:
                 self.assertIn(relative, listed)
         self.assertIn("adr/0001-stdlib-http.md", listed)
+
+    def test_a_git_ignored_file_in_the_example_directory_is_not_scanned(self):
+        planted = EXAMPLE / ".DS_Store"
+        self.assertFalse(planted.exists(), "remove the stray file first")
+        ignored = subprocess.run(["git", "check-ignore", "-q", ".DS_Store"], cwd=EXAMPLE).returncode
+        if ignored != 0:
+            self.skipTest("not a git checkout, or .DS_Store is not ignored here")
+        planted.write_bytes(b"\x00\x01 not utf-8 \xff\xfe")
+        try:
+            self.assertNotIn(planted, _example_files(EXAMPLE))
+            self.assertTrue(_example_files(EXAMPLE))
+            self.test_example_files_are_neutral_and_signoff_hashes_are_current()
+        finally:
+            planted.unlink()
 
     def test_example_replay_is_current_and_its_stage_6_answers_do_not_reopen_the_freeze(self):
         root = self.base / "replayed"

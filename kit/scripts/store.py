@@ -350,20 +350,39 @@ def rewritten(root, base: str | None = None, head: str = "HEAD") -> list[str]:
     return found
 
 
-def integrity(root, base: str | None = None, uncommitted: set[str] | frozenset = frozenset()) -> list[str]:
+def integrity(root, base: str | None = None, uncommitted: set[str] | frozenset = frozenset(),
+              schema: bool = False) -> list[str]:
     """Every reason the evidence of the checkout at `root` cannot be trusted; empty when it can.
 
     (1) every record file's sha256 matches the digest in its name; (2) no commit in `base..HEAD` (the whole history
     when `base` is None), merge commits included, modified or deleted a record file; (3) every pointer entry names
     the newest record of its kind and resolves to a record committed at HEAD with its digest (paths in
-    `uncommitted` may be new, not yet committed records).
+    `uncommitted` may be new, not yet committed records). With `schema`, (4) every record parses as a record of the kit's
+    schema for its kind (the name only proves the bytes, not that they are a record).
     """
-    problems, pending = check(root, base)
+    problems, pending = check(root, base, schema)
     return problems + [f"{path}: not committed (pointed at by {owner})" for path, owner in pending
                        if path not in uncommitted]
 
 
-def check(root, base: str | None = None) -> tuple[list[str], list[tuple[str, str]]]:
+def _schema_problem(rel: str, raw: bytes) -> str | None:
+    """Why the record at `rel` (whose bytes match its name) is not a record of the kit's schema, else None.
+
+    A file can be named after its own digest and still be anything; the store keeps only records."""
+    from evidence import validate_acceptance, validate_results  # evidence imports this module
+    kind = PurePosixPath(rel).parent.name
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        return f"{rel}: not a {kind} record: it does not parse as JSON"
+    problems = (validate_acceptance if kind == "acceptance" else validate_results)(data)
+    if problems:
+        more = f" (and {len(problems) - 1} more)" if len(problems) > 1 else ""
+        return f"{rel}: not a valid {kind} record: {problems[0]}{more}"
+    return None
+
+
+def check(root, base: str | None = None, schema: bool = False) -> tuple[list[str], list[tuple[str, str]]]:
     """(problems, pending) of the checks of `integrity`: `pending` lists (record path, pointer path) for each record a
     pointer names that is present with its digest but not committed yet; that alone is no problem here."""
     root = Path(root)
@@ -371,6 +390,8 @@ def check(root, base: str | None = None) -> tuple[list[str], list[tuple[str, str
     for rel in _record_files(root):
         problem = altered(rel, (root / rel).read_bytes()) if _NAME.match(PurePosixPath(rel).name) else \
             f"{rel}: not a record name (<utc>-<sha256[:12]>.json)"
+        if schema and not problem and _NAME.match(PurePosixPath(rel).name):
+            problem = _schema_problem(rel, (root / rel).read_bytes())
         if problem:
             problems.append(problem)
     problems.extend(rewritten(root, base))

@@ -168,7 +168,7 @@ def _accepted_problem(root: Path, task_id: str, sha: str, tier: str) -> str | No
         problem = status_module._acceptance_problem(trial, task_id, full=full)
         if problem is None:
             head = store.load_latest(trial, task_id, "results")[1]["head"]
-            broken = store.integrity(trial, git(root, "merge-base", MAIN, sha))  # what pk evidence validate checks
+            broken = store.integrity(trial, git(root, "merge-base", MAIN, sha), schema=True)  # what pk evidence validate checks
     except KitError as exc:
         problem = f"{task_id}: {exc}"
     finally:

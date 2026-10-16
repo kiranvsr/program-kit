@@ -990,6 +990,21 @@ class StoreCommands(Base):
         self.assertIn(f"error: immutable record altered: {written['path']} ", stderr)
         self.assertIn(f"error: evidence history rewritten: {written['path']} modified in ", stderr)
 
+    def test_validate_without_a_record_reports_a_digest_named_file_that_is_not_a_record(self):
+        written = self.ready().write()
+        raw = b'{"hello": "world"}\n'
+        fake = written["file"].parent / f"20000101T000000000000Z-{sha256_bytes(raw)[:12]}.json"
+        self.assertEqual(sha256_bytes(raw)[:12], fake.name.split("-")[1][:12])  # named after its own digest
+        fake.write_bytes(raw)
+        with mock.patch.object(evidence, "find_root", return_value=self.root):
+            code, _, stderr = run_pk("evidence", "validate")
+        self.assertEqual(code, 1)
+        self.assertIn(f"error: {store.BASE}/T-1/results/{fake.name}: not a valid results record: missing key", stderr)
+        fake.unlink()
+        junk = b"not json at all"
+        (fake.parent / f"20000101T000000000000Z-{sha256_bytes(junk)[:12]}.json").write_bytes(junk)
+        self.assertIn("does not parse as JSON", "\n".join(store.check(self.root, schema=True)[0]))
+
 
 class Import(Base):
     def legacy(self):
