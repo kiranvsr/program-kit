@@ -3,7 +3,7 @@
 ## Unreleased
 
 - `pk status reopen <ID> --reason TEXT [--role qa [--reject]]`: the documented way back for a branch marked `done` (late work after acceptance, or a QA rejection), with the reason kept as an audit line in the status history.
-- `pk merge` and `pk evidence validate` check that every record in the store parses as a record of the kit's schema, not only that its bytes match its name; a file named after its own digest that is not a record is refused.
+- `pk merge` and `pk evidence validate` check that every record in the store parses as a record of the kit's schema, not only that its bytes match its name; a file named after its own digest that is not a record is refused. The hand-back gate and `pk doctor` do not schema-check the whole store; merge and validate do.
 - `pk worktree finish` asks the container tool for each item's compose project label and removes only an exact match, whatever the tool's own `--filter` returned.
 - The example-neutrality test reads only the files git tracks in `examples/tiny-service`.
 

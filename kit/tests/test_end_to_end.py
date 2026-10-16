@@ -208,7 +208,8 @@ class Project:
 
 def _example_files(example: Path) -> list[Path]:
     """The example's tracked files: `git ls-files` run in the directory, else (no git checkout) a walk that skips
-    bytecode. A git-ignored file such as a Finder `.DS_Store` is never part of the example."""
+    bytecode. A git-ignored file such as a Finder `.DS_Store` is never part of the example. A new file is read
+    once it is tracked or staged (`git add`); an untracked, non-ignored one is skipped until then."""
     try:
         done = subprocess.run(["git", "ls-files", "-z", "--", "."], cwd=example, capture_output=True)
     except OSError:

@@ -506,8 +506,11 @@ def reopen(root: Path, task_id: str, reason: str, role: str = "controller", reje
     (the acceptance binds the reviewed commit, so more work needs a new review) and for a QA rejection of
     something already marked done. The controller or QA moves it back to `review`; QA with `reject` moves it
     to `in_progress` for the implementer to fix. The reason is required and is kept on the history entry as the
-    audit line. Refused once main holds the task as done (it has landed; new work is a new task). The next
-    `done` needs a new acceptance of the latest results record, as always.
+    audit line. Refused once main holds the task as done (it has landed; new work is a new task). Reopen changes
+    only the status: it appends no record and unbinds nothing. The next `done` needs what `done` always needs,
+    an acceptance that binds the latest results record; when the late work changed the task's inputs, the gate
+    asks for a new results record and QA for a new acceptance of it, but a reopen with no new record can go
+    `done` again on the acceptance that is still bound.
     """
     root = Path(root)
     _check_id(task_id)
