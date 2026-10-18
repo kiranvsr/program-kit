@@ -9,6 +9,7 @@
 - `pk fingerprint run|plan|validate|show|coverage` and `program/release-set.yaml`: one committed record per commit that runs the project's release set on parallel tracks and derives per-test tables, with readers for how far the tree has moved since and which rows of a task's latest record it covers. Reason: a results record binds one task, so "the whole release set passed at commit X" could only be answered by re-running every task's commands.
 - `parallel_steps` in `program/checks.yaml` (default false): the hand-back gate and the merge check run `test`, `scan` and `extra_gate` concurrently and print them in the serial order, so the result is the one the serial run reports. Reason: the three steps are independent and the longest of them, not their sum, should set the gate's wall time; it is opt-in because commands that write into the tree cannot share it.
 - Working rule W12, fast default with the slow set in the release set: the `test` step finishes in minutes, slow cases sit behind one environment variable and run in their own release-set tracks. Reason: a thirty-minute suite at every hand-back makes agents skip it or wait on it.
+- The kit's own tests follow W12: the cases that build whole repositories, run the gate end to end or install the kit sit behind `KIT_TESTS_SLOW=1` (`kit/tests/_slow.py`), so the default discovery run takes about two minutes instead of eleven and `KIT_TESTS_SLOW=1` still runs every test. A test fails when a module outside the documented six imports the gate.
 
 ## 0.3.0
 
