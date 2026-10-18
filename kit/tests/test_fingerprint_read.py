@@ -73,11 +73,14 @@ class CurrentFingerprint(Recorded):
         self.record_here()
         self.assertIsNone(fp.current_fingerprint(self.root, before))
 
-    def test_a_record_on_another_branch_is_not_an_ancestor(self):
+    def test_a_record_whose_head_is_on_another_branch_is_not_an_ancestor(self):
         sh(self.root, "git", "checkout", "-q", "-b", "side")
-        self.record_here()
+        self.change("side.txt", "s\n")
+        record = self.record_here()
         sh(self.root, "git", "checkout", "-q", "main")
         self.change()
+        self.write_stamped("side00000000", record, "2999-01-01T00:00:00Z")  # tracked on main, head only on side
+        self.commit("foreign record")
         self.assertIsNone(fp.current_fingerprint(self.root))
 
     def test_a_tie_in_distance_goes_to_the_latest_produced_at(self):
