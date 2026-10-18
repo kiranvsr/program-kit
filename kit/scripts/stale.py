@@ -90,7 +90,8 @@ def drift_report(root, ref: str = "HEAD") -> dict:
     """Compare the latest results record of every task's pointer with the tree of `ref`; return
     {ref, tasks, drifted, unreadable, checked}.
 
-    `tasks` rows are {task_id, path, head, state: fresh or drifted, changed_inputs}; `drifted` counts the drifted
+    `tasks` rows are {task_id, path, head, state: fresh or drifted, changed_inputs, fingerprint: {head12, covered_rows,
+    total_rows} or None when there is no current fingerprint}; `drifted` counts the drifted
     ones; `unreadable` rows are {task_id, path, changed_inputs: [], error} (a record missing, altered or without
     inputs). Both lists are sorted by task, and `checked` counts every record examined.
     """
@@ -99,6 +100,8 @@ def drift_report(root, ref: str = "HEAD") -> dict:
         raise KitError(f"not a usable commit name: {ref}")
     sha = git(root, "rev-parse", "--verify", ref + "^{commit}")
     current = _hasher(root, sha)  # shared by every record of this run
+    import fingerprint  # late: fingerprint imports gate, which imports this module
+    context = fingerprint.Coverage(root, sha)
     index = store.read_index(root)
     entries = [(task, entry) for task in sorted(index["tasks"])
                if (entry := store.latest(index, task, "results")) is not None]
@@ -115,8 +118,13 @@ def drift_report(root, ref: str = "HEAD") -> dict:
             unreadable.append({"task_id": task, "path": rel, "changed_inputs": [], "error": error})
             continue
         changed = sorted(path for path, digest in inputs.items() if current(path) != digest)
+        covered = None
+        if context.record is not None:
+            done, total = fingerprint.coverage_counts(context.rows(data.get("commands")))
+            covered = {"head12": context.head12, "covered_rows": done, "total_rows": total}
         rows.append({"task_id": task, "path": rel, "head": str(data.get("head", "")),
-                     "state": "drifted" if changed else "fresh", "changed_inputs": changed})
+                     "state": "drifted" if changed else "fresh", "changed_inputs": changed,
+                     "fingerprint": covered})
     return {"ref": sha, "tasks": rows, "drifted": sum(row["state"] == "drifted" for row in rows),
             "unreadable": unreadable, "checked": len(entries)}
 
