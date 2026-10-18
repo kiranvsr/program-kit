@@ -1,5 +1,6 @@
 """End to end: the tiny-service example runs the whole loop, command by command, in a throwaway repository."""
 import _paths  # noqa: F401  (must come first: puts kit/scripts/ on sys.path)
+from _slow import skip_unless_slow
 import json
 import os
 import re
@@ -226,6 +227,7 @@ class EndToEndTests(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.base = Path(self._tmp.name).resolve()
 
+    @skip_unless_slow()
     @NEEDS_SH
     @NEEDS_PIP
     def test_tiny_service_runs_the_whole_loop(self):
@@ -489,6 +491,7 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(sorted(project.invoked), sorted(pk.COMMANDS))
         self.assertTrue(time.monotonic() - started < 120, "the end-to-end test took two minutes or more")
 
+    @skip_unless_slow()
     @NEEDS_SH
     @NEEDS_PIP
     def test_gate_fails_with_missing_tool_without_gitleaks(self):
@@ -499,6 +502,7 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual([ln for ln in gate.stdout.splitlines() if ln.startswith("OK: ")], [])
         self.assertIsNone(project.latest())
 
+    @skip_unless_slow()
     @NEEDS_SH
     @NEEDS_PIP
     def test_gate_refuses_a_branch_whose_unit_test_fails(self):
@@ -511,6 +515,7 @@ class EndToEndTests(unittest.TestCase):
         self.assertIsNone(project.latest())  # nothing was produced past the failed step
         self.assertEqual([ln for ln in lines if ln.startswith("step ")], ["step build: ok"])
 
+    @skip_unless_slow()
     @NEEDS_SH
     @NEEDS_PIP
     def test_a_branch_that_skipped_the_gate_is_refused_at_the_merge_check(self):
@@ -551,6 +556,7 @@ class EndToEndTests(unittest.TestCase):
                                       "'accepted_development'\n")
         self.assertIn('"status": "review"', project.pk("status", "show", TASK, cwd=wt).stdout)
 
+    @skip_unless_slow()
     @NEEDS_SH
     @NEEDS_PIP
     def test_a_planted_bug_no_test_catches_is_recorded_not_killed_and_refused(self):
@@ -578,6 +584,7 @@ class EndToEndTests(unittest.TestCase):
         self.assertIn(f"error: {entry['path']}: planted_bugs_all_killed: is not true (a planted bug survived)",
                       binding.stderr)
 
+    @skip_unless_slow()
     @NEEDS_SH
     @NEEDS_PIP
     def test_a_plan_command_whose_real_exit_differs_from_the_plan_is_refused(self):
