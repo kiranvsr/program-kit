@@ -1,0 +1,27 @@
+# The commands the release fingerprint runs (pk fingerprint run), in two tracks that run at the same time:
+# the unit tests, and a compile check of the sources.
+toolchain:
+  - - python3
+    - '--version'
+entries:
+  - id: unit
+    argv:
+      - python3
+      - '-m'
+      - unittest
+      - discover
+      - '-s'
+      - src
+      - '-v'
+    track: tests
+    kind: test
+    derives: unittest
+  - id: compile
+    argv:
+      - python3
+      - '-m'
+      - compileall
+      - '-q'
+      - src
+    track: checks
+    kind: check
