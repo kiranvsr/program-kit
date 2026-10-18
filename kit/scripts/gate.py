@@ -57,6 +57,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path, PurePosixPath
 
 import evidence as evidence_module
@@ -70,7 +71,7 @@ from register import GATE_ID
 
 MAIN = "main"  # the primary branch; fixed, so no caller can choose where the rules are read from
 CHECK_KEYS = ("build", "test", "scan", "compile_check", "extra_gate")
-ALL_KEYS = CHECK_KEYS + ("guarded_files", "tiers")
+ALL_KEYS = CHECK_KEYS + ("parallel_steps", "guarded_files", "tiers")
 TIER_KEYS = ("full_paths", "light_paths", "light_ruling")
 BUILTIN_FULL = ("kit/", "program/checks.yaml", "program/gates.yaml")  # the kit's own gates: always full-tier
 LIGHT_STEPS = ("build", "compile_check", "scan")
@@ -184,6 +185,12 @@ def _parse_checks(data, require: tuple[str, ...]) -> dict:
     if not isinstance(guarded, list) or not all(isinstance(path, str) and path for path in guarded):
         raise KitError("checks.yaml: guarded_files must be a list of paths")
     checks["guarded_files"] = list(guarded)
+    parallel = data.get("parallel_steps")
+    if parallel is None:
+        parallel = False
+    if not isinstance(parallel, bool):
+        raise KitError("checks.yaml: parallel_steps must be true or false")
+    checks["parallel_steps"] = parallel
     checks["tiers"] = _parse_tiers(data.get("tiers"))
     for key in require:
         if not checks[key]:
@@ -327,27 +334,74 @@ def trial_merge(root, branch: str, main: str = MAIN) -> Path:
 
 # --- running steps -----------------------------------------------------------------
 
-def _run_commands(step: str, commands: list[tuple[list[str], int]], cwd: Path) -> bool:
-    """Run (argv, expected exit) pairs in order; print the first failure and return False.
+def _step_lines(step: str, commands: list[tuple[list[str], int]], cwd: Path) -> tuple[bool, list[str]]:
+    """Run (argv, expected exit) pairs in order; return (passed, the lines to print) without printing.
 
     Output tail lines are indented with `    | ` so a command can never print a line that looks like
-    the gate's own `OK:` line. An empty list runs nothing and prints nothing.
+    the gate's own `OK:` line. An empty list runs nothing and yields no lines.
     """
     if not commands:
-        return True
+        return True, []
     for argv, expect in commands:
         code, output = run_argv(argv, cwd, timeout=STEP_TIMEOUT)
         if code == expect:
             continue
         if code == 127:
-            _out(f"FAILED: {step} missing tool: {argv[0]}")
+            return False, [f"FAILED: {step} missing tool: {argv[0]}"]
+        lines = [f"FAILED: {step} {' '.join(argv)} (exit {code})"]
+        lines.extend(TAIL_PREFIX + line for line in output.splitlines()[-TAIL_LINES:])
+        return False, lines
+    return True, [f"step {step}: ok"]
+
+
+def _run_commands(step: str, commands: list[tuple[list[str], int]], cwd: Path) -> bool:
+    """Run (argv, expected exit) pairs in order; print the first failure and return False."""
+    passed, lines = _step_lines(step, commands, cwd)
+    for line in lines:
+        _out(line)
+    return passed
+
+
+PARALLEL_STEPS = ("test", "scan", "extra_gate")  # the steps `parallel_steps` runs together, and the print order
+
+
+def _run_parallel(checks: dict, cwd: Path) -> bool:
+    """Run test, scan and extra_gate at once, one thread each, then print them in that order.
+
+    Each step's commands stay sequential inside its thread and its output is held until all three finished.
+    The first failing step in the fixed order decides the result and the later steps print nothing, so the
+    printed lines are exactly what the serial run prints. An exception in a thread is raised after the join.
+    """
+    results: dict = {}
+
+    def work(step: str) -> None:
+        try:
+            results[step] = _step_lines(step, _commands(checks[step]), cwd)
+        except BaseException as exc:  # re-raised in the calling thread, in step order
+            results[step] = exc
+
+    threads = [threading.Thread(target=work, args=(step,), name=f"pk-gate-{step}") for step in PARALLEL_STEPS]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    for step in PARALLEL_STEPS:
+        result = results[step]
+        if isinstance(result, BaseException):
+            raise result
+        passed, lines = result
+        for line in lines:
+            _out(line)
+        if not passed:
             return False
-        _out(f"FAILED: {step} {' '.join(argv)} (exit {code})")
-        for line in output.splitlines()[-TAIL_LINES:]:
-            _out(TAIL_PREFIX + line)
-        return False
-    _out(f"step {step}: ok")
     return True
+
+
+def _run_late_steps(checks: dict, cwd: Path) -> bool:
+    """test, scan and extra_gate in `cwd`: concurrent when checks.yaml says `parallel_steps: true`, else in order."""
+    if checks["parallel_steps"]:
+        return _run_parallel(checks, cwd)
+    return all(_run_commands(step, _commands(checks[step]), cwd) for step in PARALLEL_STEPS)
 
 
 def _commands(argvs: list[list[str]]) -> list[tuple[list[str], int]]:
@@ -798,9 +852,8 @@ def _run_steps(checks: dict, task_id: str, wt: Path, trial: Path, authoritative:
     for step in ("build", "compile_check"):
         if not _run_commands(step, _commands(checks[step]), trial):
             return 1
-    for step in ("test", "scan", "extra_gate"):
-        if not _run_commands(step, _commands(checks[step]), wt):
-            return 1
+    if not _run_late_steps(checks, wt):
+        return 1
     try:
         plan = parse_plan(drop_bom(authoritative.decode("utf-8", "replace")))
     except KitError as exc:
@@ -882,10 +935,10 @@ def merge_check(root, branch: str, inspected: str | None = None, suite: bool = T
             return 0
         if meta["tier"] == "light":
             return _run_light(checks, trial)
-        for step in ("build", "compile_check", "test", "scan", "extra_gate"):
+        for step in ("build", "compile_check"):
             if not _run_commands(step, _commands(checks[step]), trial):
                 return 1
-        return 0
+        return 0 if _run_late_steps(checks, trial) else 1
 
     code = _with_trial(root, trial, steps)
     if code:

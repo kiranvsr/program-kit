@@ -258,7 +258,7 @@ class HandbackBase(GitBase):
 
 
 class PresetTests(unittest.TestCase):
-    KEYS = ("build", "test", "scan", "compile_check", "extra_gate", "guarded_files", "tiers")
+    KEYS = ("build", "test", "scan", "compile_check", "extra_gate", "parallel_steps", "guarded_files", "tiers")
     EXPECT = {
         "go": {"build": [["go", "build", "./..."]], "compile_check": [["go", "vet", "./..."]],
                "test": [["go", "test", "./..."]],
@@ -282,6 +282,7 @@ class PresetTests(unittest.TestCase):
                 for key in ("build", "test", "scan"):
                     self.assertTrue(data[key], key)
                 self.assertEqual(data["extra_gate"], [])
+                self.assertIs(data["parallel_steps"], False)
                 self.assertEqual(data["guarded_files"], expect["guarded"])
                 self.assertEqual(data["test"], expect["test"])
                 self.assertEqual(data["scan"], expect["scan"])
@@ -307,6 +308,133 @@ class PresetTests(unittest.TestCase):
                 shutil.copy(PRESETS / f"checks.{name}.yaml", Path(tmp) / "program" / "checks.yaml")
                 checks = gate.load_checks(Path(tmp), require=("build", "test", "scan"))
                 self.assertEqual(checks["scan"][-1], ["gitleaks", "detect", "--no-git"])
+
+
+# A step command that proves overlap: it writes its own marker, then waits until every marker exists.
+RENDEZVOUS = ("import os, sys, time\n"
+              "d, me = sys.argv[1], sys.argv[2]\n"
+              "open(os.path.join(d, me), 'w').close()\n"
+              "end = time.time() + 5\n"
+              "while time.time() < end:\n"
+              "    if all(os.path.exists(os.path.join(d, n)) for n in ('test', 'scan', 'extra_gate')):\n"
+              "        print('met ' + me)\n"
+              "        raise SystemExit(0)\n"
+              "    time.sleep(0.02)\n"
+              "print('never met ' + me)\n"
+              "raise SystemExit(3)\n")
+
+
+class ParallelStepsParseTests(GitBase):
+    def put_raw(self, text):
+        put(self.root, "program/checks.yaml", text)
+
+    def test_default_is_false_and_true_is_read(self):
+        self.put_raw("build:\n  - - make\n")
+        self.assertIs(gate.load_checks(self.root)["parallel_steps"], False)
+        self.put_raw("parallel_steps: true\n")
+        self.assertIs(gate.load_checks(self.root)["parallel_steps"], True)
+        self.put_raw("parallel_steps: false\n")
+        self.assertIs(gate.load_checks(self.root)["parallel_steps"], False)
+
+    def test_a_non_boolean_is_refused_by_name(self):
+        for text in ("parallel_steps: yes please\n", "parallel_steps: 1\n", "parallel_steps: []\n",
+                     'parallel_steps: "true"\n'):
+            with self.subTest(text=text):
+                self.put_raw(text)
+                with self.assertRaises(KitError) as ctx:
+                    gate.load_checks(self.root)
+                self.assertEqual(str(ctx.exception), "checks.yaml: parallel_steps must be true or false")
+
+
+class ParallelStepsRunTests(HandbackBase):
+    def set_checks(self, parallel, **over):
+        self.write_checks(parallel_steps=parallel, **over)
+        commit(self.root, "checks")
+        sh(self.wt, "git", "merge", "-q", "main")
+
+    def marker_dir(self):
+        marks = self.tmpdir.parent / "marks"
+        shutil.rmtree(marks, ignore_errors=True)
+        marks.mkdir()
+        return marks
+
+    def rendezvous(self, marks):
+        return {name: [[PY, "-c", RENDEZVOUS, str(marks), name]] for name in ("test", "scan", "extra_gate")}
+
+    def test_the_three_steps_overlap_in_the_hand_back_gate_and_the_merge_check(self):
+        marks = self.marker_dir()
+        self.set_checks(True, **self.rendezvous(marks))
+        rc, out = self.merge_check()
+        self.assertEqual(rc, 0, out)
+        for name in ("test", "scan", "extra_gate"):
+            self.assertIn(f"step {name}: ok", out)
+        shutil.rmtree(marks)
+        marks.mkdir()
+        rc, out = self.handback()
+        self.assertEqual(rc, 0, out)
+
+    def test_serial_steps_do_not_overlap(self):
+        marks = self.marker_dir()
+        self.set_checks(False, **self.rendezvous(marks))
+        rc, out = self.merge_check()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("never met test", out)
+
+    def test_the_output_order_is_test_scan_extra_gate_whatever_finishes_first(self):
+        slow = [[PY, "-c", "import time; time.sleep(0.6); print('slow test')"]]
+        self.set_checks(True, test=slow, extra_gate=[[PY, "-c", "print('quick extra')"]])
+        rc, out = self.merge_check()
+        self.assertEqual(rc, 0, out)
+        lines = [ln for ln in out.splitlines() if ln.startswith("step ")]
+        self.assertEqual(lines, ["step build: ok", "step test: ok", "step scan: ok", "step extra_gate: ok"])
+
+    def serial_and_parallel(self, runner, **over):
+        outs = []
+        for parallel in (False, True):
+            self.set_checks(parallel, **over)
+            rc, out = runner()
+            outs.append((rc, re.sub(r"\b[0-9a-f]{40}\b", "<sha>", out)))  # the branch tip moves with each merge of main
+        return outs
+
+    def test_a_failing_scan_with_a_passing_test_reports_exactly_as_the_serial_run(self):
+        script = "print('\\n'.join('s%d' % i for i in range(30))); raise SystemExit(2)"
+        over = {"scan": [[PY, "-c", script]], "extra_gate": [[PY, "-c", "raise SystemExit(5)"]]}
+        for runner in (self.handback, self.merge_check):
+            with self.subTest(runner=runner.__name__):
+                serial, parallel = self.serial_and_parallel(runner, **over)
+                self.assertEqual(serial[0], 1)
+                self.assertEqual(parallel, serial)
+                lines = parallel[1].splitlines()
+                self.assertIn("step test: ok", lines)
+                self.assertEqual(lines[-21], f"FAILED: scan {PY} -c {script} (exit 2)")
+                self.assertEqual(lines[-20:], [f"{TAIL}s{i}" for i in range(10, 30)])
+                self.assertNotIn("extra_gate", parallel[1])
+                self.assert_no_trial_left()
+
+    def test_a_failing_test_hides_the_later_steps_output(self):
+        over = {"test": [[PY, "-c", "print('boom'); raise SystemExit(4)"]],
+                "scan": [[PY, "-c", "raise SystemExit(6)"]]}
+        serial, parallel = self.serial_and_parallel(self.merge_check, **over)
+        self.assertEqual(parallel, serial)
+        self.assertEqual(parallel[1].splitlines()[-2:], [f"FAILED: test {PY} -c print('boom'); raise SystemExit(4) (exit 4)",
+                                                         f"{TAIL}boom"])
+
+    def test_a_passing_run_prints_what_the_serial_run_prints(self):
+        serial, parallel = self.serial_and_parallel(self.merge_check)
+        self.assertEqual(parallel, serial)
+
+    def test_a_missing_tool_in_a_parallel_step_is_reported_as_serial(self):
+        (self.bin / "gitleaks").unlink()
+        serial, parallel = self.serial_and_parallel(self.merge_check)
+        self.assertEqual(parallel, serial)
+        self.assertEqual(parallel[1].splitlines()[-1], "FAILED: scan missing tool: gitleaks")
+
+    def test_the_light_tier_is_unchanged(self):
+        self.set_checks(True)
+        checks = gate.load_checks_at(self.root, "main")
+        with mock.patch.object(gate, "_run_parallel") as parallel:
+            self.assertEqual(gate._run_light(checks, self.root), 0)
+        parallel.assert_not_called()
 
 
 class LoadChecksTests(GitBase):

@@ -60,6 +60,7 @@ program-kit/
       phase_brief.md, milestone_brief.md, step_brief.md, task_brief.md     the generated brief shapes
       results.schema.json, acceptance.schema.json, status.schema.json
       checks.yaml, CLAIM_BOUNDARIES.md, HANDOFF.md, controller-state.json, rulings.md
+      release-set.yaml, fingerprint.schema.json     the release set example and the schema of a fingerprint record (section 9.4)
       stage_report.md       the completion report every stage ends with
       challenge_report.md   the per-lens challenge round report
       change_request.md
@@ -77,6 +78,7 @@ program-kit/
       evidence.py           the evidence kit (section 9.2)
       store.py              the append-only record layout, the per-task pointers and the integrity checks (section 9.2)
       gate.py               the hand-back gate, merge check, binding check and gate claims
+      fingerprint.py        the release fingerprint: runs the release set on parallel tracks, derives per-test tables, validates and reads records (section 9.4)
       fetch.py              fetches and caches network inputs by digest; the only script that downloads
       stale.py              drift report: is each task's latest record fresh against the current tree
       rulings.py            appends a numbered ruling; validates the log
@@ -127,7 +129,9 @@ program/
   rulings.md                append-only, numbered R1..
   changes/CR-NNN.md         change requests after approval
   changes/register-log.md   one line per register change after approval
-  checks.yaml               commands, guarded files and the `tiers` section
+  checks.yaml               commands, guarded files, `parallel_steps` and the `tiers` section
+  release-set.yaml          the commands the release fingerprint runs, grouped in tracks (section 9.4)
+  evidence/fingerprint/<head12>/   the release fingerprint of one commit: fingerprint.json and one table file per derived table (section 9.4)
   COMMON.md                 run commands, constraints, model mapping, report contract, known failures on main
   costs.jsonl               append-only, one line per subagent run
   rounds/<NAME>.json        integration rounds: members, tested tree, what merged
@@ -297,15 +301,32 @@ compile_check:
     - vet
     - ./...
 extra_gate: []            # project-specific gate commands, run in order
+parallel_steps: false     # true runs test, scan and extra_gate concurrently
 guarded_files:
   - go.mod
   - go.sum
   - program/checks.yaml
 ```
-Presets fill these for Go, Node/TypeScript and Python. Commands are argv lists; `pk gate` runs them without a shell. `build`, `test` and `scan` must each list a command. A guarded file is an exact path, or a directory when the entry ends in a slash. The gate reads `checks.yaml` from main, never from the task branch or a dirty checkout, so a branch cannot change the rules it is judged by. Unclaimable environments come from `environments.yaml`, not from here. `pk doctor` applies the same rules to a project's `checks.yaml` and reports each problem on its own line, and runs the evidence integrity checks of section 9.2.
+Presets fill these for Go, Node/TypeScript and Python. `parallel_steps` is false by default and a value that is not a boolean is refused by name. When true, in the hand-back gate and in the merge check, `build` and `compile_check` still run first, in order; then `test`, `scan` and `extra_gate` run concurrently, one thread each, the commands of a step still one after another and each step's output captured; when all three have finished the outputs are printed in the fixed order test, scan, extra_gate and the first failing step in that order decides the exit, so the printed result is the one the serial run prints (a later step may have run although an earlier one failed, and prints nothing). The `plan` commands, the evidence step and the drift step stay serial after them, and the light tier is unchanged. Keep it false unless the test, scan and extra-gate commands can share one tree at once: a test that writes into the tree while a scanner reads it is a reason to leave it off. Commands are argv lists; `pk gate` runs them without a shell. `build`, `test` and `scan` must each list a command. A guarded file is an exact path, or a directory when the entry ends in a slash. The gate reads `checks.yaml` from main, never from the task branch or a dirty checkout, so a branch cannot change the rules it is judged by. Unclaimable environments come from `environments.yaml`, not from here. `pk doctor` applies the same rules to a project's `checks.yaml` and reports each problem on its own line, and runs the evidence integrity checks of section 9.2.
+### 9.4 The release fingerprint
+
+**What it claims.** A results record binds one task's inputs and commands at one commit. It cannot say "the whole release set passed at commit X", and answering that today means re-running every task's commands. A release fingerprint is one committed record per commit that runs the project's release set on parallel tracks and derives a per-test table from the output. It claims exactly: at `head`, these commands ran with these exit codes and these test verdicts. It claims nothing about any other commit; the readers say how far the tree has moved since.
+
+**The release set.** `program/release-set.yaml` (block-style YAML in the kit's subset; `kit/templates/release-set.yaml` is the commented example and `pk init` copies it) lists `entries`, each with an `id` (`[a-z0-9-]+`, unique), the literal `argv` (never a shell string), `expected_exit` (default 0), a `track` (one thread per distinct track), a `kind` (`check`, `test` or `gate`), `derives` (`null`, `unittest` or `go-tests`: the table the output is parsed into) and an optional `env` that is set for that command only and whose values are never recorded; `toolchain` lists argv lists whose first output line is recorded as the toolchain version. Anything else is refused by name. It is read from a git ref, never from the working copy, and it is a guarded file, so a task branch cannot change what the fingerprint runs.
+
+**Layout.** `program/evidence/fingerprint/<head12>/fingerprint.json` and one `<table>.json` per derived table, checked against `kit/templates/fingerprint.schema.json` (`"schema": "program-kit.fingerprint.v1"`). The record keeps, per command, the exit, whether it was as expected, the seconds, the `output_sha256` and the last 20 lines of output; full output goes to a scratch directory, never into the record. It also keeps the sha256 of the release set, of `program/checks.yaml` and of `kit/MANIFEST.sha256` at `head`, and the toolchain lines. No absolute path, no environment value and no output body appears in it.
+
+**The producer.** `pk fingerprint run [--only TRACK] [--scratch DIR]` needs a clean tree and refuses when the directory for HEAD is already tracked ("a record is never rewritten"); an untracked directory of that name from an earlier uncommitted run is removed and rewritten. It runs every entry at HEAD from the repository root, one thread per track and the entries of a track in release-set order, with the gate's per-command timeout; a failing command does not stop its track. `unittest` tables are parsed from the verbose runner's lines and `go-tests` tables from `go test -json` events. A command that exited 0 but parsed to no entries is recorded as not as expected ("no test entries parsed"): a vacuous pass is not a pass. Tables from several commands merge: `skipped` yields to any other verdict, two different non-skipped verdicts for one name are a `table_conflicts` entry and make the record incomplete, and the summary key takes the worst verdict. After the run the tree must be clean again (`tree_unchanged_by_run`), otherwise the record says so and the command exits 1. `complete` means every entry ran (no `--only`), the tree was unchanged and there are no conflicts; `all_as_expected` means every command was. It exits 0 only when both hold. `pk fingerprint plan` prints the entries by track with the seconds the current fingerprint recorded for each, and runs nothing. `pk fingerprint validate [PATH]` checks the schema, each table file's digest, the release-set digest at `head`, that no absolute path appears and that `head12` is the directory name; the history check behind `pk evidence validate` and `pk doctor` also covers `program/evidence/fingerprint/`, so a commit that modified or deleted a tracked fingerprint file is refused like a modified task record.
+
+**The readers.** The current fingerprint is the record tracked at a ref whose `head` is that ref or an ancestor of it, the nearest one winning and the latest `produced_at` breaking a tie. `pk fingerprint show [--json]` reports it, how many commits and paths the tree has moved since, the seconds per track and the commands that were not as expected; it always exits 0, as information, like `pk stale`. `pk fingerprint coverage [ID]` classifies each row of a task's latest results record: `exact` (same argv and expected exit as an entry that was as expected), `derived-unittest` or `derived-go` (a named-test or package-level command whose tests are in the derived table as passed), or `not_covered` with one reason (no fingerprint, incomplete fingerprint, ad-hoc command, expected non-zero exit, env override, all matched entries skipped, package not in the table, build-changing flag). `pk stale` adds a `fingerprint` field to each task's entry and `pk handoff update` adds one Now line, `Fingerprint: <head12>, complete, N of M as expected, K commits behind` or `Fingerprint: none`. Coverage is computed on read and never written.
+
+**When the controller runs it.** After a merge that changes the release set or a suite it names, and before a release. The record is committed only when it is complete and every command was as expected, in its own commit through `pk record`. A red run is not committed: keep the directory uncommitted, fix, and run again at the new commit. There is no run store: the kit never re-binds, QA runs fresh by design, and the merge check runs on a trial-merge commit, so a stored result would never match.
+
+**What it is not.** It does not replace the gates or QA's re-run, it is not signed, and it is not a statement about any commit but its own `head`.
+
 ## 10. Working rules and the controller's rules (kit/rules/RULES.md, parts 2 and 4)
 
-Rework and token cost, not coding, are what slow a program down. Part 2 of the rules file holds the working rules every agent follows (W1 to W11: decide don't ask, the OK line, fix rounds, your own folder and worktree, no polling, the return contract, read only what you are pointed at, interruptions, decided means decided, work to your tier, report the cost). Part 4 holds the controller's rules (C1 to C20). This section explains the three mechanisms behind them; the rules themselves are not repeated here.
+Rework and token cost, not coding, are what slow a program down. Part 2 of the rules file holds the working rules every agent follows (W1 to W12: decide don't ask, the OK line, fix rounds, your own folder and worktree, no polling, the return contract, read only what you are pointed at, interruptions, decided means decided, work to your tier, report the cost, fast default with the slow set in the release set). Part 4 holds the controller's rules (C1 to C20). This section explains the three mechanisms behind them; the rules themselves are not repeated here.
 
 ### 10.1 Verification tiers and the fast path
 
