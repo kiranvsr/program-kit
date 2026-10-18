@@ -267,9 +267,12 @@ class RulesTests(unittest.TestCase):
             self.assertIn(phrase, w12.group(1))
 
     def test_the_execute_playbook_points_the_evidence_step_to_w12_and_the_fingerprint(self):
-        step = next(ln for ln in read(PLAYBOOK_DIR / "08_execute.md").splitlines() if ln.startswith("5. Evidence"))
-        self.assertIn("W12", step)
-        self.assertIn("`pk fingerprint run`", step)
+        lines = read(PLAYBOOK_DIR / "08_execute.md").splitlines()
+        at = next(i for i, ln in enumerate(lines) if ln.startswith("5. Evidence"))
+        self.assertTrue(lines[at + 1].startswith("   - "), "the paragraph is a sub-point of the evidence step")
+        self.assertIn("W12", lines[at + 1])
+        self.assertIn("`pk fingerprint run`", lines[at + 1])
+        self.assertTrue(lines[at + 2].startswith("6. Hand-back gate"))
 
     def test_throughput_covers_required_topics(self):
         text = (rule_part(2) + rule_part(4)).lower()
