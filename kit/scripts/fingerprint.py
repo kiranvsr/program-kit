@@ -46,13 +46,24 @@ _HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 _STAMP = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\Z")
 _ENTRY_KEYS = ("id", "argv", "expected_exit", "track", "kind", "derives", "env")
 _TOP_KEYS = ("toolchain", "entries")
-# An absolute path of the kinds that name a person or a machine. A POSIX prefix counts only at the start of its token
-# (split on whitespace and quotes) once a leading `-<letter>`, `--name=`, `_` or a file-URL prefix is stripped, so `-L/Users/x`
-# and `--out=/tmp/x` are absolute and `src/home` is not. A drive letter counts anywhere. One finder serves the
-# validator (ABSOLUTE_PATH), the tail scrubber (_PATH_RUN) and the argv pre-check, so they cannot drift.
+# An absolute path of the kinds that name a person or a machine. A POSIX prefix inside a token (split on whitespace
+# and quotes) counts as absolute when the text before it in the token, after one leading `<scheme>:/` + `/` is stripped,
+# is empty, a flag letter (`-L`) or ends in a character that cannot end a path segment (`=`, `:`,
+# `(`, `_` ...). So `-L/Users/x`, `cwd=/tmp/x`, `(/Users/x)` and `--out=/tmp/x` are absolute; `src/home`,
+# `../tmp` and `a/b/tmp` are not. A drive letter counts anywhere. One finder serves the validator (ABSOLUTE_PATH), the
+# tail scrubber (_PATH_RUN) and the argv pre-check, so they cannot drift.
 _PATH_PREFIX = re.compile(r"/(?:Users|home|private|tmp)(?![\w.-])|(?<!\w)[A-Za-z]:[\\/]")
 _TOKEN_TAIL = re.compile(r"[^\s'\"]*\Z")
-_TOKEN_LEAD = re.compile(r"(?:-[A-Za-z]|--[\w-]+=|_|file:/{2})?\Z")
+_SCHEME = re.compile(r"[A-Za-z]+:/{2}")
+
+
+def _absolute_head(head: str) -> bool:
+    """Whether the token text before a POSIX prefix leaves the prefix at the start of an absolute path."""
+    scheme = _SCHEME.match(head)
+    head = head[scheme.end():] if scheme else head
+    return not head or re.fullmatch(r"-[A-Za-z]", head) is not None or not (head[-1].isalnum() or head[-1] == ".")
+
+
 _PATH_REST = re.compile(r"[^\s'\"<>():,;]*")
 
 
@@ -67,7 +78,7 @@ class _PathFinder:
                 continue  # inside the path just reported
             if found.group()[0] == "/":
                 head = _TOKEN_TAIL.search(text, 0, found.start()).group()
-                if not _TOKEN_LEAD.match(head):
+                if not _absolute_head(head):
                     continue
             end = _PATH_REST.match(text, found.end()).end() if self.extend else found.end()
             yield found.start(), end

@@ -810,6 +810,10 @@ REAL_SHAPES = (  # path shapes a boundary-checking pattern misses: a letter or u
 )  # each pair is joined by the command, so the program's own argv holds no absolute path
 
 
+ABSOLUTE_SHAPES = ("-L/Users/x", "-I/home/x", "_/Users/x", "cwd=/tmp/x", "path:/tmp/x", "(/Users/x)", "--out=/tmp/x",
+                   "file:/" + "//tmp/x", "/tmp/x", "/private/x")
+
+
 class FixRound(Repo):
     def test_path_shapes_with_a_letter_before_the_prefix_are_scrubbed_and_refused(self):
         code = "\n".join(f"print({head!r} + {tail!r})" for head, tail in REAL_SHAPES)
@@ -841,25 +845,27 @@ class FixRound(Repo):
         self.assertEqual(record["commands"][0]["argv"][-2:], ["src/home", "tests/tmp"])
         self.assertEqual(record["commands"][0]["output_tail"], "built src/home tests/tmp ./internal/private/x")
         self.assertIsNone(fp.ABSOLUTE_PATH.search(self.text()))
-        for relative in ("src/home", "tests/tmp", "./internal/private/x", "a/Users/b", "x=y/tmp"):
+        for relative in ("src/home", "tests/tmp", "./internal/private/x", "a/Users/b", "a/b/tmp", "../tmp/x"):
             with self.subTest(relative):
                 self.assertIsNone(fp.ABSOLUTE_PATH.search(f"tail {relative} end"))
                 self.assertEqual(fp._PATH_RUN.sub("<path>", f"tail {relative} end"), f"tail {relative} end")
-        for shape in ("-L/Users/x", "-I/home/x", "_/Users/x", "file:/" + "//tmp/x", "--out=/tmp/x", "/tmp/x", "'/private/x'"):
+        for shape in ABSOLUTE_SHAPES:
             with self.subTest(shape):
                 self.assertIsNotNone(fp.ABSOLUTE_PATH.search(f"tail {shape} end"))
-                self.assertNotIn("/", fp._PATH_RUN.sub("<path>", f"tail {shape} end").replace("file:/" + "/", ""))
+                self.assertIn("<path>", fp._PATH_RUN.sub("<path>", f"tail {shape} end"))
                 self.assertIsNotNone(fp.ABSOLUTE_PATH.search(shape))  # also as a whole argv part
         path = self.root / BASE / record["head12"] / "fingerprint.json"
-        data = json.loads(path.read_text())
-        data["commands"][0]["output_tail"] = "ld: -L/Users/x"
-        path.write_text(json.dumps(data, indent=2) + "\n")
-        code, _, err = self.cli("validate", f"{BASE}/{record['head12']}")
-        self.assertEqual(code, 1)
-        self.assertIn("holds an absolute path", err)
+        for shape in ABSOLUTE_SHAPES:
+            with self.subTest("planted " + shape):
+                data = json.loads(path.read_text())
+                data["commands"][0]["output_tail"] = f"ld: {shape} done"
+                path.write_text(json.dumps(data, indent=2) + "\n")
+                code, _, err = self.cli("validate", f"{BASE}/{record['head12']}")
+                self.assertEqual(code, 1)
+                self.assertIn("holds an absolute path", err)
 
     def test_an_argv_part_in_each_absolute_shape_is_refused_before_anything_runs(self):
-        for shape in ("-L/Users/x", "--out=/tmp/x", "file:/" + "//home/x", "_/private/x"):
+        for shape in ABSOLUTE_SHAPES:
             with self.subTest(shape):
                 self.release({"id": "abs", "argv": [PY, "-c", "pass", shape], "track": "plain", "kind": "check"})
                 code, _, err = self.cli("run", "--scratch", str(self.scratch))
