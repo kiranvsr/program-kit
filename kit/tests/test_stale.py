@@ -69,9 +69,13 @@ class DriftReport(Base):
         report = stale.drift_report(self.root, "main")
         self.assertEqual(report["ref"], sh(self.root, "git", "rev-parse", "main").strip())
         self.assertEqual(report["tasks"][0], {"task_id": "T-1", "path": self.path_of("T-1"), "head": "",
-                                              "state": "drifted", "changed_inputs": ["calc.py"]})
+                                              "fingerprint": None, "state": "drifted", "changed_inputs": ["calc.py"]})
         self.assertEqual(self.rows(report), {"T-1": ("drifted", ["calc.py"]), "T-2": ("fresh", [])})
         self.assertEqual((report["drifted"], report["unreadable"], report["checked"]), (1, [], 2))
+
+    def test_every_row_has_a_fingerprint_field_null_without_a_fingerprint(self):
+        report = stale.drift_report(self.root, "main")
+        self.assertEqual([row["fingerprint"] for row in report["tasks"]], [None, None])
 
     def test_nothing_changed_is_all_fresh(self):
         report = stale.drift_report(self.root, "main")

@@ -149,6 +149,7 @@ def render(root: Path, main: str = "main") -> str:
     unregistered = [task for task in unregistered if task not in adhoc]
     by_id = {record["task_id"]: record for record in records}
     now = [_line(state["now"])] if state["now"].strip() else []
+    now.append(_line(_fingerprint_line(root)))
     listed = {item["id"] for item in state["adhoc"] if item["state"] != "closed"}  # the loop below prints these
     for r in records:
         if r["status"] not in IN_FLIGHT or r["task_id"] in listed:
@@ -235,8 +236,28 @@ def _round_lines(root: Path) -> list[str]:
     return lines
 
 
+_BEHIND = re.compile(r"(?<=^- Fingerprint: )(.*), \d+ commits behind(?=\r?\n?\Z)")
+
+
 def _comparable(block: str) -> str:
-    return "".join(line for line in block.splitlines(keepends=True) if not line.startswith(COMMIT_PREFIX))
+    """The block without the commit line and without the fingerprint's distance: committing the hand-off moves HEAD."""
+    lines = (line for line in block.splitlines(keepends=True) if not line.startswith(COMMIT_PREFIX))
+    return "".join(_BEHIND.sub(r"\1", line) for line in lines)
+
+
+def _fingerprint_line(root: Path) -> str:
+    import fingerprint  # late: fingerprint imports gate, which imports modules that import this one
+    try:
+        record = fingerprint.current_fingerprint(root)
+    except KitError:
+        record = None
+    if record is None:
+        return "Fingerprint: none"
+    rows = [r for r in record["commands"] if isinstance(r, dict)]
+    good = sum(r.get("as_expected") is True for r in rows)
+    state = "complete" if record.get("complete") is True else "incomplete"
+    return (f"Fingerprint: {record.get('head12', record['head'][:12])}, {state}, {good} of {len(rows)} as expected, "
+            f"{fingerprint.commits_behind(root, record)} commits behind")
 
 
 def _marker(text: str, marker: str) -> re.Match:
