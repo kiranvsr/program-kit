@@ -202,6 +202,14 @@ class RenderTests(HandoffBase):
         self.assertIn("program/register.yaml is malformed", str(caught.exception))
 
 
+class FingerprintLineTests(HandoffBase):
+    def test_the_now_list_says_none_without_a_fingerprint_and_the_hand_off_stays_current(self):
+        handoff.update(self.root)
+        self.assertIn("- Fingerprint: none\n", self.text())
+        commit_all(self.root, "hand-off")
+        self.assertTrue(handoff.check(self.root))
+
+
 class UpdateTests(HandoffBase):
     def test_update_touches_only_marked_block(self):
         self.put_status(T1, "in_progress")
