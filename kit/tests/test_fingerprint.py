@@ -1,6 +1,7 @@
 """The release fingerprint producer: the release set, the run, the parsers, the merge rule, validate, plan, immutability."""
 import _paths  # noqa: F401  (must come first: puts kit/scripts/ on sys.path)
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -647,12 +648,45 @@ class ValidateAndPlan(Repo):
     def test_a_planted_absolute_path_is_found(self):
         record = self.recorded()
         self.record_head12 = record["head12"]
-        for planted in ("/Users/someone/x.py", "/home/ci/x", "/private/var/x", "/tmp/x", "C:\\\\work\\\\x"):
+        for planted in ("/Users/someone/x.py", "/home/ci/x", "/private/var/x", "/tmp/x", "C:\\\\work\\\\x",
+                        "first line\n/Users/someone/x", "first line\n-L/Users/someone/lib", "ok  \t/home/ci/pkg 0.1s"):
             with self.subTest(planted):
                 self.edit_record(lambda d: d["commands"][0].update(output_tail=f"at {planted} line 1"))
                 code, _, err = self.cli("validate", f"{BASE}/{record['head12']}")
                 self.assertEqual(code, 1)
                 self.assertIn("holds an absolute path", err)
+
+    def edit_table(self, record, change):
+        """Rewrite the unittest table of a record and its hash, as a forger of the table file would."""
+        table = self.root / BASE / record["head12"] / "unittest.json"
+        data = json.loads(table.read_text())
+        change(data)
+        table.write_text(json.dumps(data, indent=2) + "\n")
+        self.edit_record(lambda d: d["tables"]["unittest"].update(
+            sha256=hashlib.sha256(table.read_bytes()).hexdigest()))
+
+    def test_a_planted_absolute_path_in_a_table_file_is_found(self):
+        record = self.recorded()
+        self.record_head12 = record["head12"]
+        self.edit_table(record, lambda d: d.update({"a\n/Users/someone/x.test_b": "ok"}))
+        code, _, err = self.cli("validate", f"{BASE}/{record['head12']}")
+        self.assertEqual(code, 1)
+        self.assertIn("holds an absolute path", err)
+
+    def test_an_env_value_in_a_table_file_or_after_a_line_break_is_found(self):
+        record = self.recorded(entry("t", say("test_a (m.C.test_a) ... ok"), kind="test", derives="unittest",
+                                     env={"SEG": "scratchpad"}))
+        self.record_head12 = record["head12"]
+        self.edit_table(record, lambda d: d.update({"m.C.scratchpad_case": "ok"}))
+        code, _, err = self.cli("validate", f"{BASE}/{record['head12']}")
+        self.assertEqual(code, 1)
+        self.assertIn("entry t: the value of env SEG appears in the record", err)
+        self.assertNotIn("scratchpad", err)
+        self.edit_table(record, lambda d: d.pop("m.C.scratchpad_case"))
+        self.edit_record(lambda d: d["commands"][0].update(output_tail="line one\nthen scratchpad\there"))
+        code, _, err = self.cli("validate", f"{BASE}/{record['head12']}")
+        self.assertEqual(code, 1)
+        self.assertIn("the value of env SEG appears in the record", err)
 
     def test_a_record_in_the_wrong_directory_is_found(self):
         record = self.recorded()
@@ -811,7 +845,7 @@ REAL_SHAPES = (  # path shapes a boundary-checking pattern misses: a letter or u
 
 
 ABSOLUTE_SHAPES = ("-L/Users/x", "-I/home/x", "_/Users/x", "cwd=/tmp/x", "path:/tmp/x", "(/Users/x)", "--out=/tmp/x",
-                   "file:/" + "//tmp/x", "/tmp/x", "/private/x")
+                   "-Wl,-L/Users/x", "-isysroot/tmp/x", "file:/" + "//tmp/x", "/tmp/x", "/private/x")
 
 
 class FixRound(Repo):

@@ -48,7 +48,7 @@ _ENTRY_KEYS = ("id", "argv", "expected_exit", "track", "kind", "derives", "env")
 _TOP_KEYS = ("toolchain", "entries")
 # An absolute path of the kinds that name a person or a machine. A POSIX prefix inside a token (split on whitespace
 # and quotes) counts as absolute when the text before it in the token, after one leading `<scheme>:/` + `/` is stripped,
-# is empty, a flag letter (`-L`) or ends in a character that cannot end a path segment (`=`, `:`,
+# is empty, starts with `-` and holds no slash (an option with its value joined), or ends in a character that cannot end a path segment (`=`, `:`,
 # `(`, `_` ...). So `-L/Users/x`, `cwd=/tmp/x`, `(/Users/x)` and `--out=/tmp/x` are absolute; `src/home`,
 # `../tmp` and `a/b/tmp` are not. A drive letter counts anywhere. One finder serves the validator (ABSOLUTE_PATH), the
 # tail scrubber (_PATH_RUN) and the argv pre-check, so they cannot drift.
@@ -61,7 +61,32 @@ def _absolute_head(head: str) -> bool:
     """Whether the token text before a POSIX prefix leaves the prefix at the start of an absolute path."""
     scheme = _SCHEME.match(head)
     head = head[scheme.end():] if scheme else head
-    return not head or re.fullmatch(r"-[A-Za-z]", head) is not None or not (head[-1].isalnum() or head[-1] == ".")
+    if head.startswith("-") and "/" not in head:  # an option with its value joined: -L/x, -isysroot/x, -Wl,-L/x
+        return True
+    return not head or not (head[-1].isalnum() or head[-1] == ".")
+
+
+def _strings(obj):
+    """Every decoded string of a parsed JSON value, keys included."""
+    if isinstance(obj, str):
+        yield obj
+    elif isinstance(obj, dict):
+        for key, value in obj.items():
+            yield from _strings(key)
+            yield from _strings(value)
+    elif isinstance(obj, list):
+        for value in obj:
+            yield from _strings(value)
+
+
+def _path_problem(where: str, parsed) -> str | None:
+    """A problem text when a decoded string of `parsed` holds an absolute path. The finder must see decoded text: in
+    raw JSON a line break or a tab is the escape `\\n` or `\\t`, which hides the start of a path from it."""
+    for text in _strings(parsed):
+        found = ABSOLUTE_PATH.search(text)
+        if found:
+            return f"{where} holds an absolute path ({text[found.start():found.start() + 24]!r}...)"
+    return None
 
 
 _PATH_REST = re.compile(r"[^\s'\"<>():,;]*")
@@ -548,7 +573,9 @@ def run(root, only: str | None = None, scratch: Path | None = None) -> tuple[dic
         "all_as_expected": all(row["as_expected"] for row in rows), "tree_unchanged_by_run": unchanged,
     }
     text = json.dumps(record, indent=2) + "\n"
-    problems = record_problems(record, text, directory.name) + _release_problems(root, record)
+    problems = record_problems(record, text, directory.name) + _release_problems(root, record, files)
+    problems += [why for table in _table_values(root, record, files)
+                 for why in [_path_problem("a table", table)] if why]
     if problems:
         raise KitError("the record would not validate, so nothing was written: " + "; ".join(problems))
     if directory.is_symlink():
@@ -679,9 +706,9 @@ def record_problems(data, text: str, dirname: str) -> list[str]:
         should = data["only"] is None and data["tree_unchanged_by_run"] and not conflicts
         if data["complete"] != should:
             bad("complete", "does not match only, tree_unchanged_by_run and table_conflicts")
-    found = ABSOLUTE_PATH.search(text)
-    if found:
-        bad("text", f"holds an absolute path ({text[found.start():found.start() + 24]!r}...)")
+    why = _path_problem("text", data)
+    if why:
+        bad("text", why)
     return problems
 
 
@@ -713,7 +740,12 @@ def validate_record(root, rel: str) -> list[str]:
         except OSError as exc:
             problems.append(f"{rel}: table {name} cannot be read ({table['path']}): {exc.strerror or exc}")
             continue
-        if actual != table["sha256"]:
+        if actual == table["sha256"]:
+            for parsed in _table_values(root, {"tables": {name: table}}):
+                why = _path_problem(f"table {name}", parsed)
+                if why:
+                    problems.append(f"{rel}: {why}")
+        else:
             problems.append(f"{rel}: table {name} was altered: {table['path']} hashes to {actual}, not "
                             f"{table['sha256']}")
     try:
@@ -732,7 +764,19 @@ def validate_record(root, rel: str) -> list[str]:
     return problems
 
 
-def _release_problems(root: Path, data: dict) -> list[str]:
+def _table_values(root: Path, data: dict, raw: dict | None = None) -> list:
+    """The parsed table files of the record: from `raw` (name -> bytes) before they are written, else from disk."""
+    parsed = []
+    for name, table in sorted(data["tables"].items()):
+        try:
+            blob = raw[name] if raw is not None else (root / table["path"]).read_bytes()
+            parsed.append(json.loads(blob.decode("utf-8")))
+        except (OSError, KeyError, ValueError, RecursionError):
+            pass  # an unreadable table is reported by the hash check
+    return parsed
+
+
+def _release_problems(root: Path, data: dict, raw_tables: dict | None = None) -> list[str]:
     """The record against the release set at its head: the rows are the entries it ran, and no env value of 4 or
     more characters appears in the text a command could have echoed (output tails, toolchain lines, problems)."""
     try:
@@ -755,7 +799,8 @@ def _release_problems(root: Path, data: dict) -> list[str]:
                 f"{', '.join(extra) or 'none'}; or a row differs in argv, expected_exit, track, kind, derives or "
                 "env_keys)"]
     texts = [row["output_tail"] for row in data["commands"]] + [v["line"] for v in data["toolchain"]["versions"]] \
-        + [row["problem"] or "" for row in data["commands"]]
+        + [row["problem"] or "" for row in data["commands"]] \
+        + [text for table in _table_values(root, data, raw_tables) for text in _strings(table)]
     return [f"entry {entry['id']}: the value of env {name} appears in the record"
             for entry in release["entries"] for name, value in sorted(entry["env"].items())
             if len(value) >= 4 and any(value in text for text in texts)]
