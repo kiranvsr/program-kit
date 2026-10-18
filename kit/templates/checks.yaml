@@ -9,10 +9,13 @@
 #
 # build, test and scan must each list at least one command before `pk doctor` passes.
 build: []
+# The fast default suite that finishes in minutes; slow cases sit behind one environment variable and run in release-set tracks (rule W12, pk fingerprint).
 test: []
 scan: []
 compile_check: []
 extra_gate: []
+# true runs test, scan and extra_gate concurrently; keep false unless those commands can share one tree at once.
+parallel_steps: false
 # Files that only the controller may change. An entry is an exact path, or a directory when it ends
 # in a slash (everything under it is guarded). A task branch may change one only if its SPEC on main has
 # a line `Guarded edit: <path>`.
