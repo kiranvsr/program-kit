@@ -513,8 +513,10 @@ def run(root, only: str | None = None, scratch: Path | None = None) -> tuple[dic
         raise KitError("git hides changes to tracked files (skip-worktree or assume-unchanged): " + ", ".join(hidden))
     release = load_release_set(root, head)
     for argv in [*release["toolchain"], *(e["argv"] for e in release["entries"])]:
-        if any(ABSOLUTE_PATH.search(part) for part in argv):  # the record would be refused after the whole run
-            raise KitError(f"{RELEASE_SET}: the argv {argv!r} holds an absolute path, which a record may not hold")
+        for index, part in enumerate(argv):  # the record would be refused after the whole run
+            if ABSOLUTE_PATH.search(part):
+                raise KitError(f"{RELEASE_SET}: argv[{index}] {part!r} of {argv[0]!r} holds an absolute path, which a "
+                               "record may not hold (give a relative path, or split an option from its value)")
     tracks: dict[str, list[dict]] = {}
     for entry in release["entries"]:
         tracks.setdefault(entry["track"], []).append(entry)
@@ -573,7 +575,7 @@ def run(root, only: str | None = None, scratch: Path | None = None) -> tuple[dic
         "all_as_expected": all(row["as_expected"] for row in rows), "tree_unchanged_by_run": unchanged,
     }
     text = json.dumps(record, indent=2) + "\n"
-    problems = record_problems(record, text, directory.name) + _release_problems(root, record, files)
+    problems = record_problems(record, text, directory.name) + _release_problems(root, record)
     problems += [why for table in _table_values(root, record, files)
                  for why in [_path_problem("a table", table)] if why]
     if problems:
@@ -706,7 +708,7 @@ def record_problems(data, text: str, dirname: str) -> list[str]:
         should = data["only"] is None and data["tree_unchanged_by_run"] and not conflicts
         if data["complete"] != should:
             bad("complete", "does not match only, tree_unchanged_by_run and table_conflicts")
-    why = _path_problem("text", data)
+    why = _path_problem("the record", data)
     if why:
         bad("text", why)
     return problems
@@ -741,10 +743,10 @@ def validate_record(root, rel: str) -> list[str]:
             problems.append(f"{rel}: table {name} cannot be read ({table['path']}): {exc.strerror or exc}")
             continue
         if actual == table["sha256"]:
-            for parsed in _table_values(root, {"tables": {name: table}}):
-                why = _path_problem(f"table {name}", parsed)
-                if why:
-                    problems.append(f"{rel}: {why}")
+            parsed = _table_values(root, {"tables": {name: table}})
+            why = _path_problem(f"table {name}", parsed) if parsed else f"table {name} is not JSON"
+            if why:
+                problems.append(f"{rel}: {why}")
         else:
             problems.append(f"{rel}: table {name} was altered: {table['path']} hashes to {actual}, not "
                             f"{table['sha256']}")
@@ -776,7 +778,7 @@ def _table_values(root: Path, data: dict, raw: dict | None = None) -> list:
     return parsed
 
 
-def _release_problems(root: Path, data: dict, raw_tables: dict | None = None) -> list[str]:
+def _release_problems(root: Path, data: dict) -> list[str]:
     """The record against the release set at its head: the rows are the entries it ran, and no env value of 4 or
     more characters appears in the text a command could have echoed (output tails, toolchain lines, problems)."""
     try:
@@ -799,8 +801,7 @@ def _release_problems(root: Path, data: dict, raw_tables: dict | None = None) ->
                 f"{', '.join(extra) or 'none'}; or a row differs in argv, expected_exit, track, kind, derives or "
                 "env_keys)"]
     texts = [row["output_tail"] for row in data["commands"]] + [v["line"] for v in data["toolchain"]["versions"]] \
-        + [row["problem"] or "" for row in data["commands"]] \
-        + [text for table in _table_values(root, data, raw_tables) for text in _strings(table)]
+        + [row["problem"] or "" for row in data["commands"]]
     return [f"entry {entry['id']}: the value of env {name} appears in the record"
             for entry in release["entries"] for name, value in sorted(entry["env"].items())
             if len(value) >= 4 and any(value in text for text in texts)]

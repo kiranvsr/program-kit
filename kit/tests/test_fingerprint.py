@@ -673,20 +673,32 @@ class ValidateAndPlan(Repo):
         self.assertEqual(code, 1)
         self.assertIn("holds an absolute path", err)
 
-    def test_an_env_value_in_a_table_file_or_after_a_line_break_is_found(self):
+    def test_an_env_value_after_a_line_break_in_a_tail_is_found(self):
         record = self.recorded(entry("t", say("test_a (m.C.test_a) ... ok"), kind="test", derives="unittest",
                                      env={"SEG": "scratchpad"}))
         self.record_head12 = record["head12"]
-        self.edit_table(record, lambda d: d.update({"m.C.scratchpad_case": "ok"}))
+        self.edit_record(lambda d: d["commands"][0].update(output_tail="line one\nthen scratchpad\there"))
         code, _, err = self.cli("validate", f"{BASE}/{record['head12']}")
         self.assertEqual(code, 1)
         self.assertIn("entry t: the value of env SEG appears in the record", err)
         self.assertNotIn("scratchpad", err)
-        self.edit_table(record, lambda d: d.pop("m.C.scratchpad_case"))
-        self.edit_record(lambda d: d["commands"][0].update(output_tail="line one\nthen scratchpad\there"))
+
+    def test_an_env_value_that_is_a_word_of_a_test_name_does_not_block_the_record(self):
+        record = self.recorded(entry("unit", say("test_sqlite_backend (m.C.test_sqlite_backend) ... ok"),
+                                     kind="test", derives="unittest", env={"APP_ENV": "test"}))
+        self.assertIn("m.C.test_sqlite_backend", json.loads(
+            (self.root / BASE / record["head12"] / "unittest.json").read_text()))
+        self.assertEqual(self.cli("validate", f"{BASE}/{record['head12']}")[0], 0)
+
+    def test_a_table_file_that_is_not_json_is_found(self):
+        record = self.recorded()
+        self.record_head12 = record["head12"]
+        table = self.root / BASE / record["head12"] / "unittest.json"
+        table.write_text("not json: built at /Users/someone/project\n")
+        self.edit_record(lambda d: d["tables"]["unittest"].update(sha256=hashlib.sha256(table.read_bytes()).hexdigest()))
         code, _, err = self.cli("validate", f"{BASE}/{record['head12']}")
         self.assertEqual(code, 1)
-        self.assertIn("the value of env SEG appears in the record", err)
+        self.assertIn("is not JSON", err)
 
     def test_a_record_in_the_wrong_directory_is_found(self):
         record = self.recorded()
