@@ -263,15 +263,17 @@ class PresetTests(unittest.TestCase):
         "go": {"build": [["go", "build", "./..."]], "compile_check": [["go", "vet", "./..."]],
                "test": [["go", "test", "./..."]],
                "scan": [["gosec", "./..."], ["gitleaks", "detect", "--no-git"]],
-               "guarded": ["go.mod", "go.sum", "program/checks.yaml"]},
+               "guarded": ["go.mod", "go.sum", "program/checks.yaml", "program/release-set.yaml"]},
         "node": {"build": [["pnpm", "install", "--frozen-lockfile", "--offline"], ["pnpm", "build"]],
                  "compile_check": [], "test": [["pnpm", "test"]],
                  "scan": [["gitleaks", "detect", "--no-git"]],
-                 "guarded": ["package.json", "pnpm-lock.yaml", "program/checks.yaml"]},
+                 "guarded": ["package.json", "pnpm-lock.yaml", "program/checks.yaml",
+                             "program/release-set.yaml"]},
         "python": {"build": [["python3", "-m", "compileall", "-q", "."]], "compile_check": [],
                    "test": [["python3", "-m", "unittest", "discover"]],
                    "scan": [["python3", "-m", "pip", "check"], ["gitleaks", "detect", "--no-git"]],
-                   "guarded": ["pyproject.toml", "requirements.txt", "program/checks.yaml"]},
+                   "guarded": ["pyproject.toml", "requirements.txt", "program/checks.yaml",
+                             "program/release-set.yaml"]},
     }
 
     def test_presets_parse_and_have_all_keys(self):

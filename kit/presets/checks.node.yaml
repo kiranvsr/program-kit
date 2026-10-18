@@ -20,6 +20,7 @@ guarded_files:
   - package.json
   - pnpm-lock.yaml
   - program/checks.yaml
+  - program/release-set.yaml
 # Verification tiers (kit/rules/RULES.md, part 4). While full_paths is empty every task is full-tier.
 # full_paths: the paths that are always full-tier in this program (access control, tenancy, data migrations,
 # cryptography, release); a standard or light task that changes one fails the gate. The kit's own gates
