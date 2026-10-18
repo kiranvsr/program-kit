@@ -9,9 +9,11 @@ modifies or deletes one is refused by `store.rewritten`.
     pk fingerprint run [--only TRACK] [--scratch DIR]
     pk fingerprint plan
     pk fingerprint validate [PATH]
+    pk fingerprint show [--json]
+    pk fingerprint coverage [ID] [--json]
 
-Standard library only. The readers of a finished record (the current fingerprint, coverage, `show`) are a later
-addition: they go in the marked section at the end of this file, after the producer.
+Standard library only. The readers of a finished record (the current fingerprint, `show`, coverage) are in the
+marked section at the end of this file, after the producer; they only read.
 """
 from __future__ import annotations
 
@@ -811,7 +813,7 @@ def _release_problems(root: Path, data: dict) -> list[str]:
 
 def _print_plan(root: Path) -> None:
     release = load_release_set(root, "HEAD")
-    seconds = _recorded_seconds(root)
+    seconds = recorded_seconds(root)
     tracks: dict[str, list[dict]] = {}
     for entry in release["entries"]:
         tracks.setdefault(entry["track"], []).append(entry)
@@ -870,7 +872,8 @@ def cmd_validate(args: argparse.Namespace) -> int:
 
 def cmd_fingerprint(args: argparse.Namespace) -> int:
     action = getattr(args, "fingerprint_action", None)
-    handlers = {"run": cmd_run, "plan": cmd_plan, "validate": cmd_validate}
+    handlers = {"run": cmd_run, "plan": cmd_plan, "validate": cmd_validate, "show": cmd_show,
+                "coverage": cmd_coverage}
     if action not in handlers:
         raise KitError("fingerprint needs an action: " + ", ".join(handlers))
     return handlers[action](args)
@@ -885,37 +888,406 @@ def _configure(parser: argparse.ArgumentParser) -> None:
     actions.add_parser("plan", help="list the release set by track with the seconds the last record took")
     checker = actions.add_parser("validate", help="check fingerprint records (default: every tracked one)")
     checker.add_argument("path", nargs="?", help="a record directory or its fingerprint.json")
+    shower = actions.add_parser("show", help="the current fingerprint and how far the tree has moved since")
+    shower.add_argument("--json", action="store_true", help="print the fields as JSON")
+    cover = actions.add_parser("coverage", help="which rows of each task's latest results record the fingerprint covers")
+    cover.add_argument("task", nargs="?", metavar="ID", help="one task (default: every task with a results record)")
+    cover.add_argument("--json", action="store_true", help="print the mapping as JSON")
 
 
 def register(add_command) -> None:
-    add_command("fingerprint", cmd_fingerprint, help="the release fingerprint: run, plan, validate",
+    add_command("fingerprint", cmd_fingerprint, help="the release fingerprint: run, plan, validate, show, coverage",
                 configure=_configure)
 
 
-# --- readers (section 4: a later batch) ----------------------------------------------------------
-# `current_fingerprint(root, ref)`, `show`, `coverage` and the `pk stale` / hand-off fields belong here, after the
-# producer. Until they land, `plan` uses `_recorded_seconds`, a private stand-in with the same nearest-ancestor rule.
+# --- readers (section 4) --------------------------------------------------------------------------------------
+# The readers only read: they never write a record, never run a command and never call the record check.
 
-def _recorded_seconds(root: Path) -> dict[str, float]:
-    """{command id: seconds} of the nearest tracked record at or behind HEAD; empty when there is none."""
-    best = None
-    for rel in _record_files(root):
-        blob = _show(root, "HEAD", rel)
+def _loadable(data) -> bool:
+    """A record the readers can use: a mapping of this schema with a commit and a list of command rows."""
+    return (isinstance(data, dict) and data.get("schema") == SCHEMA and isinstance(data.get("head"), str)
+            and bool(_HEX40.match(data["head"])) and isinstance(data.get("commands"), list))
+
+
+def _distance(root: Path, older: str, newer: str) -> int | None:
+    """Commits in `older..newer` when `older` is `newer` or an ancestor of it, else None."""
+    try:
+        _git_bytes(root, "merge-base", "--is-ancestor", older, newer)
+        return int(_git_bytes(root, "rev-list", "--count", f"{older}..{newer}").decode().strip())
+    except (KitError, ValueError):
+        return None
+
+
+def current_fingerprint(root, ref: str = "HEAD") -> dict | None:
+    """The fingerprint record in force at `ref`, or None.
+
+    Among the records tracked at `ref`, those whose `head` is `ref` or an ancestor of it; the nearest wins (fewest
+    commits from its head to `ref`), a tie going to the latest `produced_at`. A file that is not a usable record
+    is skipped, not an error: `pk fingerprint validate` is where a bad record is reported.
+    """
+    root = Path(root)
+    if not isinstance(ref, str) or not ref or ref.startswith("-"):
+        raise KitError(f"not a usable commit name: {ref}")
+    commit = _git_bytes(root, "rev-parse", "--verify", ref + "^{commit}").decode().strip()
+    listing = _git_bytes(root, "ls-tree", "-r", "--name-only", "-z", commit, "--", BASE).decode("utf-8", "replace")
+    best, best_key = None, None
+    for rel in sorted(p for p in listing.split("\0") if p):
+        parts = PurePosixPath(rel).parts
+        if len(parts) != 5 or parts[-1] != RECORD:
+            continue
+        blob = _show(root, commit, rel)
         try:
             data = json.loads(blob.decode("utf-8")) if blob is not None else None
-        except (ValueError, UnicodeDecodeError):
+        except (ValueError, UnicodeDecodeError, RecursionError):
             continue
-        if not isinstance(data, dict) or not isinstance(data.get("head"), str):
+        if not _loadable(data):
+            continue
+        behind = _distance(root, data["head"], commit)
+        if behind is None:
+            continue
+        stamp = data.get("produced_at") if isinstance(data.get("produced_at"), str) else ""
+        if best is None or behind < best_key[0] or (behind == best_key[0] and stamp > best_key[1]):
+            best, best_key = data, (behind, stamp)
+    return best
+
+
+def commits_behind(root, record: dict, ref: str = "HEAD") -> int:
+    """Commits between the record's head and `ref` (0 when the head is `ref`)."""
+    behind = _distance(Path(root), record["head"], ref)
+    return behind if behind is not None else 0
+
+
+def paths_changed(root, record: dict, ref: str = "HEAD") -> int:
+    """How many paths differ between the record's head and `ref`."""
+    out = _git_bytes(Path(root), "diff", "--name-only", "-z", record["head"], ref).decode("utf-8", "replace")
+    return len([p for p in out.split("\0") if p])
+
+
+def _plural(count: int, noun: str) -> str:
+    return f"{count} {noun}" + ("" if count == 1 else "s")
+
+
+def show_data(root, ref: str = "HEAD") -> dict:
+    """The fields `pk fingerprint show` prints; {"head12": None} when there is no current fingerprint."""
+    record = current_fingerprint(root, ref)
+    if record is None:
+        return {"head12": None}
+    rows = [row for row in record["commands"] if isinstance(row, dict)]
+    tracks = record.get("tracks") if isinstance(record.get("tracks"), dict) else {}
+    return {
+        "head12": record.get("head12", record["head"][:12]), "head": record["head"],
+        "produced_at": record.get("produced_at"), "complete": record.get("complete") is True,
+        "all_as_expected": record.get("all_as_expected") is True,
+        "commits_behind": commits_behind(root, record, ref), "paths_changed": paths_changed(root, record, ref),
+        "tracks": {name: {"seconds": t.get("seconds"), "commands": len(t.get("commands", []))}
+                   for name, t in sorted(tracks.items()) if isinstance(t, dict)},
+        "not_as_expected": [row.get("id") for row in rows if row.get("as_expected") is not True],
+        "table_conflicts": [c for c in record.get("table_conflicts", []) if isinstance(c, dict)],
+    }
+
+
+def cmd_show(args: argparse.Namespace) -> int:
+    data = show_data(find_root())
+    if args.json:
+        print(json.dumps(data, indent=2, sort_keys=True))
+        return 0
+    if data["head12"] is None:
+        print("fingerprint: none")
+        return 0
+    print(f"fingerprint {data['head12']}: produced {data['produced_at']}")
+    print(f"complete {str(data['complete']).lower()}, all as expected {str(data['all_as_expected']).lower()}")
+    print(f"{_plural(data['commits_behind'], 'commit')} behind HEAD, {_plural(data['paths_changed'], 'path')} changed")
+    for name, track in data["tracks"].items():
+        print(f"track {name}: {track['seconds']}s, {_plural(track['commands'], 'command')}")
+    if data["not_as_expected"]:
+        print("not as expected: " + ", ".join(str(i) for i in data["not_as_expected"]))
+    for conflict in data["table_conflicts"]:
+        print(f"conflict: {conflict.get('table')} {conflict.get('name')}: {', '.join(conflict.get('verdicts', []))}")
+    return 0
+
+
+def recorded_seconds(root, ref: str = "HEAD") -> dict[str, float]:
+    """{command id: seconds} of the current fingerprint; empty when there is none."""
+    record = current_fingerprint(root, ref)
+    if record is None:
+        return {}
+    return {row["id"]: row["seconds"] for row in record["commands"]
+            if isinstance(row, dict) and isinstance(row.get("id"), str) and _is_num(row.get("seconds"))}
+
+
+# --- coverage ---------------------------------------------------------------------------------------------------
+
+EXACT, DERIVED_UNITTEST, DERIVED_GO, NOT_COVERED = "exact", "derived-unittest", "derived-go", "not_covered"
+NO_FINGERPRINT, INCOMPLETE = "no fingerprint", "fingerprint incomplete"
+ADHOC, NONZERO, ENV_OVERRIDE = "ad-hoc command", "expected non-zero exit", "env override"
+ALL_SKIPPED, NOT_IN_TABLE, BUILD_FLAG = "all matched entries skipped", "package not in the table", "build-changing flag"
+_BUILD_FLAGS = ("tags", "race", "ldflags", "gcflags", "msan", "asan")
+_NAME = re.compile(r"[A-Za-z_][\w.]*\Z")
+
+
+def _uncovered(reason: str) -> tuple[str, str]:
+    return NOT_COVERED, reason
+
+
+def _row_env(row: dict) -> set[str]:
+    """The environment names a results row says it set (`env_keys`, or the keys of `env`); empty when it says none."""
+    names = row.get("env_keys") if isinstance(row.get("env_keys"), list) else row.get("env")
+    if isinstance(names, dict):
+        names = list(names)
+    return {n for n in names if isinstance(n, str)} if isinstance(names, list) else set()
+
+
+def _unittest_names(argv: list[str]) -> list[str] | None:
+    """The names of `python3 -m unittest [-v] <name>...`, else None (discovery, other flags and paths are not names)."""
+    if argv[:3] != ["python3", "-m", "unittest"]:
+        return None
+    names = argv[4:] if argv[3:4] == ["-v"] else argv[3:]
+    if not names or any(n == "discover" or not _NAME.match(n) for n in names):
+        return None
+    return names
+
+
+def _go_form(argv: list[str]) -> dict | None:
+    """{"patterns", "run", "build"} for `go test [flags] <pattern>...` with the allowed flags, else None."""
+    if argv[:2] != ["go", "test"]:
+        return None
+    patterns, run, build, i = [], None, False, 2
+    while i < len(argv):
+        token = argv[i]
+        i += 1
+        name, equals, value = token.lstrip("-").partition("=")
+        if token.startswith("-") and (name in _BUILD_FLAGS or name.startswith("cover")):
+            build = True
+            if name in ("tags", "ldflags", "gcflags") and not equals:
+                i += 1  # its value is the next argument
+        elif token == "-count=1" or token == "-v":
+            pass
+        elif token.startswith("-") and name in ("run", "timeout"):
+            if not equals:
+                if i >= len(argv):
+                    return None
+                value, i = argv[i], i + 1
+            if name == "run":
+                run = value
+        elif token.startswith("-"):
+            return None
+        else:
+            patterns.append(token)
+    return {"patterns": patterns, "run": run, "build": build} if patterns or build else None
+
+
+def _relative(package: str, module: str | None) -> str | None:
+    if module is None:
+        return package
+    if package == module:
+        return ""
+    return package[len(module) + 1:] if package.startswith(module + "/") else None
+
+
+def _go_packages(pattern: str, packages: list[str], module: str | None) -> list[str]:
+    """The packages of the table that `pattern` names: `./...`, `./dir/...`, `./dir`, `.` or an import path."""
+    local = pattern == "." or pattern.startswith("./")
+    wildcard = pattern.endswith("...")
+    base = pattern[:-3] if wildcard else pattern
+    if local:
+        base = base[2:] if base.startswith("./") else ""
+    base = base.rstrip("/")
+    found = []
+    for package in packages:
+        if local:
+            rel = _relative(package, module)
+            if rel is None:
+                continue
+            options = [rel] if module is not None else [package, *[package.split("/", i)[-1]
+                                                                     for i in range(1, package.count("/") + 1)]]
+            hit = any(o == base or (wildcard and (not base or o.startswith(base + "/"))) for o in options)
+        else:
+            hit = package == base or (wildcard and package.startswith(base + "/"))
+        if hit:
+            found.append(package)
+    return found
+
+
+def _test_matches(expression: str, test: str) -> bool:
+    """Go's -run rule: each slash-separated part of the expression matches the same-depth part of the name."""
+    parts, elements = expression.split("/"), test.split("/")
+    return len(elements) >= len(parts) and all(re.search(p, e) for p, e in zip(parts, elements))
+
+
+def _classify_unittest(names: list[str], table) -> tuple[str, str | None]:
+    table = table if isinstance(table, dict) else {}
+    verdicts = []
+    for name in names:
+        found = [v for key, v in table.items() if key and isinstance(v, str) and (key == name or key.startswith(name + "."))]
+        if not found:
+            return _uncovered(NOT_IN_TABLE)
+        verdicts += found
+    if any(v not in ("ok", "skipped") for v in verdicts):
+        return _uncovered(ADHOC)
+    return (DERIVED_UNITTEST, None) if "ok" in verdicts else _uncovered(ALL_SKIPPED)
+
+
+def _classify_go(form: dict, table, module: str | None) -> tuple[str, str | None]:
+    table = table if isinstance(table, dict) else {}
+    packages = [p for p, rows in table.items() if isinstance(rows, dict)]
+    chosen: list[str] = []
+    for pattern in form["patterns"]:
+        found = _go_packages(pattern, packages, module)
+        if not found:
+            return _uncovered(NOT_IN_TABLE)
+        chosen += [p for p in found if p not in chosen]
+    summaries = [table[p].get("") for p in chosen]
+    if any(v is None for v in summaries):
+        return _uncovered(NOT_IN_TABLE)
+    if any(v not in ("pass", "skip") for v in summaries):
+        return _uncovered(ADHOC)
+    verdicts = summaries
+    if form["run"] is not None:
+        try:
+            verdicts = [v for p in chosen for t, v in table[p].items() if t and _test_matches(form["run"], t)]
+        except re.error:
+            return _uncovered(ADHOC)
+        if not verdicts:
+            return _uncovered(NOT_IN_TABLE)
+        if any(v not in ("pass", "skip") for v in verdicts):
+            return _uncovered(ADHOC)
+    return (DERIVED_GO, None) if "pass" in verdicts else _uncovered(ALL_SKIPPED)
+
+
+def classify_row(row: dict, record: dict | None, tables: dict, go_module: str | None = None) -> tuple[str, str | None]:
+    """(class, reason) of one results-record command row against a fingerprint record and its tables.
+
+    The class is `exact`, `derived-unittest`, `derived-go` or `not_covered`; the reason is None unless the class is
+    `not_covered`, and then exactly one of the strings in section 4. `tables` maps a table name to its parsed
+    content; `go_module` is the module path that go package names start with, when known. Pure: no I/O.
+    """
+    if record is None:
+        return _uncovered(NO_FINGERPRINT)
+    if record.get("complete") is not True:
+        return _uncovered(INCOMPLETE)
+    argv = row.get("argv")
+    if not isinstance(argv, list) or not argv or not all(isinstance(a, str) for a in argv):
+        return _uncovered(ADHOC)
+    expected = row.get("expected_exit", 0)
+    env = _row_env(row)
+    commands = [c for c in record.get("commands", []) if isinstance(c, dict)]
+    same = [c for c in commands if c.get("argv") == argv]
+    overridden = False
+    for command in same:
+        if command.get("expected_exit") == expected and command.get("as_expected") is True:
+            if env <= set(command.get("env_keys") or []):
+                return EXACT, None
+            overridden = True
+    if overridden:
+        return _uncovered(ENV_OVERRIDE)
+    names, form = _unittest_names(argv), _go_form(argv)
+    if names is None and form is None:
+        return _uncovered(NONZERO if same and expected != 0 else ADHOC)
+    if expected != 0:
+        return _uncovered(NONZERO)
+    table_name = "unittest" if names is not None else "go-tests"
+    allowed = {k for c in commands if c.get("derives") == table_name for k in (c.get("env_keys") or [])}
+    if env - allowed:
+        return _uncovered(ENV_OVERRIDE)
+    if names is not None:
+        return _classify_unittest(names, tables.get("unittest"))
+    if form["build"]:
+        return _uncovered(BUILD_FLAG)
+    return _classify_go(form, tables.get("go-tests"), go_module)
+
+
+class Coverage:
+    """The current fingerprint at a ref with the tables and go module path that classification needs, read once."""
+
+    def __init__(self, root, ref: str = "HEAD"):
+        self.root = Path(root)
+        self.record = current_fingerprint(self.root, ref)
+        self.tables: dict = {}
+        self.go_module = None
+        if self.record is None:
+            return
+        listed = self.record.get("tables") if isinstance(self.record.get("tables"), dict) else {}
+        for name in DERIVES:
+            self.tables[name] = self._table(listed.get(name), ref)
+        blob = _show(self.root, self.record["head"], "go.mod")
+        found = re.search(r"^module\s+(\S+)", blob.decode("utf-8", "replace"), re.MULTILINE) if blob else None
+        self.go_module = found.group(1) if found else None
+
+    def _table(self, listed, ref: str) -> dict:
+        """A table file read from the commit, only when its digest is the recorded one; else empty."""
+        if not isinstance(listed, dict) or not isinstance(listed.get("path"), str):
+            return {}
+        blob = _show(self.root, self.record["head"], listed["path"]) or _show(self.root, ref, listed["path"])
+        if blob is None or sha256_bytes(blob) != listed.get("sha256"):
+            return {}
+        try:
+            data = json.loads(blob.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError, RecursionError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    @property
+    def head12(self) -> str | None:
+        return None if self.record is None else self.record.get("head12", self.record["head"][:12])
+
+    def classify(self, row) -> tuple[str, str | None]:
+        return classify_row(row if isinstance(row, dict) else {}, self.record, self.tables, self.go_module)
+
+    def rows(self, commands) -> list[dict]:
+        """One {label, argv, class, reason} per row of a results record's `commands`."""
+        found = []
+        for row in commands if isinstance(commands, list) else []:
+            kind, reason = self.classify(row)
+            item = row if isinstance(row, dict) else {}
+            found.append({"label": item.get("label"), "argv": item.get("argv"), "class": kind, "reason": reason})
+        return found
+
+
+def coverage_counts(rows: list[dict]) -> tuple[int, int]:
+    """(covered, total) of classified rows."""
+    return sum(r["class"] != NOT_COVERED for r in rows), len(rows)
+
+
+def coverage_report(root, task_id: str | None = None, ref: str = "HEAD") -> dict:
+    """{head12, tasks: {id: {covered, total, rows, error?}}} over each task's latest results record.
+
+    Computed on read and never written. With `task_id`, only that task; a task with no results record is a KitError.
+    """
+    import store  # late: store and this module are loaded in different orders by the command table
+    root = Path(root)
+    index = store.read_index(root)
+    ids = [task_id] if task_id is not None else sorted(index["tasks"])
+    if task_id is not None and store.latest(index, task_id, "results") is None:
+        raise KitError(f"{task_id} has no results record")
+    context = Coverage(root, ref)
+    tasks = {}
+    for task in ids:
+        if store.latest(index, task, "results") is None:
             continue
         try:
-            _git_bytes(root, "merge-base", "--is-ancestor", data["head"], "HEAD")
-            behind = int(_git_bytes(root, "rev-list", "--count", f"{data['head']}..HEAD").decode().strip())
-        except (KitError, ValueError):
+            _, data = store.load_latest(root, task, "results", index)
+        except KitError as exc:
+            tasks[task] = {"covered": 0, "total": 0, "rows": [], "error": " ".join(str(exc).split())}
             continue
-        key = (behind, str(data.get("produced_at", "")))
-        if best is None or key[0] < best[0][0] or (key[0] == best[0][0] and key[1] > best[0][1]):
-            best = (key, data)
-    if best is None:
-        return {}
-    return {row["id"]: row["seconds"] for row in best[1].get("commands", [])
-            if isinstance(row, dict) and "id" in row and _is_num(row.get("seconds"))}
+        rows = context.rows(data.get("commands") if isinstance(data, dict) else None)
+        covered, total = coverage_counts(rows)
+        tasks[task] = {"covered": covered, "total": total, "rows": rows}
+    return {"head12": context.head12, "tasks": tasks}
+
+
+def cmd_coverage(args: argparse.Namespace) -> int:
+    report = coverage_report(find_root(), args.task)
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return 0
+    if report["head12"] is None:
+        print("fingerprint: none")
+    for task, info in report["tasks"].items():
+        if "error" in info:
+            print(f"{task}: unreadable record ({info['error']})")
+            continue
+        print(f"{task}: covered {info['covered']} of {info['total']} rows")
+        for row in info["rows"]:
+            if row["class"] == NOT_COVERED:
+                print(f"  {row['label'] if row['label'] is not None else row['argv']}: {row['reason']}")
+    return 0
