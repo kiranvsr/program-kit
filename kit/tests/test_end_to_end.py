@@ -456,6 +456,33 @@ class EndToEndTests(unittest.TestCase):
         refused = project.pk("fetch", "verify", "--pins", pins, expect=1)
         self.assertIn("pk fetch --pins", refused.stderr)
         project.pk("manifest", "check")
+
+        # The release fingerprint: the example's release set (two tracks) runs at main's head, the record validates,
+        # and committing it breaks neither the evidence checks nor doctor.
+        project.put(EXAMPLE / "release-set.yaml", repo / "program" / "release-set.yaml")
+        project.commit("add the release set", "program/release-set.yaml")
+        self.assertEqual(project.git("status", "--porcelain"), "")
+        scratch = project.base / "fingerprint-output"
+        ran = project.pk("fingerprint", "run", "--scratch", scratch, env=project.gate_env).stdout
+        head12 = project.git("rev-parse", "HEAD")[:12]
+        fingerprint_dir = f"program/evidence/fingerprint/{head12}"
+        self.assertIn(f"fingerprint {head12}: complete true, all as expected true, 2 command(s)", ran)
+        fingerprint = read_json(repo / fingerprint_dir / "fingerprint.json")
+        self.assertTrue(fingerprint["complete"] and fingerprint["all_as_expected"])
+        self.assertEqual({name: row["commands"] for name, row in fingerprint["tracks"].items()},
+                         {"tests": ["unit"], "checks": ["compile"]})
+        table = read_json(repo / fingerprint["tables"]["unittest"]["path"])
+        self.assertGreaterEqual(len([name for name in table if name]), 10)
+        self.assertEqual(table[""], "ok")
+        self.assertEqual(fingerprint["toolchain"]["versions"][0]["line"].split()[0], "Python")
+        self.assertIsNotNone(fingerprint["toolchain"]["kit_manifest_sha256"])
+        self.assertTrue((scratch / "unit.log").is_file())
+        project.pk("fingerprint", "validate", fingerprint_dir)
+        self.assertIn("  unit\ttest\t", project.pk("fingerprint", "plan").stdout)
+        project.commit("record the release fingerprint", fingerprint_dir)
+        self.assertIn("1 record(s) ok", project.pk("fingerprint", "validate").stdout)
+        project.pk("evidence", "validate")
+        project.pk("doctor")
         project.pk("init", expect=1)  # program/ exists: init refuses to overwrite it
 
         pk.build_parser()  # fills pk.COMMANDS: only init and doctor register at import, the rest when it is built

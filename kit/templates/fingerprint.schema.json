@@ -1,0 +1,94 @@
+{
+  "title": "program/evidence/fingerprint/<head12>/fingerprint.json",
+  "description": "Written once per commit by `pk fingerprint run`, never modified (a commit that modifies or deletes it is refused by `pk evidence validate` and `pk doctor`) and checked by `pk fingerprint validate`. It holds no absolute path, no environment value and no output body, only each command's output digest and last 20 lines. The checker enforces the same shape in code; its list of required keys is read from this file.",
+  "type": "object",
+  "required": ["schema", "head", "head12", "produced_at", "only", "release_set_sha256", "toolchain", "tracks",
+               "commands", "tables", "table_conflicts", "complete", "all_as_expected", "tree_unchanged_by_run"],
+  "properties": {
+    "schema": {"const": "program-kit.fingerprint.v1"},
+    "head": {"type": "string", "pattern": "^[0-9a-f]{40}$", "description": "the one commit the record binds to"},
+    "head12": {"type": "string", "pattern": "^[0-9a-f]{12}$", "description": "the first 12 characters of head, and the name of the record directory"},
+    "produced_at": {"type": "string", "description": "UTC, YYYY-MM-DDTHH:MM:SSZ"},
+    "only": {"type": ["string", "null"], "description": "the one track that ran (a partial record), or null"},
+    "release_set_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$", "description": "of program/release-set.yaml at head"},
+    "toolchain": {
+      "type": "object",
+      "required": ["kit_manifest_sha256", "checks_sha256", "versions"],
+      "properties": {
+        "kit_manifest_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$", "description": "of kit/MANIFEST.sha256 at head; null when the file is absent"},
+        "checks_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$", "description": "of program/checks.yaml at head; null when the file is absent"},
+        "versions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["argv", "line"],
+            "properties": {
+              "argv": {"type": "array", "items": {"type": "string"}},
+              "line": {"type": "string", "description": "the first output line"}
+            }
+          }
+        }
+      }
+    },
+    "tracks": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["seconds", "commands"],
+        "properties": {
+          "seconds": {"type": "number", "minimum": 0},
+          "commands": {"type": "array", "items": {"type": "string"}, "description": "the ids, in run order"}
+        }
+      }
+    },
+    "commands": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "track", "kind", "argv", "env_keys", "expected_exit", "exit", "as_expected", "seconds",
+                     "output_sha256", "output_tail", "derives", "problem"],
+        "properties": {
+          "id": {"type": "string"},
+          "track": {"type": "string"},
+          "kind": {"enum": ["check", "test", "gate"]},
+          "argv": {"type": "array", "minItems": 1, "items": {"type": "string"}, "description": "the literal command, never a shell string"},
+          "env_keys": {"type": "array", "items": {"type": "string"}, "description": "the names the entry set; the values are never recorded"},
+          "expected_exit": {"type": "integer"},
+          "exit": {"type": "integer"},
+          "as_expected": {"type": "boolean", "description": "exit equals expected_exit and the output parsed when it had to"},
+          "seconds": {"type": "number", "minimum": 0},
+          "output_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$", "description": "over the full combined stdout and stderr"},
+          "output_tail": {"type": "string", "description": "the last 20 lines, with absolute paths replaced"},
+          "derives": {"enum": ["unittest", "go-tests", null]},
+          "problem": {"type": ["string", "null"]}
+        }
+      }
+    },
+    "tables": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["path", "sha256"],
+        "properties": {
+          "path": {"type": "string", "description": "relative to the repository root"},
+          "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        }
+      }
+    },
+    "table_conflicts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["table", "name", "verdicts"],
+        "properties": {
+          "table": {"type": "string"},
+          "name": {"type": "string"},
+          "verdicts": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    },
+    "complete": {"type": "boolean", "description": "every entry ran, the tree was unchanged by the run, and no table conflicts"},
+    "all_as_expected": {"type": "boolean", "description": "every command row is as_expected"},
+    "tree_unchanged_by_run": {"type": "boolean", "description": "clean at the start, clean at the end, same HEAD"}
+  }
+}

@@ -16,7 +16,7 @@ from common import KitError, read_json, read_yaml
 KIT = Path(__file__).resolve().parent.parent
 TEMPLATE_FILES = ["BRIEF.md", "checks.yaml", "environments.yaml", "CLAIM_BOUNDARIES.md", "ledger.yaml",
                   "HANDOFF.md", "controller-state.json", "rulings.md",
-                  "register.yaml", "traceability.yaml", "gates.yaml", "COMMON.md"]
+                  "register.yaml", "traceability.yaml", "gates.yaml", "COMMON.md", "release-set.yaml"]
 
 
 class PkTests(unittest.TestCase):
@@ -68,7 +68,7 @@ class PkTests(unittest.TestCase):
         # no lower tier is switched on in a new program: every task is full-tier until full_paths is filled
         self.assertEqual(checks.pop("tiers"), {"full_paths": [], "light_paths": [], "light_ruling": ""})
         for key, value in checks.items():
-            self.assertEqual(value, ["program/checks.yaml"] if key == "guarded_files" else [], key)
+            self.assertEqual(value, ["program/checks.yaml", "program/release-set.yaml"] if key == "guarded_files" else [], key)
         self.assertEqual(read_yaml(KIT / "templates" / "environments.yaml"), {"environments": {}})
         self.assertEqual(read_yaml(KIT / "templates" / "ledger.yaml"), {"sources": {}, "entries": []})
 

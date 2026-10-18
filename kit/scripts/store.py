@@ -19,6 +19,10 @@ branches never edit the same evidence file. Every check reads the latest record 
 stay as history (`pk evidence history`). In memory the pointers are read together as one mapping
 (`read_index`), task id -> {kind: entry}.
 
+Release fingerprint records (`program/evidence/fingerprint/<head12>/`, written by `pk fingerprint run`) are not
+task records and have no pointer, but they are immutable in the same way: `rewritten` refuses a commit that modified
+or deleted a tracked file under that directory.
+
 Known limits: records are not signed; a record rewritten consistently together with its name and its pointer, in
 a history that is itself rewritten, is not detected.
 """
@@ -36,7 +40,8 @@ SCHEMA_VERSION = 1
 KINDS = ("results", "acceptance")
 BASE = "program/evidence"
 POINTER = "latest.json"
-RECORD_PATHSPECS = tuple(f":(glob){BASE}/*/{kind}/**" for kind in KINDS)
+FINGERPRINT_BASE = f"{BASE}/fingerprint"  # release fingerprint records (`pk fingerprint run`): immutable like a task record
+RECORD_PATHSPECS = (*(f":(glob){BASE}/*/{kind}/**" for kind in KINDS), f":(glob){FINGERPRINT_BASE}/**")
 _COMPACT = "%Y%m%dT%H%M%S%fZ"
 _NAME = re.compile(r"(\d{8}T\d{12}Z)-([0-9a-f]{12})\.json\Z")
 _TASK = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
@@ -48,6 +53,9 @@ ACCEPTANCE_FIELDS = ("digest", "path", "decision", "accepted_at", "results_diges
 def check_task(task_id) -> str:
     if not isinstance(task_id, str) or not _TASK.match(task_id):
         raise KitError(f"not a usable task id: {task_id!r}")
+    if task_id == "fingerprint":
+        raise KitError("not a usable task id: 'fingerprint' names the release fingerprint directory "
+                       f"({FINGERPRINT_BASE}/), whose files are never rewritten")
     return task_id
 
 

@@ -1,0 +1,50 @@
+# Commands the release fingerprint runs (pk fingerprint run), grouped in tracks that run in parallel.
+# Each entry is an argv list, never a shell string. Entries of one track run in this order on one thread; each
+# distinct track gets its own thread. pk fingerprint plan lists them without running anything.
+# toolchain: argv lists whose first output line is recorded as the toolchain version.
+# entries: one per command, with these keys:
+# id: lowercase letters, digits and hyphens, unique in the file.
+# argv: the literal command, one element per line.
+# expected_exit: the exit code that counts as a pass (default 0).
+# track: lowercase letters, digits and hyphens; one thread per distinct track.
+# kind: check, test or gate.
+# derives: null, unittest or go-tests; the test table the output is parsed into (default null).
+# env: names and values set for this command only (default empty); values are never recorded.
+# A project that runs a fast suite and a slow suite lists them in different tracks:
+#
+#   toolchain:
+#     - - python3
+#       - '--version'
+#   entries:
+#     - id: unit
+#       argv:
+#         - python3
+#         - '-m'
+#         - unittest
+#         - discover
+#         - '-s'
+#         - src
+#         - '-v'
+#       expected_exit: 0
+#       track: plain
+#       kind: test
+#       derives: unittest
+#       env: {}
+#     - id: slow-unit
+#       argv:
+#         - python3
+#         - '-m'
+#         - unittest
+#         - discover
+#         - '-s'
+#         - src
+#         - '-v'
+#       track: slow
+#       kind: test
+#       derives: unittest
+#       env:
+#         PROJECT_TESTS_SLOW: "1"
+#
+# entries must list at least one command before pk fingerprint run accepts the file.
+toolchain: []
+entries: []
