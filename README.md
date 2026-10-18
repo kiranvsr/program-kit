@@ -136,7 +136,7 @@ The rules are stated once, in `kit/rules/RULES.md` (hard rules, working rules, e
 
 Run `sh install.sh /path/to/your-repo --upgrade` from a newer copy of the kit. The installer first checks the new copy against its own manifest and the installed `kit/` against its `kit/MANIFEST.sha256`, and refuses if either does not match (for the installed one, if you changed anything under it, a file you added under `kit/tests` included), then replaces `kit/` wholesale; a `kit/tests` left by an older install goes with the old kit. It also appends `__pycache__/`, `*.pyc` and `.worktrees/` to `.gitignore` if they are missing, exactly as a fresh install does (existing lines are left as they are), and it never reads, writes or lists `program/`. Keep your own changes in `program/`, not in `kit/`.
 
-From 0.2 to 0.3 nothing in `program/` has to change: every existing task reads as full-tier and the 0.2 controller state reads as it is. To use what is new, add `program/COMMON.md` from `kit/templates/COMMON.md`, add a `tiers` section to `program/checks.yaml`, and point your agents at `kit/rules/RULES.md` in place of the three rule files it replaces. `CHANGELOG.md` has the steps.
+From 0.2 to 0.3 nothing in `program/` has to change: every existing task reads as full-tier and the 0.2 controller state reads as it is. To use what is new, add `program/COMMON.md` from `kit/templates/COMMON.md`, add a `tiers` section to `program/checks.yaml`, and point your agents at `kit/rules/RULES.md` in place of the three rule files it replaces. `CHANGELOG.md` has the steps. From 0.3 to 0.4 nothing has to change either: the release fingerprint and `parallel_steps` are opt-in, and `CHANGELOG.md` says how to switch each on.
 
 ## Requirements
 

@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.4.0
+
+A release-level statement of health, and a shorter wait at every gate. The evidence model of 0.2.0 and the tiers of 0.3.0 are unchanged; a program upgraded from 0.3.0 runs exactly as before until it adds `program/release-set.yaml` or sets `parallel_steps`.
+
+What changed:
 
 - `pk status reopen <ID> --reason TEXT [--role qa [--reject]]`: the documented way back for a branch marked `done` (late work after acceptance, or a QA rejection), with the reason kept as an audit line in the status history.
 - `pk merge` and `pk evidence validate` check that every record in the store parses as a record of the kit's schema, not only that its bytes match its name; a file named after its own digest that is not a record is refused. The hand-back gate and `pk doctor` do not schema-check the whole store; merge and validate do.
@@ -10,6 +14,18 @@
 - `parallel_steps` in `program/checks.yaml` (default false): the hand-back gate and the merge check run `test`, `scan` and `extra_gate` concurrently and print them in the serial order, so the result is the one the serial run reports. Reason: the three steps are independent and the longest of them, not their sum, should set the gate's wall time; it is opt-in because commands that write into the tree cannot share it.
 - Working rule W12, fast default with the slow set in the release set: the `test` step finishes in minutes, slow cases sit behind one environment variable and run in their own release-set tracks. Reason: a thirty-minute suite at every hand-back makes agents skip it or wait on it.
 - The kit's own tests follow W12: the cases that build whole repositories, run the gate end to end or install the kit sit behind `KIT_TESTS_SLOW=1` (`kit/tests/_slow.py`), so the default discovery run takes about two minutes instead of eleven and `KIT_TESTS_SLOW=1` still runs every test. A test fails when a module outside the documented six imports the gate.
+
+Design choices, each with its reason:
+
+- The fingerprint is a record per commit under `program/evidence/fingerprint/<head12>/`, outside the per-task store, because it binds a commit and a release set rather than one task's inputs; it is immutable like a task record, and a run at a commit that already has a tracked record is refused rather than rewritten.
+- The record is committed only when it is complete and every command was as expected, by the controller, in a plain commit of exactly that directory; a red run stays uncommitted so that main never carries a fingerprint that claims less than green.
+- No run store or replay: the kit never re-binds task records, QA runs commands fresh by design, and the merge check runs on a trial-merge commit, so a cached result keyed by commit would never be hit.
+- Coverage is computed on read and never written next to the record, so a committed fingerprint is never touched after the fact.
+- Absolute paths are refused by a token rule (a reserved prefix after nothing, an option, or punctuation is absolute; after a path segment it is not), so `cwd=/tmp/x` and `-Wl,-L/Users/x` are caught while `tests/tmp` and `src/home` run; environment values are scrubbed and refused only in free text (output tails, toolchain lines, problem strings), because a value such as `test` is also a word in test names.
+- `parallel_steps` is off by default because the three steps share one tree, and only the program knows whether its commands can.
+- The kit's own slow tests are gated rather than trimmed, and the manifest does not change, because `kit/tests/` is not installed into a program.
+
+Upgrading from 0.3.0: nothing in `program/` has to change. To use the fingerprint, copy `kit/templates/release-set.yaml` to `program/release-set.yaml`, fill the entries, add that path to `guarded_files` in `program/checks.yaml`, and run `pk fingerprint run` from a clean tree at the commit you want to attest.
 
 ## 0.3.0
 
