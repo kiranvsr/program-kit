@@ -12,6 +12,7 @@ and `pk status set done`. Nothing in these tests writes `done` into a status fil
 forgery.
 """
 import _paths  # noqa: F401  (must come first: puts kit/scripts on sys.path)
+from _slow import skip_unless_slow
 import contextlib
 import io
 import os
@@ -198,6 +199,7 @@ class ReviewWorktreeTests(LandBase):
             worktree.new(self.root, "AH-1")
 
 
+@skip_unless_slow()
 class FinishTests(LandBase):
     def merged(self):
         sh(self.root, "git", "merge", "-q", "--no-ff", "-m", "merge", BRANCH)
@@ -361,6 +363,7 @@ class FinishTests(LandBase):
         self.assertTrue(self.wt.is_dir())
 
 
+@skip_unless_slow()
 class MergeTests(LandBase):
     def test_a_branch_qa_has_not_accepted_is_never_merged(self):
         self.standard(done=False)
@@ -667,6 +670,7 @@ class MergeTests(LandBase):
         self.assertEqual((code, err), (0, ""), out)
 
 
+@skip_unless_slow()
 class LightMergeTests(LandBase):
     LIGHT = {"full_paths": ["auth/"], "light_paths": ["web/"], "light_ruling": "R1"}
 
@@ -725,6 +729,7 @@ class LightMergeTests(LandBase):
         self.assertIn("changed full-tier paths: auth/policy.py", " ".join(status.validate(self.root)))
 
 
+@skip_unless_slow()
 class RoundTests(LandBase):
     def setUp(self):
         super().setUp()
@@ -877,6 +882,7 @@ class RoundTests(LandBase):
         self.assertIn(f"not merged yet: {T2}", err)
 
 
+@skip_unless_slow()
 class RoundCombinedFailureTests(LandBase):
     def test_a_suite_that_fails_only_on_the_combined_tree_fails_the_round_and_records_no_tested_tree(self):
         self.standard()  # this branch adds calc.mul; the other one's test passes only while there is none

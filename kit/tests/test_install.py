@@ -1,4 +1,5 @@
 import _paths  # noqa: F401  (must come first: puts kit/scripts on sys.path)
+from _slow import skip_unless_slow
 import os
 import shutil
 import subprocess
@@ -74,6 +75,7 @@ class InstallCase(unittest.TestCase):
         return sorted(p.name for p in Path(target).iterdir() if p.name.startswith((".kit.tmp.", ".kit.old.")))
 
 
+@skip_unless_slow()
 class InstallTests(InstallCase):
     def test_install_fresh_copies_kit_and_inits_program(self):
         for preset in (None, "go", "node", "python"):
@@ -377,6 +379,7 @@ class InstallUnderDashTests(InstallCase):
         self.assert_refused(self.install(target), "already exists; use --upgrade")
 
 
+@skip_unless_slow()
 class ProjectPreparationTests(InstallCase):
     """Finding 8: a first commit made by following the README leaves a clean tree and tracks no bytecode."""
 
@@ -520,6 +523,7 @@ class ProjectPreparationTests(InstallCase):
         self.first_commit_is_clean(target)
 
 
+@skip_unless_slow()
 class KitTestsStayInTheKitRepositoryTests(InstallCase):
     """Finding 15: the kit's tests are not installed; an upgrade removes them from an older install."""
 
@@ -584,6 +588,7 @@ class KitTestsStayInTheKitRepositoryTests(InstallCase):
         self.assertEqual(self.leftovers(target), [])
 
 
+@skip_unless_slow()
 class SourceManifestTests(InstallCase):
     """Lesser 15: a source kit that does not match its own manifest is refused with one error line."""
 
