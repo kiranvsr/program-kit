@@ -378,14 +378,17 @@ class Producer(Repo):
         self.assertNotIn(str(self.scratch), text)
         self.assertIn("root <root>", record["commands"][0]["output_tail"])
         self.assertGreaterEqual(record["commands"][0]["output_tail"].count("<path>"), 3)  # the user, home and drive paths
-        self.assertIn("scratch <env>", record["commands"][0]["output_tail"])
+        self.assertIn("scratch <scratch>", record["commands"][0]["output_tail"])
         self.assertEqual(fp.record_problems(record, text, record["head12"]), [])
 
-    def test_a_record_its_own_validator_would_refuse_is_not_written(self):
-        self.release({"id": "abs", "argv": ["/tmp/some-tool"], "track": "plain", "kind": "check"})
+    def test_an_argv_with_an_absolute_path_is_refused_before_anything_runs(self):
+        marker = self.root.parent / "ran.txt"
+        self.release(entry("first", "open(%r, 'w').write('x')" % str(marker), track="other"),
+                     {"id": "abs", "argv": ["/tmp/some-tool"], "track": "plain", "kind": "check"})
         code, _, err = self.cli("run", "--scratch", str(self.scratch))
         self.assertEqual(code, 1)
-        self.assertIn("would not validate", err)
+        self.assertIn("holds an absolute path", err)
+        self.assertFalse(marker.exists())  # refused before anything ran
         self.assertFalse((self.root / BASE).exists())
 
     def test_a_derived_command_that_parses_nothing_is_not_a_pass(self):
@@ -442,6 +445,15 @@ class Producer(Repo):
                          {"ex/a": {"": "pass", "TestOne": "pass"}})
 
 
+# Exact `python3 -m unittest -v` output of tiny throwaway modules (Python 3.14.6). Only the absolute path in each
+# traceback `File` line is shortened to the file name.
+REAL_SUB_LAST = 'test_aa_ok (test_sub_last.A.test_aa_ok) ... ok\ntest_zz_sub (test_sub_last.Z.test_zz_sub) ... \n  test_zz_sub (test_sub_last.Z.test_zz_sub) (i=1) ... FAIL\n\n======================================================================\nFAIL: test_zz_sub (test_sub_last.Z.test_zz_sub) (i=1)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File "test_sub_last.py", line 9, in test_zz_sub\n    self.assertEqual(i, 0)\n    ~~~~~~~~~~~~~~~~^^^^^^\nAssertionError: 1 != 0\n\n----------------------------------------------------------------------\nRan 2 tests in 0.001s\n\nFAILED (failures=1)\n'
+
+REAL_LOGGING = 'test_a_logs (test_log.L.test_a_logs) ... ERROR:svc:connection refused\nok\ntest_b_ok (test_log.L.test_b_ok) ... ok\n\n----------------------------------------------------------------------\nRan 2 tests in 0.000s\n\nOK\n'
+
+REAL_MIXED = 'test_apos (test_mix.C.test_apos) ... skipped "can\'t run here"\ntest_doc (test_mix.C.test_doc)\nHas a docstring. ... ok\ntest_sub_err (test_mix.C.test_sub_err) ... \n  test_sub_err (test_mix.C.test_sub_err) (i=1) ... ERROR\ntest_sub_fail (test_mix.C.test_sub_fail) ... \n  test_sub_fail (test_mix.C.test_sub_fail) (i=0) ... FAIL\n  test_sub_fail (test_mix.C.test_sub_fail) (i=1) ... FAIL\ntest_sub_ok (test_mix.C.test_sub_ok) ... ok\ntest_sub_skip (test_mix.C.test_sub_skip) ... \n  test_sub_skip (test_mix.C.test_sub_skip) (i=1) ... skipped \'later\'\ntest_z_last (test_mix.C.test_z_last) ... ok\n\n======================================================================\nERROR: test_sub_err (test_mix.C.test_sub_err) (i=1)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File "test_mix.py", line 13, in test_sub_err\n    raise RuntimeError("x")\nRuntimeError: x\n\n======================================================================\nFAIL: test_sub_fail (test_mix.C.test_sub_fail) (i=0)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File "test_mix.py", line 10, in test_sub_fail\n    self.assertEqual(i, 5)\n    ~~~~~~~~~~~~~~~~^^^^^^\nAssertionError: 0 != 5\n\n======================================================================\nFAIL: test_sub_fail (test_mix.C.test_sub_fail) (i=1)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File "test_mix.py", line 10, in test_sub_fail\n    self.assertEqual(i, 5)\n    ~~~~~~~~~~~~~~~~^^^^^^\nAssertionError: 1 != 5\n\n----------------------------------------------------------------------\nRan 7 tests in 0.001s\n\nFAILED (failures=2, errors=1, skipped=2)\n'
+
+
 class Parsers(unittest.TestCase):
     def test_the_3_11_and_later_name_format(self):
         out = ("test_a (pkg.test_mod.Case.test_a) ... ok\ntest_b (pkg.test_mod.Case.test_b) ... FAIL\n"
@@ -478,6 +490,29 @@ class Parsers(unittest.TestCase):
     def test_subtests_keep_the_worst_verdict_under_the_test_name(self):
         out = "test_a (m.C.test_a) (i=1) ... ok\ntest_a (m.C.test_a) (i=2) ... FAIL\ntest_a (m.C.test_a) ... ok\n"
         self.assertEqual(fp.parse_unittest(out), {"m.C.test_a": "fail"})
+
+    def test_real_output_whose_last_test_has_a_failing_subtest_parses(self):
+        # The main line has no verdict, the subtest line is indented, and the next line the parser reads that starts
+        # with a verdict word is the runner's `FAIL: ...` block header. This used to raise KeyError.
+        self.assertEqual(fp.parse_unittest(REAL_SUB_LAST), {"test_sub_last.A.test_aa_ok": "ok",
+                                                            "test_sub_last.Z.test_zz_sub": "fail", "": "fail"})
+
+    def test_real_output_of_a_test_that_logs_before_its_verdict_parses(self):
+        # `... ERROR:svc:connection refused` is log output, not a verdict; the verdict `ok` is the next line.
+        self.assertEqual(fp.parse_unittest(REAL_LOGGING), {"test_log.L.test_a_logs": "ok", "test_log.L.test_b_ok": "ok",
+                                                           "": "ok"})
+
+    def test_real_output_with_subtests_docstrings_and_quoted_skips_gives_every_test_an_entry(self):
+        self.assertEqual(fp.parse_unittest(REAL_MIXED), {
+            "test_mix.C.test_apos": "skipped",  # skipped "can't run here": a double-quoted reason
+            "test_mix.C.test_doc": "ok", "test_mix.C.test_sub_err": "error", "test_mix.C.test_sub_fail": "fail",
+            "test_mix.C.test_sub_ok": "ok", "test_mix.C.test_sub_skip": "skipped", "test_mix.C.test_z_last": "ok",
+            "": "error"})
+
+    def test_a_text_that_is_not_a_verdict_is_ignored_and_never_raises(self):
+        self.assertEqual(fp.parse_unittest("test_a (m.C.test_a) ... okay then\nok, more\nFAIL: x\n"), {})
+        self.assertEqual(fp._unittest_verdict("nonsense"), "")
+        self.assertIsNone(fp._UT_BARE.match("okay, more"))
 
     def test_lines_that_are_not_tests_are_ignored(self):
         out = ("ERROR: test_a (m.C.test_a)\nTraceback (most recent call last):\n  File \"x.py\", line 1, in f\n"
@@ -745,17 +780,167 @@ class Immutability(Repo):
             self.assertEqual(code, 1, command)
             self.assertIn(f"evidence history rewritten: {BASE}/{head12}/fingerprint.json deleted", err.getvalue())
 
-    def test_a_task_records_edit_is_still_refused_and_a_task_named_fingerprint_is_listed_once(self):
-        store.record(self.root, "fingerprint", "results", {"head": "a" * 40, "produced_at": "t"})
-        appended = store.append(self.root, "T-1", "results", {"x": 1})
+    def test_a_task_records_edit_is_still_refused(self):
+        first = store.append(self.root, "T-1", "results", {"x": 1})
+        second = store.append(self.root, "T-2", "results", {"x": 2})
         self.commit("records")
-        for path in (self.root / appended["path"], next((self.root / BASE / "results").glob("*.json"))):
-            path.chmod(0o644)
-            path.write_text("{}\n")
+        for appended in (first, second):
+            appended["file"].chmod(0o644)
+            appended["file"].write_text("{}\n")
         commit = self.commit("edit both")
         found = store.rewritten(self.root)
         self.assertEqual(len(found), 2)
         self.assertTrue(all(commit in line for line in found))
+
+    def test_a_task_cannot_be_named_fingerprint(self):
+        # Its pointer would be program/evidence/fingerprint/latest.json, rewritten by every record: a permanent
+        # "history rewritten" in the fingerprint directory.
+        for call in (lambda: store.check_task("fingerprint"), lambda: store.pointer_path("fingerprint"),
+                     lambda: store.record(self.root, "fingerprint", "results", {"head": "a" * 40, "produced_at": "t"})):
+            with self.assertRaisesRegex(KitError, "'fingerprint' names the release fingerprint directory"):
+                call()
+        self.assertFalse((self.root / BASE).exists())
+        self.assertEqual(store.check_task("fingerprint-2"), "fingerprint-2")
+
+
+REAL_SHAPES = (  # path shapes a boundary-checking pattern misses: a letter or underscore before the prefix
+    ("ld: warning: directory not found for option '-L/Us", "ers/someone/lib'"),
+    ("cc -I/ho", "me/someone/include x.c"),
+    ("ok _/Us", "ers/someone/gopath/x 0.1s"),
+)  # each pair is joined by the command, so the program's own argv holds no absolute path
+
+
+class FixRound(Repo):
+    def test_path_shapes_with_a_letter_before_the_prefix_are_scrubbed_and_refused(self):
+        code = "\n".join(f"print({head!r} + {tail!r})" for head, tail in REAL_SHAPES)
+        self.release(entry("shapes", code))
+        record = self.run_ok()[3]
+        tail = record["commands"][0]["output_tail"].splitlines()
+        self.assertEqual(tail, ["ld: warning: directory not found for option '-L<path>'", "cc -I<path> x.c",
+                                "ok _<path> 0.1s"])
+        self.assertIsNone(fp.ABSOLUTE_PATH.search(self.text()))
+        for shape in ("-L/Users/someone/lib", "-I/home/someone/include", "_/Users/someone/gopath/x", "x/private/y"[1:]):
+            with self.subTest(shape):
+                self.assertIsNotNone(fp.ABSOLUTE_PATH.search(f"tail {shape} end"))
+        for fine in ("/usersx", "src/tmpfile", "a /tmp.txt", "key:/value"):
+            with self.subTest(fine):
+                self.assertIsNone(fp.ABSOLUTE_PATH.search(fine))
+        path = self.root / BASE / record["head12"] / "fingerprint.json"
+        data = json.loads(path.read_text())
+        data["commands"][0]["output_tail"] = "ld: -L/Users/someone/lib"
+        path.write_text(json.dumps(data, indent=2) + "\n")
+        code, _, err = self.cli("validate", f"{BASE}/{record['head12']}")
+        self.assertEqual(code, 1)
+        self.assertIn("holds an absolute path", err)
+
+    def test_path_literals_are_replaced_before_env_values(self):
+        self.release(entry("cwd", "import os; print('cwd', os.getcwd())", env={"SEG": self.root.name}))
+        self.assertEqual(self.run_ok()[3]["commands"][0]["output_tail"], "cwd <root>")
+
+    def test_the_validator_refuses_an_env_value_in_the_text_a_command_echoed(self):
+        self.release(entry("uses-env", "import os; print('seg', os.environ['SEG'])", env={"SEG": "scratchpad"}),
+                     entry("short", "import os; print('pin', os.environ['PIN'])", env={"PIN": "a9z"}))
+        record = self.run_ok()[3]
+        directory = f"{BASE}/{record['head12']}"
+        self.assertEqual(self.cli("validate", directory)[0], 0)
+        path = self.root / directory / "fingerprint.json"
+        data = json.loads(path.read_text())
+        data["commands"][0]["output_tail"] = "seg scratchpad"
+        data["commands"][1]["output_tail"] = "pin a9z"  # under 4 characters: the scrubber keeps such values
+        path.write_text(json.dumps(data, indent=2) + "\n")
+        code, _, err = self.cli("validate", directory)
+        self.assertEqual(code, 1)
+        self.assertIn("entry uses-env: the value of env SEG appears in the record", err)
+        self.assertNotIn("PIN", err)
+        self.assertNotIn("scratchpad", err)  # the value itself is never printed
+
+    def test_the_validator_ties_the_rows_to_the_release_set_at_head(self):
+        self.release(entry("good", say("fine")), entry("bad", "import sys; sys.exit(3)", track="two"))
+        record = self.run_ok()[3]
+        self.assertFalse(record["all_as_expected"])
+        directory = f"{BASE}/{record['head12']}"
+        self.assertEqual(self.cli("validate", directory)[0], 0)  # red but honest
+        path = self.root / directory / "fingerprint.json"
+        pristine = path.read_text()
+        data = json.loads(pristine)
+        data["commands"] = [row for row in data["commands"] if row["id"] != "bad"]
+        del data["tracks"]["two"]
+        data["all_as_expected"] = True
+        path.write_text(json.dumps(data, indent=2) + "\n")
+        code, _, err = self.cli("validate", directory)
+        self.assertEqual(code, 1)
+        self.assertIn("not the entries of the release set", err)
+        self.assertIn("missing: bad", err)
+        for change in (lambda d: d["commands"][0].update(argv=["true"]), lambda d: d["commands"][0].update(kind="gate"),
+                       lambda d: d["commands"][1].update(expected_exit=3)):
+            data = json.loads(pristine)
+            change(data)
+            path.write_text(json.dumps(data, indent=2) + "\n")
+            self.assertEqual(self.cli("validate", directory)[0], 1)
+
+    def test_an_only_record_is_compared_with_that_track_alone(self):
+        self.release(entry("one", say("1")), entry("two", say("2"), track="other"))
+        record = self.run_ok("--only", "other")[3]
+        self.assertEqual(self.cli("validate", f"{BASE}/{record['head12']}")[0], 0)
+
+    def test_an_untracked_path_in_the_fingerprint_directory_that_is_not_a_record_makes_the_tree_dirty(self):
+        self.release(entry("one", "pass"))
+        stray = self.root / BASE / "notes.txt"
+        stray.parent.mkdir(parents=True)
+        stray.write_text("x\n")
+        code, _, err = self.cli("run", "--scratch", str(self.scratch))
+        self.assertEqual(code, 1)
+        self.assertIn("working tree is not clean: " + BASE + "/notes.txt", err)
+
+    def test_a_command_that_writes_into_the_fingerprint_directory_is_seen(self):
+        self.release(entry("writer", f"import pathlib; pathlib.Path({BASE!r}, 'other.txt').parent.mkdir(parents=True, "
+                                     f"exist_ok=True); pathlib.Path({BASE!r}, 'other.txt').write_text('x')"))
+        code, _, err, record = self.run_ok()
+        self.assertEqual(code, 1)
+        self.assertFalse(record["tree_unchanged_by_run"])
+
+    def test_a_scratch_directory_inside_the_repository_is_refused(self):
+        self.release(entry("one", "pass"))
+        code, _, err = self.cli("run", "--scratch", str(self.root / "logs"))
+        self.assertEqual(code, 1)
+        self.assertIn("is inside the repository", err)
+        self.assertFalse((self.root / BASE).exists())
+
+    def test_a_toolchain_command_that_dirties_the_tree_is_seen(self):
+        self.release(entry("one", "pass"), toolchain=[[PY, "-c", "open('made-by-toolchain.txt', 'w').write('x')"]])
+        code, _, err, record = self.run_ok()
+        self.assertEqual(code, 1)
+        self.assertFalse(record["tree_unchanged_by_run"])
+        self.assertIn("made-by-toolchain.txt", err)
+
+    def test_changes_hidden_by_skip_worktree_or_assume_unchanged_are_refused(self):
+        self.release(entry("one", "pass"))
+        for flag in ("--skip-worktree", "--assume-unchanged"):
+            with self.subTest(flag):
+                sh(self.root, "git", "update-index", flag, "a.txt")
+                code, _, err = self.cli("run", "--scratch", str(self.scratch))
+                self.assertEqual(code, 1)
+                self.assertIn("git hides changes to tracked files", err)
+                self.assertIn("a.txt", err)
+                sh(self.root, "git", "update-index", "--no-" + flag[2:], "a.txt")
+        self.assertEqual(self.cli("run", "--scratch", str(self.scratch))[0], 0)
+
+    def test_an_untracked_symlink_at_the_record_directory_is_replaced_and_its_target_kept(self):
+        self.release(entry("one", "pass"))
+        head12 = sh(self.root, "git", "rev-parse", "HEAD").strip()[:12]
+        target = self.root.parent / "elsewhere"
+        target.mkdir()
+        (target / "keep.txt").write_text("keep\n")
+        (self.root / BASE).mkdir(parents=True)
+        os.symlink(target, self.root / BASE / head12)
+        code, _, err, record = self.run_ok()
+        self.assertEqual((code, err), (0, ""))
+        self.assertFalse((self.root / BASE / head12).is_symlink())
+        self.assertEqual((target / "keep.txt").read_text(), "keep\n")
+
+    def test_an_empty_program_name_is_refused(self):
+        with self.assertRaisesRegex(KitError, "entry e: argv: the first element"):
+            fp.parse_release_set("entries:\n  - id: e\n    argv:\n      - ''\n    track: t\n    kind: check\n")
 
 
 if __name__ == "__main__":

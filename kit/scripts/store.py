@@ -53,6 +53,9 @@ ACCEPTANCE_FIELDS = ("digest", "path", "decision", "accepted_at", "results_diges
 def check_task(task_id) -> str:
     if not isinstance(task_id, str) or not _TASK.match(task_id):
         raise KitError(f"not a usable task id: {task_id!r}")
+    if task_id == "fingerprint":
+        raise KitError("not a usable task id: 'fingerprint' names the release fingerprint directory "
+                       f"({FINGERPRINT_BASE}/), whose files are never rewritten")
     return task_id
 
 

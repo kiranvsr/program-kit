@@ -28,7 +28,7 @@ import time
 from pathlib import Path, PurePosixPath
 
 import miniyaml
-from common import KitError, find_root, read_json, run_argv, sha256_bytes, utc_now, write_json
+from common import KitError, find_root, read_json, run_argv, sha256_bytes, utc_now
 from gate import STEP_TIMEOUT
 
 SCHEMA = "program-kit.fingerprint.v1"
@@ -48,8 +48,9 @@ _ENTRY_KEYS = ("id", "argv", "expected_exit", "track", "kind", "derives", "env")
 _TOP_KEYS = ("toolchain", "entries")
 # An absolute path of the kinds that name a person or a machine. The validator looks for the prefix anywhere in the
 # record's text; the scrubber replaces the prefix and the rest of the path.
-_PATH_PREFIX = r"(?<![\w.-])(?:/(?:Users|home|private|tmp)(?=/|\b)|[A-Za-z]:[\\/])"
+_PATH_PREFIX = r"(?:/(?:Users|home|private|tmp)(?![\w.-])|(?<!\w)[A-Za-z]:[\\/])"
 ABSOLUTE_PATH = re.compile(_PATH_PREFIX)
+_RECORD_DIR = re.compile(re.escape(BASE) + r"/[0-9a-f]{12}(?:/|\Z)")  # an earlier, uncommitted run's record directory
 _PATH_RUN = re.compile(_PATH_PREFIX + r"[^\s'\"<>():,;]*")
 
 
@@ -88,7 +89,7 @@ def _dirty_paths(root: Path) -> list[str]:
         status, path = field[:2], field[3:]
         if status[0] in "RC":
             next(fields, None)  # the original path of a rename or copy follows as its own field
-        if status == "??" and path.startswith(BASE + "/"):
+        if status == "??" and _RECORD_DIR.match(path):
             continue
         paths.append(path)
     return paths
@@ -99,6 +100,8 @@ def _dirty_paths(root: Path) -> list[str]:
 def _argv(value, what: str) -> list[str]:
     if not isinstance(value, list) or not value or not all(isinstance(part, str) for part in value):
         raise KitError(f"{what} must be a non-empty list of strings (an argv list, never a shell string)")
+    if not value[0]:
+        raise KitError(f"{what}: the first element (the program) must not be empty")
     return list(value)
 
 
@@ -186,9 +189,9 @@ def load_release_set(root, ref: str) -> dict:
 
 # Verdict names. Both tables use these ranks to decide which of two verdicts is worse.
 RANK = {"skipped": 0, "skip": 0, "xfail": 1, "ok": 2, "pass": 2, "xpass": 3, "fail": 4, "error": 5}
-_UNITTEST_VERDICT = r"ok|FAIL|ERROR|skipped(?: '.*')?|expected failure|unexpected success"
-_UT_HEAD = re.compile(r"(\w+) \(([\w.]+)\)(?: \(.*?\))*(.*)\Z")
-_UT_BARE = re.compile(_UNITTEST_VERDICT + r"\Z")
+_UNITTEST_VERDICT = r"ok|FAIL|ERROR|skipped(?: '.*'| \".*\")?|expected failure|unexpected success"
+_UT_HEAD = re.compile(r"(?: {0,4})(\w+) \(([\w.]+)\)(?: \(.*?\))*(.*)\Z")
+_UT_BARE = re.compile("(?:" + _UNITTEST_VERDICT + r")\Z")
 _UT_DOC_END = re.compile(r" \.\.\. (" + _UNITTEST_VERDICT + r")\Z")
 _UT_OK = re.compile(r"OK(?: \(.*\))?\Z")
 _UT_FAILED = re.compile(r"FAILED \((.*)\)\Z")
@@ -198,7 +201,7 @@ def _unittest_verdict(text: str) -> str:
     if text.startswith("skipped"):
         return "skipped"
     return {"ok": "ok", "FAIL": "fail", "ERROR": "error", "expected failure": "xfail",
-            "unexpected success": "xpass"}[text]
+            "unexpected success": "xpass"}.get(text, "")
 
 
 def _worse(a: str, b: str) -> str:
@@ -210,12 +213,15 @@ def parse_unittest(text: str) -> dict[str, str]:
 
     A name is `module.Class.test`: the 3.11+ line `test (module.Class.test)` carries it whole, the older
     `test (module.Class)` is completed with the test name. A docstring (the verdict on the next line) and a test
-    that printed output before its verdict are followed. A test seen twice (subtests) keeps its worst verdict.
+    that printed output before its verdict are followed. A subtest line (indented, `test (m.C.test) (i=1) ... FAIL`)
+    counts under its test's name, and a test seen twice keeps its worst verdict.
     """
     table: dict[str, str] = {}
 
-    def put(key: str, verdict: str) -> None:
-        table[key] = _worse(table[key], verdict) if key in table else verdict
+    def put(key: str, text: str) -> None:
+        verdict = _unittest_verdict(text)
+        if verdict:  # a text that is not a verdict is ignored, never raised
+            table[key] = _worse(table[key], verdict) if key in table else verdict
 
     pending, strict = None, False  # strict: a docstring line is next, so only that one line may complete the test
     for line in text.splitlines():
@@ -225,7 +231,7 @@ def parse_unittest(text: str) -> dict[str, str]:
             key = path if path.rsplit(".", 1)[-1] == name else f"{path}.{name}"
             if rest.startswith(" ... "):
                 if _UT_BARE.match(rest[5:]):
-                    put(key, _unittest_verdict(rest[5:]))
+                    put(key, rest[5:])
                     pending = None
                 else:
                     pending, strict = key, False  # the test printed first; its verdict is a later line
@@ -234,12 +240,12 @@ def parse_unittest(text: str) -> dict[str, str]:
             continue
         if pending is not None:
             if _UT_BARE.match(line):
-                put(pending, _unittest_verdict(line))
+                put(pending, line)
                 pending = None
                 continue
             ended = _UT_DOC_END.search(line)
             if ended and strict:
-                put(pending, _unittest_verdict(ended.group(1)))
+                put(pending, ended.group(1))
                 pending = None
                 continue
             if strict:
@@ -329,11 +335,11 @@ def _scrubber(root: Path, scratch: Path, env_values: list[str]):
     secrets = sorted({v for v in env_values if len(v) >= 4}, key=len, reverse=True)
 
     def scrub(text: str) -> str:
-        for value in secrets:
-            text = text.replace(value, "<env>")
-        for literal in ordered:
+        for literal in ordered:  # the paths first: an env value that is a path segment must not break them
             if literal and literal != "/":
                 text = text.replace(literal, literals[literal])
+        for value in secrets:
+            text = text.replace(value, "<env>")
         return _PATH_RUN.sub("<path>", text)
     return scrub
 
@@ -415,7 +421,14 @@ def run(root, only: str | None = None, scratch: Path | None = None) -> tuple[dic
     tracked = _git_bytes(root, "ls-tree", "-r", "--name-only", "HEAD", "--", f"{BASE}/{head12}").decode().split()
     if tracked:
         raise KitError(f"already recorded at {head12}; a record is never rewritten")
+    hidden = [line[2:].strip() for line in _git_bytes(root, "ls-files", "-v").decode("utf-8", "replace").splitlines()
+              if line[:1] == "S" or line[:1].islower()]
+    if hidden:
+        raise KitError("git hides changes to tracked files (skip-worktree or assume-unchanged): " + ", ".join(hidden))
     release = load_release_set(root, head)
+    for argv in [*release["toolchain"], *(e["argv"] for e in release["entries"])]:
+        if any(ABSOLUTE_PATH.search(part) for part in argv):  # the record would be refused after the whole run
+            raise KitError(f"{RELEASE_SET}: the argv {argv!r} holds an absolute path, which a record may not hold")
     tracks: dict[str, list[dict]] = {}
     for entry in release["entries"]:
         tracks.setdefault(entry["track"], []).append(entry)
@@ -424,8 +437,11 @@ def run(root, only: str | None = None, scratch: Path | None = None) -> tuple[dic
     selected = {name: rows for name, rows in tracks.items() if only in (None, name)}
     scratch = Path(tempfile.mkdtemp(prefix="fingerprint-")) if scratch is None else Path(scratch)
     scratch.mkdir(parents=True, exist_ok=True)
+    if scratch.resolve() == root or root in scratch.resolve().parents:
+        raise KitError(f"the scratch directory {scratch} is inside the repository: full output is never kept there")
     scrub = _scrubber(root, scratch.resolve(), [v for e in release["entries"] for v in e["env"].values()])
 
+    versions = _toolchain_versions(root, release["toolchain"], scrub)  # before the tracks: the tree check sees them
     results: dict[str, dict] = {}
     seconds: dict[str, float] = {}
     failures: list = []
@@ -461,7 +477,7 @@ def run(root, only: str | None = None, scratch: Path | None = None) -> tuple[dic
         "release_set_sha256": _hash_at(root, head, RELEASE_SET),
         "toolchain": {"kit_manifest_sha256": _hash_at(root, head, "kit/MANIFEST.sha256"),
                       "checks_sha256": _hash_at(root, head, "program/checks.yaml"),
-                      "versions": _toolchain_versions(root, release["toolchain"], scrub)},
+                      "versions": versions},
         "tracks": {name: {"seconds": seconds[name], "commands": [e["id"] for e in selected[name]]}
                    for name in selected},
         "commands": rows,
@@ -474,7 +490,9 @@ def run(root, only: str | None = None, scratch: Path | None = None) -> tuple[dic
     problems = record_problems(record, text, directory.name)
     if problems:
         raise KitError("the record would not validate, so nothing was written: " + "; ".join(problems))
-    if directory.exists():  # an earlier uncommitted run at this commit
+    if directory.is_symlink():
+        directory.unlink()
+    elif directory.exists():  # an earlier uncommitted run at this commit
         shutil.rmtree(directory)
     directory.mkdir(parents=True)
     for name, raw in files.items():
@@ -648,7 +666,38 @@ def validate_record(root, rel: str) -> list[str]:
         if actual != data["release_set_sha256"]:
             problems.append(f"{rel}: release_set_sha256 is {data['release_set_sha256']}, but {RELEASE_SET} at "
                             f"{data['head12']} hashes to {actual}")
+        else:
+            problems.extend(f"{rel}: {why}" for why in _release_problems(root, data))
     return problems
+
+
+def _release_problems(root: Path, data: dict) -> list[str]:
+    """The record against the release set at its head: the rows are the entries it ran, and no env value of 4 or
+    more characters appears in the text a command could have echoed (output tails, toolchain lines, problems)."""
+    try:
+        release = load_release_set(root, data["head"])
+    except KitError as exc:
+        return [f"the release set at {data['head12']} does not load: {exc}"]
+    wanted = [e for e in release["entries"] if data["only"] in (None, e["track"])]
+    def shape(entry: dict) -> tuple:
+        return (entry["id"], entry["argv"], entry["expected_exit"], entry["track"], entry["kind"], entry["derives"],
+                sorted(entry["env"]))
+
+    ran = [(row["id"], row["argv"], row["expected_exit"], row["track"], row["kind"], row["derives"],
+            sorted(row["env_keys"])) for row in data["commands"]]
+    if ran != [shape(entry) for entry in wanted]:
+        have = {row[0] for row in ran}
+        missing = [e["id"] for e in wanted if e["id"] not in have]
+        extra = sorted(have - {e["id"] for e in wanted})
+        return ["the command rows are not the entries of the release set at "
+                f"{data['head12']} (missing: {', '.join(missing) or 'none'}; not in the set: "
+                f"{', '.join(extra) or 'none'}; or a row differs in argv, expected_exit, track, kind, derives or "
+                "env_keys)"]
+    texts = [row["output_tail"] for row in data["commands"]] + [v["line"] for v in data["toolchain"]["versions"]] \
+        + [row["problem"] or "" for row in data["commands"]]
+    return [f"entry {entry['id']}: the value of env {name} appears in the record"
+            for entry in release["entries"] for name, value in sorted(entry["env"].items())
+            if len(value) >= 4 and any(value in text for text in texts)]
 
 
 # --- commands ---------------------------------------------------------------------------------
