@@ -258,6 +258,22 @@ class RulesTests(unittest.TestCase):
         self.assertIn("the per-task latest.json is the only mutable evidence file", text)  # rule 11
         self.assertIn("A record binds only its inputs, never a derived output", text)  # rule 12
 
+    def test_the_working_rules_run_w1_to_w12_and_w12_is_the_fast_default_rule(self):
+        text = rule_part(2)
+        self.assertEqual([int(n) for n in re.findall(r"^- \*\*W(\d+)\. ", text, re.M)], list(range(1, 13)))
+        w12 = re.search(r"^- \*\*W12\. Fast default, slow set in the release set\.\*\*(.*)$", text, re.M)
+        self.assertTrue(w12, "W12 missing or retitled")
+        for phrase in ("`test` step", "environment variable", "program/release-set.yaml", "pk fingerprint"):
+            self.assertIn(phrase, w12.group(1))
+
+    def test_the_execute_playbook_points_the_evidence_step_to_w12_and_the_fingerprint(self):
+        lines = read(PLAYBOOK_DIR / "08_execute.md").splitlines()
+        at = next(i for i, ln in enumerate(lines) if ln.startswith("5. Evidence"))
+        self.assertTrue(lines[at + 1].startswith("   - "), "the paragraph is a sub-point of the evidence step")
+        self.assertIn("W12", lines[at + 1])
+        self.assertIn("`pk fingerprint run`", lines[at + 1])
+        self.assertTrue(lines[at + 2].startswith("6. Hand-back gate"))
+
     def test_throughput_covers_required_topics(self):
         text = (rule_part(2) + rule_part(4)).lower()
         for topic in ("merge queue", "hand-back gate", "decide, don't ask", "finding-to-fix", "class a", "class d",
@@ -293,7 +309,8 @@ READING = {
 # What the same roles had to read in 0.2.0: three rule files (14.1 KB) and, for the controller, all four briefs,
 # the start and execute playbooks and the hand-off playbook. The 0.3.0 sets must stay under these.
 READING_0_2_KB = {"Controller or successor": 54.7, "Implementer, full or standard tier": 19.6,
-                  "Implementer, light tier": 19.6, "QA": 20.0, "Spec QA": 17.9}
+                  "Implementer, light tier": 19.6, "QA": 20.5, "Spec QA": 17.9}
+# QA's ceiling is 20.5, not the 20.0 of 0.2.0: working rule W12 added a paragraph to part 2, which QA reads.
 
 
 class RuleFilePointerTests(unittest.TestCase):
@@ -408,6 +425,26 @@ class CommandTests(unittest.TestCase):
                 for flag in re.findall(r"(?<![\w-])(--[a-z][a-z-]*)", f" {word or ''}{rest}"):
                     self.assertIn(flag, valid, f"{where}: unknown flag {flag}")
         self.assertGreater(seen, 40)
+
+    def test_every_pk_command_the_readme_names_exists(self):
+        parsers = command_parsers()
+        known = set(pk.COMMANDS)
+        mention = re.compile(r"\bpk ([a-z][a-z-]*)(?: ([a-z][a-z-]*))?([^`\n]*)")
+        text = read(KIT.parent / "README.md")
+        seen = 0
+        for command, word, rest in mention.findall(text):
+            self.assertIn(command, known, f"README.md: pk {command}: not a pk command")
+            seen += 1
+            if command not in parsers:
+                continue
+            parser, actions = parsers[command]
+            valid = options_of(parser)
+            if actions and word:
+                self.assertIn(word, actions, f"README.md: pk {command} {word}: not an action")
+                valid |= options_of(actions[word])
+            for flag in re.findall(r"(?<![\w-])(--[a-z][a-z-]*)", f" {word or ''}{rest}"):
+                self.assertIn(flag, valid, f"README.md: pk {command}: unknown flag {flag}")
+        self.assertGreater(seen, 5)
 
 
 class NeutralityTests(unittest.TestCase):

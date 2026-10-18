@@ -6,6 +6,9 @@
 - `pk merge` and `pk evidence validate` check that every record in the store parses as a record of the kit's schema, not only that its bytes match its name; a file named after its own digest that is not a record is refused. The hand-back gate and `pk doctor` do not schema-check the whole store; merge and validate do.
 - `pk worktree finish` asks the container tool for each item's compose project label and removes only an exact match, whatever the tool's own `--filter` returned.
 - The example-neutrality test reads only the files git tracks in `examples/tiny-service`.
+- `pk fingerprint run|plan|validate|show|coverage` and `program/release-set.yaml`: one committed record per commit that runs the project's release set on parallel tracks and derives per-test tables, with readers for how far the tree has moved since and which rows of a task's latest record it covers. Reason: a results record binds one task, so "the whole release set passed at commit X" could only be answered by re-running every task's commands.
+- `parallel_steps` in `program/checks.yaml` (default false): the hand-back gate and the merge check run `test`, `scan` and `extra_gate` concurrently and print them in the serial order, so the result is the one the serial run reports. Reason: the three steps are independent and the longest of them, not their sum, should set the gate's wall time; it is opt-in because commands that write into the tree cannot share it.
+- Working rule W12, fast default with the slow set in the release set: the `test` step finishes in minutes, slow cases sit behind one environment variable and run in their own release-set tracks. Reason: a thirty-minute suite at every hand-back makes agents skip it or wait on it.
 
 ## 0.3.0
 

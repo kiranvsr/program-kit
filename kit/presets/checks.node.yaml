@@ -6,6 +6,7 @@ build:
     - '--offline'
   - - pnpm
     - build
+# The fast default suite that finishes in minutes; slow cases sit behind one environment variable and run in release-set tracks (rule W12, pk fingerprint).
 test:
   - - pnpm
     - test
@@ -16,6 +17,8 @@ scan:
     - '--no-git'
 compile_check: []
 extra_gate: []
+# true runs test, scan and extra_gate concurrently; keep false unless those commands can share one tree at once.
+parallel_steps: false
 guarded_files:
   - package.json
   - pnpm-lock.yaml

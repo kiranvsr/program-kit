@@ -82,6 +82,10 @@ Upgrade the kit (`sh install.sh <repo> --upgrade`), then run `pk evidence import
 
 Run `sh install.sh /path/to/your-repo --upgrade`. Nothing in `program/` has to change: a status record without a tier reads as `full`, a 0.2 `controller-state.json` reads as it is (follow-ups get IDs the first time a command writes the file), and the evidence store is untouched. Then, to use what is new: copy `kit/templates/COMMON.md` to `program/COMMON.md` and fill it; add a `tiers` section to `program/checks.yaml` (it is a guarded file, so the controller edits it on main) listing your full-tier paths; rename the Known gotchas heading of your hand-off to Known hazards if you like; and tell your agents that `kit/rules/RULES.md` replaces `HARD_RULES.md`, `EVIDENCE_HONESTY.md` and `THROUGHPUT.md`. If `pk handoff check` now fails on the size budget, move history into rulings and close or tag follow-ups; `pk record --ruling TEXT --handoff-budget BYTES` raises the budget, by a ruling, while you do.
 
+## When do I run pk fingerprint, and what if it is red?
+
+Run `pk fingerprint run` from a clean checkout of main after a merge that changes `program/release-set.yaml` or a suite it names, and before a release; `pk fingerprint plan` shows the tracks and how long each took last time without running anything. Commit the result, in its own commit through `pk record`, only when it is complete and every command was as expected (the command exits 0 exactly then). If it is red, keep the directory `program/evidence/fingerprint/<head12>/` uncommitted, fix the cause, and run again at the new commit; an untracked directory left by the earlier run is replaced. A committed record is never rewritten. A fast `test` step with the slow cases in their own tracks (working rule W12) is what keeps the run affordable.
+
 ## What are the known limits?
 
 Five things the kit does not do, so you know where its checks stop.
