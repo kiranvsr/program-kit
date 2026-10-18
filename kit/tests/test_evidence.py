@@ -1,4 +1,5 @@
 import _paths  # noqa: F401  (must come first: puts kit/scripts/ on sys.path)
+from _slow import skip_unless_slow
 import contextlib
 import copy
 import hashlib
@@ -178,6 +179,7 @@ class RunCommand(Base):
             ev.run_command("shell", "echo hi")
 
 
+@skip_unless_slow()
 class PlantedBugs(Base):
     def test_planted_bug_counts_only_test_failure(self):
         ev = evidence.Evidence(self.root, "T-1")
@@ -506,6 +508,7 @@ class PlantedBugs(Base):
             sh(self.root, "git", "worktree", "remove", "--force", made[0])
 
 
+@skip_unless_slow()
 class Write(Base):
     def test_write_creates_schema_shaped_file(self):
         ev = self.ready()
@@ -657,6 +660,7 @@ class Write(Base):
         self.assertNotIn("stale", read_json(self.ready().write()["file"]))
 
 
+@skip_unless_slow()
 class Validate(Base):
     def written(self):
         """A copy of a written record outside the store, free to tamper with."""
@@ -825,6 +829,7 @@ def run_pk(*argv):
     return code, out.getvalue(), err.getvalue()
 
 
+@skip_unless_slow()
 class Lint(Base):
     def record(self, inputs, task_id="T-1", children=None):
         data = {"task_id": task_id, "inputs": {path: "0" * 64 for path in inputs}}
@@ -898,6 +903,7 @@ class Lint(Base):
         self.assertIn("binds only inputs", stdout)
 
 
+@skip_unless_slow()
 class StoreCommands(Base):
     def acceptance(self, results, **over):
         data = read_json(results["file"])
@@ -1006,6 +1012,7 @@ class StoreCommands(Base):
         self.assertIn("does not parse as JSON", "\n".join(store.check(self.root, schema=True)[0]))
 
 
+@skip_unless_slow()
 class Import(Base):
     def legacy(self):
         """A 0.1 layout: results.json and acceptance.json committed under program/evidence/T-1/."""

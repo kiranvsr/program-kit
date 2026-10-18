@@ -1,4 +1,5 @@
 import _paths  # noqa: F401  (must come first: puts kit/scripts/ on sys.path)
+from _slow import skip_unless_slow
 import ast
 import contextlib
 import hashlib
@@ -348,6 +349,7 @@ class ParallelStepsParseTests(GitBase):
                 self.assertEqual(str(ctx.exception), "checks.yaml: parallel_steps must be true or false")
 
 
+@skip_unless_slow()
 class ParallelStepsRunTests(HandbackBase):
     def set_checks(self, parallel, **over):
         self.write_checks(parallel_steps=parallel, **over)
@@ -548,6 +550,7 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(gate.parse_plan("# Plan\n$ echo hi\n"), [])
 
 
+@skip_unless_slow()
 class HandbackTests(HandbackBase):
     def test_handback_prints_ok_line_only_when_every_step_passes(self):
         rc, out = self.handback()
@@ -1053,6 +1056,7 @@ class HandbackTests(HandbackBase):
                 run_quiet(gate.handback, self.root, task, branch)
 
 
+@skip_unless_slow()
 class MergeCheckTests(HandbackBase):
     def test_merge_check_prints_ok_line_with_branch_head(self):
         rc, out = self.merge_check()
@@ -1176,6 +1180,7 @@ class MergeCheckTests(HandbackBase):
         self.assertEqual((rc, out.splitlines()[-1]), (1, f"FAILED: {BRANCH} moved during the merge check"))
 
 
+@skip_unless_slow()
 class ReviewRecordTests(HandbackBase):
     """The spec-QA record `review.md` is frozen with the SPEC and the PLAN: both gates need it on main and
     compare the branch's with it."""
@@ -1267,6 +1272,7 @@ class ReviewRecordTests(HandbackBase):
                          (1, f"FAILED: spec program/tasks/{TASK}/SPEC.md differs from main"))
 
 
+@skip_unless_slow()
 class ByteOrderMarkTests(HandbackBase):
     """A file saved with a leading UTF-8 byte-order mark reads the same from a git object as from the disk."""
 
@@ -1310,6 +1316,7 @@ class ByteOrderMarkTests(HandbackBase):
         self.assertIn("binding holds", out.getvalue())
 
 
+@skip_unless_slow()
 class FixedMainTests(HandbackBase):
     """The rules are always read from `main`: no argument can make a branch the judge of itself."""
 
@@ -1363,6 +1370,7 @@ class FixedMainTests(HandbackBase):
         self.assertEqual(err, f"error: unrecognized arguments: --main {BRANCH}\n")
 
 
+@skip_unless_slow()
 class TrialMergeTests(HandbackBase):
     def test_trial_merge_leaves_merge_uncommitted_and_main_untouched(self):
         head_before = sh(self.root, "git", "rev-parse", "main").strip()
@@ -1451,6 +1459,7 @@ class ClaimsBase(GitBase):
         return read_json(self.root / "program" / "claims" / gate_id / name)
 
 
+@skip_unless_slow()
 class ClaimsTests(ClaimsBase):
     def test_claims_never_evidence_missing_environment(self):
         acceptance = self.accept()
@@ -1716,6 +1725,7 @@ class CommandTests(ClaimsBase):
         self.assertTrue(err.startswith("error: "), err)
 
 
+@skip_unless_slow()
 class CommandRunTests(HandbackBase):
     def test_cli_handback_and_merge_check_print_ok_lines(self):
         for argv, expect in ((("handback", TASK, "--branch", BRANCH), f"OK: {BRANCH} passes the hand-back gate at "),
@@ -1729,6 +1739,7 @@ class CommandRunTests(HandbackBase):
                 self.assertEqual(out.getvalue().splitlines()[-1], expect + self.sha)
 
 
+@skip_unless_slow()
 class BindingTests(HandbackBase):
     def bind(self):
         out = io.StringIO()

@@ -140,7 +140,7 @@ From 0.2 to 0.3 nothing in `program/` has to change: every existing task reads a
 
 ## Requirements
 
-Python 3.11 or newer (standard library only), git, and a POSIX shell for `install.sh`. The kit's own tests run in the kit's own repository (they need its `install.sh`, `examples/`, `docs/` and `LICENSE`, and are not installed into projects): `TMPDIR=$(mktemp -d) python3 -W error -m unittest discover -s kit/tests`.
+Python 3.11 or newer (standard library only), git, and a POSIX shell for `install.sh`. The kit's own tests run in the kit's own repository (they need its `install.sh`, `examples/`, `docs/` and `LICENSE`, and are not installed into projects): `TMPDIR=$(mktemp -d) python3 -W error -m unittest discover -s kit/tests` (about two minutes; the slow cases are skipped unless `KIT_TESTS_SLOW=1` is set, which runs everything).
 
 ## Licence
 

@@ -5,6 +5,7 @@ not switched on, a task that touches a full-tier path, a branch that lowers its 
 full tier, a brief that is not on main, a light merge nobody inspected, a light task called done.
 """
 import _paths  # noqa: F401  (must come first: puts kit/scripts on sys.path)
+from _slow import skip_unless_slow
 import subprocess
 import tempfile
 import unittest
@@ -388,6 +389,7 @@ class TierGateBase(HandbackBase):
         commit(self.wt, f"change {name}")
 
 
+@skip_unless_slow()
 class StandardTierGateTests(TierGateBase):
     def test_a_standard_task_passes_both_gates_when_it_stays_off_the_full_paths(self):
         self.on_main(status_record(TASK, tier="standard"), FULL_PATHS,
@@ -501,6 +503,7 @@ class StandardTierGateTests(TierGateBase):
             gate.merge_check(self.root, BRANCH)
 
 
+@skip_unless_slow()
 class FastPathGateTests(TierGateBase):
     def fast(self, **over):
         record = status_record(TASK, tier="standard", fast=True, ruling="R1")
@@ -593,6 +596,7 @@ class FastPathGateTests(TierGateBase):
         self.assertIn("guarded files changed: pyproject.toml", out)
 
 
+@skip_unless_slow()
 class LightTierGateTests(TierGateBase):
     LIGHT = {"full_paths": ["auth/"], "light_paths": ["web/"], "light_ruling": "R1"}
 

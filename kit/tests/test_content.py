@@ -488,5 +488,23 @@ class TaughtYamlTests(unittest.TestCase):
         self.assertIn("- <environment>", step)
 
 
+# The documented slow set (docs/DESIGN.md section 13): only these modules gate cases behind KIT_TESTS_SLOW.
+SLOW_MODULES = ["test_end_to_end.py", "test_evidence.py", "test_gate.py", "test_install.py", "test_land.py",
+                "test_tiers.py"]
+SLOW_IMPORT = re.compile(r"^(?:from _slow import|import _slow\b)", re.M)
+
+
+class SlowGateTests(unittest.TestCase):
+    def test_the_modules_importing_the_slow_gate_are_the_documented_slow_set(self):
+        found = sorted(p.name for p in (KIT / "tests").glob("test_*.py") if SLOW_IMPORT.search(read(p)))
+        self.assertEqual(found, sorted(SLOW_MODULES))
+
+    def test_design_names_every_gated_module_and_the_variable(self):
+        design = read(KIT.parent / "docs" / "DESIGN.md")
+        self.assertIn("KIT_TESTS_SLOW=1", design)
+        for name in SLOW_MODULES:
+            self.assertIn(name[:-3], design, name)
+
+
 if __name__ == "__main__":
     unittest.main()
