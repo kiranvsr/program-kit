@@ -57,6 +57,7 @@ Read top to bottom and stop where your part ends. Every agent: parts 1 and 2. Im
 - **W9. Decided means decided.** What your definition lists under "Decided (do not reopen)" is not yours to revisit. When a "Stop and report when" condition occurs, stop and report; do not work round it.
 - **W10. Work to your tier.** Your task's verification tier is in its status record (`pk status show <ID>`). Do what it asks, no less and no more, and never change it. If the work turns out to touch a full-tier path, stop and report: the controller raises the tier by a ruling.
 - **W11. Report the cost.** End your report with a Cost line: model, tokens, tool calls, seconds, resumes, as far as your tooling shows them.
+- **W12. Fast default, slow set in the release set.** The `test` step of `checks.yaml` is the suite that finishes in minutes and runs at every gate and merge check. Cases that build whole fixtures or spawn many processes sit behind one environment variable the project names (`<PROJECT>_TESTS_SLOW=1`), are skipped by default, and run in their own tracks of `program/release-set.yaml`. A thirty-minute suite at every hand-back makes agents skip it or wait on it; `pk fingerprint run` runs it in parallel once per commit that matters.
 
 ## Part 3. Evidence honesty (implementer and QA of a task that produces evidence)
 
