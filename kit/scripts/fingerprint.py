@@ -46,12 +46,62 @@ _HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 _STAMP = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\Z")
 _ENTRY_KEYS = ("id", "argv", "expected_exit", "track", "kind", "derives", "env")
 _TOP_KEYS = ("toolchain", "entries")
-# An absolute path of the kinds that name a person or a machine. The validator looks for the prefix anywhere in the
-# record's text; the scrubber replaces the prefix and the rest of the path.
-_PATH_PREFIX = r"(?:/(?:Users|home|private|tmp)(?![\w.-])|(?<!\w)[A-Za-z]:[\\/])"
-ABSOLUTE_PATH = re.compile(_PATH_PREFIX)
+# An absolute path of the kinds that name a person or a machine. A POSIX prefix counts only at the start of its token
+# (split on whitespace and quotes) once a leading `-<letter>`, `--name=`, `_` or a file-URL prefix is stripped, so `-L/Users/x`
+# and `--out=/tmp/x` are absolute and `src/home` is not. A drive letter counts anywhere. One finder serves the
+# validator (ABSOLUTE_PATH), the tail scrubber (_PATH_RUN) and the argv pre-check, so they cannot drift.
+_PATH_PREFIX = re.compile(r"/(?:Users|home|private|tmp)(?![\w.-])|(?<!\w)[A-Za-z]:[\\/]")
+_TOKEN_TAIL = re.compile(r"[^\s'\"]*\Z")
+_TOKEN_LEAD = re.compile(r"(?:-[A-Za-z]|--[\w-]+=|_|file:/{2})?\Z")
+_PATH_REST = re.compile(r"[^\s'\"<>():,;]*")
+
+
+class _PathFinder:
+    def __init__(self, extend: bool):
+        self.extend = extend  # whether a match covers the rest of the path or only its prefix
+
+    def _matches(self, text: str):
+        end = 0
+        for found in _PATH_PREFIX.finditer(text):
+            if found.start() < end:
+                continue  # inside the path just reported
+            if found.group()[0] == "/":
+                head = _TOKEN_TAIL.search(text, 0, found.start()).group()
+                if not _TOKEN_LEAD.match(head):
+                    continue
+            end = _PATH_REST.match(text, found.end()).end() if self.extend else found.end()
+            yield found.start(), end
+
+    def search(self, text: str):
+        for start, end in self._matches(text):
+            return _Span(text, start, end)
+        return None
+
+    def sub(self, repl: str, text: str) -> str:
+        out, last = [], 0
+        for start, end in self._matches(text):
+            out += [text[last:start], repl]
+            last = end
+        return "".join(out) + text[last:]
+
+
+class _Span:
+    def __init__(self, text: str, start: int, end: int):
+        self.string, self._start, self._end = text, start, end
+
+    def start(self) -> int:
+        return self._start
+
+    def end(self) -> int:
+        return self._end
+
+    def group(self) -> str:
+        return self.string[self._start:self._end]
+
+
+ABSOLUTE_PATH = _PathFinder(extend=False)
 _RECORD_DIR = re.compile(re.escape(BASE) + r"/[0-9a-f]{12}(?:/|\Z)")  # an earlier, uncommitted run's record directory
-_PATH_RUN = re.compile(_PATH_PREFIX + r"[^\s'\"<>():,;]*")
+_PATH_RUN = _PathFinder(extend=True)
 
 
 # --- git ----------------------------------------------------------------------------
@@ -436,9 +486,9 @@ def run(root, only: str | None = None, scratch: Path | None = None) -> tuple[dic
         raise KitError(f"no track named {only!r} in {RELEASE_SET} (tracks: {', '.join(tracks)})")
     selected = {name: rows for name, rows in tracks.items() if only in (None, name)}
     scratch = Path(tempfile.mkdtemp(prefix="fingerprint-")) if scratch is None else Path(scratch)
-    scratch.mkdir(parents=True, exist_ok=True)
-    if scratch.resolve() == root or root in scratch.resolve().parents:
+    if scratch.resolve() == root or root in scratch.resolve().parents:  # before the mkdir: nothing is left behind
         raise KitError(f"the scratch directory {scratch} is inside the repository: full output is never kept there")
+    scratch.mkdir(parents=True, exist_ok=True)
     scrub = _scrubber(root, scratch.resolve(), [v for e in release["entries"] for v in e["env"].values()])
 
     versions = _toolchain_versions(root, release["toolchain"], scrub)  # before the tracks: the tree check sees them
@@ -487,7 +537,7 @@ def run(root, only: str | None = None, scratch: Path | None = None) -> tuple[dic
         "all_as_expected": all(row["as_expected"] for row in rows), "tree_unchanged_by_run": unchanged,
     }
     text = json.dumps(record, indent=2) + "\n"
-    problems = record_problems(record, text, directory.name)
+    problems = record_problems(record, text, directory.name) + _release_problems(root, record)
     if problems:
         raise KitError("the record would not validate, so nothing was written: " + "; ".join(problems))
     if directory.is_symlink():

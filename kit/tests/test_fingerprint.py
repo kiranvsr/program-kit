@@ -833,6 +833,47 @@ class FixRound(Repo):
         self.assertEqual(code, 1)
         self.assertIn("holds an absolute path", err)
 
+    def test_relative_paths_with_a_prefix_segment_are_kept_and_every_absolute_shape_is_found(self):
+        code = "import sys\nprint('built', sys.argv[1], sys.argv[2], './internal/private/x')"
+        self.release({"id": "rel", "argv": [PY, "-c", code, "src/home", "tests/tmp"], "track": "plain",
+                      "kind": "check"})
+        record = self.run_ok()[3]
+        self.assertEqual(record["commands"][0]["argv"][-2:], ["src/home", "tests/tmp"])
+        self.assertEqual(record["commands"][0]["output_tail"], "built src/home tests/tmp ./internal/private/x")
+        self.assertIsNone(fp.ABSOLUTE_PATH.search(self.text()))
+        for relative in ("src/home", "tests/tmp", "./internal/private/x", "a/Users/b", "x=y/tmp"):
+            with self.subTest(relative):
+                self.assertIsNone(fp.ABSOLUTE_PATH.search(f"tail {relative} end"))
+                self.assertEqual(fp._PATH_RUN.sub("<path>", f"tail {relative} end"), f"tail {relative} end")
+        for shape in ("-L/Users/x", "-I/home/x", "_/Users/x", "file:/" + "//tmp/x", "--out=/tmp/x", "/tmp/x", "'/private/x'"):
+            with self.subTest(shape):
+                self.assertIsNotNone(fp.ABSOLUTE_PATH.search(f"tail {shape} end"))
+                self.assertNotIn("/", fp._PATH_RUN.sub("<path>", f"tail {shape} end").replace("file:/" + "/", ""))
+                self.assertIsNotNone(fp.ABSOLUTE_PATH.search(shape))  # also as a whole argv part
+        path = self.root / BASE / record["head12"] / "fingerprint.json"
+        data = json.loads(path.read_text())
+        data["commands"][0]["output_tail"] = "ld: -L/Users/x"
+        path.write_text(json.dumps(data, indent=2) + "\n")
+        code, _, err = self.cli("validate", f"{BASE}/{record['head12']}")
+        self.assertEqual(code, 1)
+        self.assertIn("holds an absolute path", err)
+
+    def test_an_argv_part_in_each_absolute_shape_is_refused_before_anything_runs(self):
+        for shape in ("-L/Users/x", "--out=/tmp/x", "file:/" + "//home/x", "_/private/x"):
+            with self.subTest(shape):
+                self.release({"id": "abs", "argv": [PY, "-c", "pass", shape], "track": "plain", "kind": "check"})
+                code, _, err = self.cli("run", "--scratch", str(self.scratch))
+                self.assertEqual(code, 1)
+                self.assertIn("holds an absolute path", err)
+
+    def test_run_never_writes_a_record_that_validate_refuses(self):
+        self.release(entry("cache", "print('cache at /tm' + 'p/x')", env={"MODE": "path"}))
+        code, _, err = self.cli("run", "--scratch", str(self.scratch))
+        self.assertEqual(code, 1)
+        self.assertIn("the record would not validate, so nothing was written", err)
+        self.assertIn("the value of env MODE appears in the record", err)
+        self.assertFalse((self.root / BASE).exists())
+
     def test_path_literals_are_replaced_before_env_values(self):
         self.release(entry("cwd", "import os; print('cwd', os.getcwd())", env={"SEG": self.root.name}))
         self.assertEqual(self.run_ok()[3]["commands"][0]["output_tail"], "cwd <root>")
@@ -905,6 +946,7 @@ class FixRound(Repo):
         self.assertEqual(code, 1)
         self.assertIn("is inside the repository", err)
         self.assertFalse((self.root / BASE).exists())
+        self.assertFalse((self.root / "logs").exists())  # refused before the directory is made
 
     def test_a_toolchain_command_that_dirties_the_tree_is_seen(self):
         self.release(entry("one", "pass"), toolchain=[[PY, "-c", "open('made-by-toolchain.txt', 'w').write('x')"]])
