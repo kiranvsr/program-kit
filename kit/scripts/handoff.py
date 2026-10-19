@@ -5,7 +5,9 @@ The file has hand-written parts and one generated block between the marker lines
 `<!-- generated:start -->` and `<!-- generated:end -->`. `render` builds the block from the
 status records, `program/controller-state.json`, the branches not merged into main, the task
 worktrees and the open change requests. `update` rewrites only the text between the markers;
-everything else is preserved byte for byte. `check` says whether the block on disk is current.
+everything else is preserved byte for byte. `check` says whether the block on disk is current; a block that was
+never written (a new program: `pk init` and `install.sh` commit nothing and need no commit to exist) is reported as
+such, with the command to run, not as stale.
 
 The block holds no wall-clock time, so `check` is stable. It carries the commit it was generated
 from on one `Commit: ` line, and `check` and `update` ignore that line when they compare:
@@ -287,6 +289,13 @@ def _read(root: Path) -> tuple[Path, str]:
         raise
 
 
+def never_generated(root: Path) -> bool:
+    """True when nothing was ever written between the markers: a new program, before its first `pk handoff update`."""
+    _, text = _read(root)
+    begin, finish = _split(text)
+    return not text[begin:finish].strip()
+
+
 def check(root: Path) -> bool:
     """True when the block on disk equals the block rendered now, ignoring the commit line."""
     _, text = _read(root)
@@ -336,7 +345,10 @@ def cmd_handoff(args: argparse.Namespace) -> int:
     root = find_root()
     if action == "update":
         print("handoff: updated" if update(root) else "handoff: unchanged")
-    elif not check(root):
+    elif not check(root):  # check renders first, so a state that does not read is reported before this
+        if never_generated(root):  # a new program: not stale, just never written (install and init commit nothing)
+            raise KitError("program/HANDOFF.md has no generated block yet (a new program); run: pk handoff update, "
+                           "then commit it")
         raise KitError("program/HANDOFF.md is stale; run: pk handoff update")
     else:
         problems = budget_problems(root)

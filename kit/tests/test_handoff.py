@@ -274,7 +274,21 @@ class UpdateTests(HandoffBase):
 
 
 class CheckTests(HandoffBase):
+    def test_a_block_never_generated_says_run_update_not_stale(self):
+        """KF-1: a new program's hand-off has empty markers; check names the first update instead of 'stale'."""
+        shutil.copy(KIT / "templates" / "HANDOFF.md", self.file)
+        self.assertTrue(handoff.never_generated(self.root))
+        code, out, err = run_cli("handoff", self.root, "handoff", "check")
+        self.assertEqual((code, out), (1, ""))
+        self.assertEqual(err, "error: program/HANDOFF.md has no generated block yet (a new program); run: pk handoff "
+                              "update, then commit it\n")
+        self.assertEqual(run_cli("handoff", self.root, "handoff", "update"), (0, "handoff: updated\n", ""))
+        self.assertFalse(handoff.never_generated(self.root))
+        self.assertEqual(run_cli("handoff", self.root, "handoff", "check"), (0, "handoff: current\n", ""))
+
     def test_check_exits_1_when_stale(self):
+        handoff.update(self.root)
+        self.write_handoff(self.text().replace("not_started: 0", "not_started: 9"))
         code, out, err = run_cli("handoff", self.root, "handoff", "check")
         self.assertEqual((code, out), (1, ""))
         self.assertEqual(err, "error: program/HANDOFF.md is stale; run: pk handoff update\n")
