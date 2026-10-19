@@ -12,9 +12,15 @@
     "merge_base": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
     "produced_at": {"type": "string", "description": "UTC, YYYY-MM-DDTHH:MM:SSZ"},
     "inputs": {
-      "type": "object", "minProperties": 1,
-      "description": "root-relative path -> sha256 of the blob committed at head",
-      "additionalProperties": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      "description": "the sha256 of each input's blob committed at head. Written since 0.4.1 as a list of {path, sha256} objects sorted by path, so no path shares a JSON line with a hex value (a secret scanner's generic-key rule matched a path such as src/auth/token.py next to its digest); a record written before 0.4.1 holds a mapping of path to sha256, and every reader accepts both",
+      "oneOf": [
+        {"type": "array", "minItems": 1,
+         "items": {"type": "object", "required": ["path", "sha256"], "additionalProperties": false,
+                   "properties": {"path": {"type": "string", "minLength": 1},
+                                  "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}}},
+        {"type": "object", "minProperties": 1,
+         "additionalProperties": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+      ]
     },
     "commands": {
       "type": "array",

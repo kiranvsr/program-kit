@@ -694,7 +694,7 @@ def _evidence_step(wt: Path, task_id: str) -> bool:
     if not problems and not new:
         recorded = data["head"]
         code, _ = run_argv(["git", "-C", str(wt), "merge-base", "--is-ancestor", recorded, head], wt)
-        changed = stale_module.changed_inputs(wt, head, data["inputs"]) if code == 0 else {}
+        changed = stale_module.changed_inputs(wt, head, store.input_digests(data["inputs"])) if code == 0 else {}
         if code != 0:
             problems = [f"head: {recorded} of the latest record is not an ancestor of {head}"]
         elif changed:
@@ -1221,16 +1221,17 @@ def binding(root, task_id: str, branch: str) -> list[str]:
     code, _ = run_argv(["git", "-C", str(root), "merge-base", "--is-ancestor", head, tip], root)
     if code != 0:
         return [f"{_show(rel)}: head {_show(head)} is not an ancestor of {_show(branch)} ({tip})"]
-    changed = stale_module.changed_inputs(root, head, data["inputs"])
+    inputs = store.input_digests(data["inputs"])  # either shape: the 0.4.0 mapping or the 0.4.1 list
+    changed = stale_module.changed_inputs(root, head, inputs)
     if changed:
         path, actual = next(iter(changed.items()))
         found = (f"its blob at the recorded head {head} hashes to {actual}" if actual is not None
                  else f"it is not a file at the recorded head {head}")
-        return [f"{_show(rel)}: inputs: {_show(path)} is recorded as {data['inputs'][path]} but {found}"]
+        return [f"{_show(rel)}: inputs: {_show(path)} is recorded as {inputs[path]} but {found}"]
     rewritten = store.rewritten(root, git(root, "merge-base", MAIN, tip), tip)
     if rewritten:
         return [_show(rewritten[0])]
-    drift = stale_module.changed_inputs(root, tip, data["inputs"])
+    drift = stale_module.changed_inputs(root, tip, inputs)
     state = (f"drifted since {head} at the tip: {_show(', '.join(drift))}" if drift else "fresh at the tip")
     _out(f"binding holds: results record {entry['digest'][:12]} at {head} bound; {state}")
     return []

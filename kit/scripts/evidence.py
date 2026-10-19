@@ -497,9 +497,9 @@ class Evidence:
             if store.latest(index, task_id, "results") is None:
                 raise KitError(f"{task_id} has no results record in {store.pointer_path(task_id)}")
             entry = store.latest(index, task_id, "results")
-            inputs = store.load(self.root, entry["path"], entry["digest"]).get("inputs")
-            changed = stale_module.changed_inputs(self.root, self.head, inputs if isinstance(inputs, dict) else {})
-            drift = "drifted" if changed or not isinstance(inputs, dict) else "fresh"
+            inputs = store.input_digests(store.load(self.root, entry["path"], entry["digest"]).get("inputs"))
+            changed = stale_module.changed_inputs(self.root, self.head, inputs or {})
+            drift = "drifted" if changed or inputs is None else "fresh"
             for kind in store.KINDS:
                 entry = store.latest(index, task_id, kind)
                 if entry is not None:
@@ -554,7 +554,7 @@ class Evidence:
             raise KitError("; ".join(reasons))
         data = {
             "task_id": self.task_id, "head": self.head, "main": self.main_sha, "merge_base": self.merge_base,
-            "produced_at": utc_now(), "inputs": dict(self.inputs), "commands": list(self.commands),
+            "produced_at": utc_now(), "inputs": store.input_list(self.inputs), "commands": list(self.commands),
             "planted_bugs": list(self.planted_bug_rows),
             "planted_bugs_all_killed": all(row["killed"] for row in bugs),
             "all_commands_as_expected": all(cmd["as_expected"] for cmd in self.commands),
@@ -614,9 +614,10 @@ def validate_results(data) -> list[str]:
             bad(key, "must be a 40-character lowercase hex SHA")
     if not isinstance(data["produced_at"], str) or not _STAMP.match(data["produced_at"]):
         bad("produced_at", "must be UTC, YYYY-MM-DDTHH:MM:SSZ")
-    inputs = data["inputs"]
-    if not isinstance(inputs, dict) or not inputs:
-        bad("inputs", "must be a non-empty mapping of path to sha256")
+    inputs = store.input_digests(data["inputs"])
+    if not inputs:
+        bad("inputs", "must be a non-empty list of {path, sha256} objects with distinct paths (a record written "
+                      "before 0.4.1 holds a mapping of path to sha256, which is read the same way)")
     elif not all(isinstance(k, str) and isinstance(v, str) and _HEX64.match(v) for k, v in inputs.items()):
         bad("inputs", "every value must be a 64-character lowercase hex sha256")
     for key in ("planted_bugs_all_killed", "all_commands_as_expected", "tree_unchanged_by_run"):
@@ -733,9 +734,9 @@ def lint_record(data, root=None) -> list[str]:
     """
     if not isinstance(data, dict):
         return []
-    inputs = data.get("inputs")
+    inputs = store.input_digests(data.get("inputs"))
     problems = [f"binds a derived output: {path}" for path in sorted(inputs)
-                if derived_output(path)] if isinstance(inputs, dict) else []
+                if derived_output(path)] if inputs is not None else []
     children = data.get("children") or []
     if not isinstance(children, list):
         return problems

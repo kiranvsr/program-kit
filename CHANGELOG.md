@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.1 (unreleased)
+
+Fixes for the findings a program recorded while running kit 0.4.0 (KF-1 to KF-9). Nothing in `program/` has to change: every file written by 0.4.0 reads as it did, evidence records included.
+
+What changed:
+
+- KF-9: a results record's `inputs` is written as a list of `{"path": ..., "sha256": ...}` objects sorted by path, no longer as a mapping of path to digest. Reason: a mapping puts a path that holds a word such as `token`, `secret`, `auth` or `key` and its 64-character digest on one JSON line, which a secret scanner's generic-key rule reports, so a committed record failed every later scan. Every reader (`pk evidence validate`, `accept` and `lint`, the hand-back gate, `pk gate binding`, `pk merge`, `pk stale`, `pk status set ... done`, gate records' child rows) accepts both shapes through `store.input_digests`, so records written by 0.4.0 stay valid and are never rewritten. A digest prefix (`sha256:<hex>`) would also have defeated the rule, but it changes the meaning of every value and relies on the scanner's character class; the list keeps each value a plain digest and separates it from the path structurally. Records carry no schema version of their own (the pointer's `schema_version` stays 1), and the shape says which form a record holds. `Evidence.inputs` and `hash_inputs` still return a mapping.
+
 ## 0.4.0
 
 A release-level statement of health, and a shorter wait at every gate. The evidence model of 0.2.0 and the tiers of 0.3.0 are unchanged; a program upgraded from 0.3.0 runs exactly as before until it adds `program/release-set.yaml` or sets `parallel_steps`.

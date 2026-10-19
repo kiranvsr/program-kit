@@ -261,8 +261,9 @@ class EndToEndTests(unittest.TestCase):
             self.assertEqual(row["test_argv"][:3], ["python3", "-m", "unittest"])
         self.assertEqual([i for i, row in bugs.items() if not row["killed"]], ["self-test-noncompiling"])
         self.assertTrue(any(c["derived"].get("tests", 0) >= 10 for c in results["commands"]))
-        self.assertIn("src/tiny_service.py", results["inputs"])
-        self.assertIn(f"program/tasks/{TASK}/PLAN.md", results["inputs"])
+        inputs = store.input_digests(results["inputs"])
+        self.assertIn("src/tiny_service.py", inputs)
+        self.assertIn(f"program/tasks/{TASK}/PLAN.md", inputs)
 
         # Evidence commit: the record, its pointer, the report and the status file, nothing else.
         project.pk("status", "set", TASK, "review", "--role", "implementer", "--evidence", record, cwd=wt)
@@ -296,7 +297,7 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual((drift["checked"], drift["drifted"]), (1, 0))
         self.assertEqual(drift["tasks"][0]["state"], "fresh")
         project.pk("evidence", "validate", cwd=wt)  # names, history and pointers intact
-        for path, digest in results["inputs"].items():
+        for path, digest in inputs.items():
             self.assertEqual(sha256_bytes(project.run(["git", "show", f"{gated}:{path}"], cwd=wt).stdout.encode()),
                              digest)
         commands = []

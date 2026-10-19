@@ -55,8 +55,8 @@ def _one_line(text) -> str:
 
 def _inputs(data: dict):
     """(inputs mapping, None) for a usable record, else (None, one-line reason)."""
-    inputs = data.get("inputs")
-    if not isinstance(inputs, dict):
+    inputs = store.input_digests(data.get("inputs"))  # either shape: the 0.4.0 mapping or the 0.4.1 list
+    if inputs is None:
         return None, "no inputs mapping"
     if not inputs:
         return None, "inputs mapping is empty"
