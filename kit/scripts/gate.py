@@ -67,7 +67,7 @@ import status as status_module
 import store
 import miniyaml
 from common import KitError, drop_bom, find_root, git, read_json, read_yaml, run_argv, write_json
-from register import GATE_ID
+from register import GATE_ID, GATE_SHAPE
 
 MAIN = "main"  # the primary branch; fixed, so no caller can choose where the rules are read from
 CHECK_KEYS = ("build", "test", "scan", "compile_check", "extra_gate")
@@ -1006,7 +1006,7 @@ def _record_task(item: dict, gate_id: str) -> tuple[str, str | None]:
 def _gate(root: Path, gate_id: str) -> tuple[str, list[tuple[str, str | None]]]:
     """(environment, [(record name, task)]) of a gate; KitError when it is unknown or malformed."""
     if not isinstance(gate_id, str) or not GATE_ID.match(gate_id):
-        raise KitError(f"not a valid gate id (expected G-<NAME>): {_show(gate_id)}")
+        raise KitError(f"not a valid gate id (expected {GATE_SHAPE}): {_show(gate_id)}")
     gates = _mapping(read_yaml(root / "program" / "gates.yaml"), "program/gates.yaml", "gates")
     entry = gates.get(gate_id)
     if entry is None:
