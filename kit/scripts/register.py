@@ -33,6 +33,9 @@ _SHAPE = {"phase": "P<n>", "milestone": "P<n>-M<n>", "step": "P<n>-M<n>-S<n>", "
 _GATE = re.compile(r"G-[A-Z0-9][A-Z0-9_]*\Z")
 _CLOSES = re.compile(r"(?:REQ-\d{3}|NFR-\d{3}|J\d+)\Z", re.ASCII)
 GATE_ID, CLOSES_ID, TASK_ID = _GATE, _CLOSES, ID_PATTERNS["task"]  # public aliases for trace.py (ID_PATTERNS is for briefs.py)
+# How a gate id is written, with the pattern, for every message that refuses one: NAME takes no second hyphen.
+GATE_SHAPE = ("G-<NAME>, pattern G-[A-Z0-9][A-Z0-9_]*: NAME is capitals, digits and _, no hyphen "
+              "(G-R1_CORE, not G-R1-CORE)")
 
 
 def _path(root: Path) -> Path:
@@ -259,7 +262,7 @@ def validate(register: dict, environments: dict | None, roles: dict | None) -> l
             problems.append(f"{who}: title is missing")
         gate = node.get("gate")
         if gate is not None and not (isinstance(gate, str) and _GATE.match(gate)):
-            problems.append(f"{who}: gate {gate!r} must be G-<NAME> or null")
+            problems.append(f"{who}: gate {gate!r} must be {GATE_SHAPE}, or null")
         if level < 3:
             continue
 

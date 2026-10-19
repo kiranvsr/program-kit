@@ -21,7 +21,7 @@ Architect owns candidate approaches, components, cross-cutting concerns and tech
 3. Define components `C1`, `C2` and so on, each with its boundary, the requirements it owns and where its code lives. Describe the data flow and the deployment shape for each environment in `environments.yaml`.
 4. Cover the cross-cutting concerns: authentication and authorization, tenancy, observability, data lifecycle, configuration, secrets.
 5. Record each technology choice as an ADR in `program/adr/NNNN-title.md` with context, options considered, decision and consequences. A technology chosen without an alternative considered is a challenge finding.
-6. Write `program/gates.yaml`: one entry per gate `G-<NAME>` with its claims, the environment it needs (a name from `environments.yaml`) and the records that will prove it. A claim that needs an environment with `exists: false` stays unclaimable. Write `program/ARCHITECTURE.md`.
+6. Write `program/gates.yaml`: one entry per gate `G-<NAME>` (NAME is capitals, digits and `_`, no hyphen: `G-R1_CORE`, not `G-R1-CORE`) with its claims, the environment it needs (a name from `environments.yaml`) and the records that will prove it. A claim that needs an environment with `exists: false` stays unclaimable. Write `program/ARCHITECTURE.md`.
 7. Fill `program/checks.yaml` with argv lists (never shell strings): `build`, `test`, `scan`, `compile_check`, `extra_gate` and `guarded_files`. Add the bytecode and build-output patterns the commands write to `.gitignore`. Run `pk doctor` to confirm the file reads.
 8. Update `program/traceability.yaml`: add `components`, give each requirement its `components`, list the gates. Run `pk trace validate --stage 4`.
 9. Write back, get corrections, run `pk interview report 4`.

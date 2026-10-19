@@ -1774,6 +1774,18 @@ class BindingTests(HandbackBase):
         commit(self.wt, "acceptance and status")
         self.assertEqual(self.bind(), ([], self.holds(self.sha)))
 
+    def test_binding_and_the_gate_read_a_record_of_the_0_4_0_inputs_shape(self):
+        """KF-9: a record written before 0.4.1 holds its inputs as a mapping; it binds exactly as the list does."""
+        self.produce_and_commit()
+        self.assertIsInstance(self.latest()[1]["inputs"], list)
+        self.forge(inputs=store.input_digests(self.latest()[1]["inputs"]))
+        commit(self.wt, "a record of the 0.4.0 shape")
+        self.assertIsInstance(self.latest()[1]["inputs"], dict)
+        self.assertEqual(self.bind(), ([], self.holds(self.sha)))
+        put(self.wt, "calc.py", CALC + "\n# later edit\n")
+        commit(self.wt, "source after the evidence")
+        self.assertEqual(self.bind(), ([], self.holds(self.sha, f"drifted since {self.sha} at the tip: calc.py")))
+
     def test_binding_ignores_the_working_tree(self):
         self.produce_and_commit()
         (self.wt / POINTER).write_text("{ nope")  # an uncommitted edit changes nothing
@@ -1828,7 +1840,7 @@ class BindingTests(HandbackBase):
         put(self.wt, "calc.py", CALC.replace("a + b", "a - b") + "\n\ndef mul(a, b):\n    return a * b\n")
         broken = commit(self.wt, "break add after the evidence")
         self.assertIn("drifted since", self.bind()[1])
-        recorded = self.latest()[1]["inputs"]["calc.py"]
+        recorded = store.input_digests(self.latest()[1]["inputs"])["calc.py"]
         forged = self.forge(head=broken)
         commit(self.wt, "move the recorded head past the edit")
         problems, out = self.bind()
@@ -1843,7 +1855,8 @@ class BindingTests(HandbackBase):
         honest = self.latest()[1]
         for name, edit in (("edited", {"calc.py": "0" * 64}), ("made up", {"gone.py": "1" * 64})):
             with self.subTest(case=name):
-                forged = store.record(self.wt, TASK, "results", dict(honest, inputs={**honest["inputs"], **edit}))
+                inputs = store.input_list({**store.input_digests(honest["inputs"]), **edit})
+                forged = store.record(self.wt, TASK, "results", dict(honest, inputs=inputs))
                 commit(self.wt, "evidence with a hand-edited hash")
                 problems, out = self.bind()
                 self.assertEqual(out, "")

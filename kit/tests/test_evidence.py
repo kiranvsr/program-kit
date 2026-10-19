@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -578,7 +579,7 @@ class Write(Base):
         sh(self.root, "git", "commit", "-q", "-m", "tooling")
         ev = self.ready()
         ev.hash_inputs(["program/evidence/T-1"])
-        self.assertIn("program/evidence/T-1/produce.py", read_json(ev.write()["file"])["inputs"])
+        self.assertIn("program/evidence/T-1/produce.py", store.input_digests(read_json(ev.write()["file"])["inputs"]))
 
     def test_write_refuses_dirty_tree_and_names_paths(self):
         (self.root / "junk.txt").write_text("x")
@@ -696,7 +697,10 @@ class Validate(Base):
             "self-test builds": lambda d: d["planted_bugs"][-1].update(builds=True),
             "self-test killed": lambda d: d["planted_bugs"][-1].update(killed=True),
             "empty inputs": lambda d: d.update(inputs={}),
-            "short input hash": lambda d: d["inputs"].update({"calc.py": "abc"}),
+            "short input hash": lambda d: d["inputs"][0].update(sha256="abc"),
+            "repeated input path": lambda d: d["inputs"].append(dict(d["inputs"][0])),
+            "input without its digest": lambda d: d["inputs"][0].pop("sha256"),
+            "old-shape short input hash": lambda d: d.update(inputs={"calc.py": "abc"}),
             "short head": lambda d: d.update(head="abc"),
             "short merge_base": lambda d: d.update(merge_base="Z" * 40),
             "tree changed": lambda d: d.update(tree_unchanged_by_run=False),
@@ -888,7 +892,7 @@ class Lint(Base):
 
     def test_the_gate_problems_include_the_lint(self):
         data = read_json(self.ready().write()["file"])
-        data["inputs"]["program/evidence/T-1/acceptance.json"] = "0" * 64
+        data["inputs"].append({"path": "program/evidence/T-1/acceptance.json", "sha256": "0" * 64})
         self.assertEqual(evidence.gate_problems(data, "T-1"),
                          ["binds a derived output: program/evidence/T-1/acceptance.json"])
 
@@ -1010,6 +1014,79 @@ class StoreCommands(Base):
         junk = b"not json at all"
         (fake.parent / f"20000101T000000000000Z-{sha256_bytes(junk)[:12]}.json").write_bytes(junk)
         self.assertIn("does not parse as JSON", "\n".join(store.check(self.root, schema=True)[0]))
+
+
+# The generic-key rule of a common secret scanner, as it ships: a keyword, up to 20 word characters, an operator,
+# then a long token. A record line holding a path such as `auth/token.py` and its hex digest matches it.
+GENERIC_KEY = re.compile(
+    r"""(?i)[\w.-]{0,50}?(?:access|auth|(?-i:[Aa]pi|API)|credential|creds|key|passw(?:or)?d|secret|token)"""
+    r"""(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}"""
+    r"""([\w.=-]{10,150}|[a-z0-9][a-z0-9+/]{11,}={0,3})(?:[\x60'"\s;]|\\[nr]|$)""", re.MULTILINE)
+
+
+class InputShapes(Base):
+    """KF-9: records are written with inputs as a list of {path, sha256}; the 0.4.0 mapping still reads everywhere."""
+
+    def setUp(self):
+        super().setUp()
+        (self.root / "auth").mkdir()
+        (self.root / "auth" / "token.py").write_text("SECRET_NAME = 'not a secret'\n")
+        sh(self.root, "git", "add", "-A")
+        sh(self.root, "git", "commit", "-q", "-m", "a path with scanner keywords")
+
+    def write_both(self):
+        """(new-shape record, old-shape copy of it) of T-1, each appended to the store."""
+        ev = self.ready()
+        ev.hash_inputs(["auth/token.py"])
+        new = read_json(ev.write()["file"])
+        old = dict(new, inputs=store.input_digests(new["inputs"]), supersedes=None)
+        return new, old
+
+    def test_new_records_hold_a_sorted_list_that_the_scanner_rule_does_not_match(self):
+        new, old = self.write_both()
+        self.assertEqual(new["inputs"], [{"path": path, "sha256": digest} for path, digest in sorted(
+            {"auth/token.py": sha256_bytes((self.root / "auth" / "token.py").read_bytes()),
+             "calc.py": sha256_bytes(CALC.encode()), "test_calc.py": sha256_bytes(CALC_TEST.encode())}.items())])
+        self.assertIsNone(GENERIC_KEY.search(store.encode(new).decode()))
+        self.assertIsNotNone(GENERIC_KEY.search(store.encode(old).decode()))  # the 0.4.0 shape: the defect
+
+    def test_every_reader_accepts_both_shapes(self):
+        new, old = self.write_both()
+        for name, data in (("0.4.1 list", new), ("0.4.0 mapping", old)):
+            with self.subTest(shape=name):
+                self.assertEqual(evidence.validate_results(data), [])
+                self.assertEqual(evidence.gate_problems(data, "T-1", data["head"]), [])
+                derived = copy.deepcopy(data)
+                if isinstance(derived["inputs"], list):
+                    derived["inputs"].append({"path": "program/status/T-1.json", "sha256": "0" * 64})
+                else:
+                    derived["inputs"]["program/status/T-1.json"] = "0" * 64
+                self.assertEqual(evidence.lint_record(derived), ["binds a derived output: program/status/T-1.json"])
+                appended = store.record(self.root, "T-1", "results", data)
+                sh(self.root, "git", "add", "-A")
+                sh(self.root, "git", "commit", "-q", "-m", f"evidence, {name}")
+                self.assertEqual(store.check(self.root, schema=True), ([], []))  # pk merge and pk evidence validate
+                code, _, err = run_pk("evidence", "validate", str(appended["file"]))
+                self.assertEqual((code, err), (0, ""))
+                report = __import__("stale").drift_report(self.root)
+                self.assertEqual(([row["state"] for row in report["tasks"]], report["unreadable"]), (["fresh"], []))
+                accepted = evidence.accept(self.root, "T-1", {
+                    "task_id": "T-1", "decision": "accepted_development", "evidence_sha256": appended["digest"],
+                    "source_commit": data["head"], "accepted_at": "2026-10-19T00:00:00Z", "role": "qa",
+                    "commands": [], "planted_bugs": [], "findings": [], "blocked_by": []})
+                self.assertTrue(accepted["path"].startswith("program/evidence/T-1/acceptance/"))
+        (self.root / "auth" / "token.py").write_text("changed\n")
+        sh(self.root, "git", "commit", "-q", "-am", "drift")
+        self.assertEqual(__import__("stale").drift_report(self.root)["tasks"][0]["changed_inputs"], ["auth/token.py"])
+
+    def test_a_list_with_a_repeated_path_or_a_stray_key_is_neither_shape(self):
+        digest = "0" * 64
+        self.assertEqual(store.input_digests([{"path": "a", "sha256": digest}]), {"a": digest})
+        self.assertEqual(store.input_digests({"a": digest}), {"a": digest})
+        for bad in ([{"path": "a", "sha256": digest}] * 2, [{"path": "a", "sha256": digest, "x": 1}],
+                    [{"path": ["a"], "sha256": digest}], ["a"], "a", None):
+            with self.subTest(inputs=bad):
+                self.assertIsNone(store.input_digests(bad))
 
 
 @skip_unless_slow()

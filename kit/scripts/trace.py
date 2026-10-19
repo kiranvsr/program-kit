@@ -31,7 +31,7 @@ _KINDS = {  # kind -> (pattern, how it is written)
     "journey": (_JOURNEY, "J<n>"),
     "requirement": (_REQUIREMENT, "REQ-<nnn> or NFR-<nnn>"),
     "component": (_COMPONENT, "C<n>"),
-    "gate": (register_module.GATE_ID, "G-<NAME>"),
+    "gate": (register_module.GATE_ID, register_module.GATE_SHAPE),
     "task": (register_module.TASK_ID, "P<n>-M<nn>-S<nn>-T<nn>"),
     "closes": (register_module.CLOSES_ID, "REQ-<nnn>, NFR-<nnn> or J<n>"),
 }

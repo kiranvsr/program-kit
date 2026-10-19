@@ -10,6 +10,7 @@ from unittest import mock
 
 import miniyaml
 import pk
+import register
 import trace as trace_module  # kit/scripts/trace.py (it shadows the standard library module of that name)
 from common import KitError, read_json, read_yaml, write_json, write_yaml
 from test_register import reg, task
@@ -165,7 +166,7 @@ class ValidateTests(TraceBase):
         problems = self.validate(1)
         flagged = {p.split(":")[0] for p in problems}
         self.assertEqual(flagged, {"j1", "REQ-1", "c1", "program/traceability.yaml", "T1"})
-        self.assertIn("program/traceability.yaml: g-p0 is not a valid gate id (expected G-<NAME>)", problems)
+        self.assertIn(f"program/traceability.yaml: g-p0 is not a valid gate id (expected {register.GATE_SHAPE})", problems)
         self.assertTrue(all("REQ-1" in p or "J-1" in p or "Cx" in p or "is not a valid" in p for p in problems))
 
     def test_id_patterns_accept_only_ascii_digits(self):
@@ -186,8 +187,25 @@ class ValidateTests(TraceBase):
         for stage in (1, 4):
             problems = [p for p in self.validate(stage) if "g-p0" in p]
             self.assertEqual(problems, [
-                "program/traceability.yaml: g-p0 is not a valid gate id (expected G-<NAME>)",
-                "program/gates.yaml: g-p0 is not a valid gate id (expected G-<NAME>)"], stage)
+                f"program/traceability.yaml: g-p0 is not a valid gate id (expected {register.GATE_SHAPE})",
+                f"program/gates.yaml: g-p0 is not a valid gate id (expected {register.GATE_SHAPE})"], stage)
+
+    def test_a_gate_id_with_a_second_hyphen_is_refused_with_the_pattern(self):
+        """KF-6: G-R1-CORE is refused, and every message says why: NAME takes no hyphen."""
+        import gate as gate_module
+
+        self.put(matrix(journeys={"J1": {"requirements": []}}, gates={"G-R1-CORE": {}}))
+        self.put({"gates": {"G-R1-CORE": {"records": [{"task": "G-R1-CORE", "acceptance": "ok"}]}}}, "gates.yaml")
+        problems = [p for p in self.validate(4) if "G-R1-CORE" in p]
+        self.assertEqual(problems[:2], [
+            f"program/traceability.yaml: G-R1-CORE is not a valid gate id (expected {register.GATE_SHAPE})",
+            f"program/gates.yaml: G-R1-CORE is not a valid gate id (expected {register.GATE_SHAPE})"])
+        with self.assertRaises(KitError) as caught:
+            gate_module._gate(self.root, "G-R1-CORE")
+        self.assertIn("pattern G-[A-Z0-9][A-Z0-9_]*", str(caught.exception))
+        self.assertIn("no hyphen", str(caught.exception))
+        self.assertTrue(register.GATE_ID.match("G-R1_CORE") and not register.GATE_ID.match("G-R1-CORE"))
+        self.assertIn(register.GATE_ID.pattern.removesuffix("\\Z"), register.GATE_SHAPE)
 
     def test_lower_stage_problems_are_reported_in_a_higher_stage_run(self):
         self.put(full_matrix(journeys={"J1": {"title": "a", "requirements": ["REQ-001"]}, "J2": {"title": "b"}},

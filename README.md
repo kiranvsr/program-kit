@@ -109,10 +109,11 @@ The gates enforce all of this from main, not from the branch. In a new program e
 
 ## Keeping a long program cheap
 
-- One command per controller step: `pk record --ruling TEXT` appends the ruling, updates the state, regenerates the hand-off and commits exactly those files.
+- One command per controller step: `pk record --ruling TEXT` appends the ruling, updates the state, regenerates the hand-off and commits exactly those files. Other changed files under `program/` are named on one line, not staged; `--no-commit` lets you commit a ruling and its edits together.
 - The hand-off has a size budget (60 KB) that `pk handoff check` enforces; history lives in `program/rulings.md`, and the hand-off shows the newest fifteen rulings.
 - Follow-ups have IDs and are closed, tagged or marked duplicate (`pk followups`); work outside the register is an ad-hoc task (`pk adhoc`) that the hand-off shows like any other.
-- `pk cost add` records each subagent run with the model it ran on; `pk cost report` flags an agent past 400,000 tokens or three resumes, when a fresh agent with a tight brief is cheaper than another resume.
+- `pk cost add` records each subagent run with the model it ran on, against a register task or an ad-hoc task (`--allow-unknown` for any other ID); `pk cost report` flags an agent past 400,000 tokens or three resumes, when a fresh agent with a tight brief is cheaper than another resume.
+- `pk dashboard <out.html>` (optional) writes the generated hand-off state, the register with statuses and tiers, the gates, the costs and the open follow-ups as one self-contained HTML page (no scripts, no network); write it outside the repository, since a dirty tree stops the gates.
 - `pk fingerprint run|plan|validate|show|coverage`: the release fingerprint of section 9.4 of `docs/DESIGN.md`. Run it after a merge that changes the release set or a suite it names, and before a release; keep the `test` step fast and put slow cases in their own tracks (working rule W12).
 - Each role reads only its own brief, its parts of the rules file and `program/COMMON.md`. `kit/playbooks/09_handoff.md` lists the files and their sizes.
 
@@ -136,7 +137,7 @@ The rules are stated once, in `kit/rules/RULES.md` (hard rules, working rules, e
 
 Run `sh install.sh /path/to/your-repo --upgrade` from a newer copy of the kit. The installer first checks the new copy against its own manifest and the installed `kit/` against its `kit/MANIFEST.sha256`, and refuses if either does not match (for the installed one, if you changed anything under it, a file you added under `kit/tests` included), then replaces `kit/` wholesale; a `kit/tests` left by an older install goes with the old kit. It also appends `__pycache__/`, `*.pyc` and `.worktrees/` to `.gitignore` if they are missing, exactly as a fresh install does (existing lines are left as they are), and it never reads, writes or lists `program/`. Keep your own changes in `program/`, not in `kit/`.
 
-From 0.2 to 0.3 nothing in `program/` has to change: every existing task reads as full-tier and the 0.2 controller state reads as it is. To use what is new, add `program/COMMON.md` from `kit/templates/COMMON.md`, add a `tiers` section to `program/checks.yaml`, and point your agents at `kit/rules/RULES.md` in place of the three rule files it replaces. `CHANGELOG.md` has the steps. From 0.3 to 0.4 nothing has to change either: the release fingerprint and `parallel_steps` are opt-in, and `CHANGELOG.md` says how to switch each on.
+From 0.2 to 0.3 nothing in `program/` has to change: every existing task reads as full-tier and the 0.2 controller state reads as it is. To use what is new, add `program/COMMON.md` from `kit/templates/COMMON.md`, add a `tiers` section to `program/checks.yaml`, and point your agents at `kit/rules/RULES.md` in place of the three rule files it replaces. `CHANGELOG.md` has the steps. From 0.3 to 0.4 nothing has to change either: the release fingerprint and `parallel_steps` are opt-in, and `CHANGELOG.md` says how to switch each on. From 0.4.0 to 0.4.1 nothing has to change: evidence records written by 0.4.0 stay valid, and the one-time steps (a `pk handoff update` once the hand-off gains its Interview section) are in `CHANGELOG.md`.
 
 ## Requirements
 

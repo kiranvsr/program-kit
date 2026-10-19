@@ -5,7 +5,9 @@ The file has hand-written parts and one generated block between the marker lines
 `<!-- generated:start -->` and `<!-- generated:end -->`. `render` builds the block from the
 status records, `program/controller-state.json`, the branches not merged into main, the task
 worktrees and the open change requests. `update` rewrites only the text between the markers;
-everything else is preserved byte for byte. `check` says whether the block on disk is current.
+everything else is preserved byte for byte. `check` says whether the block on disk is current; a block that was
+never written (a new program: `pk init` and `install.sh` commit nothing and need no commit to exist) is reported as
+such, with the command to run, not as stale.
 
 The block holds no wall-clock time, so `check` is stable. It carries the commit it was generated
 from on one `Commit: ` line, and `check` and `update` ignore that line when they compare:
@@ -21,7 +23,10 @@ integration rounds that are not closed), it counts the done tasks by tier, lists
 decision it waits on, and it shows the open follow-ups that are
 not deferred by a tag (newest first, counted, at most FOLLOWUPS_SHOWN), the newest RULINGS_SHOWN rulings on one
 line each with the next free number, the newest ADHOC_CLOSED_SHOWN closed ad-hoc tasks and the agents past
-the fresh-agent threshold of the cost log. History is never copied in: it lives in `program/rulings.md`.
+the fresh-agent threshold of the cost log. When `program/ledger.yaml` exists an Interview section follows the Now
+list: the stage `pk interview next` names, its topics closed and open, the blocking questions unanswered and the
+assumptions unconfirmed, so a takeover during discovery needs no other command. History is never copied in: it
+lives in `program/rulings.md`.
 `check` also fails when the file is over its size budget (BUDGET_BYTES unless the controller state sets
 `handoff_budget_bytes`) or its hand-written "Next steps" section is over NEXT_STEPS_BYTES: a successor must
 be able to read the hand-off whole.
@@ -190,6 +195,7 @@ def render(root: Path, main: str = "main") -> str:
     followups_heading, followups = _followup_lines(state)
     rulings_heading, ruling_lines = _ruling_lines(root)
     over = [_line(line) for line in cost_module.flagged_lines(root)]
+    interview_lines = _interview_lines(root)
 
     def tasks(table: dict[str, str]) -> list[str]:
         return [f"{_line(task)}: {_line(text)}" for task, text in sorted(table.items())]
@@ -198,6 +204,7 @@ def render(root: Path, main: str = "main") -> str:
              *([f"Size budget: {budget} bytes, set in the controller state in place of the default "
                 f"{BUDGET_BYTES} (pk record --handoff-budget)", ""] if budget is not None else []),
              "#### Now", *_bullets(now), "",
+             *(["#### Interview", *_bullets(interview_lines), ""] if interview_lines else []),
              "#### Tasks by status",
              *[f"- {name}: {number}" + (f" ({by_tier})" if name == "done" and number else "")
                for name, number in counts.items()],
@@ -215,6 +222,55 @@ def render(root: Path, main: str = "main") -> str:
     if any(line.strip() in (START, END) for line in block.splitlines()):  # belt and braces: state text is escaped
         raise KitError("the generated block would contain a marker line; check controller-state.json")
     return block
+
+
+IDS_SHOWN = 10
+
+
+def _ids(items: list[str]) -> str:
+    """`n (A, B, ...)`: a count and the first IDS_SHOWN ids."""
+    shown = ", ".join(items[:IDS_SHOWN]) + (", ..." if len(items) > IDS_SHOWN else "")
+    return f"{len(items)}" + (f" ({shown})" if items else "")
+
+
+def _interview_lines(root: Path) -> list[str]:
+    """The interview at a glance, for a takeover during stages 1 to 6; empty when there is no `program/ledger.yaml`.
+
+    The stage `pk interview next` names, its topics closed and open, and over the whole ledger the blocking questions
+    still unanswered and the assumptions not yet confirmed: what `pk interview next` and `report` would say first.
+    """
+    if not (Path(root) / "program" / "ledger.yaml").is_file():
+        return []
+    import interview  # late: only a program with a ledger pays for the coverage map
+
+    try:
+        coverage = interview.load_coverage(root)
+        stage = interview.next_stage(root)
+        entries = interview._load_ledger(root)["entries"]
+        name = interview._stage(coverage, stage)["name"]
+        if stage == interview.PER_TASK_STAGE:
+            lines = [f"stage {stage} ({name}): discovery complete, stages 1 to 6 approved and current"]
+        else:
+            states = [state["state"] for state in interview.topic_states(root, stage).values()]
+            applicable = [state for state in states if state != "not_applicable"]
+            closed = sum(state in ("closed", "deferred") for state in applicable)
+            lines = [f"stage {stage} ({name}): topics closed {closed} of {len(applicable)}, open "
+                     f"{applicable.count('open')} (pk interview next, pk interview report {stage})"]
+            changed = interview._changed_since_approval(root, stage)
+            if changed:
+                lines.append(f"stage {stage} was approved and its files changed: {', '.join(changed)}")
+        unanswered = interview._unanswered(entries)
+        blocking = [str(item.get("id")) for item in entries if item.get("kind") == "question"  # ledger order
+                    and item.get("blocking") is True and str(item.get("id")) in unanswered]
+        unconfirmed = [str(item.get("id")) for item in entries
+                       if item.get("kind") == "assumption" and item.get("confirmed") is not True]
+        lines += [f"blocking questions unanswered: {_ids(blocking)}", f"assumptions unconfirmed: {_ids(unconfirmed)}"]
+    except KitError as exc:
+        lines = [f"the interview state does not read: {exc}; run: pk interview validate"]
+    except (TypeError, AttributeError, KeyError, ValueError) as exc:  # a hand-edited approval of the wrong shape
+        lines = [f"the interview state does not read ({type(exc).__name__}); run: pk interview validate and "
+                 "pk interview next"]
+    return [_line(line) for line in lines]
 
 
 def _round_lines(root: Path) -> list[str]:
@@ -287,6 +343,13 @@ def _read(root: Path) -> tuple[Path, str]:
         raise
 
 
+def never_generated(root: Path) -> bool:
+    """True when nothing was ever written between the markers: a new program, before its first `pk handoff update`."""
+    _, text = _read(root)
+    begin, finish = _split(text)
+    return not text[begin:finish].strip()
+
+
 def check(root: Path) -> bool:
     """True when the block on disk equals the block rendered now, ignoring the commit line."""
     _, text = _read(root)
@@ -336,7 +399,10 @@ def cmd_handoff(args: argparse.Namespace) -> int:
     root = find_root()
     if action == "update":
         print("handoff: updated" if update(root) else "handoff: unchanged")
-    elif not check(root):
+    elif not check(root):  # check renders first, so a state that does not read is reported before this
+        if never_generated(root):  # a new program: not stale, just never written (install and init commit nothing)
+            raise KitError("program/HANDOFF.md has no generated block yet (a new program); run: pk handoff update, "
+                           "then commit it")
         raise KitError("program/HANDOFF.md is stale; run: pk handoff update")
     else:
         problems = budget_problems(root)

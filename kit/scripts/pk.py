@@ -31,7 +31,7 @@ TEMPLATE_FILES = ("BRIEF.md", "checks.yaml", "environments.yaml", "CLAIM_BOUNDAR
 # Modules that register further subcommands (each defines `register(add_command)`).
 COMMAND_MODULES: tuple[str, ...] = ("status", "rulings", "register", "briefs", "trace", "interview", "evidence",
                                     "stale", "fetch", "gate", "worktree", "handoff", "change", "manifest",
-                                    "cost", "tracker", "land", "fingerprint")
+                                    "cost", "tracker", "land", "fingerprint", "dashboard")
 
 COMMANDS: dict[str, Callable[[argparse.Namespace], int]] = {}
 CONFIGURERS: dict[str, tuple[str, Callable[[argparse.ArgumentParser], None] | None]] = {}
@@ -186,6 +186,19 @@ def _tier_path_warnings(root: Path, data) -> list[str]:
     return warnings
 
 
+def _work_started(root: Path) -> bool:
+    """Whether any task has a status record past `not_started`. Before that, no path is expected to hold a file yet.
+
+    A status record that does not read counts as started, so a broken file never hides a warning.
+    """
+    import status as status_module  # lazy: status imports the register
+
+    try:
+        return any(record["status"] != "not_started" for record in status_module.list_all(root))
+    except KitError:
+        return True
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     if tuple(sys.version_info[:2]) < MIN_PYTHON:
         found = ".".join(str(part) for part in sys.version_info[:3])
@@ -198,7 +211,12 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         raise KitError(f"program/ not found at {root}; run `pk init`")
     checks = read_yaml(program / "checks.yaml")  # a file that does not read raises, naming the line
     problems = _checks_problems(checks)
-    for warning in _tier_path_warnings(root, checks):
+    warnings = _tier_path_warnings(root, checks)
+    if warnings and not _work_started(root):  # a tiers path is listed ahead of its first file: expected before any work
+        print(f"note: {len(warnings)} tiers path warning(s) held back: no task is past not_started yet, so a tiers "
+              "path may cover no file; pk doctor reports them once a task has started", file=sys.stderr)
+        warnings = []
+    for warning in warnings:
         print(f"warning: {warning}", file=sys.stderr)
     branch = primary_branch_problem(root)
     if branch:

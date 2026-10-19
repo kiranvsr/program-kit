@@ -1,6 +1,7 @@
 import _paths  # noqa: F401  (must come first: puts kit/scripts on sys.path)
 import contextlib
 import io
+import json
 import os
 import shutil
 import subprocess
@@ -188,6 +189,29 @@ class PkTests(unittest.TestCase):
         self.run_pk("init", "--preset", "python")
         rc, out, err = self.run_pk("doctor")
         self.assertEqual((rc, out, err), (0, "doctor: ok\n", ""))
+
+    def test_doctor_holds_back_tier_path_warnings_until_a_task_has_started(self):
+        """KF-7: before any task leaves not_started a tiers path that covers no file yet is expected, not a warning."""
+        self.git_repo(commit=True)
+        self.run_pk("init", "--preset", "python")
+        checks = self.tmp / "program" / "checks.yaml"
+        checks.write_text(checks.read_text().replace("  full_paths: []", "  full_paths:\n    - auth/"))
+        held = ("note: 1 tiers path warning(s) held back: no task is past not_started yet, so a tiers path may cover "
+                "no file; pk doctor reports them once a task has started\n")
+        self.assertEqual(self.run_pk("doctor"), (0, "doctor: ok\n", held))  # no status file at all
+        status_dir = self.tmp / "program" / "status"
+        status_dir.mkdir()
+        record = {"task_id": "P1-M01-S01-T01", "status": "not_started", "role": "", "updated_at": "", "note": "",
+                  "evidence": [], "blocked_by": [], "history": []}
+        (status_dir / "P1-M01-S01-T01.json").write_text(json.dumps(record))
+        self.assertEqual(self.run_pk("doctor"), (0, "doctor: ok\n", held))  # every task still not started
+        record.update(status="in_progress", role="controller")
+        (status_dir / "P1-M01-S01-T01.json").write_text(json.dumps(record))
+        rc, out, err = self.run_pk("doctor")
+        self.assertEqual((rc, out), (0, "doctor: ok\n"))
+        self.assertTrue(err.startswith("warning: checks.yaml: tiers.full_paths entry 'auth/' covers no tracked file"),
+                        err)
+        self.assertNotIn("note:", err)
 
     def test_doctor_reports_missing_program_dir(self):
         rc, out, err = self.run_pk("doctor")

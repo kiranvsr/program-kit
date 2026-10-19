@@ -202,6 +202,53 @@ class RenderTests(HandoffBase):
         self.assertIn("program/register.yaml is malformed", str(caught.exception))
 
 
+class InterviewSectionTests(HandoffBase):
+    """KF-2: during discovery the block says where the interview stands; without a ledger it says nothing."""
+
+    def put_ledger(self, entries):
+        (self.root / "kit" / "interview").mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(KIT / "tests" / "fixtures" / "coverage_min.yaml",
+                        self.root / "kit" / "interview" / "coverage.yaml")
+        write_yaml(self.root / "program" / "ledger.yaml",
+                   {"sources": {"S1": {"kind": "user", "ref": "message 1", "at": "2026-10-01T10:00:00Z"}},
+                    "entries": entries})
+
+    def test_no_ledger_no_interview_section(self):
+        self.assertNotIn("#### Interview", handoff.render(self.root))
+
+    def test_the_stage_topics_blocking_questions_and_unconfirmed_assumptions_are_shown(self):
+        base = {"source": "S1", "at": "2026-10-01T10:00:00Z", "text": "t"}
+        self.put_ledger([
+            dict(base, id="F-1", kind="fact", topics=["T1.1"], tags=["measure"]),
+            dict(base, id="Q-1", kind="question", topics=["T1.1"], tags=[], lens="program", blocking=True),
+            dict(base, id="Q-2", kind="question", topics=["T1.1"], tags=[], lens="program", blocking=False),
+            dict(base, id="A-1", kind="assumption", topics=["T1.1"], tags=[], confirmed=False),
+            dict(base, id="A-2", kind="assumption", topics=["T1.1"], tags=["beneficiary"], confirmed=True)])
+        block = handoff.render(self.root)
+        section = block.split("#### Interview\n", 1)[1].split("\n\n", 1)[0]
+        self.assertEqual(section.splitlines(), [
+            "- stage 1 (discover): topics closed 1 of 1, open 0 (pk interview next, pk interview report 1)",
+            "- blocking questions unanswered: 1 (Q-1)",
+            "- assumptions unconfirmed: 1 (A-1)"])
+        self.assertLess(block.index("#### Now"), block.index("#### Interview"))
+        self.assertLess(block.index("#### Interview"), block.index("#### Tasks by status"))
+        handoff.update(self.root)
+        self.assertTrue(handoff.check(self.root))  # the section is stable: nothing in it moves by itself
+
+    def test_a_ledger_that_does_not_read_is_one_line(self):
+        self.put_ledger([])
+        (self.root / "program" / "ledger.yaml").write_text("sources: {}\nentries: 5\n")
+        section = handoff.render(self.root).split("#### Interview\n", 1)[1].split("\n\n", 1)[0]
+        self.assertEqual(len(section.splitlines()), 1, section)
+        self.assertIn("the interview state does not read", section)
+        self.assertIn("pk interview validate", section)
+        self.put_ledger([])
+        with mock.patch("interview.next_stage", side_effect=TypeError("hand-edited")):  # never a traceback
+            section = handoff.render(self.root).split("#### Interview\n", 1)[1].split("\n\n", 1)[0]
+        self.assertEqual(section, "- the interview state does not read (TypeError); run: pk interview validate and "
+                                  "pk interview next")
+
+
 class FingerprintLineTests(HandoffBase):
     def test_the_now_list_says_none_without_a_fingerprint_and_the_hand_off_stays_current(self):
         handoff.update(self.root)
@@ -274,7 +321,21 @@ class UpdateTests(HandoffBase):
 
 
 class CheckTests(HandoffBase):
+    def test_a_block_never_generated_says_run_update_not_stale(self):
+        """KF-1: a new program's hand-off has empty markers; check names the first update instead of 'stale'."""
+        shutil.copy(KIT / "templates" / "HANDOFF.md", self.file)
+        self.assertTrue(handoff.never_generated(self.root))
+        code, out, err = run_cli("handoff", self.root, "handoff", "check")
+        self.assertEqual((code, out), (1, ""))
+        self.assertEqual(err, "error: program/HANDOFF.md has no generated block yet (a new program); run: pk handoff "
+                              "update, then commit it\n")
+        self.assertEqual(run_cli("handoff", self.root, "handoff", "update"), (0, "handoff: updated\n", ""))
+        self.assertFalse(handoff.never_generated(self.root))
+        self.assertEqual(run_cli("handoff", self.root, "handoff", "check"), (0, "handoff: current\n", ""))
+
     def test_check_exits_1_when_stale(self):
+        handoff.update(self.root)
+        self.write_handoff(self.text().replace("not_started: 0", "not_started: 9"))
         code, out, err = run_cli("handoff", self.root, "handoff", "check")
         self.assertEqual((code, out), (1, ""))
         self.assertEqual(err, "error: program/HANDOFF.md is stale; run: pk handoff update\n")

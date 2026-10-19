@@ -50,6 +50,35 @@ RESULTS_FIELDS = ("digest", "path", "head", "produced_at")
 ACCEPTANCE_FIELDS = ("digest", "path", "decision", "accepted_at", "results_digest")
 
 
+def input_digests(inputs) -> dict[str, str] | None:
+    """A results record's `inputs` as {path: sha256}, in whichever shape the record holds them; None when neither.
+
+    Kit 0.4.0 and earlier wrote a mapping `{"<path>": "<sha256>"}`. From 0.4.1 the writer stores a list of
+    `{"path": ..., "sha256": ...}` objects sorted by path (`input_list`): a path holding a word such as `token`,
+    `secret` or `auth` followed by a hex value on the same JSON line is what a secret scanner's generic-key rule
+    matches, so a committed record of the old shape could fail every later scan. A record is never rewritten, so
+    every reader accepts both shapes through this one function. The digests themselves are checked by
+    `evidence.validate_results`, not here; a list with a repeated path, or an item that is not exactly
+    {path, sha256} with a string path, is neither shape.
+    """
+    if isinstance(inputs, dict):
+        return dict(inputs)
+    if not isinstance(inputs, list):
+        return None
+    found: dict[str, str] = {}
+    for item in inputs:
+        if not (isinstance(item, dict) and set(item) == {"path", "sha256"} and isinstance(item["path"], str)) \
+                or item["path"] in found:
+            return None
+        found[item["path"]] = item["sha256"]
+    return found
+
+
+def input_list(digests: dict) -> list[dict]:
+    """{path: sha256} as the list a results record stores from 0.4.1 on: `{"path", "sha256"}` objects by path."""
+    return [{"path": path, "sha256": digest} for path, digest in sorted(digests.items())]
+
+
 def check_task(task_id) -> str:
     if not isinstance(task_id, str) or not _TASK.match(task_id):
         raise KitError(f"not a usable task id: {task_id!r}")
