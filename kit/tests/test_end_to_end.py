@@ -486,6 +486,10 @@ class EndToEndTests(unittest.TestCase):
         self.assertIn("1 record(s) ok", project.pk("fingerprint", "validate").stdout)
         project.pk("evidence", "validate")
         project.pk("doctor")
+        page = self.base / "dashboard.html"  # outside the repository: the page never dirties the tree
+        self.assertIn("dashboard: wrote", project.pk("dashboard", page).stdout)
+        self.assertIn(TASK, page.read_text(encoding="utf-8"))
+        self.assertEqual(project.git("status", "--porcelain"), "")
         project.pk("init", expect=1)  # program/ exists: init refuses to overwrite it
 
         pk.build_parser()  # fills pk.COMMANDS: only init and doctor register at import, the rest when it is built

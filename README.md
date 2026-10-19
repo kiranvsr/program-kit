@@ -113,6 +113,7 @@ The gates enforce all of this from main, not from the branch. In a new program e
 - The hand-off has a size budget (60 KB) that `pk handoff check` enforces; history lives in `program/rulings.md`, and the hand-off shows the newest fifteen rulings.
 - Follow-ups have IDs and are closed, tagged or marked duplicate (`pk followups`); work outside the register is an ad-hoc task (`pk adhoc`) that the hand-off shows like any other.
 - `pk cost add` records each subagent run with the model it ran on, against a register task or an ad-hoc task (`--allow-unknown` for any other ID); `pk cost report` flags an agent past 400,000 tokens or three resumes, when a fresh agent with a tight brief is cheaper than another resume.
+- `pk dashboard <out.html>` (optional) writes the generated hand-off state, the register with statuses and tiers, the gates, the costs and the open follow-ups as one self-contained HTML page (no scripts, no network); write it outside the repository, since a dirty tree stops the gates.
 - `pk fingerprint run|plan|validate|show|coverage`: the release fingerprint of section 9.4 of `docs/DESIGN.md`. Run it after a merge that changes the release set or a suite it names, and before a release; keep the `test` step fast and put slow cases in their own tracks (working rule W12).
 - Each role reads only its own brief, its parts of the rules file and `program/COMMON.md`. `kit/playbooks/09_handoff.md` lists the files and their sizes.
 
