@@ -449,6 +449,38 @@ class CostTests(TrackerBase):
         code, out, _ = self.cli("cost", "cost", "report")
         self.assertEqual(out, f"{TID}\t150000 tokens\t40 tool calls\t600 s\t2 run(s)\n")
 
+    def test_an_unknown_task_is_refused_unless_allowed(self):
+        """KF-4: a typo or an ad-hoc ID logged before the task exists is refused; --allow-unknown logs it anyway."""
+        for typo in ("P1-M01-S01-T99", "AH-0001"):
+            code, out, err = self.cli("cost", "cost", "add", "--task", typo, "--role", "qa", "--model", "m",
+                                      "--tokens", "5")
+            self.assertEqual((code, out), (1, ""), typo)
+            self.assertIn(f"--task {typo} is not a task in program/register.yaml or an ad-hoc task", err)
+            self.assertIn("--allow-unknown", err)
+        self.assertFalse((self.root / cost.COST_FILE).exists())
+        task_id = self.cli("tracker", "adhoc", "add", "--title", "a probe")[1].strip()
+        self.assertEqual(task_id, "AH-0001")
+        for task in (TID, task_id):
+            code, _, err = self.cli("cost", "cost", "add", "--task", task, "--role", "qa", "--model", "m",
+                                    "--tokens", "5")
+            self.assertEqual((code, err), (0, ""), task)
+        code, _, err = self.cli("cost", "cost", "add", "--task", "P9-M01-S01-T01", "--role", "qa", "--model", "m",
+                                "--tokens", "5", "--allow-unknown")
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual([r["task"] for r in cost.read(self.root)], [TID, task_id, "P9-M01-S01-T01"])
+        code, out, _ = self.cli("cost", "cost", "report")  # an existing orphan line still reads and reports
+        self.assertEqual(code, 0)
+        self.assertIn("P9-M01-S01-T01\t5 tokens", out)
+
+    def test_without_a_register_only_ad_hoc_tasks_are_known(self):
+        (self.root / "program" / "register.yaml").unlink()
+        code, _, err = self.cli("cost", "cost", "add", "--task", TID, "--role", "qa", "--model", "m", "--tokens", "1")
+        self.assertEqual(code, 1)
+        self.assertIn("is not a task in program/register.yaml", err)
+        task_id = self.cli("tracker", "adhoc", "add", "--title", "stage 1 interview")[1].strip()
+        self.assertEqual(self.cli("cost", "cost", "add", "--task", task_id, "--role", "interviewer", "--model", "m",
+                                  "--tokens", "1")[0], 0)
+
     def test_every_run_names_its_model(self):
         with self.assertRaisesRegex(KitError, "every dispatch names its model"):
             cost.add(self.root, TID, "implementer", "  ", 10)

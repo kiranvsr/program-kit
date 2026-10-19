@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """The cost log, `program/costs.jsonl`: one line per subagent run, append-only (standard library only).
 
-`add` appends one JSON object: when, task, role, agent (a label for one agent session, so its resumes add
+`pk cost add` refuses a task that is neither in the register nor an ad-hoc task (`unknown_task`) unless
+`--allow-unknown` is given. `add` appends one JSON object: when, task, role, agent (a label for one agent session, so its resumes add
 up), model, tokens, tool calls, seconds and whether the run resumed an earlier one. The model is required:
 every dispatch names the model it ran on. Earlier lines are never rewritten. `totals` sums per task;
 `flagged` names each agent of a task that has passed the fresh-agent threshold (TOKEN_THRESHOLD tokens in all,
@@ -79,6 +80,27 @@ def add(root: Path, task: str, role: str, model: str, tokens: int, tool_calls: i
     return record
 
 
+def unknown_task(root: Path, task: str) -> str | None:
+    """Why `task` is not a task a cost line may name, or None: it must be in `program/register.yaml` or be an ad-hoc
+    task `program/controller-state.json` lists. `pk cost add` refuses an unknown one unless `--allow-unknown`, so a
+    typo, or an ad-hoc ID logged before the task was added, does not leave an orphan line. Lines already in the
+    log are never checked: the log is read as it is."""
+    import status as status_module  # lazy: status imports the register, which nothing here needs otherwise
+
+    task = " ".join(str(task).split())
+    try:
+        known = status_module._registered(root)
+    except KitError:
+        if (Path(root) / "program" / "register.yaml").is_file():
+            raise  # a register that does not read is its own error, not an unknown task
+        known = set()  # no register yet (discovery): only ad-hoc tasks are known
+    if task in known:
+        return None
+    return (f"--task {task} is not a task in program/register.yaml or an ad-hoc task in program/controller-state.json; "
+            "check the ID, add the ad-hoc task first (pk adhoc add, or pk record --adhoc), or pass --allow-unknown "
+            "to log it anyway")
+
+
 def totals(records: list[dict]) -> dict[str, dict]:
     """{task: {tokens, tool_calls, seconds, runs}} in first-seen order."""
     found: dict[str, dict] = {}
@@ -120,6 +142,9 @@ def cmd_cost(args: argparse.Namespace) -> int:
     action = getattr(args, "cost_action", None)
     root = find_root()
     if action == "add":
+        problem = None if args.allow_unknown else unknown_task(root, args.task)
+        if problem:
+            raise KitError(problem)
         record = add(root, args.task, args.role, args.model, args.tokens, args.tools, args.seconds,
                      agent=args.agent, resume=args.resume)
         print(f"cost: {record['task']} {record['agent']} ({record['model']}) {record['tokens']} tokens")
@@ -149,6 +174,8 @@ def _configure(parser: argparse.ArgumentParser) -> None:
     adder.add_argument("--seconds", type=int, default=0)
     adder.add_argument("--agent", default="", help="a label for this agent session (default: the role)")
     adder.add_argument("--resume", action="store_true", help="this run resumed the same agent")
+    adder.add_argument("--allow-unknown", action="store_true", dest="allow_unknown",
+                       help="log a task ID that is neither in the register nor an ad-hoc task")
     report = actions.add_parser("report", help="totals per task, and the agents past the fresh-agent threshold")
     report.add_argument("--task")
     report.add_argument("--tokens", type=int, default=TOKEN_THRESHOLD, help="token threshold per agent")
