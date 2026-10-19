@@ -2,9 +2,9 @@
 """The cost log, `program/costs.jsonl`: one line per subagent run, append-only (standard library only).
 
 `pk cost add` refuses a task that is neither in the register nor an ad-hoc task (`unknown_task`) unless
-`--allow-unknown` is given. `add` appends one JSON object: when, task, role, agent (a label for one agent session, so its resumes add
-up), model, tokens, tool calls, seconds and whether the run resumed an earlier one. The model is required:
-every dispatch names the model it ran on. Earlier lines are never rewritten. `totals` sums per task;
+`--allow-unknown` is given. `add` appends one JSON object: when, task, role, agent (a label for one agent session,
+so its resumes add up), model, tokens, tool calls, seconds and whether the run resumed an earlier one. The model
+is required: every dispatch names the model it ran on. Earlier lines are never rewritten. `totals` sums per task;
 `flagged` names each agent of a task that has passed the fresh-agent threshold (TOKEN_THRESHOLD tokens in all,
 or RESUME_THRESHOLD resumes): past it the controller stops resuming that agent and starts a fresh one with a
 tight fix brief, because an agent that has read that much re-reads it on every turn.

@@ -23,9 +23,10 @@ integration rounds that are not closed), it counts the done tasks by tier, lists
 decision it waits on, and it shows the open follow-ups that are
 not deferred by a tag (newest first, counted, at most FOLLOWUPS_SHOWN), the newest RULINGS_SHOWN rulings on one
 line each with the next free number, the newest ADHOC_CLOSED_SHOWN closed ad-hoc tasks and the agents past
-the fresh-agent threshold of the cost log. When `program/ledger.yaml` exists an Interview section follows the Now list: the stage `pk interview next`
-names, its topics closed and open, the blocking questions unanswered and the assumptions unconfirmed, so a takeover
-during discovery needs no other command. History is never copied in: it lives in `program/rulings.md`.
+the fresh-agent threshold of the cost log. When `program/ledger.yaml` exists an Interview section follows the Now
+list: the stage `pk interview next` names, its topics closed and open, the blocking questions unanswered and the
+assumptions unconfirmed, so a takeover during discovery needs no other command. History is never copied in: it
+lives in `program/rulings.md`.
 `check` also fails when the file is over its size budget (BUDGET_BYTES unless the controller state sets
 `handoff_budget_bytes`) or its hand-written "Next steps" section is over NEXT_STEPS_BYTES: a successor must
 be able to read the hand-off whole.
@@ -259,8 +260,8 @@ def _interview_lines(root: Path) -> list[str]:
             if changed:
                 lines.append(f"stage {stage} was approved and its files changed: {', '.join(changed)}")
         unanswered = interview._unanswered(entries)
-        blocking = sorted(str(item.get("id")) for item in entries if item.get("kind") == "question"
-                          and item.get("blocking") is True and str(item.get("id")) in unanswered)
+        blocking = [str(item.get("id")) for item in entries if item.get("kind") == "question"  # ledger order
+                    and item.get("blocking") is True and str(item.get("id")) in unanswered]
         unconfirmed = [str(item.get("id")) for item in entries
                        if item.get("kind") == "assumption" and item.get("confirmed") is not True]
         lines += [f"blocking questions unanswered: {_ids(blocking)}", f"assumptions unconfirmed: {_ids(unconfirmed)}"]

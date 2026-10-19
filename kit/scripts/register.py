@@ -34,7 +34,8 @@ _GATE = re.compile(r"G-[A-Z0-9][A-Z0-9_]*\Z")
 _CLOSES = re.compile(r"(?:REQ-\d{3}|NFR-\d{3}|J\d+)\Z", re.ASCII)
 GATE_ID, CLOSES_ID, TASK_ID = _GATE, _CLOSES, ID_PATTERNS["task"]  # public aliases for trace.py (ID_PATTERNS is for briefs.py)
 # How a gate id is written, with the pattern, for every message that refuses one: NAME takes no second hyphen.
-GATE_SHAPE = "G-<NAME>, pattern G-[A-Z0-9][A-Z0-9_]*: NAME is capitals, digits and _, no hyphen (G-R1_CORE, not G-R1-CORE)"
+GATE_SHAPE = ("G-<NAME>, pattern G-[A-Z0-9][A-Z0-9_]*: NAME is capitals, digits and _, no hyphen "
+              "(G-R1_CORE, not G-R1-CORE)")
 
 
 def _path(root: Path) -> Path:

@@ -145,10 +145,11 @@ def render(root: Path) -> tuple[str, dict]:
                  [[f"<code>{_e(r['id'])}</code>", _e(r["title"]), _chip(r["status"]), _e(r["tier"])] for r in tasks],
                  "no tasks")
         + "</details>" for phase, tasks in phases.items()) or '<p class="empty">No register yet (stage 6).</p>'
-    tiles = "".join(f'<div class="tile"><div class="n">{_e(n)}</div><div class="l">{_e(label)}</div></div>' for n, label in (
-        (len(rows), "tasks in the register"), (done, "done or merged"),
-        (counts["in_progress"] + counts["review"], "in flight"), (counts["blocked"], "blocked"),
-        (len(followups), "open follow-ups"), (f"{tokens:,}", "tokens logged")))
+    tiles = "".join(f'<div class="tile"><div class="n">{_e(n)}</div><div class="l">{_e(label)}</div></div>'
+                    for n, label in ((len(rows), "tasks in the register"), (done, "done or merged"),
+                                     (counts["in_progress"] + counts["review"], "in flight"),
+                                     (counts["blocked"], "blocked"), (len(followups), "open follow-ups"),
+                                     (f"{tokens:,}", "tokens logged")))
     legend = " ".join(f'{_chip(state)} {counts[state]}' for state in ORDER)
     gates_html = _table(["Gate", "Environment", "Claims", "Records (status)"], [
         [f"<code>{_e(g['id'])}</code><br><span class=meta>{_e(g['title'])}</span>", _e(g["environment"]),
@@ -185,7 +186,8 @@ TEMPLATE = """<!doctype html>
 --ok:#6cc08a;--info:#7fa6dc;--warn:#e0a35a;--crit:#e3736a;--idle:#7a838c;color-scheme:dark}}
 body{margin:0;padding:0 16px 48px;background:var(--bg);color:var(--fg);font:15px/1.45 system-ui,sans-serif}
 .wrap{max-width:1200px;margin:0 auto}
-header{display:flex;flex-wrap:wrap;gap:8px 20px;align-items:baseline;padding:24px 0 10px;border-bottom:2px solid var(--fg)}
+header{display:flex;flex-wrap:wrap;gap:8px 20px;align-items:baseline;padding:24px 0 10px;
+border-bottom:2px solid var(--fg)}
 h1{margin:0;font-size:1.6rem}h2{font-size:1.1rem;margin:28px 0 10px}h3{font-size:.95rem;margin:14px 0 4px}
 .meta{color:var(--muted);font-size:.82rem}code{font-family:var(--mono);font-size:.82rem}
 .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-top:16px}
@@ -202,7 +204,8 @@ border:1px solid currentColor}
 .bar .s-in_progress{background:var(--warn)}.bar .s-blocked{background:var(--crit)}.bar .s-parked{background:var(--idle)}
 .grid{display:grid;grid-template-columns:3fr 2fr;gap:20px;align-items:start}
 @media (max-width:860px){.grid{grid-template-columns:1fr}}
-details{margin-bottom:10px}summary{display:flex;flex-wrap:wrap;gap:6px 14px;align-items:center;cursor:pointer;font-weight:600}
+details{margin-bottom:10px}
+summary{display:flex;flex-wrap:wrap;gap:6px 14px;align-items:center;cursor:pointer;font-weight:600}
 summary .bar{flex:0 0 160px;margin:0}
 table{border-collapse:collapse;width:100%;font-size:.86rem;margin-top:6px}
 th{text-align:left;font-size:.72rem;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);
