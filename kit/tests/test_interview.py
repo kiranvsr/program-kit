@@ -41,6 +41,12 @@ FINISHED_CHALLENGE = "# challenge\n\n" + "".join(
 CLOSING = [entry("F-1", tags=["measure"]), entry("F-2", tags=["beneficiary"])]
 
 
+def amended(stage, *paths):
+    """What `pk interview amend` prints when it re-hashed `paths`: each path, then one summary line (KF-5)."""
+    return "".join(f"{path}\n" for path in paths) + (
+        f"amended stage {stage}: {len(paths)} changed file(s) re-hashed into program/approvals/stage-{stage}.json\n")
+
+
 class InterviewBase(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -963,7 +969,10 @@ class EarlierStagesTests(InterviewBase):
         self.assertEqual(lines[0], "next stage: 1 (discover)")
         self.assertIn("stage 1 was approved and its files changed: program/discovery.md; "
                       "run pk interview amend 1 for a correction, or raise a change request", lines)
-        self.assertEqual(self.run_cli("interview", "amend", "1")[1], "program/discovery.md\n")
+        self.assertEqual(self.run_cli("interview", "amend", "1")[1],  # KF-5: the paths, then a summary line
+                         "program/discovery.md\n"
+                         "amended stage 1: 1 changed file(s) re-hashed into program/approvals/stage-1.json\n")
+        self.assertEqual(self.run_cli("interview", "amend", "1"), (0, "no changes\n", ""))
         code, out, err = self.run_cli("interview", "next")
         self.assertEqual(out.splitlines()[0], "next stage: 2 (define the product)")
         self.assertNotIn("was approved", out)
@@ -1027,7 +1036,9 @@ class RemovedAdrTests(InterviewBase):
         self.assertIn("program/adr/0002-renamed.md", out)
         self.assertIn("program/adr/0002-second.md", out)
         self.assertEqual(self.run_cli("interview", "amend", "4"), (0, "program/adr/0002-renamed.md\n"
-                                                                     "program/adr/0002-second.md\n", ""))
+                                                                     "program/adr/0002-second.md\n"
+                                                                     "amended stage 4: 2 changed file(s) re-hashed "
+                                                                     "into program/approvals/stage-4.json\n", ""))
         self.assertEqual(self.recorded(), ["program/ARCHITECTURE.md", "program/adr/0001-first.md",
                                            "program/adr/0002-renamed.md"])
         self.assertEqual(interview.next_stage(self.root), 7)
@@ -1166,7 +1177,7 @@ class StageSixAnswersTests(InterviewBase):
     def test_an_entry_on_a_stage_3_topic_after_approval_5_reopens_the_freeze_until_amended(self):
         self.put_ledger(self.spec + [entry("F-6", topics=["T3.1"]), entry("F-7", topics=["T6.1"])])
         self.assert_freeze_reopened()
-        self.assertEqual(self.run_cli("interview", "amend", "5"), (0, "program/ledger.yaml\n", ""))
+        self.assertEqual(self.run_cli("interview", "amend", "5"), (0, amended(5, "program/ledger.yaml"), ""))
         self.assertEqual(self.next().splitlines()[0], "next stage: 6 (roadmap and register)")
         self.put_ledger(self.spec + [entry("F-6", topics=["T3.1"]), entry("F-7", topics=["T6.1"]),
                                      entry("F-8", topics=["T6.2"])])  # the amended record still lets stage 6 grow
@@ -1199,7 +1210,7 @@ class StageSixAnswersTests(InterviewBase):
         out = self.next()
         self.assertEqual(out.splitlines()[0], "next stage: 6 (roadmap and register)")
         self.assertIn("stage 6 was approved and its files changed: program/ledger.yaml; run pk interview amend 6", out)
-        self.assertEqual(self.run_cli("interview", "amend", "6"), (0, "program/ledger.yaml\n", ""))
+        self.assertEqual(self.run_cli("interview", "amend", "6"), (0, amended(6, "program/ledger.yaml"), ""))
         self.assertEqual(self.next().splitlines()[0], "next stage: 7 (stage 7)")
         self.put_ledger(self.spec + answers + [entry("F-8", topics=["T6.2"])])  # an added one, too
         self.assertIn("stage 6 was approved and its files changed: program/ledger.yaml", self.next())
@@ -1209,7 +1220,7 @@ class StageSixAnswersTests(InterviewBase):
         self.put_ledger(self.spec + [entry("F-6", topics=["T6.1"], tags=["payments"])])  # a tag counts anywhere
         self.assertEqual(interview.topic_states(self.root, 1)["T1.9"]["state"], "open")
         self.assert_freeze_reopened()
-        self.assertEqual(self.run_cli("interview", "amend", "5"), (0, "program/ledger.yaml\n", ""))
+        self.assertEqual(self.run_cli("interview", "amend", "5"), (0, amended(5, "program/ledger.yaml"), ""))
         self.put_ledger(self.spec + [entry("F-6", topics=["T6.1"])])  # and taking the tag away switches it off again
         self.assert_freeze_reopened()
 
@@ -1228,7 +1239,7 @@ class StageSixAnswersTests(InterviewBase):
         self.assertIn("stage 5 was approved and its files changed: program/ledger.yaml; run pk interview amend 5", out)
         self.run_cli("interview", "amend", "6")
         self.assertEqual(self.next().splitlines()[0], "next stage: 5 (freeze review)")
-        self.assertEqual(self.run_cli("interview", "amend", "5"), (0, "program/ledger.yaml\n", ""))
+        self.assertEqual(self.run_cli("interview", "amend", "5"), (0, amended(5, "program/ledger.yaml"), ""))
         self.run_cli("interview", "amend", "6")
         self.assertEqual(self.next().splitlines()[0], "next stage: 7 (stage 7)")
 
@@ -1241,7 +1252,7 @@ class StageSixAnswersTests(InterviewBase):
         self.assertEqual(self.next().splitlines()[0], "next stage: 6 (roadmap and register)")
         self.put_ledger(self.spec + [entry("F-6", topics=["T6.1"])])
         self.assert_freeze_reopened()  # as the record's writer behaved
-        self.assertEqual(self.run_cli("interview", "amend", "5"), (0, "program/ledger.yaml\n", ""))
+        self.assertEqual(self.run_cli("interview", "amend", "5"), (0, amended(5, "program/ledger.yaml"), ""))
         self.assertIn("frozen_entries_sha256", read_json(path))
         self.put_ledger(self.spec + [entry("F-6", topics=["T6.1"]), entry("F-7", topics=["T6.2"])])
         self.assertEqual(self.next().splitlines()[0], "next stage: 6 (roadmap and register)")
@@ -1374,7 +1385,7 @@ class CliTests(InterviewBase):
         self.assertEqual(out.splitlines()[0], "next stage: 2 (define the product)")
         self.assertEqual(self.run_cli("interview", "amend", "1")[1], "no changes\n")
         self.write("program/discovery.md", "v2\n")
-        self.assertEqual(self.run_cli("interview", "amend", "1")[1], "program/discovery.md\n")
+        self.assertEqual(self.run_cli("interview", "amend", "1")[1], amended(1, "program/discovery.md"))
         doc = self.write("incoming/notes.md")
         code, out, _ = self.run_cli("interview", "ingest", str(doc))
         self.assertEqual(code, 0)

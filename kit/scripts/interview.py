@@ -959,7 +959,12 @@ def cmd_interview(args: argparse.Namespace) -> int:
         print(f"approved stage {args.stage}: {_show(root, approve(root, args.stage, artifacts))}")
     elif action == "amend":
         changed = amend(root, args.stage)
-        print("\n".join(changed) if changed else "no changes")
+        if changed:  # the paths, then one line that says what was done
+            print("\n".join(changed))
+            print(f"amended stage {args.stage}: {len(changed)} changed file(s) re-hashed into "
+                  f"{_show(root, _approval_path(root, args.stage))}")
+        else:
+            print("no changes")
     elif action == "ingest":
         source_id = ingest(root, Path.cwd() / args.file)
         print(f"{source_id} {_read_ref(root, source_id)}")
