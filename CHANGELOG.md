@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.4.1 (unreleased)
+## 0.4.1
 
 Fixes for the findings a program recorded while running kit 0.4.0 (KF-1 to KF-9). Nothing in `program/` has to change: every file written by 0.4.0 reads as it did, evidence records included.
 
