@@ -109,7 +109,7 @@ The gates enforce all of this from main, not from the branch. In a new program e
 
 ## Keeping a long program cheap
 
-- One command per controller step: `pk record --ruling TEXT` appends the ruling, updates the state, regenerates the hand-off and commits exactly those files.
+- One command per controller step: `pk record --ruling TEXT` appends the ruling, updates the state, regenerates the hand-off and commits exactly those files. Other changed files under `program/` are named on one line, not staged; `--no-commit` lets you commit a ruling and its edits together.
 - The hand-off has a size budget (60 KB) that `pk handoff check` enforces; history lives in `program/rulings.md`, and the hand-off shows the newest fifteen rulings.
 - Follow-ups have IDs and are closed, tagged or marked duplicate (`pk followups`); work outside the register is an ad-hoc task (`pk adhoc`) that the hand-off shows like any other.
 - `pk cost add` records each subagent run with the model it ran on, against a register task or an ad-hoc task (`--allow-unknown` for any other ID); `pk cost report` flags an agent past 400,000 tokens or three resumes, when a fresh agent with a tight brief is cheaper than another resume.

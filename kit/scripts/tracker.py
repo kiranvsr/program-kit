@@ -6,7 +6,9 @@ not commit. `pk record` is one controller step in one command: it appends a ruli
 given with it (ad-hoc tasks, stage text, the queued and parked notes, follow-ups, the now line, the hand-off
 budget), regenerates the hand-off block, checks the hand-off budget and commits exactly the files it wrote
 (`program/rulings.md`, `program/controller-state.json`, `program/HANDOFF.md`, and the cost log when it has new
-lines), with a message taken from the ruling's first sentence. It runs in the main checkout only, with or
+lines), with a message taken from the ruling's first sentence. Other changed files under `program/` are never
+staged; after the commit one line names them (`left_out`), so a ruling and its artifact edits can be committed
+together by hand. It runs in the main checkout only, with or
 without `--no-commit`.
 
 What a refusal leaves behind. Everything that can be checked before the first write is: the arguments, the
@@ -167,6 +169,27 @@ def commit_paths(root: Path, paths, subject: str, trailers=()) -> str | None:
     return git(root, "rev-parse", "--short", "HEAD")
 
 
+LEFT_OUT_SHOWN = 10
+
+
+def left_out(root: Path) -> str:
+    """One line naming the changed `program/` paths a `pk record` commit left out, or "" when there are none.
+
+    `pk record` commits only the files it writes, so artifact edits made for the same step (a SPEC, a register
+    change, a CR) stay uncommitted. It does not stage them: a sweep of `program/` would also take a half-written
+    status file or an evidence record into a ruling commit. It says which they are, so the step can be finished
+    by hand, or done next time with `--no-commit` and one commit of everything.
+    """
+    listing = git(root, "status", "--porcelain", "--untracked-files=all", "--", "program/")
+    paths = sorted({line[3:].split(" -> ")[-1] for line in listing.splitlines() if len(line) > 3})
+    if not paths:
+        return ""
+    shown = ", ".join(paths[:LEFT_OUT_SHOWN]) + (f" and {len(paths) - LEFT_OUT_SHOWN} more" if len(paths) >
+                                                 LEFT_OUT_SHOWN else "")
+    return (f"not in this commit, changed under program/: {shown} (pk record commits only its own files: commit "
+            "these with git, or use pk record --no-commit and commit everything together)")
+
+
 def _table_entry(planned: dict, table: str, text: str, registered: set[str]) -> str:
     """Set (`ID=TEXT`) or remove (`ID=`) one line of the queued or parked table; the line to print."""
     task_id, sep, note = (part.strip() for part in text.partition("="))
@@ -256,6 +279,9 @@ def record(root: Path, ruling: str, question: str = "", precedent: str = "", rol
         if commit:
             sha = commit_paths(root, RECORD_FILES, _subject(number, ruling), trailers)
             lines.append(f"committed {sha}: {_subject(number, ruling)}" if sha else "nothing to commit")
+            left = left_out(root)
+            if left:
+                lines.append(left)
         else:
             lines.append("not committed (--no-commit): " + ", ".join(RECORD_FILES))
     except BaseException:  # a failed write or commit: no ruling without its state change, nothing left staged

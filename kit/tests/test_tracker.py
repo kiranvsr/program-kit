@@ -245,6 +245,25 @@ class RecordTests(TrackerBase):
         self.assertEqual(message.splitlines()[0], "R1: Use one local stack")
         self.assertEqual(message.strip().splitlines()[-1], "Co-Authored-By: Test Agent")
 
+    def test_record_names_the_program_files_it_left_out_of_its_commit(self):
+        """KF-8: artifact edits are never staged by pk record; one line names them so the step can be finished."""
+        (self.root / "program" / "SPEC.md").write_text("an edit the ruling asked for\n")
+        (self.root / "program" / "tasks").mkdir()
+        (self.root / "program" / "tasks" / "new.md").write_text("untracked\n")
+        (self.root / "notes.txt").write_text("outside program/\n")
+        code, out, err = self.record("--ruling", "Rename the export.")
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertEqual(out.splitlines()[-1],
+                         "not in this commit, changed under program/: program/SPEC.md, program/tasks/new.md "
+                         "(pk record commits only its own files: commit these with git, or use pk record "
+                         "--no-commit and commit everything together)")
+        self.assertEqual(self.dirty(), ["notes.txt", "program/SPEC.md", "program/tasks/"])  # nothing staged
+        self.assertEqual(sh(self.root, "git", "diff", "--cached", "--name-only"), "")
+        commit_all(self.root, "the edits")
+        code, out, _ = self.record("--ruling", "Nothing else changed.")
+        self.assertEqual(code, 0)
+        self.assertNotIn("not in this commit", out)
+
     def test_the_hand_off_says_why_a_task_is_blocked_or_parked(self):
         """L2, the reviewer's run: T1 blocked by an environment, T2 parked on a decision of the user."""
         status.transition(self.root, TID, "blocked", "controller", blocked_by=["staging-env"], note="no cluster yet")
