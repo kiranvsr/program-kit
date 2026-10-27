@@ -15,7 +15,9 @@ committing the hand-off moves HEAD, which must not make it stale. `update` there
 file alone when nothing else changed, and the commit line names HEAD as of the last real change.
 
 The main checkout is not listed among the worktrees: its dirty state changes whenever this
-file is rewritten, which would make the block unstable.
+file is rewritten, which would make the block unstable. For the same reason `check` does not compare the lines
+under the Task worktrees heading (KF-14): heads, clean or dirty states and short-lived worktrees move with every
+commit and every running agent. `update` still writes them as they are.
 
 The block is compact on purpose. It opens with a "Now" list (the controller's one line, every task in
 flight with its verification tier and, when blocked, what it waits on, the ad-hoc tasks that are open, the
@@ -210,7 +212,7 @@ def render(root: Path, main: str = "main") -> str:
                for name, number in counts.items()],
              *([f"- not in register: {', '.join(_line(t) for t in unregistered)}"] if unregistered else []), "",
              f"#### Branches not merged into {main}", *_bullets(branches), "",
-             "#### Task worktrees", *_bullets(trees), "",
+             WORKTREES_HEADING, *_bullets(trees), "",
              "#### Queued", *_bullets(tasks(state["queued"])), "",
              "#### Parked", *_bullets(tasks(parked)), "",
              f"#### Ad-hoc tasks closed (newest {ADHOC_CLOSED_SHOWN} of {len(closed)})", *_bullets(closed_lines), "",
@@ -295,10 +297,30 @@ def _round_lines(root: Path) -> list[str]:
 _BEHIND = re.compile(r"(?<=^- Fingerprint: )(.*), \d+ commits behind(?=\r?\n?\Z)")
 
 
-def _comparable(block: str) -> str:
-    """The block without the commit line and without the fingerprint's distance: committing the hand-off moves HEAD."""
-    lines = (line for line in block.splitlines(keepends=True) if not line.startswith(COMMIT_PREFIX))
-    return "".join(_BEHIND.sub(r"\1", line) for line in lines)
+WORKTREES_HEADING = "#### Task worktrees"
+
+
+def _comparable(block: str, live: bool = False) -> str:
+    """The block without the commit line and without the fingerprint's distance: committing the hand-off moves HEAD.
+
+    With `live`, the lines under the Task worktrees heading are left out as well (KF-14): each records a head and a
+    clean or dirty state, and gates and agents add and remove short-lived worktrees, so any commit or running agent
+    changed them. `check` compares this way; `update` still writes the lines as they are now.
+    """
+    kept, skipping = [], False
+    for line in block.splitlines(keepends=True):
+        if line.startswith(COMMIT_PREFIX):
+            continue
+        if live and line.rstrip("\r\n") == WORKTREES_HEADING:
+            kept.append(line)
+            skipping = True
+            continue
+        if skipping:
+            if line.startswith("- "):
+                continue
+            skipping = False
+        kept.append(_BEHIND.sub(r"\1", line))
+    return "".join(kept)
 
 
 def _fingerprint_line(root: Path) -> str:
@@ -351,10 +373,10 @@ def never_generated(root: Path) -> bool:
 
 
 def check(root: Path) -> bool:
-    """True when the block on disk equals the block rendered now, ignoring the commit line."""
+    """True when the block on disk equals the block rendered now, ignoring the commit line and the live worktree lines."""
     _, text = _read(root)
     begin, finish = _split(text)
-    return _comparable(text[begin:finish]) == _comparable(render(root))
+    return _comparable(text[begin:finish], live=True) == _comparable(render(root), live=True)
 
 
 def budget_problems(root: Path) -> list[str]:

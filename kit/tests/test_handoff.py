@@ -360,6 +360,34 @@ class CheckTests(HandoffBase):
         self.write_handoff(self.text().replace("not_started: 0", "not_started: 9"))
         self.assertFalse(handoff.check(self.root))
 
+    def test_check_ignores_the_live_worktree_lines_but_not_real_drift(self):
+        """KF-14: a worktree going dirty, its head moving, or a short-lived worktree coming and going is not stale."""
+        self.put_status(T1, "in_progress")
+        path = worktree.new(self.root, T1)
+        (path / "first.txt").write_text("1")
+        commit_all(path, "first work")  # the branch is not merged into main from here on
+        commit_all(self.root, "state")
+        handoff.update(self.root)
+        commit_all(self.root, "hand-off")
+        self.assertTrue(handoff.check(self.root))
+        (path / "scratch.txt").write_text("x")  # clean -> dirty
+        self.assertTrue(handoff.check(self.root))
+        (path / "work.txt").write_text("y")
+        commit_all(path, "work on the task branch")  # the worktree's head moves
+        self.assertTrue(handoff.check(self.root))
+        sh(self.root, "git", "worktree", "add", "--detach", "-q", str(self.root / ".worktrees" / "mirror"), "HEAD")
+        self.assertTrue(handoff.check(self.root))  # a temporary worktree of a gate or an agent
+        code, out, err = run_cli("handoff", self.root, "handoff", "check")
+        self.assertEqual((code, out, err), (0, "handoff: current\n", ""))
+        self.assertIs(handoff.update(self.root), True)  # update still writes the lines as they are now
+        self.write_handoff(self.text().replace(", clean", ", dirty"))
+        self.assertTrue(handoff.check(self.root))
+        self.put_status(T2, "in_progress")  # real drift outside the worktree list is still stale
+        self.assertFalse(handoff.check(self.root))
+        handoff.update(self.root)
+        self.write_handoff(self.text().replace("#### Task worktrees", "#### Worktrees"))
+        self.assertFalse(handoff.check(self.root))  # only the lines under the heading are live, not the heading
+
     def test_commit_line_is_the_only_thing_ignored(self):
         handoff.update(self.root)
         lines = self.text().splitlines(keepends=True)
