@@ -19,7 +19,7 @@ from typing import Callable
 
 sys.dont_write_bytecode = True  # before any kit import: running pk must never leave bytecode in the project
 
-from common import KitError, ensure_gitignore, find_root, git, primary_branch_problem, read_yaml  # noqa: E402
+from common import KitError, Refusal, ensure_gitignore, find_root, git, primary_branch_problem, read_yaml  # noqa: E402
 
 KIT_DIR = Path(__file__).resolve().parent.parent
 MIN_PYTHON = (3, 11)
@@ -31,7 +31,7 @@ TEMPLATE_FILES = ("BRIEF.md", "checks.yaml", "environments.yaml", "CLAIM_BOUNDAR
 # Modules that register further subcommands (each defines `register(add_command)`).
 COMMAND_MODULES: tuple[str, ...] = ("status", "rulings", "register", "briefs", "trace", "interview", "evidence",
                                     "stale", "fetch", "gate", "worktree", "handoff", "change", "manifest",
-                                    "cost", "tracker", "land", "fingerprint", "dashboard")
+                                    "cost", "tracker", "land", "fingerprint", "dashboard", "drift")
 
 COMMANDS: dict[str, Callable[[argparse.Namespace], int]] = {}
 CONFIGURERS: dict[str, tuple[str, Callable[[argparse.ArgumentParser], None] | None]] = {}
@@ -75,7 +75,10 @@ def main(argv: list[str] | None = None) -> int:
             raise KitError("no command given (try: pk init)")
         return COMMANDS[args.command](args)
     except KitError as exc:
-        print("error: " + " ".join(str(exc).split()), file=sys.stderr)
+        line = "error: " + " ".join(str(exc).split())
+        if isinstance(exc, Refusal):  # KF-15: on standard output too, so a caller that keeps only one stream sees it
+            print(line, flush=True)
+        print(line, file=sys.stderr)
         return 1
 
 
@@ -153,6 +156,7 @@ def _checks_problems(data) -> list[str]:
         parts = [({key: data.get(key)}, (key,) if key in required else ()) for key in gate.CHECK_KEYS]
         parts.append(({"guarded_files": data.get("guarded_files")}, ()))
         parts.append(({"tiers": data.get("tiers")}, ()))
+        parts.append(({"drift": data.get("drift")}, ()))
         parts.append(({key: value for key, value in data.items() if key not in gate.ALL_KEYS}, ()))
     problems = []
     for part, require in parts:

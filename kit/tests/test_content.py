@@ -11,6 +11,7 @@ KIT = Path(__file__).resolve().parent.parent
 PLAYBOOK_DIR = KIT / "playbooks"
 BRIEF_DIR = KIT / "briefs"
 RULES_DIR = KIT / "rules"
+RUBRIC_DIR = KIT / "rubrics"
 
 PLAYBOOKS = ["00_START.md", "01_discover.md", "02_define_product.md", "03_specify.md", "04_architect.md",
              "05_freeze_review.md", "06_register.md", "07_task_specs.md", "08_execute.md", "09_handoff.md",
@@ -81,8 +82,14 @@ HARD_RULE_LINES = (
 )
 
 
+RUBRICS = {"tenancy-security.md": ("TS", 9), "failure-modes.md": ("FM", 8), "challenger.md": ("CH", 4)}
+DROPPED_LENSES = ("zoom-out", "comprehension", "plant-rigour", "readiness", "synthesizer")
+LENS_CLASSES = ("SAME", "NEW-HIGH", "NEW-LOW", "FALSE", "REJECT")
+
+
 def all_files() -> list:
-    return [PLAYBOOK_DIR / n for n in PLAYBOOKS] + [BRIEF_DIR / n for n in BRIEFS] + [RULES_DIR / n for n in RULES]
+    return ([PLAYBOOK_DIR / n for n in PLAYBOOKS] + [BRIEF_DIR / n for n in BRIEFS] + [RULES_DIR / n for n in RULES]
+            + [BRIEF_DIR / "lens.md", RUBRIC_DIR / "README.md"] + [RUBRIC_DIR / n for n in RUBRICS])
 
 
 def command_parsers() -> dict:
@@ -213,6 +220,69 @@ class BriefTests(unittest.TestCase):
             self.assertLessEqual(len(found["Report shape"].strip().splitlines()), 25 + 6,
                                  f"{name}: report shape is not short")
             self.assertRegex(text, r"(?i)under 25 lines", f"{name}: report limit not stated")
+
+
+class ZeroContextReviewTests(unittest.TestCase):
+    """0.5.0: the lens and challenger reviews a full-tier spec gets, and how spec QA rules on them."""
+
+    def test_the_rubrics_ship_with_numbered_items_and_the_zero_context_rule(self):
+        self.assertEqual(sorted(p.name for p in RUBRIC_DIR.iterdir() if p.suffix == ".md"),
+                         sorted(["README.md", *RUBRICS]))
+        readme = read(RUBRIC_DIR / "README.md")
+        for name, (prefix, count) in RUBRICS.items():
+            text = read(RUBRIC_DIR / name)
+            ids = re.findall(rf"^- ({prefix}-\d+) ", text, re.M)
+            self.assertEqual(ids, [f"{prefix}-{n}" for n in range(1, count + 1)], name)
+            self.assertIn(name, readme)
+            self.assertLess(len(text.encode("utf-8")), 2000, f"{name}: a rubric is short")
+        for needle in ("zero-context", "goldfish", "SPEC.md", "PLAN.md", "CONTRACT.md", "one rubric",
+                       "no rulings", "no controller summary"):
+            self.assertIn(needle, readme)
+        for dropped in DROPPED_LENSES:
+            self.assertFalse((RUBRIC_DIR / f"{dropped}.md").exists(), dropped)
+
+    def test_the_lens_brief_reads_in_full_writes_finding_lines_and_never_writes_the_repository(self):
+        text = read(BRIEF_DIR / "lens.md")
+        found = sections(text)
+        for heading in ("Role", "Read first", "What you do", "Report shape", "Never"):
+            self.assertIn(heading, found, heading)
+        self.assertLessEqual(len(text.splitlines()), 60)
+        self.assertRegex(text, r"(?i)under 25 lines")
+        self.assertIn("in full", found["Read first"])
+        self.assertIn("`ID | severity | anchor | finding | exact fix`", text)
+        self.assertIn("rubric item", text)
+        self.assertIn("scratch folder", text)
+        self.assertRegex(found["Never"], r"(?i)never write, edit, stage or commit anything in the repository")
+        for unread in ("rulings", "HANDOFF", "review.md", "controller-state.json", "git history"):
+            self.assertIn(unread, found["Read first"], unread)
+
+    def test_playbook_07_runs_the_lenses_and_the_challenger_on_the_full_tier_before_spec_qa(self):
+        steps = sections(read(PLAYBOOK_DIR / "07_task_specs.md"))["Steps"]
+        step = next(line for line in steps.splitlines() if line.startswith("6a. "))
+        self.assertLess(steps.index("6a. "), steps.index("7. Start a spec-QA agent"))
+        self.assertLess(steps.index("6. "), steps.index("6a. "))
+        for needle in ("full tier only", "hands back", "before spec QA", "in parallel", "tenancy-security",
+                       "class A", "failure-modes", "class C", "challenger", "before any", "beside the author's",
+                       "kit/briefs/lens.md", "kit/rubrics/"):
+            self.assertIn(needle, step, needle)
+        self.assertIn("phase 2", steps[steps.index("7. Start a spec-QA agent"):])
+
+    def test_playbook_08_runs_pk_drift_after_each_merge_batch(self):
+        steps = sections(read(PLAYBOOK_DIR / "08_execute.md"))["Steps"]
+        self.assertRegex(steps, r"After each merge batch[^\n]*`pk drift`")
+
+    def test_spec_qa_reviews_blind_then_rules_on_every_lens_row_with_no_synthesizer_or_judge(self):
+        text = read(BRIEF_DIR / "spec_qa.md")
+        work = sections(text)["What you do"]
+        self.assertLess(work.index("Phase 1"), work.index("Phase 2"))
+        self.assertIn("blind", work)
+        for cls in LENS_CLASSES:
+            self.assertIn(f"`{cls}`", work, cls)
+        self.assertIn("every lens row", work)
+        self.assertIn("review.md", work)
+        self.assertRegex(work, r"(?i)no synthesizer and no separate judge")
+        self.assertIn("Never fix the spec yourself.", text)  # the accepted rows become findings; the author fixes
+        self.assertRegex(sections(text)["Never"], r"(?i)never read a lens report before your phase 1 findings")
 
 
 class RulesTests(unittest.TestCase):

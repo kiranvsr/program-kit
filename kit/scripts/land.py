@@ -42,7 +42,8 @@ import rulings as rulings_module
 import status as status_module
 import store
 import tracker
-from common import KitError, PRIMARY_BRANCH, find_root, git, read_json, read_yaml, run_argv, utc_now, write_json
+from common import (KitError, PRIMARY_BRANCH, Refusal, find_root, git, read_json, read_yaml, run_argv, utc_now,
+                    write_json)
 
 MAIN = PRIMARY_BRANCH
 ROUND_NAME = re.compile(r"[a-z0-9][a-z0-9-]*\Z")
@@ -488,8 +489,8 @@ def merge(root: Path, task_id: str, inspected: str | None = None, round_name: st
         done = tracker.commit_paths(root, wrote, f"chore(program): {task_id} merged ({tier} tier); hand-off and claims",
                                     trailers)
         lines.append(f"committed {done}" if done else "nothing to commit")
-    if problems:
-        raise KitError("; ".join([*lines, *problems]))
+    if problems:  # merged and committed, then the reasons, on both streams (KF-15)
+        raise Refusal("; ".join([*lines, *problems]))
     return lines
 
 

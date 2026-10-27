@@ -15,7 +15,9 @@ committing the hand-off moves HEAD, which must not make it stale. `update` there
 file alone when nothing else changed, and the commit line names HEAD as of the last real change.
 
 The main checkout is not listed among the worktrees: its dirty state changes whenever this
-file is rewritten, which would make the block unstable.
+file is rewritten, which would make the block unstable. For the same reason `check` does not compare the lines
+under the Task worktrees heading (KF-14): heads, clean or dirty states and short-lived worktrees move with every
+commit and every running agent. `update` still writes them as they are.
 
 The block is compact on purpose. It opens with a "Now" list (the controller's one line, every task in
 flight with its verification tier and, when blocked, what it waits on, the ad-hoc tasks that are open, the
@@ -27,9 +29,10 @@ the fresh-agent threshold of the cost log. When `program/ledger.yaml` exists an 
 list: the stage `pk interview next` names, its topics closed and open, the blocking questions unanswered and the
 assumptions unconfirmed, so a takeover during discovery needs no other command. History is never copied in: it
 lives in `program/rulings.md`.
-`check` also fails when the file is over its size budget (BUDGET_BYTES unless the controller state sets
+`check` (and, after writing the block, `update`) also fails when the file is over its size budget (BUDGET_BYTES unless the controller state sets
 `handoff_budget_bytes`) or its hand-written "Next steps" section is over NEXT_STEPS_BYTES: a successor must
-be able to read the hand-off whole.
+be able to read the hand-off whole. Those refusals name the section and the bytes over, and `pk` prints them on
+standard output as well as standard error (KF-15).
 
 Writing the block changes `program/HANDOFF.md` and no other file, and nothing at all when the block is current.
 """
@@ -47,7 +50,7 @@ import status as status_module
 import trace as trace_module
 import worktree as worktree_module
 import register as register_module
-from common import KitError, find_root, git, primary_branch_problem, read_json, read_text, write_text
+from common import KitError, Refusal, find_root, git, primary_branch_problem, read_json, read_text, write_text
 
 START, END = "<!-- generated:start -->", "<!-- generated:end -->"
 COMMIT_PREFIX = "Commit: "
@@ -210,7 +213,7 @@ def render(root: Path, main: str = "main") -> str:
                for name, number in counts.items()],
              *([f"- not in register: {', '.join(_line(t) for t in unregistered)}"] if unregistered else []), "",
              f"#### Branches not merged into {main}", *_bullets(branches), "",
-             "#### Task worktrees", *_bullets(trees), "",
+             WORKTREES_HEADING, *_bullets(trees), "",
              "#### Queued", *_bullets(tasks(state["queued"])), "",
              "#### Parked", *_bullets(tasks(parked)), "",
              f"#### Ad-hoc tasks closed (newest {ADHOC_CLOSED_SHOWN} of {len(closed)})", *_bullets(closed_lines), "",
@@ -295,10 +298,30 @@ def _round_lines(root: Path) -> list[str]:
 _BEHIND = re.compile(r"(?<=^- Fingerprint: )(.*), \d+ commits behind(?=\r?\n?\Z)")
 
 
-def _comparable(block: str) -> str:
-    """The block without the commit line and without the fingerprint's distance: committing the hand-off moves HEAD."""
-    lines = (line for line in block.splitlines(keepends=True) if not line.startswith(COMMIT_PREFIX))
-    return "".join(_BEHIND.sub(r"\1", line) for line in lines)
+WORKTREES_HEADING = "#### Task worktrees"
+
+
+def _comparable(block: str, live: bool = False) -> str:
+    """The block without the commit line and without the fingerprint's distance: committing the hand-off moves HEAD.
+
+    With `live`, the lines under the Task worktrees heading are left out as well (KF-14): each records a head and a
+    clean or dirty state, and gates and agents add and remove short-lived worktrees, so any commit or running agent
+    changed them. `check` compares this way; `update` still writes the lines as they are now.
+    """
+    kept, skipping = [], False
+    for line in block.splitlines(keepends=True):
+        if line.startswith(COMMIT_PREFIX):
+            continue
+        if live and line.rstrip("\r\n") == WORKTREES_HEADING:
+            kept.append(line)
+            skipping = True
+            continue
+        if skipping:
+            if line.startswith("- "):
+                continue
+            skipping = False
+        kept.append(_BEHIND.sub(r"\1", line))
+    return "".join(kept)
 
 
 def _fingerprint_line(root: Path) -> str:
@@ -351,10 +374,10 @@ def never_generated(root: Path) -> bool:
 
 
 def check(root: Path) -> bool:
-    """True when the block on disk equals the block rendered now, ignoring the commit line."""
+    """True when the block on disk equals the block rendered now, ignoring the commit line and the live worktree lines."""
     _, text = _read(root)
     begin, finish = _split(text)
-    return _comparable(text[begin:finish]) == _comparable(render(root))
+    return _comparable(text[begin:finish], live=True) == _comparable(render(root), live=True)
 
 
 def budget_problems(root: Path) -> list[str]:
@@ -364,15 +387,16 @@ def budget_problems(root: Path) -> list[str]:
     size = len(text.encode("utf-8"))
     problems = []
     if size > budget:
-        problems.append(f"program/HANDOFF.md is {size} bytes, over its budget of {budget}: history belongs in "
-                        "program/rulings.md, closed items in the closed lists; close or tag follow-ups and "
-                        "trim the hand-written sections")
+        problems.append(f"program/HANDOFF.md is {size} bytes, {size - budget} bytes over its budget of {budget}: "
+                        "history belongs in program/rulings.md, closed items in the closed lists; close or tag "
+                        "follow-ups and trim the hand-written sections")
     section = re.search(r"^## Next steps[^\n]*\n(.*?)(?=^## |^[ \t]*" + re.escape(START) + r"|\Z)", text,
                         re.MULTILINE | re.DOTALL)
-    if section and len(section.group(1).encode("utf-8")) > NEXT_STEPS_BYTES:
-        problems.append(f"program/HANDOFF.md: the Next steps section is {len(section.group(1).encode('utf-8'))} "
-                        f"bytes, over {NEXT_STEPS_BYTES}: the generated Now list carries what is in flight; keep "
-                        "only the order of what comes next")
+    steps = len(section.group(1).encode("utf-8")) if section else 0
+    if steps > NEXT_STEPS_BYTES:
+        problems.append(f"program/HANDOFF.md: the Next steps section is {steps} bytes, {steps - NEXT_STEPS_BYTES} "
+                        f"bytes over its budget of {NEXT_STEPS_BYTES}: the generated Now list carries what is in "
+                        "flight; keep only the order of what comes next")
     return problems
 
 
@@ -399,6 +423,9 @@ def cmd_handoff(args: argparse.Namespace) -> int:
     root = find_root()
     if action == "update":
         print("handoff: updated" if update(root) else "handoff: unchanged")
+        problems = budget_problems(root)  # KF-15: the block is written; then say why the file is not fit to hand over
+        if problems:
+            raise Refusal("; ".join(problems))
     elif not check(root):  # check renders first, so a state that does not read is reported before this
         if never_generated(root):  # a new program: not stale, just never written (install and init commit nothing)
             raise KitError("program/HANDOFF.md has no generated block yet (a new program); run: pk handoff update, "
@@ -407,7 +434,7 @@ def cmd_handoff(args: argparse.Namespace) -> int:
     else:
         problems = budget_problems(root)
         if problems:
-            raise KitError("; ".join(problems))
+            raise Refusal("; ".join(problems))
         print("handoff: current")
     return 0
 

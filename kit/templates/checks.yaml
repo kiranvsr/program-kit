@@ -34,3 +34,13 @@ tiers:
   full_paths: []
   light_paths: []
   light_ruling: ""
+# Optional, read by `pk drift` only: the program's own generators, which must leave the tree as committed, and
+# a glob of migration files that a document must each name. For example:
+#
+#   drift:
+#     regenerate:
+#       - - python3
+#         - tools/gen_docs.py
+#     docs_vs_migrations:
+#       glob: db/migrations/*.sql
+#       doc: docs/DATABASE.md

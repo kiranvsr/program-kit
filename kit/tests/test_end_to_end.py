@@ -490,6 +490,20 @@ class EndToEndTests(unittest.TestCase):
         self.assertIn("dashboard: wrote", project.pk("dashboard", page).stdout)
         self.assertIn(TASK, page.read_text(encoding="utf-8"))
         self.assertEqual(project.git("status", "--porcelain"), "")
+        # The drift report after the merge batch (0.5.0): report only, in a temporary worktree it removes again.
+        trees = project.git("worktree", "list", "--porcelain")
+        report = project.pk("drift").stdout
+        self.assertRegex(report, rf"^drift report at {project.git('rev-parse', 'HEAD')[:12]} ")
+        self.assertEqual(len(re.findall(r"^  D[1-6] (?:ok|DRIFT) ", report, re.M)), 6, report)
+        self.assertIn("  D5 ok    every done task has an acceptance record (1 done)", report)
+        self.assertIn("  D3 DRIFT program/HANDOFF.md is stale", report)  # the fingerprint landed after the last update
+        self.assertIn("  1 of 6 checks drift", report)
+        project.pk("drift", "--strict", expect=1)
+        self.assertEqual((project.git("status", "--porcelain"), project.git("worktree", "list", "--porcelain")),
+                         ("", trees))
+        project.pk("handoff", "update")
+        project.commit("hand-off after the fingerprint", "program/HANDOFF.md")
+        self.assertIn("  0 of 6 checks drift", project.pk("drift", "--strict").stdout)
         project.pk("init", expect=1)  # program/ exists: init refuses to overwrite it
 
         pk.build_parser()  # fills pk.COMMANDS: only init and doctor register at import, the rest when it is built
