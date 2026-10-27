@@ -103,6 +103,8 @@ Not every task needs all of that, and the careful ones should not be judged by t
 | `standard` | ordinary work off those paths | QA's re-run of the suite and its planted-bug quota: one scoped review, the suite once at the gate and once at the merge check | `done`, set by QA |
 | `light` | the kinds of change a ruling of your program names | tests, evidence and QA: build, compile check and scans, then the controller reads the diff | `merged`, set by the controller; never `done` |
 
+A full-tier SPEC and PLAN also get two zero-context lens reviews before spec QA (`kit/briefs/lens.md` with `kit/rubrics/tenancy-security.md` and `failure-modes.md`), and a challenger argues against each open-point recommendation before any point goes to you, its new options shown beside the author's. Spec QA reviews blind first, then rules on every lens finding (playbook 07, step 6a).
+
 A fast path (`--fast --ruling R<n>`) replaces SPEC, PLAN and spec QA with one brief and a ruling for small bounded work you ask for directly; it is never available for the full tier. Several accepted branches below the full tier can be verified together in an integration round (`pk integrate`) and still merge one at a time.
 
 The gates enforce all of this from main, not from the branch. In a new program every task is full-tier: the lower tiers exist only once `tiers.full_paths` in `program/checks.yaml` lists the paths that must always be full, and a task below full that changes one of them fails. `docs/DESIGN.md`, section 10.1, lists every guard.
@@ -114,6 +116,7 @@ The gates enforce all of this from main, not from the branch. In a new program e
 - Follow-ups have IDs and are closed, tagged or marked duplicate (`pk followups`); work outside the register is an ad-hoc task (`pk adhoc`) that the hand-off shows like any other.
 - `pk cost add` records each subagent run with the model it ran on, against a register task or an ad-hoc task (`--allow-unknown` for any other ID); `pk cost report` flags an agent past 400,000 tokens or three resumes, when a fresh agent with a tight brief is cheaper than another resume.
 - `pk dashboard <out.html>` (optional) writes the generated hand-off state, the register with statuses and tiers, the gates, the costs and the open follow-ups as one self-contained HTML page (no scripts, no network); write it outside the repository, since a dirty tree stops the gates.
+- `pk drift` (report only; `--rev REV` for another commit) checks, in a temporary worktree, that regenerating the documents changes nothing, that no approved stage's files changed, that the hand-off is current, that every migration is named in its document (optional), that every done task has an acceptance record and that the validators pass. Run it after each merge batch; `--strict` makes it fail for a scheduled run.
 - `pk fingerprint run|plan|validate|show|coverage`: the release fingerprint of section 9.4 of `docs/DESIGN.md`. Run it after a merge that changes the release set or a suite it names, and before a release; keep the `test` step fast and put slow cases in their own tracks (working rule W12).
 - Each role reads only its own brief, its parts of the rules file and `program/COMMON.md`. `kit/playbooks/09_handoff.md` lists the files and their sizes.
 
