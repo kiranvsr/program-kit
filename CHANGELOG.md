@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.5.0 (unreleased)
+## 0.5.0
 
 Sharper review of full-tier specs at a lower cost, and a report of the drift between a program's documents and what they are generated from. It comes from a trial a program ran on three full-tier specs and its merge batches; what the trial dropped is listed below, with its numbers, so that a later program need not run it again. Everything is additive: nothing in `program/` has to change and no existing rule is removed or tightened. A program that adds neither the `drift` section nor the step 6a reviews runs as before, apart from the two hand-off fixes.
 
