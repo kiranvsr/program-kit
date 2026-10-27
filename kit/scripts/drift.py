@@ -58,7 +58,9 @@ def parse(value) -> dict:
     unknown = sorted(str(key) for key in value if key not in KEYS)
     if unknown:
         raise KitError(f"checks.yaml: drift: unknown key {', '.join(unknown)} (expected {', '.join(KEYS)})")
-    commands = value.get("regenerate") or []
+    commands = value.get("regenerate")
+    if commands is None:
+        commands = []
     if not isinstance(commands, list) or not all(
             isinstance(item, list) and item and all(isinstance(part, str) and part for part in item)
             for item in commands):

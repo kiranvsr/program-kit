@@ -194,7 +194,7 @@ class ChecksSectionTests(unittest.TestCase):
         good = {"regenerate": [["python3", "tools/gen.py"]], "docs_vs_migrations": {"glob": "m/*.sql", "doc": "D.md"}}
         self.assertEqual(gate._parse_checks({"drift": good}, ())["drift"], good)
         for bad, needle in (("x", "drift must be a mapping"), ({"other": 1}, "unknown key other"),
-                            ({"regenerate": "python3 gen.py"}, "argv list"),
+                            ({"regenerate": "python3 gen.py"}, "argv list"), ({"regenerate": ""}, "argv list"),
                             ({"regenerate": [["a", ""]]}, "argv list"),
                             ({"docs_vs_migrations": {"glob": "m/*.sql"}}, "glob and doc"),
                             ({"docs_vs_migrations": {"glob": "/abs/*.sql", "doc": "D.md"}}, "relative"),
