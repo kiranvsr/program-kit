@@ -1,6 +1,7 @@
 """The controller's tracking commands: follow-ups, ad-hoc tasks, the cost log, `pk record` and the hand-off budget."""
 import _paths  # noqa: F401  (must come first: puts kit/scripts on sys.path)
 import json
+import re
 import shutil
 import unittest
 from pathlib import Path
@@ -433,6 +434,52 @@ class BudgetTests(TrackerBase):
         self.assertEqual(len(problems), 1)
         self.assertIn("Next steps section", problems[0])
         self.assertEqual(self.cli("handoff", "handoff", "check")[0], 1)
+
+    def bloat_next_steps(self):
+        path = self.root / "program" / "HANDOFF.md"
+        head, tail = path.read_text().split("## Next steps", 1)
+        title, rest = tail.split("\n", 1)
+        path.write_text(head + "## Next steps" + title + "\n" + "1. do the next thing\n" * 120 + rest)
+
+    def assert_refused_on_both_streams(self, out, err, pattern):
+        """KF-15: the refusal is on standard output as well as standard error, so a caller that keeps one sees it."""
+        self.assertRegex(err, pattern)
+        self.assertRegex(out, pattern)
+        match = re.search(pattern, err)
+        size, over, budget = (int(group) for group in match.groups())
+        self.assertEqual(size - budget, over)
+        self.assertGreater(over, 0)
+
+    NEXT_STEPS = r"the Next steps section is (\d+) bytes, (\d+) bytes over its budget of (2048)"
+    WHOLE = r"program/HANDOFF.md is (\d+) bytes, (\d+) bytes over its budget of (60000)"
+
+    def test_update_over_the_next_steps_budget_writes_the_block_and_says_why_on_both_streams(self):
+        self.bloat_next_steps()
+        self.put_in_flight()
+        code, out, err = self.cli("handoff", "handoff", "update")
+        self.assertEqual(code, 1)
+        self.assertEqual(out.splitlines()[0], "handoff: updated")  # the block is still refreshed
+        self.assert_refused_on_both_streams(out, err, self.NEXT_STEPS)
+        self.assertIn("Next steps", err)
+        self.assertTrue(handoff.check(self.root))
+        code, out, err = self.cli("handoff", "handoff", "update")
+        self.assertEqual((code, out.splitlines()[0]), (1, "handoff: unchanged"))
+        self.assert_refused_on_both_streams(out, err, self.NEXT_STEPS)
+        code, out, err = self.cli("handoff", "handoff", "check")
+        self.assertEqual(code, 1)
+        self.assert_refused_on_both_streams(out, err, self.NEXT_STEPS)
+
+    def test_record_over_budget_says_why_on_both_streams_with_the_bytes_over(self):
+        path = self.root / "program" / "HANDOFF.md"
+        path.write_text(path.read_text().replace("## How the program works\n",
+                                                 "## How the program works\n" + "history " * 9000 + "\n"))
+        commit_all(self.root, "a bloated hand-off")
+        code, out, err = self.cli("tracker", "record", "--ruling", "A step.")
+        self.assertEqual(code, 1)
+        self.assert_refused_on_both_streams(out, err, self.WHOLE)
+
+    def put_in_flight(self):
+        status.transition(self.root, TID, "in_progress", "controller")
 
     def test_record_reports_an_over_budget_hand_off_as_a_failure(self):
         path = self.root / "program" / "HANDOFF.md"

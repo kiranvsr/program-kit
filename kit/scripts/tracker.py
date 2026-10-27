@@ -32,7 +32,7 @@ import ctlstate
 import handoff as handoff_module
 import rulings as rulings_module
 import status as status_module
-from common import KitError, PRIMARY_BRANCH, find_root, git, run_argv, utc_now
+from common import KitError, PRIMARY_BRANCH, Refusal, find_root, git, run_argv, utc_now
 
 RECORD_FILES = ("program/rulings.md", ctlstate.STATE_FILE, "program/HANDOFF.md", "program/costs.jsonl")
 NOW_CHARS = 200
@@ -292,8 +292,8 @@ def record(root: Path, ruling: str, question: str = "", precedent: str = "", rol
             elif (root / name).read_bytes() != data:
                 (root / name).write_bytes(data)
         raise
-    if problems:
-        raise KitError("; ".join([*lines, *problems]))
+    if problems:  # committed, then the reason, on both streams (KF-15)
+        raise Refusal("; ".join([*lines, *problems]))
     return lines
 
 

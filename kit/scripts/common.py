@@ -14,6 +14,14 @@ class KitError(Exception):
     """A user-facing failure; scripts print it as one line and exit non-zero."""
 
 
+class Refusal(KitError):
+    """A KitError that `pk` prints on standard output as well as standard error (KF-15).
+
+    For a step that did its work and then refuses over a limit (the hand-off budgets): a caller that keeps only
+    one stream, or discards the other, still sees why it exited non-zero.
+    """
+
+
 def find_root(start: Path | None = None) -> Path:
     """Nearest ancestor of `start` (default: cwd) containing `program/` or `.git`."""
     here = Path(start if start is not None else Path.cwd()).resolve()

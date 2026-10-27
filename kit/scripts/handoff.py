@@ -29,9 +29,10 @@ the fresh-agent threshold of the cost log. When `program/ledger.yaml` exists an 
 list: the stage `pk interview next` names, its topics closed and open, the blocking questions unanswered and the
 assumptions unconfirmed, so a takeover during discovery needs no other command. History is never copied in: it
 lives in `program/rulings.md`.
-`check` also fails when the file is over its size budget (BUDGET_BYTES unless the controller state sets
+`check` (and, after writing the block, `update`) also fails when the file is over its size budget (BUDGET_BYTES unless the controller state sets
 `handoff_budget_bytes`) or its hand-written "Next steps" section is over NEXT_STEPS_BYTES: a successor must
-be able to read the hand-off whole.
+be able to read the hand-off whole. Those refusals name the section and the bytes over, and `pk` prints them on
+standard output as well as standard error (KF-15).
 
 Writing the block changes `program/HANDOFF.md` and no other file, and nothing at all when the block is current.
 """
@@ -49,7 +50,7 @@ import status as status_module
 import trace as trace_module
 import worktree as worktree_module
 import register as register_module
-from common import KitError, find_root, git, primary_branch_problem, read_json, read_text, write_text
+from common import KitError, Refusal, find_root, git, primary_branch_problem, read_json, read_text, write_text
 
 START, END = "<!-- generated:start -->", "<!-- generated:end -->"
 COMMIT_PREFIX = "Commit: "
@@ -386,15 +387,16 @@ def budget_problems(root: Path) -> list[str]:
     size = len(text.encode("utf-8"))
     problems = []
     if size > budget:
-        problems.append(f"program/HANDOFF.md is {size} bytes, over its budget of {budget}: history belongs in "
-                        "program/rulings.md, closed items in the closed lists; close or tag follow-ups and "
-                        "trim the hand-written sections")
+        problems.append(f"program/HANDOFF.md is {size} bytes, {size - budget} bytes over its budget of {budget}: "
+                        "history belongs in program/rulings.md, closed items in the closed lists; close or tag "
+                        "follow-ups and trim the hand-written sections")
     section = re.search(r"^## Next steps[^\n]*\n(.*?)(?=^## |^[ \t]*" + re.escape(START) + r"|\Z)", text,
                         re.MULTILINE | re.DOTALL)
-    if section and len(section.group(1).encode("utf-8")) > NEXT_STEPS_BYTES:
-        problems.append(f"program/HANDOFF.md: the Next steps section is {len(section.group(1).encode('utf-8'))} "
-                        f"bytes, over {NEXT_STEPS_BYTES}: the generated Now list carries what is in flight; keep "
-                        "only the order of what comes next")
+    steps = len(section.group(1).encode("utf-8")) if section else 0
+    if steps > NEXT_STEPS_BYTES:
+        problems.append(f"program/HANDOFF.md: the Next steps section is {steps} bytes, {steps - NEXT_STEPS_BYTES} "
+                        f"bytes over its budget of {NEXT_STEPS_BYTES}: the generated Now list carries what is in "
+                        "flight; keep only the order of what comes next")
     return problems
 
 
@@ -421,6 +423,9 @@ def cmd_handoff(args: argparse.Namespace) -> int:
     root = find_root()
     if action == "update":
         print("handoff: updated" if update(root) else "handoff: unchanged")
+        problems = budget_problems(root)  # KF-15: the block is written; then say why the file is not fit to hand over
+        if problems:
+            raise Refusal("; ".join(problems))
     elif not check(root):  # check renders first, so a state that does not read is reported before this
         if never_generated(root):  # a new program: not stale, just never written (install and init commit nothing)
             raise KitError("program/HANDOFF.md has no generated block yet (a new program); run: pk handoff update, "
@@ -429,7 +434,7 @@ def cmd_handoff(args: argparse.Namespace) -> int:
     else:
         problems = budget_problems(root)
         if problems:
-            raise KitError("; ".join(problems))
+            raise Refusal("; ".join(problems))
         print("handoff: current")
     return 0
 

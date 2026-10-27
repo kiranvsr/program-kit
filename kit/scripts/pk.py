@@ -19,7 +19,7 @@ from typing import Callable
 
 sys.dont_write_bytecode = True  # before any kit import: running pk must never leave bytecode in the project
 
-from common import KitError, ensure_gitignore, find_root, git, primary_branch_problem, read_yaml  # noqa: E402
+from common import KitError, Refusal, ensure_gitignore, find_root, git, primary_branch_problem, read_yaml  # noqa: E402
 
 KIT_DIR = Path(__file__).resolve().parent.parent
 MIN_PYTHON = (3, 11)
@@ -75,7 +75,10 @@ def main(argv: list[str] | None = None) -> int:
             raise KitError("no command given (try: pk init)")
         return COMMANDS[args.command](args)
     except KitError as exc:
-        print("error: " + " ".join(str(exc).split()), file=sys.stderr)
+        line = "error: " + " ".join(str(exc).split())
+        if isinstance(exc, Refusal):  # KF-15: on standard output too, so a caller that keeps only one stream sees it
+            print(line, flush=True)
+        print(line, file=sys.stderr)
         return 1
 
 
