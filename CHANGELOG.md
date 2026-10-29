@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.5.1 (unreleased)
+## 0.5.1
 
 Three speed-ups a program proved locally, so a spec and a fix round each cost fewer gate runs. Everything is additive: nothing in `program/` has to change, every record written before reads as it did, and no command changes what it accepts.
 
