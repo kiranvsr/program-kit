@@ -31,7 +31,7 @@ TEMPLATE_FILES = ("BRIEF.md", "checks.yaml", "environments.yaml", "CLAIM_BOUNDAR
 # Modules that register further subcommands (each defines `register(add_command)`).
 COMMAND_MODULES: tuple[str, ...] = ("status", "rulings", "register", "briefs", "trace", "interview", "evidence",
                                     "stale", "fetch", "gate", "worktree", "handoff", "change", "manifest",
-                                    "cost", "tracker", "land", "fingerprint", "dashboard", "drift")
+                                    "cost", "tracker", "land", "fingerprint", "dashboard", "drift", "precheck")
 
 COMMANDS: dict[str, Callable[[argparse.Namespace], int]] = {}
 CONFIGURERS: dict[str, tuple[str, Callable[[argparse.ArgumentParser], None] | None]] = {}

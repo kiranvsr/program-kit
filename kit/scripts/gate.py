@@ -81,6 +81,8 @@ TAIL_LINES = 20
 TAIL_PREFIX = "    | "
 PLAN_SECTION = "## Exact Commands"
 NOT_EVALUATED, EVIDENCED, BLOCKED = "not_evaluated", "evidenced", "blocked"
+FIX_ON_MAIN = ("(task files stay on main: never edit program/tasks/<ID>/ on the task branch; a needed change goes in "
+               "the hand-back, and the controller makes it on main and merges main into the branch)")
 
 _TASK = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 _REF = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._/-]*\Z")
@@ -749,7 +751,7 @@ def _frozen_brief(root: Path, tree: Path, task_id: str, meta: dict) -> bytes | N
         return None
     own = tree / rel
     if (own.read_bytes() if own.is_file() else None) != authoritative:
-        _out(f"FAILED: brief {rel} differs from {MAIN}")
+        _out(f"FAILED: brief {rel} differs from {MAIN} {FIX_ON_MAIN}")
         return None
     lines = {line.strip() for line in drop_bom(authoritative.decode("utf-8", "replace")).splitlines()}
     missing = [heading for heading in FAST_BRIEF_HEADINGS if heading not in lines]
@@ -805,7 +807,7 @@ def _frozen_contract(root: Path, tree: Path, task_id: str) -> bool:
         return True  # no contract on main: nothing to hold the branch to
     own = tree / rel
     if (own.read_bytes() if own.is_file() else None) != authoritative:
-        _out(f"FAILED: contract {rel} differs from {MAIN}")
+        _out(f"FAILED: contract {rel} differs from {MAIN} {FIX_ON_MAIN}")
         return False
     return True
 
@@ -832,7 +834,7 @@ def _frozen_plan(root: Path, tree: Path, task_id: str) -> bytes | None:
             return None
         own = tree / rel
         if authoritative is None or (own.read_bytes() if own.is_file() else None) != authoritative:
-            _out(f"FAILED: {step} {rel} differs from {MAIN}")
+            _out(f"FAILED: {step} {rel} differs from {MAIN} {FIX_ON_MAIN}")
             return None
         if name == "PLAN.md":
             plan = authoritative
@@ -1250,8 +1252,12 @@ def _report(problems: list[str]) -> int:
 
 def cmd_gate(args: argparse.Namespace) -> int:
     action = getattr(args, "gate_action", None)
-    if action not in ("handback", "merge-check", "binding", "claims", "validate"):
-        raise KitError("gate needs an action: handback, merge-check, binding, claims or validate")
+    if action not in ("handback", "merge-check", "binding", "rejudge", "claims", "validate"):
+        raise KitError("gate needs an action: handback, merge-check, binding, rejudge, claims or validate")
+    if action == "rejudge":
+        import rejudge  # late: rejudge imports this module
+
+        return rejudge.cmd_rejudge(args)
     root = find_root()
     if action == "handback":
         return handback(root, args.task_id, args.branch, worktree=args.worktree)
@@ -1289,6 +1295,9 @@ def _configure(parser: argparse.ArgumentParser) -> None:
                                               "head; drift to the tip is reported")
     bind.add_argument("task_id", metavar="ID", help="task ID, for example P0-M01-S01-T01")
     bind.add_argument("--branch", required=True, help="the task branch")
+    import rejudge  # late: rejudge imports this module
+
+    rejudge.configure(actions)
     make = actions.add_parser("claims", help="write the claim documents of a gate")
     make.add_argument("gate", metavar="GATE", help="gate ID, for example G-P0")
     check = actions.add_parser("validate", help="fail on drift between claim documents and a recomputation")
@@ -1296,5 +1305,5 @@ def _configure(parser: argparse.ArgumentParser) -> None:
 
 
 def register(add_command) -> None:
-    add_command("gate", cmd_gate, help="gate runner: handback, merge-check, binding, claims, validate",
+    add_command("gate", cmd_gate, help="gate runner: handback, merge-check, binding, rejudge, claims, validate",
                 configure=_configure)

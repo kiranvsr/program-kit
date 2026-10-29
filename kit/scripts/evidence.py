@@ -126,7 +126,55 @@ def _clear_bytecode(mirror: Path) -> None:
             dirnames.remove(name)
 
 
-class Evidence:
+class _MirrorCleanup:
+    """What every throwaway mirror shares: its restore to the commit it was made at, and its removal.
+
+    `Evidence.planted_bugs` and `PlantJudge` both use it, so a re-judged row runs on exactly the mirror the gate's
+    runner uses. A subclass sets `self.root` and `self._mirror`; `_after_restore` runs after every restore.
+    """
+
+    root: Path
+    _mirror: "Path | None"
+
+    def _remove_mirror(self, mirror: Path, added: bool) -> str | None:
+        """Remove the mirror; why that failed, or None."""
+        if not added:  # git never registered it: remove the empty directory this call created
+            shutil.rmtree(mirror, ignore_errors=True)
+            return None
+        try:
+            git(self.root, "worktree", "remove", "--force", str(mirror))
+        except KitError as exc:
+            return f"cannot remove mirror {mirror}: {exc}"
+        return None
+
+    def _restore(self, mirror: Path) -> None:
+        """Return the whole mirror to HEAD: tracked edits undone, untracked and ignored files removed.
+
+        Refuses unless `mirror` is the temp directory this instance created and is its own git top level,
+        so `git clean` can never reach the project.
+        """
+        if self._mirror is None or mirror != self._mirror or mirror == self.root \
+                or not mirror.name.startswith("pk-mirror-"):
+            raise KitError(f"refusing to clean {mirror}: not the mirror this run created")
+        if Path(git(mirror, "rev-parse", "--show-toplevel")).resolve() != mirror.resolve():
+            raise KitError(f"refusing to clean {mirror}: it is not its own worktree")
+        git(mirror, "checkout", "--", ".")
+        git(mirror, "clean", "-fdxq")
+
+    def _restore_problem(self, mirror: Path) -> str | None:
+        """Restore the mirror; why that failed, or None."""
+        try:
+            self._restore(mirror)
+            self._after_restore(mirror)
+        except (KitError, OSError) as exc:
+            return f"the mirror could not be restored: {exc}"
+        return None
+
+    def _after_restore(self, mirror: Path) -> None:
+        """Hook run after every restore; the evidence runner needs nothing more."""
+
+
+class Evidence(_MirrorCleanup):
     """One task's evidence run. Construction records the starting state; nothing is written until `write`."""
 
     def __init__(self, root: Path, task_id: str, main: str = "main"):
@@ -344,39 +392,6 @@ class Evidence:
         self.planted_bug_rows = results
         return results
 
-    def _remove_mirror(self, mirror: Path, added: bool) -> str | None:
-        """Remove the mirror; why that failed, or None."""
-        if not added:  # git never registered it: remove the empty directory this call created
-            shutil.rmtree(mirror, ignore_errors=True)
-            return None
-        try:
-            git(self.root, "worktree", "remove", "--force", str(mirror))
-        except KitError as exc:
-            return f"cannot remove mirror {mirror}: {exc}"
-        return None
-
-    def _restore(self, mirror: Path) -> None:
-        """Return the whole mirror to HEAD: tracked edits undone, untracked and ignored files removed.
-
-        Refuses unless `mirror` is the temp directory this instance created and is its own git top level,
-        so `git clean` can never reach the project.
-        """
-        if self._mirror is None or mirror != self._mirror or mirror == self.root \
-                or not mirror.name.startswith("pk-mirror-"):
-            raise KitError(f"refusing to clean {mirror}: not the mirror this run created")
-        if Path(git(mirror, "rev-parse", "--show-toplevel")).resolve() != mirror.resolve():
-            raise KitError(f"refusing to clean {mirror}: it is not its own worktree")
-        git(mirror, "checkout", "--", ".")
-        git(mirror, "clean", "-fdxq")
-
-    def _restore_problem(self, mirror: Path) -> str | None:
-        """Restore the mirror; why that failed, or None."""
-        try:
-            self._restore(mirror)
-        except (KitError, OSError) as exc:
-            return f"the mirror could not be restored: {exc}"
-        return None
-
     def _attempt(self, mirror: Path, rid: str, path: str, edit: Callable[[bytes], bytes], build: list[str] | None,
                  argv: list[str], timeout: int | None) -> tuple[bool, int | None, str]:
         """Edit `path` in the mirror, build, test, restore. Returns (builds, test exit or None, test hash)."""
@@ -570,6 +585,163 @@ class Evidence:
             raise KitError("; ".join(problems))
         appended = store.record(self.root, self.task_id, "results", data)
         return {key: appended[key] for key in ("digest", "path", "file")}
+
+
+# --- one row at a time ------------------------------------------------------------
+
+class PlantJudge(_MirrorCleanup):
+    """Judges single planted-bug rows on a throwaway mirror the way `Evidence.planted_bugs` does, writing nothing.
+
+    Use it as a context manager: entering adds a detached worktree of `ref` in a fresh temp directory (`pk-mirror-`,
+    the evidence runner's own prefix) and runs `prepare(mirror)` when given; leaving removes it. Each `attempt`
+    starts from that clean mirror (`git checkout -- .`, `git clean -fdxq`, then `prepare` again), applies one edit,
+    runs the row's build commands, then its test, and restores the mirror. The verdict is the runner's: killed only
+    when every build command passed and the test exited non-zero; a test exit of 124 or 127 (timeout, program not
+    found) is never a kill and reads `build failed`, as in a results record. A row with no test reports only whether
+    the edit builds (`kill_reason` `builds`). No record, pointer or status is written: this is feedback between gate
+    runs, never evidence. The project's own checkout is never edited.
+
+    A row: `{id, path, find, replace}` with `build_argv` (one argv list, or None) or `build_argvs` (several, run in
+    order), and `test_argv` (an argv list, or None for a build-only row). `find` must occur exactly once in `path`;
+    otherwise, and for a path that leaves the mirror or is not a file, the result carries a `problem` and no verdict.
+    """
+
+    def __init__(self, root, ref: str = "HEAD", prepare: Callable[[Path], None] | None = None,
+                 timeout: int | None = None):
+        self.root = Path(root).resolve()
+        self.ref = ref
+        self.timeout = timeout
+        self._prepare = prepare
+        self._mirror: Path | None = None
+        self._added = False
+
+    def __enter__(self) -> "PlantJudge":
+        mirror = Path(tempfile.mkdtemp(prefix="pk-mirror-")).resolve()
+        self._mirror = mirror
+        try:
+            git(self.root, "worktree", "add", "--detach", str(mirror), self.ref)
+            self._added = True
+            if self._prepare is not None:
+                self._prepare(mirror)
+        except BaseException as exc:
+            problem = self._remove_mirror(mirror, self._added)
+            self._mirror, self._added = None, False
+            if problem and isinstance(exc, KitError):
+                raise KitError(f"{exc}; {problem}") from exc
+            raise
+        return self
+
+    def __exit__(self, kind, exc, trace) -> None:
+        mirror, added = self._mirror, self._added
+        self._mirror, self._added = None, False
+        problem = self._remove_mirror(mirror, added) if mirror is not None else None
+        if problem and exc is None:
+            raise KitError(problem)
+        if problem:
+            exc.add_note(problem)
+
+    @property
+    def mirror(self) -> Path:
+        if self._mirror is None:
+            raise KitError("the plant judge has no mirror: use it in a with block")
+        return self._mirror
+
+    def _after_restore(self, mirror: Path) -> None:
+        if self._prepare is not None:
+            self._prepare(mirror)
+
+    def restore(self) -> None:
+        """Return the mirror to `ref` (and `prepare` again) after a caller ran something in it."""
+        problem = self._restore_problem(self.mirror)
+        if problem:
+            raise KitError(problem)
+
+    def _env(self) -> dict:
+        return dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+
+    def _builds(self, builds: list[list[str]], mirror: Path) -> tuple[int, list[str] | None, str]:
+        """(exit, the failing argv or None, its output) of the build commands, stopping at the first failure."""
+        for argv in builds:
+            code, output = run_argv(argv, mirror, env=self._env(), timeout=self.timeout)
+            if code != 0:
+                return code, list(argv), output
+        return 0, None, ""
+
+    @staticmethod
+    def _build_list(row: dict) -> list[list[str]]:
+        if row.get("build_argvs") is not None:
+            return [_argv(argv, "build") for argv in row["build_argvs"]]
+        if row.get("build_argv") is not None:
+            return [_argv(row["build_argv"], "build")]
+        return []
+
+    def baseline(self, builds: list[list[str]], test: list[str] | None) -> dict:
+        """The unmutated mirror: {ok, step (build or test), argv, exit, tail}. A failing baseline judges nothing."""
+        mirror = self.mirror
+
+        def run() -> dict:
+            _clear_bytecode(mirror)
+            code, argv, output = self._builds(builds, mirror)
+            if code != 0:
+                return {"ok": False, "step": "build", "argv": argv, "exit": code, "tail": _tail(output)}
+            if test is None:
+                return {"ok": True, "step": "build", "argv": None, "exit": 0, "tail": []}
+            code, output = run_argv(_argv(test, "test"), mirror, env=self._env(), timeout=self.timeout)
+            return {"ok": code == 0, "step": "test", "argv": list(test), "exit": code, "tail": _tail(output)}
+
+        return _then(run, lambda: self._restore_problem(mirror), lambda found: f"the baseline gave {found['exit']}")
+
+    def attempt(self, row: dict) -> dict:
+        """One edit on the clean mirror, its build, its test; the result dict described on the class."""
+        mirror = self.mirror
+        rid, path, find, replace = row.get("id"), row.get("path"), row.get("find"), row.get("replace")
+        builds = self._build_list(row)
+        test = _argv(row["test_argv"], "test") if row.get("test_argv") is not None else None
+        result = {"id": rid, "path": path, "find": find, "replace": replace, "builds": None, "killed": None,
+                  "kill_reason": None, "problem": None, "build_argv": None, "build_exit": None, "build_tail": [],
+                  "test_argv": test, "test_exit": None, "test_tail": []}
+        if not isinstance(find, str) or not find or not isinstance(replace, str):
+            return {**result, "problem": "find must be a non-empty string and replace a string"}
+        try:
+            rel = Evidence._norm(path)
+        except KitError as exc:
+            return {**result, "problem": str(exc)}
+        target = mirror / rel
+        if target.is_symlink() or not target.is_file() or not target.resolve().is_relative_to(mirror):
+            return {**result, "problem": f"{rel} is not a regular file in the mirror of {self.ref}"}
+
+        def run() -> dict:
+            raw = target.read_bytes()  # bytes as they are, as the evidence runner edits them
+            try:
+                text = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                return {**result, "problem": f"{rel} is not UTF-8 text"}
+            count = text.count(find)
+            if count != 1:
+                return {**result, "problem": f"find occurs {count} times in {rel} (it must occur exactly once)"}
+            target.write_bytes(text.replace(find, replace).encode("utf-8"))
+            _clear_bytecode(mirror)
+            code, argv, output = self._builds(builds, mirror)
+            if code != 0:
+                return {**result, "builds": False, "killed": False, "kill_reason": "build failed", "build_argv": argv,
+                        "build_exit": code, "build_tail": _tail(output)}
+            done = {**result, "build_exit": 0}
+            if test is None:
+                return {**done, "builds": True, "kill_reason": "builds"}
+            code, output = run_argv(test, mirror, env=self._env(), timeout=self.timeout)
+            done.update(test_exit=code, test_tail=_tail(output))
+            if code in _NO_RUN:  # a timeout or a missing program is never a kill
+                return {**done, "builds": False, "killed": False, "kill_reason": "build failed"}
+            if code != 0:
+                return {**done, "builds": True, "killed": True, "kill_reason": "test failed"}
+            return {**done, "builds": True, "killed": False, "kill_reason": "not killed"}
+
+        return _then(run, lambda: self._restore_problem(mirror),
+                     lambda found: f"planted bug {rid} gave {found.get('kill_reason') or found.get('problem')}")
+
+
+def _tail(output: str, lines: int = 20) -> list[str]:
+    return output.splitlines()[-lines:]
 
 
 # --- validation ------------------------------------------------------------------

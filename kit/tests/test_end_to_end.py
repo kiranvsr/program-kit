@@ -183,6 +183,8 @@ class Project:
         if plan_edit is not None:  # a PLAN the branch cannot fix: the gate reads it from main
             plan = repo / "program" / "tasks" / TASK / "PLAN.md"
             plan.write_text(plan_edit(plan.read_text(encoding="utf-8")), encoding="utf-8")
+        precheck = self.pk("spec", "precheck", f"program/tasks/{TASK}", expect=None if plan_edit else 0).stdout
+        assert plan_edit or precheck.splitlines()[-1] == "spec precheck: clean", precheck  # the author's check (0.5.1)
         self.pk("status", "set", TASK, "in_progress", "--role", "controller")
         self.commit(f"dispatch {TASK}")
         files = set(self.git("show", "--name-only", "--format=", "HEAD").splitlines())
@@ -274,6 +276,13 @@ class EndToEndTests(unittest.TestCase):
         project.commit(f"{TASK}: evidence", record, INDEX, REPORT, STATUS, cwd=wt)
         self.assertEqual(sorted(project.git("show", "--name-only", "--format=", "HEAD", cwd=wt).splitlines()),
                          sorted([record, INDEX, REPORT, STATUS]))
+
+        # Between gate runs, one row re-judged on a clean mirror of the tip (0.5.1): never evidence, nothing written.
+        again = project.pk("gate", "rejudge", TASK, "--branch", BRANCH, "--rows", next(iter(bugs)),
+                           env=project.gate_env).stdout.splitlines()
+        self.assertIn("not gate evidence", again[0])
+        self.assertIn("1 of 1 killed", again[-1])
+        self.assertEqual(project.git("status", "--porcelain", cwd=wt), "")
 
         # QA gets its own detached worktree at the reviewed commit and the diff as a file; the implementer's
         # worktree stays free. The acceptance is committed on the task branch, below.
