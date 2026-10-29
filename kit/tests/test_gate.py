@@ -19,6 +19,7 @@ from unittest import mock
 import evidence
 import gate
 import pk
+import rejudge
 import store
 from common import KitError, read_json, read_yaml, sha256_file, write_yaml
 
@@ -527,6 +528,44 @@ class OutputTests(unittest.TestCase):
         self.assertEqual(source.count("print("), 2)
 
 
+class TaskFilesStayOnMainTests(GitBase):
+    """Every "differs from main" line of the task's own files says how to fix it: the change is made on main."""
+
+    def setUp(self):
+        super().setUp()
+        for name in ("SPEC.md", "PLAN.md", "review.md", "CONTRACT.md"):
+            put(self.root, f"program/tasks/{TASK}/{name}", f"# {name}\n")
+        put(self.root, f"program/tasks/{TASK}/BRIEF.md", "# Brief\n")
+        commit(self.root, "the definition on main")
+        self.tree = self.root.parent / "tree"
+        shutil.copytree(self.root / "program", self.tree / "program")
+
+    def lines(self, function, *args):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertIn(function(self.root, self.tree, TASK, *args), (None, False))
+        return out.getvalue().splitlines()
+
+    def test_spec_plan_review_contract_and_brief_name_the_fix(self):
+        meta = {"tier": "standard", "fast": True, "ruling": "R1"}
+        for name, function, args in (("SPEC.md", gate._frozen_plan, ()), ("PLAN.md", gate._frozen_plan, ()),
+                                     ("review.md", gate._frozen_plan, ()), ("CONTRACT.md", gate._frozen_contract, ()),
+                                     ("BRIEF.md", gate._frozen_brief, (meta,))):
+            with self.subTest(name=name):
+                path = self.tree / "program" / "tasks" / TASK / name
+                original = path.read_text()
+                path.write_text("edited on the branch\n")
+                try:
+                    (line,) = self.lines(function, *args)
+                finally:
+                    path.write_text(original)
+                self.assertTrue(line.startswith("FAILED: "), line)
+                self.assertIn(f"program/tasks/{TASK}/{name} differs from main", line)
+                self.assertTrue(line.endswith(gate.FIX_ON_MAIN), line)
+        self.assertIn("never edit program/tasks/<ID>/ on the task branch", gate.FIX_ON_MAIN)
+        self.assertIn("merges main into the branch", gate.FIX_ON_MAIN)
+
+
 class PlanTests(unittest.TestCase):
     def test_plan_commands_parsed_with_expected_exit(self):
         found = gate.parse_plan(PLAN)
@@ -674,7 +713,7 @@ class HandbackTests(HandbackBase):
         self.set_plan(None)
         rc, out = self.handback()
         self.assertEqual((rc, out.splitlines()[-1]),
-                         (1, f"FAILED: plan program/tasks/{TASK}/PLAN.md differs from main"))
+                         (1, f"FAILED: plan program/tasks/{TASK}/PLAN.md differs from main {gate.FIX_ON_MAIN}"))
 
     def test_branch_editing_its_own_plan_fails_and_identical_plan_passes(self):
         path = self.wt / "program" / "tasks" / TASK / "PLAN.md"
@@ -682,7 +721,7 @@ class HandbackTests(HandbackBase):
         commit(self.wt, "easier plan")
         rc, out = self.handback()
         self.assertEqual((rc, out.splitlines()[-1]),
-                         (1, f"FAILED: plan program/tasks/{TASK}/PLAN.md differs from main"))
+                         (1, f"FAILED: plan program/tasks/{TASK}/PLAN.md differs from main {gate.FIX_ON_MAIN}"))
         path.write_text(PLAN)
         commit(self.wt, "back to the plan on main")
         rc, out = self.handback()
@@ -694,7 +733,7 @@ class HandbackTests(HandbackBase):
         commit(self.wt, "narrow the spec")
         rc, out = self.handback()
         self.assertEqual((rc, out.splitlines()[-1]),
-                         (1, f"FAILED: spec program/tasks/{TASK}/SPEC.md differs from main"))
+                         (1, f"FAILED: spec program/tasks/{TASK}/SPEC.md differs from main {gate.FIX_ON_MAIN}"))
         self.assertEqual([ln for ln in out.splitlines() if ln.startswith("step ")], [])  # refused before anything runs
         self.assert_no_trial_left()
         path.write_text("# Spec\n")
@@ -705,7 +744,7 @@ class HandbackTests(HandbackBase):
     def test_spec_missing_on_the_branch_or_on_main_fails(self):
         (self.wt / "program" / "tasks" / TASK / "SPEC.md").unlink()
         commit(self.wt, "drop spec")
-        expect = (1, f"FAILED: spec program/tasks/{TASK}/SPEC.md differs from main")
+        expect = (1, f"FAILED: spec program/tasks/{TASK}/SPEC.md differs from main {gate.FIX_ON_MAIN}")
         rc, out = self.handback()
         self.assertEqual((rc, out.splitlines()[-1]), expect)
         (self.root / "program" / "tasks" / TASK / "SPEC.md").unlink()
@@ -718,7 +757,7 @@ class HandbackTests(HandbackBase):
         commit(self.root, "amend the spec")
         rc, out = self.handback()
         self.assertEqual((rc, out.splitlines()[-1]),
-                         (1, f"FAILED: spec program/tasks/{TASK}/SPEC.md differs from main"))
+                         (1, f"FAILED: spec program/tasks/{TASK}/SPEC.md differs from main {gate.FIX_ON_MAIN}"))
         sh(self.wt, "git", "merge", "-q", "main")
         rc, out = self.handback()
         self.assertEqual(rc, 0, out)
@@ -747,7 +786,7 @@ class HandbackTests(HandbackBase):
         commit(self.wt, "drop plan")
         rc, out = self.handback()
         self.assertEqual((rc, out.splitlines()[-1]),
-                         (1, f"FAILED: plan program/tasks/{TASK}/PLAN.md differs from main"))
+                         (1, f"FAILED: plan program/tasks/{TASK}/PLAN.md differs from main {gate.FIX_ON_MAIN}"))
 
     def test_missing_produce_script_fails(self):
         (self.wt / "program" / "evidence" / TASK / "produce.py").unlink()
@@ -1159,7 +1198,7 @@ class MergeCheckTests(HandbackBase):
                 commit(self.wt, f"rewrite {name}")
                 rc, out = self.merge_check()
                 self.assertEqual((rc, out.splitlines()[-1]),
-                                 (1, f"FAILED: {label} program/tasks/{TASK}/{name} differs from main"))
+                                 (1, f"FAILED: {label} program/tasks/{TASK}/{name} differs from main {gate.FIX_ON_MAIN}"))
                 self.assertEqual([ln for ln in out.splitlines() if ln.startswith("step ")], [])
                 self.assert_no_trial_left()
 
@@ -1186,7 +1225,7 @@ class ReviewRecordTests(HandbackBase):
     compare the branch's with it."""
 
     REVIEW = f"program/tasks/{TASK}/review.md"
-    LINE = f"FAILED: review program/tasks/{TASK}/review.md differs from main"
+    LINE = f"FAILED: review program/tasks/{TASK}/review.md differs from main {gate.FIX_ON_MAIN}"
     MISSING = f"FAILED: review program/tasks/{TASK}/review.md is missing on main"
 
     def recheck_on_main(self):
@@ -1269,7 +1308,7 @@ class ReviewRecordTests(HandbackBase):
         commit(self.wt, "both")
         rc, out = self.handback()
         self.assertEqual((rc, out.splitlines()[-1]),
-                         (1, f"FAILED: spec program/tasks/{TASK}/SPEC.md differs from main"))
+                         (1, f"FAILED: spec program/tasks/{TASK}/SPEC.md differs from main {gate.FIX_ON_MAIN}"))
 
 
 @skip_unless_slow()
@@ -1337,10 +1376,10 @@ class FixedMainTests(HandbackBase):
         return next(a for a in commands["gate"]._actions if isinstance(a, argparse._SubParsersAction)).choices
 
     def test_no_gate_function_or_subcommand_takes_a_main_branch(self):
-        for function in (gate.handback, gate.merge_check, gate.binding):
+        for function in (gate.handback, gate.merge_check, gate.binding, rejudge.rejudge):
             self.assertNotIn("main", inspect.signature(function).parameters, function.__name__)
         actions = self.gate_actions()
-        self.assertEqual(sorted(actions), ["binding", "claims", "handback", "merge-check", "validate"])
+        self.assertEqual(sorted(actions), ["binding", "claims", "handback", "merge-check", "rejudge", "validate"])
         for name, parser in actions.items():
             options = {option for action in parser._actions for option in action.option_strings}
             self.assertEqual([o for o in options if o.startswith("--m")], [], name)

@@ -13,11 +13,11 @@ What each role reads at start, and nothing more. Sizes are the kit's files as sh
 
 | Role | Reads at start | Kit files, KB |
 |---|---|---|
-| Controller or successor | `program/HANDOFF.md` (60 KB at most), `kit/rules/RULES.md` whole, `kit/briefs/controller.md`, `kit/playbooks/00_START.md`, `kit/playbooks/08_execute.md`, `program/COMMON.md` | 49.3 |
+| Controller or successor | `program/HANDOFF.md` (60 KB at most), `kit/rules/RULES.md` whole, `kit/briefs/controller.md`, `kit/playbooks/00_START.md`, `kit/playbooks/08_execute.md`, `program/COMMON.md` | 50.2 |
 | Implementer, full or standard tier | `kit/rules/RULES.md` parts 1 to 3, `kit/briefs/implementer.md`, `program/COMMON.md`, the task's definition | 19.5 |
-| Implementer, light tier | `kit/rules/RULES.md` parts 1 and 2, `kit/briefs/implementer.md`, `program/COMMON.md`, the task's definition (the fast-path `BRIEF.md`, or its SPEC and PLAN) | 13.7 |
+| Implementer, light tier | `kit/rules/RULES.md` parts 1 and 2, `kit/briefs/implementer.md`, `program/COMMON.md`, the task's definition (the fast-path `BRIEF.md`, or its SPEC and PLAN) | 13.9 |
 | QA | `kit/rules/RULES.md` parts 1 to 3, `kit/briefs/qa.md`, `program/COMMON.md`, the task's definition, the diff file and the stat file | 20.4 |
-| Spec QA | `kit/rules/RULES.md` parts 1 and 2, `kit/briefs/spec_qa.md`, `program/COMMON.md`, the SPEC and PLAN | 13.9 |
+| Spec QA | `kit/rules/RULES.md` parts 1 and 2, `kit/briefs/spec_qa.md`, `program/COMMON.md`, the SPEC and PLAN | 14.0 |
 
 A lens reviewer of a full-tier spec (`07_task_specs.md`, step 6a) reads, by design, no rules file and no `program/COMMON.md`: only `kit/briefs/lens.md`, its one rubric from `kit/rubrics/` and the task's documents.
 
