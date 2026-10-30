@@ -367,8 +367,9 @@ def _acceptance_problem(root: Path, task_id: str, full: bool | None = None) -> s
     with their pointed-at digests; the acceptance has every key acceptance.schema.json requires, accepts
     (`decision` is `accepted_development`), is QA's and this task's, and binds the latest results record by
     digest; that record passes the checks of the hand-back gate (`evidence.gate_problems`); the acceptance's
-    `source_commit` is the `head` the record names; and that `head` is an ancestor of HEAD. Drift since `head`
-    does not matter: the record says what was verified there.
+    `source_commit` is the `head` the record names; that `head` is an ancestor of HEAD; and (0.5.3) every planted-bug
+    row the record deferred has a killed verdict in a `plants` record bound to it (`pk gate plants`). Drift since
+    `head` does not matter: the record says what was verified there.
 
     A full-tier task (`full`; when None, a status record in `root` that names the full tier) needs more: its
     acceptance must list the commands QA re-ran and at least FULL_PLANTED planted bugs of QA's own. That is
@@ -410,6 +411,9 @@ def _acceptance_problem(root: Path, task_id: str, full: bool | None = None) -> s
     code, _ = run_argv(["git", "-C", str(root), "merge-base", "--is-ancestor", record["head"], "HEAD"], Path(root))
     if code != 0:
         return f"{task_id}: {results['path']}: head {record['head']} is not an ancestor of HEAD"
+    uncovered = evidence_module.coverage_problem(root, task_id, results, record)
+    if uncovered:
+        return uncovered
     if _full_tier(root, task_id) if full is None else full:
         commands, planted = bound["commands"], bound["planted_bugs"]
         if not (isinstance(commands, list) and commands and isinstance(planted, list)
@@ -472,6 +476,11 @@ def transition(root: Path, task_id: str, to: str, role: str, note: str = "",
             raise KitError(f"{task_id}: a light-tier task has no QA and is never done; the controller records it "
                            f"merged, or raises its tier with: pk status tier {task_id} <tier> --ruling R<n>")
         problem = _acceptance_problem(root, task_id, full=tier == "full")
+        if problem is None:  # what pk merge would refuse at this tip is reported now (0.5.3)
+            import latework  # late: keeps the module graph flat
+
+            head = store.load_latest(root, task_id, "results")[1]["head"]
+            problem = latework.early_problem(root, task_id, head, f"pk status set {task_id} done")
         if problem:
             raise KitError(problem)
     if to == "merged":

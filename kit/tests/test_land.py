@@ -25,6 +25,7 @@ import evidence
 import gate
 import handoff
 import land
+import latework
 import pk
 import rulings
 import status
@@ -455,7 +456,12 @@ class MergeTests(LandBase):
         problems, said = run_quiet(gate.binding, self.root, TASK, BRANCH)  # qa.md step 2: it holds, and reports drift
         self.assertEqual(problems, [])
         self.assertIn("drifted since", said)
-        self.qa_accepts(self.wt, TASK)  # qa.md step 7, in the task worktree, at whatever the tip is by now
+        with self.assertRaises(KitError) as ctx:  # 0.5.3: pk evidence accept sees the late work first
+            self.qa_accepts(self.wt, TASK)
+        self.assertIn(f"pk evidence accept: {TASK}: {late[:12]} was committed after the reviewed commit "
+                      f"{reviewed[:12]} and changes backdoor.py, calc.py", str(ctx.exception))
+        with mock.patch.object(latework, "early_problem", return_value=None):  # an acceptance made before 0.5.3
+            self.qa_accepts(self.wt, TASK)  # qa.md step 7, in the task worktree, at whatever the tip is by now
         return reviewed, late
 
     def test_a_commit_made_after_the_reviewed_commit_does_not_reach_main(self):

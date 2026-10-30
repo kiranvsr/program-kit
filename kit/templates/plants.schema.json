@@ -1,0 +1,163 @@
+{
+  "title": "program/evidence/<ID>/plants/<utc>-<sha256[:12]>.json",
+  "description": "Appended by pk gate plants (0.5.3), never modified, named by the sha256 of its bytes, listed in the plants list of program/evidence/<ID>/latest.json, and checked by pk evidence validate. The verdicts of planted-bug rows that the results record named in part_of deferred, judged at that record's head in clean detached mirrors, from the definitions the record holds (the producer's commands never run again). A deferred row counts as killed for QA's acceptance, pk status set done and pk merge when a plants record bound to the record (or to a record it reused) judged it killed with the row's definition_sha256.",
+  "type": "object",
+  "required": [
+    "task_id",
+    "kind",
+    "part_of",
+    "head",
+    "kit_version",
+    "produced_at",
+    "workers",
+    "seconds",
+    "rejudge",
+    "rows",
+    "all_killed"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "task_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "kind": {
+      "const": "plants"
+    },
+    "part_of": {
+      "type": "object",
+      "required": [
+        "path",
+        "digest"
+      ],
+      "additionalProperties": false,
+      "description": "the results record whose deferred rows were judged",
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "digest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "head": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$",
+      "description": "the head of that record: the commit judged"
+    },
+    "kit_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "produced_at": {
+      "type": "string",
+      "description": "UTC, YYYY-MM-DDTHH:MM:SSZ"
+    },
+    "workers": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 64
+    },
+    "seconds": {
+      "type": "number",
+      "minimum": 0
+    },
+    "rejudge": {
+      "type": "boolean",
+      "description": "true when --rejudge judged rows a plants record had already judged killed"
+    },
+    "rows": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "builds",
+          "killed",
+          "kill_reason",
+          "test_output_sha256",
+          "path",
+          "find",
+          "replace",
+          "build_argv",
+          "test_argv",
+          "serial",
+          "definition_sha256"
+        ],
+        "description": "a verdict in the results record's row schema (judged: parallel, serial or serial-recheck, from the pool), with the serial flag and definition_sha256 of the deferred row it judged",
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "builds": {
+            "type": "boolean"
+          },
+          "killed": {
+            "type": "boolean"
+          },
+          "kill_reason": {
+            "enum": [
+              "test failed",
+              "build failed",
+              "not killed"
+            ]
+          },
+          "test_output_sha256": {
+            "type": "string",
+            "pattern": "^([0-9a-f]{64})?$"
+          },
+          "path": {
+            "type": "string",
+            "minLength": 1
+          },
+          "find": {
+            "type": "string",
+            "minLength": 1
+          },
+          "replace": {
+            "type": "string"
+          },
+          "build_argv": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "minItems": 1,
+            "items": {
+              "type": "string"
+            }
+          },
+          "test_argv": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "string"
+            }
+          },
+          "serial": {
+            "type": "boolean"
+          },
+          "definition_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "judged": {
+            "enum": [
+              "parallel",
+              "serial",
+              "serial-recheck"
+            ]
+          }
+        }
+      }
+    },
+    "all_killed": {
+      "type": "boolean"
+    }
+  }
+}
