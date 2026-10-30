@@ -41,7 +41,9 @@ def main():
     run.hash_inputs(["src", PLAN, f"program/tasks/{TASK}/SPEC.md", "program/checks.yaml", ".gitignore"])
     plan = (ROOT / PLAN).read_text(encoding="utf-8")
     for argv, expect in gate.parse_plan(plan):  # the PLAN's own lines, never a copy of them
-        run.run_command(" ".join(argv), argv, expect=expect, parse=tests_run if "unittest" in argv else None)
+        # reuse_gate_test takes the row from the hand-back gate's own test step when that step ran this exact argv
+        # at this head (so the suite is not run twice); for any other command, or outside the gate, it runs it.
+        run.reuse_gate_test(" ".join(argv), argv, expect=expect, parse=tests_run if "unittest" in argv else None)
     table = [dict(bug, test_args=TEST_ARGS) for bug in PLANTED_BUGS]
     run.planted_bugs(table, build=BUILD, test=TEST)
     run.write()

@@ -35,13 +35,14 @@
           "as_expected": {"type": "boolean", "description": "exit equals expected_exit and any parse succeeded"},
           "derived": {"type": "object", "description": "fields parsed from the real output"},
           "output_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$", "description": "over the full combined stdout and stderr"},
-          "output_tail": {"type": "string", "description": "last 2000 characters of that output"}
+          "output_tail": {"type": "string", "description": "last 2000 characters of that output"},
+          "from_gate_step": {"enum": ["test"], "description": "optional (0.5.2): the row was built from the hand-back gate's own test step, which ran this argv at this head (Evidence.reuse_gate_test)"}
         }
       }
     },
     "planted_bugs": {
       "type": "array",
-      "description": "one row per planted bug, then exactly one self-test row (id self-test-noncompiling, builds false, killed false)",
+      "description": "one row per planted bug, then exactly one self-test row (id self-test-noncompiling, builds false, killed false). Since 0.5.2 a run with more than one worker adds to every row the optional judged: parallel (judged in the pool), serial (a serial row or the self-test row, judged alone) or serial-recheck (a pool verdict that was not a clean kill, judged again alone); pk evidence validate refuses any other value",
       "items": {
         "type": "object",
         "required": ["id", "builds", "killed", "kill_reason", "test_output_sha256",
@@ -70,6 +71,17 @@
     "deviations": {"type": "array", "items": {"type": "string"}},
     "supersedes": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$",
                    "description": "digest of the task's previous latest results record, or null for its first"},
+    "reused_from": {
+      "type": "object",
+      "description": "optional (0.5.2): the hand-back gate wrote this record by copying the commands and planted-bug rows of the named record, whose head has byte-identical code (evidence.reuse_unchanged_code); head, main, merge_base and inputs are this record's own",
+      "required": ["path", "digest", "head"],
+      "additionalProperties": false,
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "head": {"type": "string", "pattern": "^[0-9a-f]{40}$"}
+      }
+    },
     "children": {
       "type": "array",
       "description": "a gate record only: the child records it binds by digest, with each child's drift at the gate's head",

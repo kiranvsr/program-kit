@@ -13,7 +13,7 @@ What each role reads at start, and nothing more. Sizes are the kit's files as sh
 
 | Role | Reads at start | Kit files, KB |
 |---|---|---|
-| Controller or successor | `program/HANDOFF.md` (60 KB at most), `kit/rules/RULES.md` whole, `kit/briefs/controller.md`, `kit/playbooks/00_START.md`, `kit/playbooks/08_execute.md`, `program/COMMON.md` | 50.2 |
+| Controller or successor | `program/HANDOFF.md` (60 KB at most), `kit/rules/RULES.md` whole, `kit/briefs/controller.md`, `kit/playbooks/00_START.md`, `kit/playbooks/08_execute.md`, `program/COMMON.md` | 51.0 |
 | Implementer, full or standard tier | `kit/rules/RULES.md` parts 1 to 3, `kit/briefs/implementer.md`, `program/COMMON.md`, the task's definition | 19.5 |
 | Implementer, light tier | `kit/rules/RULES.md` parts 1 and 2, `kit/briefs/implementer.md`, `program/COMMON.md`, the task's definition (the fast-path `BRIEF.md`, or its SPEC and PLAN) | 13.9 |
 | QA | `kit/rules/RULES.md` parts 1 to 3, `kit/briefs/qa.md`, `program/COMMON.md`, the task's definition, the diff file and the stat file | 20.4 |

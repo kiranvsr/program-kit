@@ -47,10 +47,14 @@ Limits:
   Commit both (the evidence commit) or remove the record and restore the pointer by exact path before a re-run.
 - A task whose own inputs did not change since its latest record needs no new record: produce.py may append one,
   or leave the fresh record in place. Other tasks' records are never refreshed because a shared input changed.
+- With `evidence.reuse_unchanged_code` (0.5.2, `reuse.py`) a record whose head has byte-identical code is copied
+  for the new head instead of running the test step and produce.py; `reused_from` names it, so its commands are
+  known to have run at that earlier head. `--no-reuse` runs everything.
 """
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import shlex
 import shutil
@@ -61,6 +65,7 @@ import threading
 from pathlib import Path, PurePosixPath
 
 import evidence as evidence_module
+import reuse as reuse_module
 import rulings as rulings_module
 import stale as stale_module
 import status as status_module
@@ -71,7 +76,7 @@ from register import GATE_ID, GATE_SHAPE
 
 MAIN = "main"  # the primary branch; fixed, so no caller can choose where the rules are read from
 CHECK_KEYS = ("build", "test", "scan", "compile_check", "extra_gate")
-ALL_KEYS = CHECK_KEYS + ("parallel_steps", "guarded_files", "tiers", "drift")  # drift: read by `pk drift` only
+ALL_KEYS = CHECK_KEYS + ("parallel_steps", "guarded_files", "tiers", "drift", "evidence")  # drift: `pk drift` only
 TIER_KEYS = ("full_paths", "light_paths", "light_ruling")
 BUILTIN_FULL = ("kit/", "program/checks.yaml", "program/gates.yaml")  # the kit's own gates: always full-tier
 LIGHT_STEPS = ("build", "compile_check", "scan")
@@ -197,6 +202,7 @@ def _parse_checks(data, require: tuple[str, ...]) -> dict:
     import drift  # late: the drift section is pk drift's; the gate only refuses one of the wrong shape
 
     checks["drift"] = drift.parse(data.get("drift"))
+    checks["evidence"] = evidence_module.parse_config(data.get("evidence"))
     for key in require:
         if not checks[key]:
             raise KitError(f"checks.yaml: {key} must list at least one command")
@@ -339,16 +345,20 @@ def trial_merge(root, branch: str, main: str = MAIN) -> Path:
 
 # --- running steps -----------------------------------------------------------------
 
-def _step_lines(step: str, commands: list[tuple[list[str], int]], cwd: Path) -> tuple[bool, list[str]]:
+def _step_lines(step: str, commands: list[tuple[list[str], int]], cwd: Path, env: dict | None = None,
+                sink: list | None = None) -> tuple[bool, list[str]]:
     """Run (argv, expected exit) pairs in order; return (passed, the lines to print) without printing.
 
     Output tail lines are indented with `    | ` so a command can never print a line that looks like
-    the gate's own `OK:` line. An empty list runs nothing and yields no lines.
+    the gate's own `OK:` line. An empty list runs nothing and yields no lines. `sink`, when given, receives
+    `{argv, exit, output}` of every command run (the test step's, for `Evidence.reuse_gate_test`).
     """
     if not commands:
         return True, []
     for argv, expect in commands:
-        code, output = run_argv(argv, cwd, timeout=STEP_TIMEOUT)
+        code, output = run_argv(argv, cwd, env=env, timeout=STEP_TIMEOUT)
+        if sink is not None:
+            sink.append({"argv": list(argv), "exit": code, "output": output})
         if code == expect:
             continue
         if code == 127:
@@ -359,9 +369,10 @@ def _step_lines(step: str, commands: list[tuple[list[str], int]], cwd: Path) -> 
     return True, [f"step {step}: ok"]
 
 
-def _run_commands(step: str, commands: list[tuple[list[str], int]], cwd: Path) -> bool:
+def _run_commands(step: str, commands: list[tuple[list[str], int]], cwd: Path, env: dict | None = None,
+                  sink: list | None = None) -> bool:
     """Run (argv, expected exit) pairs in order; print the first failure and return False."""
-    passed, lines = _step_lines(step, commands, cwd)
+    passed, lines = _step_lines(step, commands, cwd, env, sink)
     for line in lines:
         _out(line)
     return passed
@@ -370,7 +381,7 @@ def _run_commands(step: str, commands: list[tuple[list[str], int]], cwd: Path) -
 PARALLEL_STEPS = ("test", "scan", "extra_gate")  # the steps `parallel_steps` runs together, and the print order
 
 
-def _run_parallel(checks: dict, cwd: Path) -> bool:
+def _run_parallel(checks: dict, cwd: Path, steps: tuple[str, ...] = PARALLEL_STEPS, sink: list | None = None) -> bool:
     """Run test, scan and extra_gate at once, one thread each, then print them in that order.
 
     Each step's commands stay sequential inside its thread and its output is held until all three finished.
@@ -381,16 +392,16 @@ def _run_parallel(checks: dict, cwd: Path) -> bool:
 
     def work(step: str) -> None:
         try:
-            results[step] = _step_lines(step, _commands(checks[step]), cwd)
+            results[step] = _step_lines(step, _commands(checks[step]), cwd, sink=sink if step == "test" else None)
         except BaseException as exc:  # re-raised in the calling thread, in step order
             results[step] = exc
 
-    threads = [threading.Thread(target=work, args=(step,), name=f"pk-gate-{step}") for step in PARALLEL_STEPS]
+    threads = [threading.Thread(target=work, args=(step,), name=f"pk-gate-{step}") for step in steps]
     for thread in threads:
         thread.start()
     for thread in threads:
         thread.join()
-    for step in PARALLEL_STEPS:
+    for step in steps:
         result = results[step]
         if isinstance(result, BaseException):
             raise result
@@ -402,11 +413,17 @@ def _run_parallel(checks: dict, cwd: Path) -> bool:
     return True
 
 
-def _run_late_steps(checks: dict, cwd: Path) -> bool:
-    """test, scan and extra_gate in `cwd`: concurrent when checks.yaml says `parallel_steps: true`, else in order."""
+def _run_late_steps(checks: dict, cwd: Path, skip: tuple[str, ...] = (), sink: list | None = None) -> bool:
+    """test, scan and extra_gate in `cwd`: concurrent when checks.yaml says `parallel_steps: true`, else in order.
+
+    A step named in `skip` does not run (the test step of a hand-back that reuses its evidence). `sink` receives
+    every test command's argv, exit and output.
+    """
+    steps = tuple(step for step in PARALLEL_STEPS if step not in skip)
     if checks["parallel_steps"]:
-        return _run_parallel(checks, cwd)
-    return all(_run_commands(step, _commands(checks[step]), cwd) for step in PARALLEL_STEPS)
+        return _run_parallel(checks, cwd, steps, sink)
+    return all(_run_commands(step, _commands(checks[step]), cwd, sink=sink if step == "test" else None)
+               for step in steps)
 
 
 def _commands(argvs: list[list[str]]) -> list[tuple[list[str], int]]:
@@ -663,8 +680,9 @@ def _unexpected_changes(wt: Path, allowed: str) -> list[str]:
     return [path for path in _changes(wt) if path != allowed]
 
 
-def _evidence_step(wt: Path, task_id: str) -> bool:
-    """Run produce.py, then judge the task's latest results record.
+def _evidence_step(wt: Path, task_id: str, env: dict | None = None, reused: dict | None = None) -> bool:
+    """Run produce.py (with `env`), or write the reused record when `reused` names one, then judge the task's
+    latest results record.
 
     A record appended by this run must pass the gate's checks at the worktree HEAD. When produce.py appended
     nothing, the latest record must still be fresh: its `head` an ancestor of HEAD and none of its inputs changed
@@ -681,7 +699,14 @@ def _evidence_step(wt: Path, task_id: str) -> bool:
     except KitError as exc:
         _out("FAILED: evidence " + " ".join(str(exc).split()))
         return False
-    if not _run_commands("evidence", [(["python3", produce], 0)], wt):
+    if reused is not None:
+        try:
+            written = reuse_module.write(wt, task_id, reused)
+        except KitError as exc:
+            _out("FAILED: evidence " + " ".join(str(exc).replace(str(wt) + "/", "").split()))
+            return False
+        _out(f"step evidence: reused {reused['entry']['path']}, wrote {written['path']}")
+    elif not _run_commands("evidence", [(["python3", produce], 0)], wt, env=env):
         return False
     head = git(wt, "rev-parse", "HEAD")
     try:
@@ -849,16 +874,48 @@ def _run_light(checks: dict, where: Path) -> int:
     return 0
 
 
-def _run_steps(checks: dict, task_id: str, wt: Path, trial: Path, authoritative: bytes, meta: dict) -> int:
+def _reusable(checks: dict, task_id: str, wt: Path, no_reuse: bool) -> dict | None:
+    """The record the hand-back may reuse (`evidence.reuse_unchanged_code`), saying why or why not; else None."""
+    if not checks["evidence"]["reuse_unchanged_code"]:
+        return None
+    if no_reuse:
+        _out("evidence reuse: off for this run (--no-reuse)")
+        return None
+    found, why = reuse_module.find(wt, task_id, checks["evidence"])
+    if found is None:
+        _out(f"evidence reuse: none, {why}")
+        return None
+    _out(f"evidence reuse: {found['entry']['path']} at {found['data']['head']} has the same code as HEAD; "
+         "the test step and produce.py do not run")
+    return found
+
+
+def _run_steps(checks: dict, task_id: str, wt: Path, trial: Path, authoritative: bytes, meta: dict,
+               no_reuse: bool = False) -> int:
     if not _tier_unchanged(wt, task_id, meta):
         return 1
     if meta["tier"] == "light":
         return _run_light(checks, trial)
+    reused = _reusable(checks, task_id, wt, no_reuse)
     for step in ("build", "compile_check"):
         if not _run_commands(step, _commands(checks[step]), trial):
             return 1
-    if not _run_late_steps(checks, wt):
+    results = Path(tempfile.mkdtemp(prefix="pk-gate-test-"))  # outside the worktree, removed below
+    try:
+        return _late_and_evidence(checks, task_id, wt, authoritative, meta, reused, results)
+    finally:
+        shutil.rmtree(results, ignore_errors=True)
+
+
+def _late_and_evidence(checks: dict, task_id: str, wt: Path, authoritative: bytes, meta: dict, reused: dict | None,
+                       results: Path) -> int:
+    sink: list = []
+    if reused is not None:
+        _out("step test: skipped (the reused record holds its results)")
+    if not _run_late_steps(checks, wt, skip=("test",) if reused is not None else (), sink=sink):
         return 1
+    path = results / "test-step.json"
+    write_json(path, {"root": str(wt), "head": git(wt, "rev-parse", "HEAD"), "commands": sink})
     try:
         plan = parse_plan(drop_bom(authoritative.decode("utf-8", "replace")))
     except KitError as exc:
@@ -869,13 +926,17 @@ def _run_steps(checks: dict, task_id: str, wt: Path, trial: Path, authoritative:
         return 1
     if not _run_commands("plan", plan, wt):
         return 1
-    if not _evidence_step(wt, task_id):
+    env = dict(os.environ, **{evidence_module.GATE_TEST_ENV: str(path)})
+    if not _evidence_step(wt, task_id, env=env, reused=reused):
         return 1
     return 0 if _stale_step(wt) else 1
 
 
-def handback(root, task_id: str, branch: str, worktree=None) -> int:
-    """The hand-back gate; 0 and a final `OK:` line only when every step passed."""
+def handback(root, task_id: str, branch: str, worktree=None, no_reuse: bool = False) -> int:
+    """The hand-back gate; 0 and a final `OK:` line only when every step passed.
+
+    `no_reuse` runs the test step and produce.py even when `evidence.reuse_unchanged_code` would reuse a record.
+    """
     root = Path(root).resolve()
     _task_branch(task_id, branch)
     sha = _branch_head(root, branch)
@@ -892,7 +953,7 @@ def handback(root, task_id: str, branch: str, worktree=None) -> int:
     if authoritative is None:
         return 1
     trial = trial_merge(root, branch)
-    code = _with_trial(root, trial, lambda: _run_steps(checks, task_id, wt, trial, authoritative, meta))
+    code = _with_trial(root, trial, lambda: _run_steps(checks, task_id, wt, trial, authoritative, meta, no_reuse))
     if code:
         return code
     if git(wt, "rev-parse", "HEAD") != sha or _branch_head(root, branch) != sha:
@@ -1260,7 +1321,7 @@ def cmd_gate(args: argparse.Namespace) -> int:
         return rejudge.cmd_rejudge(args)
     root = find_root()
     if action == "handback":
-        return handback(root, args.task_id, args.branch, worktree=args.worktree)
+        return handback(root, args.task_id, args.branch, worktree=args.worktree, no_reuse=args.no_reuse)
     if action == "merge-check":
         return merge_check(root, args.branch, inspected=args.inspected)
     if action == "binding":
@@ -1284,6 +1345,8 @@ def _configure(parser: argparse.ArgumentParser) -> None:
     hand.add_argument("task_id", metavar="ID", help="task ID, for example P0-M01-S01-T01")
     hand.add_argument("--branch", required=True, help="the task branch")
     hand.add_argument("--worktree", help="the task worktree (default: <root>/.worktrees/<id lowercased>)")
+    hand.add_argument("--no-reuse", action="store_true", help="run the test step and produce.py even when "
+                                                              "evidence.reuse_unchanged_code would reuse a record")
     # No subcommand takes a main-branch option: the rules are always read from `main`.
     merge = actions.add_parser("merge-check", help="the controller's gate run before a merge: guarded files, "
                                                    "SPEC, PLAN and review.md, then build, test and scan on a "
