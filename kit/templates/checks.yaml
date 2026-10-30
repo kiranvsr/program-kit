@@ -44,3 +44,13 @@ tiers:
 #     docs_vs_migrations:
 #       glob: db/migrations/*.sql
 #       doc: docs/DATABASE.md
+# Optional (0.5.2), speeds up the evidence step; absent, everything runs one at a time as before:
+#
+#   evidence:
+#     plant_workers: 4            # planted-bug rows judged at once, each in its own mirror; rows marked
+#                                 # serial: true (browser, e2e, fixed port) run alone after the pool
+#     reuse_unchanged_code: true  # the hand-back gate reuses the latest record when the code is byte-identical
+#     reuse_ignore:               # paths outside program/ that are not code (never kit/ or a lockfile)
+#       - docs/
+#     reuse_compare:              # paths under program/ the producer reads, compared like code
+#       - program/tools/

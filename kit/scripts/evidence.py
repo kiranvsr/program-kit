@@ -37,6 +37,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Callable
 
@@ -66,6 +69,102 @@ _DERIVED_FILES = ("program/controller-state.json", "program/progress.md", "progr
                   "program/changes/register-log.md")
 _RECORD_NAMES = ("results.json", "acceptance.json")
 DECISIONS = ("accepted_development", "rejected")
+
+# --- the `evidence` section of checks.yaml (0.5.2) ---------------------------------------------------------------
+EVIDENCE_KEYS = ("plant_workers", "reuse_unchanged_code", "reuse_ignore", "reuse_compare")
+PLANT_WORKERS_ENV = "PK_PLANT_WORKERS"  # overrides evidence.plant_workers; an explicit `workers=` overrides both
+GATE_TEST_ENV = "PK_GATE_TEST_RESULTS"  # the hand-back gate's test-step results, for `Evidence.reuse_gate_test`
+MAX_WORKERS = 64
+JUDGED = ("parallel", "serial", "serial-recheck")  # a planted-bug row's optional `judged`, written by a parallel run
+# A sign that a test failed because of the machine, not the mutant: a pool verdict showing one is judged again alone.
+RESOURCE_ERROR = re.compile(
+    r"EADDRINUSE|address already in use|port is already allocated"
+    r"|ECONNREFUSED[^\n]*(?:127\.\d+\.\d+\.\d+|localhost|::1)"
+    r"|out of memory|cannot allocate memory|ENOMEM|ENOSPC|no space left on device|EMFILE|too many open files"
+    r"|timed out", re.IGNORECASE)
+
+
+def _config_paths(value, key: str, under_program: bool) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list) or not all(isinstance(item, str) and item for item in value):
+        raise KitError(f"checks.yaml: evidence.{key} must be a list of paths")
+    paths = []
+    for item in value:
+        while item.startswith("./"):
+            item = item[2:]
+        pure = PurePosixPath(item)
+        if not item or item.startswith("/") or ".." in pure.parts:
+            raise KitError(f"checks.yaml: evidence.{key}: {item!r} must be a path relative to the root")
+        inside = item.startswith("program/")
+        if under_program and not inside:
+            raise KitError(f"checks.yaml: evidence.{key}: {item!r} is not under program/ (every path outside "
+                           "program/ is compared already)")
+        if not under_program and (inside or item.rstrip("/") == "program"):
+            raise KitError(f"checks.yaml: evidence.{key}: {item!r} is under program/, which is never compared "
+                           "unless evidence.reuse_compare names it")
+        if not under_program and (item.rstrip("/") == "kit" or item.startswith("kit/")):
+            raise KitError(f"checks.yaml: evidence.{key}: {item!r} is the kit, which is always compared")
+        paths.append(item)
+    return paths
+
+
+def parse_config(value) -> dict:
+    """The `evidence` section of checks.yaml: {plant_workers, reuse_unchanged_code, reuse_ignore, reuse_compare}.
+
+    Absent means one worker, no reuse and no paths, which is how every program ran before 0.5.2.
+    """
+    if value is None:
+        value = {}
+    if not isinstance(value, dict):
+        raise KitError("checks.yaml: evidence must be a mapping of " + ", ".join(EVIDENCE_KEYS))
+    unknown = sorted(str(key) for key in value if key not in EVIDENCE_KEYS)
+    if unknown:
+        raise KitError(f"checks.yaml: evidence: unknown key {', '.join(unknown)} (expected {', '.join(EVIDENCE_KEYS)})")
+    workers = value.get("plant_workers", 1)
+    if workers is None:
+        workers = 1
+    if not (isinstance(workers, int) and not isinstance(workers, bool) and 1 <= workers <= MAX_WORKERS):
+        raise KitError(f"checks.yaml: evidence.plant_workers must be a whole number from 1 to {MAX_WORKERS}")
+    reuse = value.get("reuse_unchanged_code", False)
+    if reuse is None:
+        reuse = False
+    if not isinstance(reuse, bool):
+        raise KitError("checks.yaml: evidence.reuse_unchanged_code must be true or false")
+    return {"plant_workers": workers, "reuse_unchanged_code": reuse,
+            "reuse_ignore": _config_paths(value.get("reuse_ignore"), "reuse_ignore", False),
+            "reuse_compare": _config_paths(value.get("reuse_compare"), "reuse_compare", True)}
+
+
+def config_at(root, ref: str = "HEAD") -> dict:
+    """The `evidence` section of `program/checks.yaml` as committed at `ref`; the defaults without the file."""
+    import miniyaml  # late: only a run that reads its configuration needs the parser
+
+    try:
+        raw = _git_bytes(Path(root), "show", f"{ref}:program/checks.yaml")
+    except KitError:
+        return parse_config(None)
+    try:
+        data = miniyaml.loads(raw.decode("utf-8").removeprefix("\ufeff"))
+    except (UnicodeDecodeError, miniyaml.YAMLError) as exc:
+        raise KitError(f"program/checks.yaml at {ref} cannot be read: {exc}") from exc
+    return parse_config(data.get("evidence") if isinstance(data, dict) else None)
+
+
+def plant_workers(root, workers: int | None = None) -> int:
+    """How many planted-bug rows run at once: `workers` when given, else PK_PLANT_WORKERS, else
+    `evidence.plant_workers` of the committed checks.yaml, else 1."""
+    if workers is None:
+        raw = os.environ.get(PLANT_WORKERS_ENV, "").strip()
+        if raw:
+            if not raw.isdigit():
+                raise KitError(f"{PLANT_WORKERS_ENV} must be a whole number from 1 to {MAX_WORKERS}, not {raw!r}")
+            workers = int(raw)
+        else:
+            workers = config_at(root)["plant_workers"]
+    if not (isinstance(workers, int) and not isinstance(workers, bool) and 1 <= workers <= MAX_WORKERS):
+        raise KitError(f"planted-bug workers must be a whole number from 1 to {MAX_WORKERS}, not {workers!r}")
+    return workers
 
 
 def required_keys(name: str) -> list[str]:
@@ -199,6 +298,7 @@ class Evidence(_MirrorCleanup):
         self.blocked_by: list[str] = []
         self.deviations: list[str] = []
         self.children: list[dict] = []  # a gate record's child records, by digest
+        self.reused_from: dict | None = None  # {path, digest, head} of the record a reused run copied (0.5.2)
 
     # --- tree ------------------------------------------------------------------
 
@@ -275,6 +375,14 @@ class Evidence(_MirrorCleanup):
         """
         argv = _argv(argv, "command")
         code, output = run_argv(argv, Path(cwd) if cwd is not None else self.root, timeout=timeout)
+        record = self._command_record(label, argv, expect, parse, code, output)
+        self.commands.append(record)
+        return record
+
+    @staticmethod
+    def _command_record(label: str, argv: list[str], expect: int, parse: Callable[[str], dict] | None, code: int,
+                        output: str) -> dict:
+        """The command row of a command that exited `code` printing `output` (what `run_command` records)."""
         derived: dict = {}
         parsed_ok = True
         if parse is not None:
@@ -291,6 +399,24 @@ class Evidence(_MirrorCleanup):
             "as_expected": code == expect and parsed_ok, "derived": derived,
             "output_sha256": sha256_bytes(output.encode("utf-8")), "output_tail": output[-OUTPUT_TAIL:],
         }
+        return record
+
+    def reuse_gate_test(self, label: str, argv: list[str], parse: Callable[[str], dict] | None = None,
+                        expect: int = 0, timeout: int | None = None) -> dict:
+        """The row `run_command(label, argv, expect, parse)` records, taken from the hand-back gate's own test step
+        when that step ran exactly `argv` in this root at this head; otherwise the command is run.
+
+        The gate's test step runs `checks.yaml`'s test commands in the task worktree at the head this run records,
+        and hands their exit and full output to produce.py through PK_GATE_TEST_RESULTS. A command whose argv is
+        byte-identical to one of them, run from the root (no `cwd`), is not run again: its row is built from that
+        output as `run_command` would build it, and carries `from_gate_step: "test"`. Without the variable (a run
+        outside the gate), with a file for another root or head, or for any other command, this is `run_command`.
+        """
+        argv = _argv(argv, "command")
+        found = gate_test_output(self.root, self.head, argv)
+        if found is None:
+            return self.run_command(label, argv, expect=expect, parse=parse, timeout=timeout)
+        record = {**self._command_record(label, argv, expect, parse, *found), "from_gate_step": "test"}
         self.commands.append(record)
         return record
 
@@ -317,6 +443,9 @@ class Evidence(_MirrorCleanup):
                 raise KitError(f"planted bug {rid}: replace equals find, so nothing is planted")
             if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
                 raise KitError(f"planted bug {rid}: test_args must be a list of strings")
+            serial = raw.get("serial", False)
+            if not isinstance(serial, bool):
+                raise KitError(f"planted bug {rid}: serial must be true or false")
             path = self._norm(raw.get("path"))
             if self._object_type(path) != "blob":
                 raise KitError(f"planted bug {rid}: {path} is not a tracked file at HEAD")
@@ -331,18 +460,19 @@ class Evidence(_MirrorCleanup):
             if count != 1:
                 raise KitError(f"planted bug {rid}: find occurs {count} times in {path} (it must occur exactly "
                                "once); fix the table")
-            rows.append({"id": rid, "path": path, "find": find, "replace": replace, "test_args": args})
+            rows.append({"id": rid, "path": path, "find": find, "replace": replace, "test_args": args,
+                         "serial": serial})
         return rows
 
     def planted_bugs(self, table: list[dict], build: list[str] | None, test: list[str],
-                     timeout: int | None = None) -> list[dict]:
+                     timeout: int | None = None, workers: int | None = None) -> list[dict]:
         """Apply each planted bug to a mirror of HEAD, build, run the test; return one row per bug.
 
         Row: `{id, builds, killed, kill_reason, test_output_sha256, path, find, replace, build_argv,
         test_argv}`: the last five say what was planted (the file and the edit) and which build and test
         argv judged it. The mirror is `git worktree add --detach` of HEAD in a fresh temp dir and is
         always removed; the working tree is never edited. A table row is
-        `{id, path, find, replace, test_args}`; `test` is the
+        `{id, path, find, replace, test_args}`, and optionally `serial: true` (see below); `test` is the
         base argv and a row's `test_args` are appended. `find` must occur exactly once in `path`.
         A row is killed only when the build passed and the test exited non-zero. The unmutated
         mirror must pass first, once per distinct `test_args`, so a test that already fails cannot
@@ -371,10 +501,28 @@ class Evidence(_MirrorCleanup):
 
         A failure to restore or remove the mirror never replaces or hides what a row did: the error names
         the row's own error or result first, then the failure to clean up.
+
+        Workers (0.5.2). `workers` rows are judged at once; None means PK_PLANT_WORKERS, else
+        `evidence.plant_workers` of the committed `program/checks.yaml`, else 1. With one worker the run is
+        exactly the one above: one mirror, restored between rows, and rows without a `judged` field. With more,
+        every baseline and every row runs in its own fresh mirror (added and removed one at a time, so git's
+        index lock never races), `serial: true` rows (and their baselines) and the self-test row run after the
+        pool, one at a time, and every row gains `judged`: `parallel`, `serial`, or `serial-recheck` for a pool
+        verdict that was judged again alone because it was not a clean kill (any row that did not build or was
+        not killed, a kill whose output shows a resource error such as EADDRINUSE, ECONNREFUSED on localhost,
+        a timeout, out of memory, ENOSPC or EMFILE, and every kill of a test whose baseline failed in the pool).
+        A baseline that fails in the pool is run again alone before it can fail the run. The rows keep the
+        table's order. Rows that use a browser or a fixed port must be marked `serial: true`. One line per
+        finished baseline and row is printed to standard output.
         """
         rows = self._check_table(table)
         test = _argv(test, "test")
         build = _argv(build, "build") if build is not None else None
+        count = plant_workers(self.root, workers)
+        if count > 1:
+            results = _PlantPool(self, rows, build, test, timeout, count).run()
+            self.planted_bug_rows = results
+            return results
         mirror = Path(tempfile.mkdtemp(prefix="pk-mirror-"))
         added = []  # non-empty once git has registered the mirror
         self._mirror = mirror
@@ -392,45 +540,82 @@ class Evidence(_MirrorCleanup):
         self.planted_bug_rows = results
         return results
 
-    def _attempt(self, mirror: Path, rid: str, path: str, edit: Callable[[bytes], bytes], build: list[str] | None,
-                 argv: list[str], timeout: int | None) -> tuple[bool, int | None, str]:
-        """Edit `path` in the mirror, build, test, restore. Returns (builds, test exit or None, test hash)."""
+    def _judge(self, mirror: Path, rid: str, path: str, edit: Callable[[bytes], bytes], build: list[str] | None,
+               argv: list[str], timeout: int | None, cleaner: "_MirrorCleanup | None" = None
+               ) -> tuple[bool, int | None, str, str]:
+        """Edit `path` in the mirror, build, test, restore (through `cleaner`, by default this instance).
+
+        Returns (builds, test exit or None, test output hash, the output of the failing build or of the test).
+        """
         env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
         target = mirror / path
 
-        def run() -> tuple[bool, int | None, str]:
+        def run() -> tuple[bool, int | None, str, str]:
             target.write_bytes(edit(target.read_bytes()))
             _clear_bytecode(mirror)
             if build is not None:
-                code, _ = run_argv(build, mirror, env=env, timeout=timeout)
+                code, output = run_argv(build, mirror, env=env, timeout=timeout)
                 if code != 0:
-                    return False, None, ""
+                    return False, None, "", output
             code, output = run_argv(argv, mirror, env=env, timeout=timeout)
             builds = code not in _NO_RUN  # a timeout or a missing program is never a kill
-            return builds, code, sha256_bytes(output.encode("utf-8"))
+            return builds, code, sha256_bytes(output.encode("utf-8")), output
 
         def gave(result) -> str:
             return (f"planted bug {rid} gave builds: {str(result[0]).lower()}, "
                     f"test exit: {'not run' if result[1] is None else result[1]}")
 
-        return _then(run, lambda: self._restore_problem(mirror), gave)
+        return _then(run, lambda: (cleaner or self)._restore_problem(mirror), gave)
 
-    def _baseline(self, mirror: Path, build: list[str] | None, argv: list[str], rid: str,
-                  timeout: int | None) -> None:
+    def _attempt(self, mirror: Path, rid: str, path: str, edit: Callable[[bytes], bytes], build: list[str] | None,
+                 argv: list[str], timeout: int | None,
+                 cleaner: "_MirrorCleanup | None" = None) -> tuple[bool, int | None, str]:
+        """Edit `path` in the mirror, build, test, restore. Returns (builds, test exit or None, test hash)."""
+        return self._judge(mirror, rid, path, edit, build, argv, timeout, cleaner)[:3]
+
+    def _baseline_problem(self, mirror: Path, build: list[str] | None, argv: list[str], rid: str,
+                          timeout: int | None, cleaner: "_MirrorCleanup | None" = None) -> str | None:
+        """Why the unmutated mirror does not build or pass `argv`, or None; the mirror is restored either way."""
         env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
 
-        def run() -> None:
+        def run() -> str | None:
             if build is not None:
                 code, _ = run_argv(build, mirror, env=env, timeout=timeout)
                 if code != 0:
-                    raise KitError(f"unmutated mirror does not build (exit {code}); fix the build before planting "
-                                   f"bugs (row {rid})")
+                    return (f"unmutated mirror does not build (exit {code}); fix the build before planting bugs "
+                            f"(row {rid})")
             code, _ = run_argv(argv, mirror, env=env, timeout=timeout)
             if code != 0:
-                raise KitError(f"unmutated mirror fails its own test (exit {code}); a failing test kills "
-                               f"nothing (row {rid})")
+                return f"unmutated mirror fails its own test (exit {code}); a failing test kills nothing (row {rid})"
+            return None
 
-        _then(run, lambda: self._restore_problem(mirror), lambda _: f"unmutated mirror passes its test (row {rid})")
+        return _then(run, lambda: (cleaner or self)._restore_problem(mirror),
+                     lambda found: found or f"unmutated mirror passes its test (row {rid})")
+
+    def _baseline(self, mirror: Path, build: list[str] | None, argv: list[str], rid: str,
+                  timeout: int | None, cleaner: "_MirrorCleanup | None" = None) -> None:
+        problem = self._baseline_problem(mirror, build, argv, rid, timeout, cleaner)
+        if problem:
+            raise KitError(problem)
+
+    @staticmethod
+    def _planter(item: dict) -> Callable[[bytes], bytes]:
+        def plant(data: bytes) -> bytes:
+            return data.decode("utf-8").replace(item["find"], item["replace"]).encode("utf-8")
+
+        return plant
+
+    def _row(self, item: dict, builds: bool, code: int | None, digest: str, build: list[str] | None,
+             argv: list[str]) -> dict:
+        """A planted-bug row from what its attempt gave: killed only when it built and the test exited non-zero."""
+        if not builds:
+            killed, reason = False, "build failed"
+        elif code != 0:
+            killed, reason = True, "test failed"
+        else:
+            killed, reason = False, "not killed"
+        return {"id": item["id"], "builds": builds, "killed": killed, "kill_reason": reason,
+                "test_output_sha256": digest, **self._planted(item["path"], item["find"], item["replace"], build, argv)}
 
     def _run_rows(self, mirror: Path, rows: list[dict], build: list[str] | None, test: list[str],
                   timeout: int | None) -> list[dict]:
@@ -440,20 +625,9 @@ class Evidence(_MirrorCleanup):
             if tuple(argv) not in checked:
                 self._baseline(mirror, build, argv, item["id"], timeout)
                 checked.add(tuple(argv))
-
-            def plant(data: bytes, item=item) -> bytes:
-                return data.decode("utf-8").replace(item["find"], item["replace"]).encode("utf-8")
-
-            builds, code, digest = self._attempt(mirror, item["id"], item["path"], plant, build, argv, timeout)
-            if not builds:
-                killed, reason = False, "build failed"
-            elif code != 0:
-                killed, reason = True, "test failed"
-            else:
-                killed, reason = False, "not killed"
-            results.append({"id": item["id"], "builds": builds, "killed": killed, "kill_reason": reason,
-                            "test_output_sha256": digest,
-                            **self._planted(item["path"], item["find"], item["replace"], build, argv)})
+            builds, code, digest = self._attempt(mirror, item["id"], item["path"], self._planter(item), build, argv,
+                                                 timeout)
+            results.append(self._row(item, builds, code, digest, build, argv))
         results.append(self._self_test(mirror, rows[0], build, test + rows[0]["test_args"], timeout))
         return results
 
@@ -464,12 +638,13 @@ class Evidence(_MirrorCleanup):
                 "build_argv": list(build) if build is not None else None, "test_argv": list(argv)}
 
     def _self_test(self, mirror: Path, first: dict, build: list[str] | None, argv: list[str],
-                   timeout: int | None) -> dict:
+                   timeout: int | None, cleaner: "_MirrorCleanup | None" = None) -> dict:
         def break_file(data: bytes) -> bytes:
             lead = b"" if not data or data.endswith(b"\n") else b"\n"
             return data + lead + BROKEN_LINE.encode() + b"\n"
 
-        builds, code, digest = self._attempt(mirror, SELF_TEST_ID, first["path"], break_file, build, argv, timeout)
+        builds, code, digest = self._attempt(mirror, SELF_TEST_ID, first["path"], break_file, build, argv, timeout,
+                                             cleaner)
         if build is None:
             if code == 0:
                 raise KitError(f"self-test cannot be trusted: {first['path']} with an unparseable line still "
@@ -579,12 +754,190 @@ class Evidence(_MirrorCleanup):
         }
         if self.children:
             data["children"] = [dict(child) for child in self.children]
+        if self.reused_from is not None:
+            data["reused_from"] = dict(self.reused_from)
         # last line of defence: never append what validate or the lint would refuse
         problems = validate_results(data) + lint_record(data, self.root)
         if problems:
             raise KitError("; ".join(problems))
         appended = store.record(self.root, self.task_id, "results", data)
         return {key: appended[key] for key in ("digest", "path", "file")}
+
+
+# --- the gate's test-step output (0.5.2) ------------------------------------------
+
+def gate_test_output(root, head: str, argv: list[str]) -> tuple[int, str] | None:
+    """(exit, full output) of `argv` as the hand-back gate's test step ran it in `root` at `head`, or None.
+
+    Read from the file PK_GATE_TEST_RESULTS names: `{"root", "head", "commands": [{"argv", "exit", "output"}]}`.
+    No variable, an unreadable or malformed file, another root or head, or no byte-identical argv gives None, so
+    the caller runs the command itself.
+    """
+    name = os.environ.get(GATE_TEST_ENV)
+    if not name:
+        return None
+    try:
+        data = read_json(Path(name))
+    except KitError:
+        return None
+    if not isinstance(data, dict) or data.get("head") != head or not isinstance(data.get("root"), str) \
+            or Path(data["root"]).resolve() != Path(root).resolve() or not isinstance(data.get("commands"), list):
+        return None
+    for command in data["commands"]:
+        if isinstance(command, dict) and command.get("argv") == argv and _is_int(command.get("exit")) \
+                and isinstance(command.get("output"), str):
+            return command["exit"], command["output"]
+    return None
+
+
+# --- parallel planted-bug judging (0.5.2) -----------------------------------------
+
+class _Slot(_MirrorCleanup):
+    """The mirror of one job of a parallel run: its restore guard knows that mirror and no other."""
+
+    def __init__(self, root: Path, mirror: Path):
+        self.root = root
+        self._mirror = mirror
+
+
+class _PlantPool:
+    """`Evidence.planted_bugs` with more than one worker (its docstring says what a run guarantees).
+
+    Order: the baselines and the rows not marked `serial` in a pool of threads, each job in its own fresh mirror of
+    the recorded head; then, one at a time, every baseline that failed in the pool, every pool verdict that is not a
+    clean kill (or that a failed pool baseline puts in doubt), the serial rows with their baselines, and last the
+    self-test row. A job's mirror is added and removed under one lock; nothing else is shared between jobs.
+    """
+
+    def __init__(self, ev: "Evidence", rows: list[dict], build: list[str] | None, test: list[str],
+                 timeout: int | None, workers: int):
+        self.ev, self.rows, self.build, self.test = ev, rows, build, test
+        self.timeout, self.workers = timeout, workers
+        self._git_lock = threading.Lock()  # git worktree add and remove, one at a time
+        self._print_lock = threading.Lock()
+        self._done = 0
+
+    def _argv(self, item: dict) -> list[str]:
+        return self.test + item["test_args"]
+
+    def _progress(self, what: str, verdict: str, judged: str, started: float, counts: bool) -> None:
+        with self._print_lock:
+            if counts:
+                self._done += 1
+            where = f" [{self._done}/{len(self.rows) + 1}]" if counts else ""
+            print(f"{what}: {verdict} ({judged}, {time.monotonic() - started:.0f} s){where}", flush=True)
+
+    def _in_mirror(self, body: Callable[[_Slot, Path], object], describe: Callable[[object], str]):
+        """`body(slot, mirror)` in a fresh detached mirror of the recorded head, which is always removed."""
+        mirror = Path(tempfile.mkdtemp(prefix="pk-mirror-"))
+        slot = _Slot(self.ev.root, mirror)
+        added = []
+
+        def run():
+            with self._git_lock:
+                git(self.ev.root, "worktree", "add", "--detach", str(mirror), self.ev.head)
+                added.append(mirror)
+            return body(slot, mirror)
+
+        def cleanup() -> str | None:
+            with self._git_lock:
+                return slot._remove_mirror(mirror, bool(added))
+
+        return _then(run, cleanup, describe)
+
+    def _baseline(self, argv: list[str], rid: str, judged: str) -> str | None:
+        """Why the unmutated mirror fails `argv`, or None."""
+        started = time.monotonic()
+        problem = self._in_mirror(
+            lambda slot, mirror: self.ev._baseline_problem(mirror, self.build, argv, rid, self.timeout, slot),
+            lambda found: found or f"unmutated mirror passes its test (row {rid})")
+        verdict = "passes" if problem is None else ("fails, judged again alone" if judged == "parallel" else "fails")
+        self._progress(f"baseline of {rid}", verdict, judged, started, counts=False)
+        return problem
+
+    def _judge(self, item: dict, judged: str) -> tuple[dict, str]:
+        """(the row, the output that decided it) of one planted bug in its own mirror."""
+        started = time.monotonic()
+        argv = self._argv(item)
+        builds, code, digest, output = self._in_mirror(
+            lambda slot, mirror: self.ev._judge(mirror, item["id"], item["path"], self.ev._planter(item), self.build,
+                                                argv, self.timeout, slot),
+            lambda found: f"planted bug {item['id']} gave builds: {str(found[0]).lower()}, "
+                          f"test exit: {'not run' if found[1] is None else found[1]}")
+        row = {**self.ev._row(item, builds, code, digest, self.build, argv), "judged": judged}
+        self._progress(f"plant {item['id']}", row["kill_reason"], judged, started, counts=judged != "parallel"
+                       or not self._doubtful(row, output))
+        return row, output
+
+    @staticmethod
+    def _doubtful(row: dict, output: str) -> bool:
+        """Whether a pool verdict must be judged again alone: anything but a kill with no sign of a resource error."""
+        return not row["killed"] or RESOURCE_ERROR.search(output) is not None
+
+    def _pool(self, jobs: list[Callable[[], object]]) -> list:
+        """Every job's result in job order; the first failure in job order is raised once every running job ended."""
+        results: list = [None] * len(jobs)
+        errors: dict[int, BaseException] = {}
+        with ThreadPoolExecutor(max_workers=self.workers, thread_name_prefix="pk-plant") as pool:
+            futures = {pool.submit(job): index for index, job in enumerate(jobs)}
+            for future in as_completed(futures):
+                if future.cancelled():
+                    continue
+                index = futures[future]
+                try:
+                    results[index] = future.result()
+                except BaseException as exc:  # noqa: BLE001 - raised below, after the pool drained
+                    errors[index] = exc
+                    for other in futures:
+                        other.cancel()
+        if errors:
+            raise errors[min(errors)]
+        return results
+
+    def run(self) -> list[dict]:
+        firsts: dict[tuple, str] = {}  # each distinct test argv, with the first row that uses it
+        for item in self.rows:
+            firsts.setdefault(tuple(self._argv(item)), item["id"])
+        serial_argvs = {tuple(self._argv(item)) for item in self.rows if item["serial"]}
+        pooled_baselines = [(argv, rid) for argv, rid in firsts.items() if argv not in serial_argvs]
+        pooled = [item for item in self.rows if not item["serial"]]
+        jobs: list[Callable[[], object]] = [
+            (lambda argv=argv, rid=rid: self._baseline(list(argv), rid, "parallel")) for argv, rid in pooled_baselines]
+        jobs += [(lambda item=item: self._judge(item, "parallel")) for item in pooled]
+        outcomes = self._pool(jobs)
+        doubted = set()
+        for (argv, rid), problem in zip(pooled_baselines, outcomes[:len(pooled_baselines)]):
+            if problem is not None:  # judged again alone before it can fail the run
+                again = self._baseline(list(argv), rid, "serial-recheck")
+                if again is not None:
+                    raise KitError(again)
+                doubted.add(argv)
+        results: dict[str, dict] = {}
+        for item, (row, output) in zip(pooled, outcomes[len(pooled_baselines):]):
+            if self._doubtful(row, output) or tuple(self._argv(item)) in doubted:
+                row, _ = self._judge(item, "serial-recheck")
+            results[item["id"]] = row
+        checked = {argv for argv, _ in pooled_baselines}
+        for item in self.rows:
+            if not item["serial"]:
+                continue
+            argv = tuple(self._argv(item))
+            if argv not in checked:
+                problem = self._baseline(list(argv), item["id"], "serial")
+                if problem is not None:
+                    raise KitError(problem)
+                checked.add(argv)
+            results[item["id"]], _ = self._judge(item, "serial")
+        return [results[item["id"]] for item in self.rows] + [self._self_test()]
+
+    def _self_test(self) -> dict:
+        started = time.monotonic()
+        first = self.rows[0]
+        row = self._in_mirror(
+            lambda slot, mirror: self.ev._self_test(mirror, first, self.build, self._argv(first), self.timeout, slot),
+            lambda found: f"the self-test row gave {found['kill_reason']}")
+        self._progress(f"plant {SELF_TEST_ID}", row["kill_reason"], "serial", started, counts=True)
+        return {**row, "judged": "serial"}
 
 
 # --- one row at a time ------------------------------------------------------------
@@ -822,6 +1175,8 @@ def validate_results(data) -> list[str]:
             continue
         if cmd["as_expected"] and cmd["exit"] != cmd["expected_exit"]:
             bad(where, "marked as_expected although exit differs from expected_exit")
+        if "from_gate_step" in cmd and cmd["from_gate_step"] != "test":
+            bad(where, "from_gate_step must be test, the only gate step whose output a producer reuses")
         flags.append(cmd["as_expected"])
     if isinstance(data["all_commands_as_expected"], bool) and data["all_commands_as_expected"] != all(flags):
         bad("all_commands_as_expected", f"is {data['all_commands_as_expected']} but the commands give {all(flags)}")
@@ -855,6 +1210,8 @@ def validate_results(data) -> list[str]:
         planted = _planted_problem(row)
         if planted:
             bad(where, planted)
+        if "judged" in row and row["judged"] not in JUDGED:
+            bad(where, f"judged must be one of {', '.join(JUDGED)} (found {row['judged']!r})")
         shaped.append(row)
     selfs = [row for row in shaped if row["id"] == SELF_TEST_ID]
     bugs = [row for row in shaped if row["id"] != SELF_TEST_ID]
@@ -872,6 +1229,12 @@ def validate_results(data) -> list[str]:
     supersedes = data.get("supersedes")
     if supersedes is not None and not (isinstance(supersedes, str) and _HEX64.match(supersedes)):
         bad("supersedes", "must be the 64-character sha256 of the record it replaces, or null")
+    reused = data.get("reused_from")
+    if "reused_from" in data and not (isinstance(reused, dict) and set(reused) == {"path", "digest", "head"}
+                                      and isinstance(reused["path"], str) and reused["path"]
+                                      and isinstance(reused["digest"], str) and _HEX64.match(reused["digest"])
+                                      and isinstance(reused["head"], str) and _HEX40.match(reused["head"])):
+        bad("reused_from", "must be {path, digest: sha256, head: 40-hex sha} of the record this one copied")
     children = data.get("children", [])
     if not isinstance(children, list) or not all(
             isinstance(child, dict) and set(child) == {"task_id", "kind", "digest", "drift"}

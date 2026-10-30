@@ -157,6 +157,7 @@ def _checks_problems(data) -> list[str]:
         parts.append(({"guarded_files": data.get("guarded_files")}, ()))
         parts.append(({"tiers": data.get("tiers")}, ()))
         parts.append(({"drift": data.get("drift")}, ()))
+        parts.append(({"evidence": data.get("evidence")}, ()))
         parts.append(({key: value for key, value in data.items() if key not in gate.ALL_KEYS}, ()))
     problems = []
     for part, require in parts:
