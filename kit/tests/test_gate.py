@@ -1379,7 +1379,7 @@ class FixedMainTests(HandbackBase):
         for function in (gate.handback, gate.merge_check, gate.binding, rejudge.rejudge):
             self.assertNotIn("main", inspect.signature(function).parameters, function.__name__)
         actions = self.gate_actions()
-        self.assertEqual(sorted(actions), ["binding", "claims", "handback", "merge-check", "rejudge", "validate"])
+        self.assertEqual(sorted(actions), ["binding", "claims", "handback", "merge-check", "plants", "rejudge", "validate"])
         for name, parser in actions.items():
             options = {option for action in parser._actions for option in action.option_strings}
             self.assertEqual([o for o in options if o.startswith("--m")], [], name)

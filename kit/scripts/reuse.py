@@ -48,7 +48,7 @@ def compared(path: str, task_id: str, config: dict) -> bool:
     folder = f"program/evidence/{task_id}/"
     if path.startswith(folder):
         rest = path[len(folder):]
-        return not (rest == store.POINTER or rest.startswith(tuple(f"{kind}/" for kind in store.KINDS)))
+        return not (rest == store.POINTER or rest.startswith(tuple(f"{kind}/" for kind in store.RECORD_KINDS)))
     if path.startswith("program/"):
         return any(_covers(entry, path) for entry in config.get("reuse_compare", []))
     return not any(_covers(entry, path) for entry in config.get("reuse_ignore", []))
@@ -113,6 +113,9 @@ def write(root, task_id: str, found: dict) -> dict:
 
     The old record's input paths are hashed again at HEAD (those still tracked); its commands, planted-bug rows,
     blocked_by and deviations are copied unchanged; `reused_from` names the old record by path, digest and head.
+    When the old record deferred planted-bug rows (0.5.3), `plants_reused_from` names the plants records bound to it
+    or to a record it reused in turn: judged on the same code, they count for the new record too, and its deferred
+    rows still pending are judged with `pk gate plants` at the new head.
     """
     entry, old = found["entry"], found["data"]
     run = evidence_module.Evidence(root, task_id)
@@ -123,4 +126,8 @@ def write(root, task_id: str, found: dict) -> dict:
     run.planted_bug_rows = [dict(row) for row in old["planted_bugs"]]
     run.blocked_by, run.deviations = list(old["blocked_by"]), list(old["deviations"])
     run.reused_from = {"path": entry["path"], "digest": entry["digest"], "head": old["head"]}
+    if any(evidence_module.is_deferred(row) for row in old["planted_bugs"]):
+        chain = evidence_module.plants_chain(root, entry, old)
+        run.plants_reused_from = [{"path": item["path"], "digest": item["digest"]}
+                                  for item in store.read_plants(root, task_id) if item["part_of"] in chain]
     return run.write()

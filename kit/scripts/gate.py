@@ -65,6 +65,7 @@ import threading
 from pathlib import Path, PurePosixPath
 
 import evidence as evidence_module
+import latework
 import reuse as reuse_module
 import rulings as rulings_module
 import stale as stale_module
@@ -466,13 +467,15 @@ def _branch_task(branch) -> str:
     return task_id
 
 
-def _task_worktree(root: Path, task_id: str, branch: str, override) -> Path:
+def _task_worktree(root: Path, task_id: str, branch: str, override, allow=None,
+                   command: str = "pk gate handback") -> Path:
+    """The task's worktree, checked; `allow(path)` names uncommitted paths that may be there (none by default)."""
     try:
         here = git(root, "symbolic-ref", "HEAD").removeprefix("refs/heads/")
     except KitError:
         here = None
     if here == branch:  # the command was started inside the task worktree, where `root` is that worktree
-        raise KitError(f"run pk gate handback from the main checkout: {_show(root)} is the worktree of "
+        raise KitError(f"run {command} from the main checkout: {_show(root)} is the worktree of "
                        f"{_show(branch)}")
     wt = Path(override) if override is not None else root / ".worktrees" / task_id.lower()
     if not wt.is_dir():
@@ -491,7 +494,7 @@ def _task_worktree(root: Path, task_id: str, branch: str, override) -> Path:
         current = "a detached HEAD"
     if current != branch:
         raise KitError(f"task worktree {_show(wt)} is on {_show(current)}, not on {_show(branch)}")
-    dirty = _changes(wt)
+    dirty = [path for path in _changes(wt) if allow is None or not allow(path)]
     if dirty:
         raise KitError(f"task worktree {_show(wt)} is not clean: {_show(', '.join(dirty))}")
     return wt
@@ -725,6 +728,10 @@ def _evidence_step(wt: Path, task_id: str, env: dict | None = None, reused: dict
         recorded = data["head"]
         code, _ = run_argv(["git", "-C", str(wt), "merge-base", "--is-ancestor", recorded, head], wt)
         changed = stale_module.changed_inputs(wt, head, store.input_digests(data["inputs"])) if code == 0 else {}
+        late = latework.late_work(wt, task_id, recorded, head) if code == 0 and not changed else None
+        if late:  # the record still holds for its inputs, but it is the one QA would accept: say what merge refuses
+            _out(f"late work: {produce} appended no results record, and pk merge refuses the tip over the latest one "
+                 f"until a new record names it: {_show(late)}")
         if code != 0:
             problems = [f"head: {recorded} of the latest record is not an ancestor of {head}"]
         elif changed:
@@ -890,6 +897,35 @@ def _reusable(checks: dict, task_id: str, wt: Path, no_reuse: bool) -> dict | No
     return found
 
 
+ESTIMATE_SHARE = 0.8  # warn when the planted bugs alone are estimated to take this share of the evidence step's limit
+
+
+def plant_estimate(wt: Path, task_id: str, workers: int | None = None, limit: int = STEP_TIMEOUT) -> str | None:
+    """A warning when the judged planted-bug rows may not fit the evidence step's `limit`, else None (0.5.3).
+
+    The estimate needs a results record that timed its planted bugs (`planted_bugs_timing`, written from 0.5.3): its
+    judged row count, times the seconds per row and worker it measured, divided by the workers this run will use.
+    Without one there is no estimate. It is a warning: the gate runs on."""
+    try:
+        entry = store.read_pointer(wt, task_id).get("results")
+        data = store.load(wt, entry["path"], entry["digest"]) if entry is not None else None
+        count = evidence_module.plant_workers(wt, workers)
+    except KitError:
+        return None
+    timing = data.get("planted_bugs_timing") if isinstance(data, dict) else None
+    if not isinstance(timing, dict) or evidence_module.validate_results(data):
+        return None
+    rows = sum(1 for row in data["planted_bugs"] if not evidence_module.is_deferred(row))
+    per_row = timing["seconds"] * timing["workers"] / timing["rows"]
+    estimate = rows * per_row / count
+    if estimate < ESTIMATE_SHARE * limit:
+        return None
+    return (f"evidence estimate: about {estimate:.0f} s for {rows} judged planted-bug rows with {count} worker(s) "
+            f"({per_row:.1f} s per row and worker in {entry['path']}), against the evidence step's {limit} s limit; "
+            "mark gap rows `defer: true` in the producer and judge them with pk gate plants after the gate, raise "
+            "evidence.plant_workers in program/checks.yaml, or split the task (a warning: the gate runs on)")
+
+
 def _run_steps(checks: dict, task_id: str, wt: Path, trial: Path, authoritative: bytes, meta: dict,
                no_reuse: bool = False) -> int:
     if not _tier_unchanged(wt, task_id, meta):
@@ -897,6 +933,10 @@ def _run_steps(checks: dict, task_id: str, wt: Path, trial: Path, authoritative:
     if meta["tier"] == "light":
         return _run_light(checks, trial)
     reused = _reusable(checks, task_id, wt, no_reuse)
+    if reused is None:
+        warning = plant_estimate(wt, task_id)
+        if warning:
+            _out(warning)
     for step in ("build", "compile_check"):
         if not _run_commands(step, _commands(checks[step]), trial):
             return 1
@@ -952,6 +992,7 @@ def handback(root, task_id: str, branch: str, worktree=None, no_reuse: bool = Fa
     authoritative = _definition(root, wt, task_id, meta)
     if authoritative is None:
         return 1
+    _accepted_late_work(wt, task_id)
     trial = trial_merge(root, branch)
     code = _with_trial(root, trial, lambda: _run_steps(checks, task_id, wt, trial, authoritative, meta, no_reuse))
     if code:
@@ -959,8 +1000,45 @@ def handback(root, task_id: str, branch: str, worktree=None, no_reuse: bool = Fa
     if git(wt, "rev-parse", "HEAD") != sha or _branch_head(root, branch) != sha:
         _out(f"FAILED: {branch} moved during the gate")
         return 1
+    _deferred_lines(wt, task_id, branch)
     _print_ok("handback", branch, sha)
     return 0
+
+
+def _accepted_late_work(wt: Path, task_id: str) -> None:
+    """Before the long run: when QA accepted the latest results record and the branch went on after its head, say
+    what pk merge would refuse (`latework`): this run writes a new record, which QA must accept again."""
+    try:
+        pointer = store.read_pointer(wt, task_id)
+        results, acceptance = pointer.get("results"), pointer.get("acceptance")
+        if results is None or acceptance is None or acceptance["results_digest"] != results["digest"] \
+                or acceptance["decision"] != "accepted_development":
+            return
+        late = latework.early_problem(wt, task_id, results["head"], "pk gate handback")
+    except KitError:
+        return  # the evidence step reports an unreadable pointer or record
+    if late:
+        _out(f"late work: {_show(late)}; this run appends a new results record, and QA must accept it again before "
+             "the merge")
+
+
+def _deferred_lines(wt: Path, task_id: str, branch: str) -> None:
+    """The gate's last lines before OK: how many planted-bug rows the record deferred, and the command to judge them."""
+    try:
+        entry = store.read_pointer(wt, task_id).get("results")
+        data = store.load(wt, entry["path"], entry["digest"]) if entry is not None else None
+    except KitError:
+        return
+    if data is None:
+        return
+    deferred = [row for row in data.get("planted_bugs", []) if evidence_module.is_deferred(row)]
+    if not deferred:
+        return
+    pending = evidence_module.plants_coverage(wt, task_id, entry, data)["pending"]
+    _out(f"deferred: {len(deferred)} planted-bug row(s) of {entry['path']} are deferred and not judged by this gate "
+         f"({len(pending)} pending); QA's acceptance and the merge need each one killed in a plants record")
+    if pending:
+        _out(f"deferred: judge them with: pk gate plants {task_id} --branch {branch} --all-pending")
 
 
 def merge_check(root, branch: str, inspected: str | None = None, suite: bool = True) -> int:
@@ -1313,12 +1391,16 @@ def _report(problems: list[str]) -> int:
 
 def cmd_gate(args: argparse.Namespace) -> int:
     action = getattr(args, "gate_action", None)
-    if action not in ("handback", "merge-check", "binding", "rejudge", "claims", "validate"):
-        raise KitError("gate needs an action: handback, merge-check, binding, rejudge, claims or validate")
+    if action not in ("handback", "merge-check", "binding", "rejudge", "plants", "claims", "validate"):
+        raise KitError("gate needs an action: handback, merge-check, binding, rejudge, plants, claims or validate")
     if action == "rejudge":
         import rejudge  # late: rejudge imports this module
 
         return rejudge.cmd_rejudge(args)
+    if action == "plants":
+        import plants  # late: plants imports this module
+
+        return plants.cmd_plants(args)
     root = find_root()
     if action == "handback":
         return handback(root, args.task_id, args.branch, worktree=args.worktree, no_reuse=args.no_reuse)
@@ -1361,6 +1443,9 @@ def _configure(parser: argparse.ArgumentParser) -> None:
     import rejudge  # late: rejudge imports this module
 
     rejudge.configure(actions)
+    import plants  # late: plants imports this module
+
+    plants.configure(actions)
     make = actions.add_parser("claims", help="write the claim documents of a gate")
     make.add_argument("gate", metavar="GATE", help="gate ID, for example G-P0")
     check = actions.add_parser("validate", help="fail on drift between claim documents and a recomputation")
@@ -1368,5 +1453,5 @@ def _configure(parser: argparse.ArgumentParser) -> None:
 
 
 def register(add_command) -> None:
-    add_command("gate", cmd_gate, help="gate runner: handback, merge-check, binding, rejudge, claims, validate",
+    add_command("gate", cmd_gate, help="gate runner: handback, merge-check, binding, rejudge, plants, claims, validate",
                 configure=_configure)

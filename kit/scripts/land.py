@@ -31,13 +31,14 @@ import argparse
 import json
 import re
 import shutil
-import subprocess
 import tempfile
 from pathlib import Path
 
 import ctlstate
+import evidence as evidence_module
 import gate
 import handoff as handoff_module
+import latework
 import rulings as rulings_module
 import status as status_module
 import store
@@ -83,61 +84,38 @@ def _tip_status(root: Path, task_id: str, sha: str) -> str:
 
 
 def _own_path(path: str, task_id: str) -> bool:
-    """Whether `path` is one the kit writes for the task after its review: all a branch may add then.
-
-    The status file, and under `program/evidence/<ID>/` the pointer `latest.json`, a record name
-    (`<utc>-<sha256[:12]>.json`) directly in `results/` or `acceptance/`, and the implementer's `report.md`.
-    Anything else there (`produce.py`, a `conftest.py`, a test file, in those folders too) is work.
-    """
-    folder = f"program/evidence/{task_id}/"
-    if path.startswith((f"{folder}results/", f"{folder}acceptance/")):
-        try:  # only a record's own name, directly in results/ or acceptance/; its bytes: store.integrity
-            store.check_rel(path)
-        except KitError:
-            return False
-        return True
-    return path in (f"program/status/{task_id}.json", f"{folder}latest.json", f"{folder}report.md")
-
-
-def _names(root: Path, *args: str) -> list[str]:
-    return gate._git_fields(root, *args, "--name-only", "--no-renames", "-z")
+    """Whether `path` is one the kit writes for the task after its review (`latework.own_path`)."""
+    return latework.own_path(path, task_id)
 
 
 def _late_work(root: Path, task_id: str, head: str, sha: str) -> str | None:
-    """Why the commits after the reviewed commit `head` stop the tip `sha` from landing, or None.
+    """Why the commits after the reviewed commit `head` stop the tip `sha` from landing, or None
+    (`latework.late_work`: the same rule `pk evidence accept`, `pk status set done` and the gate apply early)."""
+    return latework.late_work(root, task_id, head, sha)
 
-    Every commit of `head..sha` that is not on main is looked at. A commit with one parent may change only the
-    task's own evidence and status files. A merge commit must be what git makes of its two parents (outside
-    those same files): a merge that carries an edit of its own, or a conflict resolved by hand, is work nobody
-    reviewed.
-    """
-    again = (f"re-run the hand-back gate so a new results record names the tip, and have QA review and accept "
-             f"that record (pk worktree review {task_id})")
-    for line in git(root, "rev-list", "--parents", f"{head}..{sha}", "--not", MAIN).splitlines():
-        commit, *parents = line.split()
-        if len(parents) == 1:
-            late = [path for path in _names(root, "diff-tree", "-r", "--no-commit-id", commit)
-                    if not _own_path(path, task_id)]
-            what = "was committed after"
-        elif len(parents) == 2:
-            try:  # exit 1 is a conflict: the tree it still writes holds the conflict markers, so it differs
-                made = subprocess.run(["git", "-C", str(root), "merge-tree", "--write-tree", *parents],
-                                      capture_output=True, text=True)
-            except OSError as exc:
-                raise KitError(f"cannot run git merge-tree: {exc}") from exc
-            tree = made.stdout.split()[0] if made.returncode in (0, 1) and made.stdout.split() else None
-            if tree is None:
-                return (f"{task_id}: cannot re-derive the merge commit {commit[:12]} made after the reviewed commit "
-                        f"{head[:12]} (git merge-tree --write-tree needs git 2.38 or later); {again}")
-            late = [path for path in _names(root, "diff", tree, commit) if not _own_path(path, task_id)]
-            what = "is a merge that is not what git makes of its two parents; it was made after"
-        else:
-            late, what = ["(a merge of more than two parents)"], "was made after"
-        if late:
-            return (f"{task_id}: {commit[:12]} {what} the reviewed commit {head[:12]} and changes "
-                    f"{', '.join(late)}: after the commit QA accepted, a branch adds only its status file and, under "
-                    f"program/evidence/{task_id}/, latest.json, report.md and records directly in results/ and acceptance/; "
-                    f"{again}")
+
+def _late_plants_problem(root: Path, trial: Path, task_id: str, head: str, sha: str) -> str | None:
+    """Why a `plants` record added after the reviewed commit is not one of the accepted record (or its reuse chain)."""
+    found = store.load_latest(trial, task_id, "results")
+    if found is None:
+        return None
+    entry, data = found
+    try:
+        chain = evidence_module.plants_chain(trial, entry, data)
+    except KitError as exc:
+        return f"{task_id}: {' '.join(str(exc).split())}"
+    for path in latework.late_plants(root, task_id, head, sha):
+        try:
+            record = store.load(trial, path)
+        except KitError as exc:
+            return f"{task_id}: {' '.join(str(exc).split())}"
+        part_of = record.get("part_of") if isinstance(record.get("part_of"), dict) else {}
+        if part_of.get("digest") not in chain:
+            return (f"{task_id}: {path} was added after the reviewed commit {head[:12]} and is bound to the results "
+                    f"record {str(part_of.get('digest'))[:12]}, not to the accepted record {entry['path']} "
+                    f"({entry['digest'][:12]}): a plants record counts only for the gate record it was judged for; "
+                    f"judge the deferred rows of the accepted record with pk gate plants {task_id} --branch "
+                    f"task/{task_id} --all-pending")
     return None
 
 
@@ -162,7 +140,7 @@ def _accepted_problem(root: Path, task_id: str, sha: str, tier: str) -> str | No
     except KitError:
         shutil.rmtree(trial, ignore_errors=True)  # git never registered it: this is the empty mkdtemp directory
         raise
-    head, broken = None, []
+    head, broken, plants = None, [], None
     on_main = gate.status_at(root, task_id)  # the tier is main's; only a record from before tiers is exempt
     full = tier == "full" and not (on_main is not None and "tier" not in on_main)
     try:
@@ -170,6 +148,7 @@ def _accepted_problem(root: Path, task_id: str, sha: str, tier: str) -> str | No
         if problem is None:
             head = store.load_latest(trial, task_id, "results")[1]["head"]
             broken = store.integrity(trial, git(root, "merge-base", MAIN, sha), schema=True)  # what pk evidence validate checks
+            plants = _late_plants_problem(root, trial, task_id, head, sha)
     except KitError as exc:
         problem = f"{task_id}: {exc}"
     finally:
@@ -181,7 +160,7 @@ def _accepted_problem(root: Path, task_id: str, sha: str, tier: str) -> str | No
                 "committed at its tip does not accept it, and only an accepted task is merged")
     late = _late_work(root, task_id, head, sha)
     if late or not broken:
-        return late
+        return late or plants
     return (f"{task_id}: the evidence at the tip of task/{task_id} fails the store's integrity check: "
             f"{' '.join(broken[0].replace(str(trial) + '/', '').split())}"
             + (f" (and {len(broken) - 1} more)" if len(broken) > 1 else ""))

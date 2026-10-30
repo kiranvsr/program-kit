@@ -4,6 +4,7 @@ Records live in the repository, next to the task's `produce.py`, and are committ
 
     program/evidence/<task_id>/results/<utc-compact>-<sha256[:12]>.json
     program/evidence/<task_id>/acceptance/<utc-compact>-<sha256[:12]>.json
+    program/evidence/<task_id>/plants/<utc-compact>-<sha256[:12]>.json      (0.5.3: deferred planted-bug chunks)
 
 `<utc-compact>` is the UTC append time `YYYYMMDDTHHMMSSffffffZ`, so names sort in append order; the digest in the
 name is the sha256 of the file's bytes. The kit creates a record once, read-only, through a temporary file that is
@@ -14,7 +15,9 @@ as "evidence history rewritten".
 
 Each task has one pointer, `program/evidence/<task_id>/latest.json`, the only mutable evidence file: it names the
 task's latest `results` and latest `acceptance` record (digest, repository-relative path, and a few fields of the
-record). An append replaces its own task's pointer atomically and touches no other task's file, so two task
+record) and, from 0.5.3, an optional `plants` list naming every `plants` record of the task (`pk gate plants`: the
+verdicts of planted-bug rows a results record deferred, each bound to that record by digest in `part_of`).
+An append replaces its own task's pointer atomically and touches no other task's file, so two task
 branches never edit the same evidence file. Every check reads the latest record through the pointer; older records
 stay as history (`pk evidence history`). In memory the pointers are read together as one mapping
 (`read_index`), task id -> {kind: entry}.
@@ -37,17 +40,20 @@ from pathlib import Path, PurePosixPath
 from common import KitError, git, new_file, read_json, sha256_bytes, write_json
 
 SCHEMA_VERSION = 1
-KINDS = ("results", "acceptance")
+KINDS = ("results", "acceptance")  # the kinds whose latest record a pointer names
+PLANTS = "plants"  # 0.5.3: chunk records of deferred planted-bug rows; the pointer lists every one of them
+RECORD_KINDS = KINDS + (PLANTS,)  # every record folder
 BASE = "program/evidence"
 POINTER = "latest.json"
 FINGERPRINT_BASE = f"{BASE}/fingerprint"  # release fingerprint records (`pk fingerprint run`): immutable like a task record
-RECORD_PATHSPECS = (*(f":(glob){BASE}/*/{kind}/**" for kind in KINDS), f":(glob){FINGERPRINT_BASE}/**")
+RECORD_PATHSPECS = (*(f":(glob){BASE}/*/{kind}/**" for kind in RECORD_KINDS), f":(glob){FINGERPRINT_BASE}/**")
 _COMPACT = "%Y%m%dT%H%M%S%fZ"
 _NAME = re.compile(r"(\d{8}T\d{12}Z)-([0-9a-f]{12})\.json\Z")
 _TASK = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 _HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 RESULTS_FIELDS = ("digest", "path", "head", "produced_at")
 ACCEPTANCE_FIELDS = ("digest", "path", "decision", "accepted_at", "results_digest")
+PLANTS_FIELDS = ("digest", "path", "part_of", "head", "produced_at")  # one item of the pointer's `plants` list
 
 
 def input_digests(inputs) -> dict[str, str] | None:
@@ -89,8 +95,8 @@ def check_task(task_id) -> str:
 
 
 def _kind(kind) -> str:
-    if kind not in KINDS:
-        raise KitError(f"unknown record kind {kind!r}; kinds are {', '.join(KINDS)}")
+    if kind not in RECORD_KINDS:
+        raise KitError(f"unknown record kind {kind!r}; kinds are {', '.join(RECORD_KINDS)}")
     return kind
 
 
@@ -156,7 +162,7 @@ def append(root, task_id: str, kind: str, data) -> dict:
 def check_rel(rel) -> tuple[str, str, str]:
     """(task_id, kind, name) of a repository-relative record path; KitError for anything else."""
     parts = PurePosixPath(rel).parts if isinstance(rel, str) and "\\" not in rel else ()
-    if len(parts) != 5 or "/".join(parts[:2]) != BASE or not _TASK.match(parts[2]) or parts[3] not in KINDS \
+    if len(parts) != 5 or "/".join(parts[:2]) != BASE or not _TASK.match(parts[2]) or parts[3] not in RECORD_KINDS \
             or not _NAME.match(parts[4]):
         raise KitError(f"not an evidence record path ({BASE}/<ID>/<kind>/<utc>-<digest>.json): {rel!r}")
     return parts[2], parts[3], parts[4]
@@ -217,13 +223,49 @@ def _entry_problem(kind: str, entry) -> str | None:
     return None
 
 
+def _plants_problem(item) -> str | None:
+    if not isinstance(item, dict) or set(item) != set(PLANTS_FIELDS):
+        return f"each item must hold exactly {', '.join(PLANTS_FIELDS)}"
+    if any(not isinstance(item[key], str) for key in PLANTS_FIELDS):
+        return "every field must be a string"
+    if not _HEX64.match(item["digest"]) or not _HEX64.match(item["part_of"]):
+        return "digest and part_of must be 64-character lowercase hex sha256 values"
+    try:
+        check_rel(item["path"])
+    except KitError as exc:
+        return str(exc)
+    if not item["path"].endswith(f"-{item['digest'][:12]}.json"):
+        return "path does not name the record of its digest"
+    return None
+
+
+def _parse_plants(data, task_id: str, where: str) -> list[dict]:
+    """The pointer's optional `plants` list (0.5.3), checked; [] for a pointer without one."""
+    items = data.get(PLANTS, [])
+    if not isinstance(items, list):
+        raise KitError(f"{where}: plants: must be a list")
+    seen = set()
+    for item in items:
+        problem = _plants_problem(item)
+        if problem is None and check_rel(item["path"])[:2] != (task_id, PLANTS):
+            problem = "path names another task or kind"
+        if problem is None and item["path"] in seen:
+            problem = f"{item['path']} is listed twice"
+        if problem:
+            raise KitError(f"{where}: plants: {problem}")
+        seen.add(item["path"])
+    return [dict(item) for item in items]
+
+
 def parse_pointer(data, task_id: str, where: str) -> dict:
-    """{kind: entry} of a checked pointer of `task_id`; KitError naming the first problem."""
+    """{kind: entry} of a checked pointer of `task_id` (results and acceptance; the optional `plants` list is read
+    by `read_plants`); KitError naming the first problem."""
     kinds = {key: value for key, value in data.items() if key in KINDS} if isinstance(data, dict) else {}
     if not isinstance(data, dict) or data.get("schema_version") != SCHEMA_VERSION or data.get("task_id") != task_id \
-            or set(data) - set(KINDS) != {"schema_version", "task_id"} or not kinds:
+            or set(data) - set(KINDS) - {PLANTS} != {"schema_version", "task_id"} or not kinds:
         raise KitError(f"{where}: not the evidence pointer of {task_id} (schema_version {SCHEMA_VERSION}, task_id, "
-                       "and results and/or acceptance)")
+                       "and results and/or acceptance, and optionally plants)")
+    _parse_plants(data, task_id, where)
     for kind, entry in kinds.items():
         problem = _entry_problem(kind, entry)
         if problem:
@@ -249,6 +291,27 @@ def read_pointer(root, task_id: str) -> dict:
     return parse_pointer(read_json(path), task_id, rel)
 
 
+def read_plants(root, task_id: str) -> list[dict]:
+    """The pointer's `plants` list of the task in the checkout at `root` (each {digest, path, part_of, head,
+    produced_at}); [] when the pointer has none or the task has no pointer."""
+    rel = pointer_path(task_id)
+    path = Path(root) / rel
+    if not path.exists():
+        return []
+    data = read_json(path)
+    parse_pointer(data, task_id, rel)
+    return _parse_plants(data, task_id, rel)
+
+
+def plants_from_text(text: str, task_id: str, where: str) -> list[dict]:
+    try:
+        data = json.loads(text)
+    except (ValueError, RecursionError) as exc:
+        raise KitError(f"{where}: invalid JSON: {exc}") from exc
+    parse_pointer(data, task_id, where)
+    return _parse_plants(data, task_id, where)
+
+
 def read_index(root) -> dict:
     """Every task pointer of the checkout at `root`, as {schema_version, tasks: {task_id: {kind: entry}}}."""
     tasks = {}
@@ -261,14 +324,31 @@ def read_index(root) -> dict:
     return {"schema_version": SCHEMA_VERSION, "tasks": tasks}
 
 
-def set_entry(root, task_id: str, kind: str, entry: dict) -> None:
-    """Point the task's pointer at `entry` for `kind`, replacing the file atomically; no other task's file changes."""
-    kinds = dict(read_pointer(root, task_id))
-    kinds[_kind(kind)] = entry
+def _write_pointer(root, task_id: str, kinds: dict, plants: list[dict]) -> None:
     data = {"schema_version": SCHEMA_VERSION, "task_id": task_id,
             **{k: dict(sorted(v.items())) for k, v in sorted(kinds.items())}}
+    if plants:  # a pointer without chunk records stays exactly as 0.5.2 wrote it
+        data[PLANTS] = [dict(sorted(item.items())) for item in sorted(plants, key=lambda item: item["path"])]
     parse_pointer(data, task_id, pointer_path(task_id))
     write_json(Path(root) / pointer_path(task_id), data)
+
+
+def set_entry(root, task_id: str, kind: str, entry: dict) -> None:
+    """Point the task's pointer at `entry` for `kind`, replacing the file atomically; no other task's file changes.
+    The pointer's `plants` list is kept as it is."""
+    if kind == PLANTS:
+        raise KitError("a plants record is listed, not pointed at: use store.record(root, task_id, 'plants', data)")
+    kinds = dict(read_pointer(root, task_id))
+    kinds[_kind(kind)] = entry
+    _write_pointer(root, task_id, kinds, read_plants(root, task_id))
+
+
+def add_plants_entry(root, task_id: str, item: dict) -> None:
+    """Add one item to the pointer's `plants` list, replacing the file atomically. The task must have a pointer."""
+    kinds = dict(read_pointer(root, task_id))
+    if not kinds:
+        raise KitError(f"{pointer_path(task_id)} names no results record: a plants record is bound to one")
+    _write_pointer(root, task_id, kinds, [*read_plants(root, task_id), item])
 
 
 def latest(index: dict, task_id: str, kind: str) -> dict | None:
@@ -278,6 +358,12 @@ def latest(index: dict, task_id: str, kind: str) -> dict | None:
 def results_entry(appended: dict, data: dict) -> dict:
     return {"digest": appended["digest"], "path": appended["path"], "head": str(data.get("head", "")),
             "produced_at": str(data.get("produced_at", ""))}
+
+
+def plants_entry(appended: dict, data: dict) -> dict:
+    part_of = data.get("part_of") if isinstance(data.get("part_of"), dict) else {}
+    return {"digest": appended["digest"], "path": appended["path"], "part_of": str(part_of.get("digest", "")),
+            "head": str(data.get("head", "")), "produced_at": str(data.get("produced_at", ""))}
 
 
 def acceptance_entry(appended: dict, data: dict) -> dict:
@@ -297,6 +383,9 @@ def record(root, task_id: str, kind: str, data) -> dict:
     if not isinstance(parsed, dict):
         raise KitError("an evidence record must be a JSON object")
     appended = append(root, task_id, kind, data)
+    if kind == PLANTS:
+        add_plants_entry(root, task_id, plants_entry(appended, parsed))
+        return appended
     entry = results_entry(appended, parsed) if kind == "results" else acceptance_entry(appended, parsed)
     set_entry(root, task_id, kind, entry)
     return appended
@@ -316,10 +405,11 @@ def load_latest(root, task_id: str, kind: str, index: dict | None = None) -> tup
 # --- history ------------------------------------------------------------------------
 
 def _record_files(root) -> list[str]:
-    """Repository-relative paths of every file in a `results/` or `acceptance/` directory under program/evidence."""
+    """Repository-relative paths of every file in a `results/`, `acceptance/` or `plants/` directory under
+    program/evidence."""
     base = Path(root) / BASE
     found = []
-    for kind in KINDS:
+    for kind in RECORD_KINDS:
         for path in base.glob(f"*/{kind}/*"):
             if path.is_file() and not path.name.startswith("."):
                 found.append(path.relative_to(root).as_posix())
@@ -334,11 +424,12 @@ def history(root, task_id: str) -> list[dict]:
     check_task(task_id)
     index = read_index(root)
     rows = []
-    for kind in KINDS:
+    listed = {item["path"] for item in read_plants(root, task_id)}
+    for kind in RECORD_KINDS:
         directory = Path(root) / BASE / task_id / kind
         if not directory.is_dir():
             continue
-        current = latest(index, task_id, kind)
+        current = latest(index, task_id, kind) if kind != PLANTS else None
         for name in os.listdir(directory):
             if not _NAME.match(name):
                 continue
@@ -351,10 +442,11 @@ def history(root, task_id: str) -> list[dict]:
             data = data if isinstance(data, dict) else {}
             digest = sha256_bytes(raw)
             rows.append({"kind": kind, "digest": digest, "path": rel,
-                         "head": str(data.get("head" if kind == "results" else "source_commit", "")),
-                         "at": str(data.get("produced_at" if kind == "results" else "accepted_at", "")),
+                         "head": str(data.get("source_commit" if kind == "acceptance" else "head", "")),
+                         "at": str(data.get("accepted_at" if kind == "acceptance" else "produced_at", "")),
                          "decision": str(data.get("decision", "")) if kind == "acceptance" else "",
-                         "current": current is not None and current["path"] == rel and current["digest"] == digest,
+                         "current": (rel in listed) if kind == PLANTS else (
+                             current is not None and current["path"] == rel and current["digest"] == digest),
                          "altered": altered(rel, raw)})
     rows.sort(key=lambda row: PurePosixPath(row["path"]).name, reverse=True)
     return rows
@@ -394,8 +486,9 @@ def integrity(root, base: str | None = None, uncommitted: set[str] | frozenset =
     (1) every record file's sha256 matches the digest in its name; (2) no commit in `base..HEAD` (the whole history
     when `base` is None), merge commits included, modified or deleted a record file; (3) every pointer entry names
     the newest record of its kind and resolves to a record committed at HEAD with its digest (paths in
-    `uncommitted` may be new, not yet committed records). With `schema`, (4) every record parses as a record of the kit's
-    schema for its kind (the name only proves the bytes, not that they are a record).
+    `uncommitted` may be new, not yet committed records); every item of a pointer's `plants` list resolves the same
+    way, and every file in a task's `plants/` folder is listed there. With `schema`, (4) every record parses as a
+    record of the kit's schema for its kind (the name only proves the bytes, not that they are a record).
     """
     problems, pending = check(root, base, schema)
     return problems + [f"{path}: not committed (pointed at by {owner})" for path, owner in pending
@@ -406,13 +499,13 @@ def _schema_problem(rel: str, raw: bytes) -> str | None:
     """Why the record at `rel` (whose bytes match its name) is not a record of the kit's schema, else None.
 
     A file can be named after its own digest and still be anything; the store keeps only records."""
-    from evidence import validate_acceptance, validate_results  # evidence imports this module
+    from evidence import validate_acceptance, validate_plants, validate_results  # evidence imports this module
     kind = PurePosixPath(rel).parent.name
     try:
         data = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError, RecursionError):
         return f"{rel}: not a {kind} record: it does not parse as JSON"
-    problems = (validate_acceptance if kind == "acceptance" else validate_results)(data)
+    problems = {"acceptance": validate_acceptance, PLANTS: validate_plants}.get(kind, validate_results)(data)
     if problems:
         more = f" (and {len(problems) - 1} more)" if len(problems) > 1 else ""
         return f"{rel}: not a valid {kind} record: {problems[0]}{more}"
@@ -443,6 +536,18 @@ def check(root, base: str | None = None, schema: bool = False) -> tuple[list[str
             if entries else set()
     except KitError:
         tracked = set()
+    for task in sorted(index["tasks"]):
+        try:
+            items = read_plants(root, task)
+        except KitError as exc:
+            problems.append(str(exc))
+            continue
+        folder = root / BASE / task / PLANTS
+        files = {f"{BASE}/{task}/{PLANTS}/{n}" for n in os.listdir(folder) if _NAME.match(n)} \
+            if folder.is_dir() else set()
+        for rel in sorted(files - {item["path"] for item in items}):
+            problems.append(f"{pointer_path(task)}: plants: {rel} is not listed (every plants record is)")
+        entries.extend((task, PLANTS, item) for item in items)  # a pointer always has an entry, so tracked is read
     for task, kind, entry in entries:
         where = f"{pointer_path(task)}: {kind}"
         try:
@@ -456,7 +561,7 @@ def check(root, base: str | None = None, schema: bool = False) -> tuple[list[str
             continue
         names = [n for n in os.listdir(root / BASE / task / kind) if _NAME.match(n)]
         newest = f"{BASE}/{task}/{kind}/{max(names)}"
-        if entry["path"] != newest:
+        if kind != PLANTS and entry["path"] != newest:
             problems.append(f"{where}: names {entry['path']}, not the newest {kind} record {newest}")
             continue
         if entry["path"] not in tracked:

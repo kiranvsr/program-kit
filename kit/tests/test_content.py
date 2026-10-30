@@ -560,7 +560,7 @@ class TaughtYamlTests(unittest.TestCase):
 
 # The documented slow set (docs/DESIGN.md section 13): only these modules gate cases behind KIT_TESTS_SLOW.
 SLOW_MODULES = ["test_end_to_end.py", "test_evidence.py", "test_gate.py", "test_gate_reuse.py", "test_install.py",
-                "test_land.py", "test_parallel_plants.py", "test_rejudge.py", "test_tiers.py"]
+                "test_land.py", "test_parallel_plants.py", "test_plant_chunks.py", "test_rejudge.py", "test_tiers.py"]
 SLOW_IMPORT = re.compile(r"^(?:from _slow import|import _slow\b)", re.M)
 
 

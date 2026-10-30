@@ -42,7 +42,7 @@
     },
     "planted_bugs": {
       "type": "array",
-      "description": "one row per planted bug, then exactly one self-test row (id self-test-noncompiling, builds false, killed false). Since 0.5.2 a run with more than one worker adds to every row the optional judged: parallel (judged in the pool), serial (a serial row or the self-test row, judged alone) or serial-recheck (a pool verdict that was not a clean kill, judged again alone); pk evidence validate refuses any other value",
+      "description": "one row per planted bug, then exactly one self-test row (id self-test-noncompiling, builds false, killed false). Since 0.5.2 a run with more than one worker adds to every row the optional judged: parallel (judged in the pool), serial (a serial row or the self-test row, judged alone) or serial-recheck (a pool verdict that was not a clean kill, judged again alone); pk evidence validate refuses any other value. Since 0.5.3 a row the producer marked defer: true is recorded in its table position as a deferred row (definitions.deferred_row): its full definition, deferred: true and definition_sha256, and no verdict. The gate does not judge it and planted_bugs_all_killed counts only the judged rows; pk gate plants judges it later at this record's head and appends a plants record (plants.schema.json) bound to this record; pk evidence accept, pk status set done and pk merge need every deferred row killed in such a record",
       "items": {
         "type": "object",
         "required": ["id", "builds", "killed", "kill_reason", "test_output_sha256",
@@ -82,6 +82,24 @@
         "head": {"type": "string", "pattern": "^[0-9a-f]{40}$"}
       }
     },
+    "plants_reused_from": {
+      "type": "array",
+      "description": "optional (0.5.3), only with reused_from when the reused record deferred planted-bug rows: the plants records bound to the reused record (or to one it reused in turn); judged on the same code, they count for this record too",
+      "items": {"type": "object", "required": ["path", "digest"], "additionalProperties": false,
+                "properties": {"path": {"type": "string", "minLength": 1},
+                               "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}}
+    },
+    "planted_bugs_timing": {
+      "type": "object",
+      "description": "optional (0.5.3): the wall time of the judged planted-bug rows (the self-test row counted), the rows and the workers; the hand-back gate reads it to warn before a run whose judged rows may not fit the evidence step's limit",
+      "required": ["seconds", "rows", "workers"],
+      "additionalProperties": false,
+      "properties": {
+        "seconds": {"type": "number", "minimum": 0},
+        "rows": {"type": "integer", "minimum": 1},
+        "workers": {"type": "integer", "minimum": 1, "maximum": 64}
+      }
+    },
     "children": {
       "type": "array",
       "description": "a gate record only: the child records it binds by digest, with each child's drift at the gate's head",
@@ -94,6 +112,26 @@
           "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
           "drift": {"enum": ["fresh", "drifted"]}
         }
+      }
+    }
+  },
+  "definitions": {
+    "deferred_row": {
+      "type": "object",
+      "description": "a planted-bug row deferred to pk gate plants (0.5.3): what to plant and how to judge it, and no verdict",
+      "required": ["id", "deferred", "path", "find", "replace", "build_argv", "test_argv", "serial", "definition_sha256"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "deferred": {"const": true},
+        "path": {"type": "string", "minLength": 1},
+        "find": {"type": "string", "minLength": 1},
+        "replace": {"type": "string"},
+        "build_argv": {"type": ["array", "null"], "minItems": 1, "items": {"type": "string"}},
+        "test_argv": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+        "serial": {"type": "boolean"},
+        "definition_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$",
+                              "description": "sha256 of the canonical JSON (sorted keys, no spaces) of path, find, replace, build_argv, test_argv and serial"}
       }
     }
   }

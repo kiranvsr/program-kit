@@ -56,6 +56,9 @@ COMMAND_KEYS = ("label", "argv", "exit", "expected_exit", "as_expected", "derive
                 "output_tail")
 ROW_KEYS = ("id", "builds", "killed", "kill_reason", "test_output_sha256")  # what a planted-bug row found
 PLANTED_KEYS = ("path", "find", "replace", "build_argv", "test_argv")  # what a row planted and what judged it
+DEFINITION_KEYS = ("path", "find", "replace", "build_argv", "test_argv", "serial")  # what defines a row (0.5.3)
+DEFERRED_KEYS = ("id", "deferred", *DEFINITION_KEYS, "definition_sha256")  # a deferred row of a results record
+TIMING_KEYS = ("seconds", "rows", "workers")  # a results record's optional `planted_bugs_timing` (0.5.3)
 _TIMED_OUT = 124
 _NO_RUN = (_TIMED_OUT, 127)  # timeout, program not found: the shell conventions run_argv uses
 
@@ -165,6 +168,23 @@ def plant_workers(root, workers: int | None = None) -> int:
     if not (isinstance(workers, int) and not isinstance(workers, bool) and 1 <= workers <= MAX_WORKERS):
         raise KitError(f"planted-bug workers must be a whole number from 1 to {MAX_WORKERS}, not {workers!r}")
     return workers
+
+
+def definition_digest(row: dict) -> str:
+    """The sha256 of a planted-bug row's definition (DEFINITION_KEYS, `serial` false when absent), as canonical JSON.
+
+    A deferred row of a results record carries it, and every row of a `plants` record carries the digest of the
+    definition it judged, so a chunk can be checked against the row the gate recorded."""
+    import json
+
+    definition = {key: row.get(key) for key in DEFINITION_KEYS}
+    definition["serial"] = bool(definition["serial"])
+    return sha256_bytes(json.dumps(definition, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+
+
+def is_deferred(row) -> bool:
+    """Whether a planted-bug row of a results record was deferred (0.5.3): recorded with its definition, not judged."""
+    return isinstance(row, dict) and row.get("deferred") is True
 
 
 def required_keys(name: str) -> list[str]:
@@ -299,6 +319,17 @@ class Evidence(_MirrorCleanup):
         self.deviations: list[str] = []
         self.children: list[dict] = []  # a gate record's child records, by digest
         self.reused_from: dict | None = None  # {path, digest, head} of the record a reused run copied (0.5.2)
+        self.planted_bugs_timing: dict | None = None  # {seconds, rows, workers} of the judged rows (0.5.3)
+        self.plants_reused_from: list[dict] | None = None  # plants records of the reused record (0.5.3)
+
+    @classmethod
+    def judging_at(cls, root, head: str) -> "Evidence":
+        """A runner that only judges planted-bug rows in mirrors of `head` (`pk gate plants`): it records nothing,
+        hashes nothing and never writes a results record."""
+        run = cls.__new__(cls)
+        run.root, run.head, run.task_id = Path(root).resolve(), head, ""
+        run._mirror = None
+        return run
 
     # --- tree ------------------------------------------------------------------
 
@@ -443,9 +474,11 @@ class Evidence(_MirrorCleanup):
                 raise KitError(f"planted bug {rid}: replace equals find, so nothing is planted")
             if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
                 raise KitError(f"planted bug {rid}: test_args must be a list of strings")
-            serial = raw.get("serial", False)
+            serial, defer = raw.get("serial", False), raw.get("defer", False)
             if not isinstance(serial, bool):
                 raise KitError(f"planted bug {rid}: serial must be true or false")
+            if not isinstance(defer, bool):
+                raise KitError(f"planted bug {rid}: defer must be true or false")
             path = self._norm(raw.get("path"))
             if self._object_type(path) != "blob":
                 raise KitError(f"planted bug {rid}: {path} is not a tracked file at HEAD")
@@ -461,7 +494,7 @@ class Evidence(_MirrorCleanup):
                 raise KitError(f"planted bug {rid}: find occurs {count} times in {path} (it must occur exactly "
                                "once); fix the table")
             rows.append({"id": rid, "path": path, "find": find, "replace": replace, "test_args": args,
-                         "serial": serial})
+                         "serial": serial, "defer": defer})
         return rows
 
     def planted_bugs(self, table: list[dict], build: list[str] | None, test: list[str],
@@ -514,15 +547,41 @@ class Evidence(_MirrorCleanup):
         A baseline that fails in the pool is run again alone before it can fail the run. The rows keep the
         table's order. Rows that use a browser or a fixed port must be marked `serial: true`. One line per
         finished baseline and row is printed to standard output.
+
+        Deferred rows (0.5.3). A row marked `defer: true` is not judged here: it is recorded with its full definition
+        (`deferred: true`, path, find, replace, build_argv, test_argv, serial and `definition_sha256`) and no
+        verdict, in its table position. `pk gate plants` judges deferred rows later, at this record's head, and
+        writes `plants` records bound to it; QA's acceptance and the merge need every deferred row killed there.
+        `planted_bugs_all_killed` counts the judged rows only. The self-test row still runs, on the first row's file.
         """
         rows = self._check_table(table)
         test = _argv(test, "test")
         build = _argv(build, "build") if build is not None else None
         count = plant_workers(self.root, workers)
+        judged = [item for item in rows if not item["defer"]]
+        started = time.monotonic()
         if count > 1:
-            results = _PlantPool(self, rows, build, test, timeout, count).run()
-            self.planted_bug_rows = results
-            return results
+            found = _PlantPool(self, judged, build, test, timeout, count, first=rows[0]).run()
+        else:
+            found = self._serial_run(rows[0], judged, build, test, timeout)
+        by_id = {row["id"]: row for row in found}
+        results = [self._deferred_row(item, build, test) if item["defer"] else by_id[item["id"]] for item in rows]
+        results.append(by_id[SELF_TEST_ID])
+        self.planted_bugs_timing = {"seconds": round(time.monotonic() - started, 1), "rows": len(judged) + 1,
+                                    "workers": count}
+        self.planted_bug_rows = results
+        return results
+
+    def _deferred_row(self, item: dict, build: list[str] | None, test: list[str]) -> dict:
+        row = {"id": item["id"], "deferred": True,
+               **self._planted(item["path"], item["find"], item["replace"], build, test + item["test_args"]),
+               "serial": item["serial"]}
+        row["definition_sha256"] = definition_digest(row)
+        return row
+
+    def _serial_run(self, first: dict, rows: list[dict], build: list[str] | None, test: list[str],
+                    timeout: int | None) -> list[dict]:
+        """One worker: one mirror of HEAD, restored between rows; the rows, then the self-test row on `first`."""
         mirror = Path(tempfile.mkdtemp(prefix="pk-mirror-"))
         added = []  # non-empty once git has registered the mirror
         self._mirror = mirror
@@ -530,15 +589,13 @@ class Evidence(_MirrorCleanup):
         def run() -> list[dict]:
             git(self.root, "worktree", "add", "--detach", str(mirror), "HEAD")
             added.append(mirror)
-            return self._run_rows(mirror, rows, build, test, timeout)
+            return self._run_rows(mirror, rows, build, test, timeout, first)
 
         try:
-            results = _then(run, lambda: self._remove_mirror(mirror, bool(added)),
-                            lambda found: f"{len(found)} planted-bug rows ran")
+            return _then(run, lambda: self._remove_mirror(mirror, bool(added)),
+                         lambda found: f"{len(found)} planted-bug rows ran")
         finally:
             self._mirror = None
-        self.planted_bug_rows = results
-        return results
 
     def _judge(self, mirror: Path, rid: str, path: str, edit: Callable[[bytes], bytes], build: list[str] | None,
                argv: list[str], timeout: int | None, cleaner: "_MirrorCleanup | None" = None
@@ -618,7 +675,7 @@ class Evidence(_MirrorCleanup):
                 "test_output_sha256": digest, **self._planted(item["path"], item["find"], item["replace"], build, argv)}
 
     def _run_rows(self, mirror: Path, rows: list[dict], build: list[str] | None, test: list[str],
-                  timeout: int | None) -> list[dict]:
+                  timeout: int | None, first: dict | None = None) -> list[dict]:
         results, checked = [], set()
         for item in rows:
             argv = test + item["test_args"]
@@ -628,7 +685,8 @@ class Evidence(_MirrorCleanup):
             builds, code, digest = self._attempt(mirror, item["id"], item["path"], self._planter(item), build, argv,
                                                  timeout)
             results.append(self._row(item, builds, code, digest, build, argv))
-        results.append(self._self_test(mirror, rows[0], build, test + rows[0]["test_args"], timeout))
+        first = rows[0] if first is None else first
+        results.append(self._self_test(mirror, first, build, test + first["test_args"], timeout))
         return results
 
     @staticmethod
@@ -724,6 +782,7 @@ class Evidence(_MirrorCleanup):
         if unexpected:
             reasons.append("commands not as expected: " + ", ".join(unexpected))
         bugs = [row for row in self.planted_bug_rows if row["id"] != SELF_TEST_ID]
+        judged = [row for row in bugs if not is_deferred(row)]
         if not self.planted_bug_rows:
             reasons.append("no planted-bug rows (run planted_bugs first)")
         else:
@@ -746,7 +805,7 @@ class Evidence(_MirrorCleanup):
             "task_id": self.task_id, "head": self.head, "main": self.main_sha, "merge_base": self.merge_base,
             "produced_at": utc_now(), "inputs": store.input_list(self.inputs), "commands": list(self.commands),
             "planted_bugs": list(self.planted_bug_rows),
-            "planted_bugs_all_killed": all(row["killed"] for row in bugs),
+            "planted_bugs_all_killed": all(row["killed"] for row in judged),
             "all_commands_as_expected": all(cmd["as_expected"] for cmd in self.commands),
             "tree_unchanged_by_run": True,
             "blocked_by": list(self.blocked_by), "deviations": list(self.deviations),
@@ -756,6 +815,10 @@ class Evidence(_MirrorCleanup):
             data["children"] = [dict(child) for child in self.children]
         if self.reused_from is not None:
             data["reused_from"] = dict(self.reused_from)
+        if self.planted_bugs_timing is not None:
+            data["planted_bugs_timing"] = dict(self.planted_bugs_timing)
+        if self.plants_reused_from is not None:
+            data["plants_reused_from"] = [dict(item) for item in self.plants_reused_from]
         # last line of defence: never append what validate or the lint would refuse
         problems = validate_results(data) + lint_record(data, self.root)
         if problems:
@@ -810,21 +873,34 @@ class _PlantPool:
     """
 
     def __init__(self, ev: "Evidence", rows: list[dict], build: list[str] | None, test: list[str],
-                 timeout: int | None, workers: int):
+                 timeout: int | None, workers: int, first: dict | None = None, self_test: bool = True):
         self.ev, self.rows, self.build, self.test = ev, rows, build, test
         self.timeout, self.workers = timeout, workers
+        self.first = first if first is not None else (rows[0] if rows else None)  # the self-test row's file
+        self.self_test = self_test
         self._git_lock = threading.Lock()  # git worktree add and remove, one at a time
         self._print_lock = threading.Lock()
         self._done = 0
 
     def _argv(self, item: dict) -> list[str]:
-        return self.test + item["test_args"]
+        """The row's test argv: its own `test_argv` (a chunk of deferred rows), else the base test and its args."""
+        return list(item["test_argv"]) if "test_argv" in item else self.test + item["test_args"]
+
+    def _build(self, item: dict) -> list[str] | None:
+        """The row's build argv: its own `build_argv` (a chunk of deferred rows), else the run's build."""
+        return (list(item["build_argv"]) if item["build_argv"] is not None else None) if "build_argv" in item \
+            else self.build
+
+    def _key(self, item: dict) -> tuple:
+        """What a baseline is shared by: the build and the test argv."""
+        build = self._build(item)
+        return (tuple(build) if build is not None else None, tuple(self._argv(item)))
 
     def _progress(self, what: str, verdict: str, judged: str, started: float, counts: bool) -> None:
         with self._print_lock:
             if counts:
                 self._done += 1
-            where = f" [{self._done}/{len(self.rows) + 1}]" if counts else ""
+            where = f" [{self._done}/{len(self.rows) + int(self.self_test)}]" if counts else ""
             print(f"{what}: {verdict} ({judged}, {time.monotonic() - started:.0f} s){where}", flush=True)
 
     def _in_mirror(self, body: Callable[[_Slot, Path], object], describe: Callable[[object], str]):
@@ -845,11 +921,12 @@ class _PlantPool:
 
         return _then(run, cleanup, describe)
 
-    def _baseline(self, argv: list[str], rid: str, judged: str) -> str | None:
-        """Why the unmutated mirror fails `argv`, or None."""
+    def _baseline(self, key: tuple, rid: str, judged: str) -> str | None:
+        """Why the unmutated mirror fails the build and test of `key`, or None."""
         started = time.monotonic()
+        build, argv = (list(key[0]) if key[0] is not None else None), list(key[1])
         problem = self._in_mirror(
-            lambda slot, mirror: self.ev._baseline_problem(mirror, self.build, argv, rid, self.timeout, slot),
+            lambda slot, mirror: self.ev._baseline_problem(mirror, build, argv, rid, self.timeout, slot),
             lambda found: found or f"unmutated mirror passes its test (row {rid})")
         verdict = "passes" if problem is None else ("fails, judged again alone" if judged == "parallel" else "fails")
         self._progress(f"baseline of {rid}", verdict, judged, started, counts=False)
@@ -858,13 +935,13 @@ class _PlantPool:
     def _judge(self, item: dict, judged: str) -> tuple[dict, str]:
         """(the row, the output that decided it) of one planted bug in its own mirror."""
         started = time.monotonic()
-        argv = self._argv(item)
+        argv, build = self._argv(item), self._build(item)
         builds, code, digest, output = self._in_mirror(
-            lambda slot, mirror: self.ev._judge(mirror, item["id"], item["path"], self.ev._planter(item), self.build,
+            lambda slot, mirror: self.ev._judge(mirror, item["id"], item["path"], self.ev._planter(item), build,
                                                 argv, self.timeout, slot),
             lambda found: f"planted bug {item['id']} gave builds: {str(found[0]).lower()}, "
                           f"test exit: {'not run' if found[1] is None else found[1]}")
-        row = {**self.ev._row(item, builds, code, digest, self.build, argv), "judged": judged}
+        row = {**self.ev._row(item, builds, code, digest, build, argv), "judged": judged}
         self._progress(f"plant {item['id']}", row["kill_reason"], judged, started, counts=judged != "parallel"
                        or not self._doubtful(row, output))
         return row, output
@@ -895,44 +972,44 @@ class _PlantPool:
         return results
 
     def run(self) -> list[dict]:
-        firsts: dict[tuple, str] = {}  # each distinct test argv, with the first row that uses it
+        firsts: dict[tuple, str] = {}  # each distinct build and test argv, with the first row that uses it
         for item in self.rows:
-            firsts.setdefault(tuple(self._argv(item)), item["id"])
-        serial_argvs = {tuple(self._argv(item)) for item in self.rows if item["serial"]}
-        pooled_baselines = [(argv, rid) for argv, rid in firsts.items() if argv not in serial_argvs]
+            firsts.setdefault(self._key(item), item["id"])
+        serial_keys = {self._key(item) for item in self.rows if item["serial"]}
+        pooled_baselines = [(key, rid) for key, rid in firsts.items() if key not in serial_keys]
         pooled = [item for item in self.rows if not item["serial"]]
         jobs: list[Callable[[], object]] = [
-            (lambda argv=argv, rid=rid: self._baseline(list(argv), rid, "parallel")) for argv, rid in pooled_baselines]
+            (lambda key=key, rid=rid: self._baseline(key, rid, "parallel")) for key, rid in pooled_baselines]
         jobs += [(lambda item=item: self._judge(item, "parallel")) for item in pooled]
         outcomes = self._pool(jobs)
         doubted = set()
-        for (argv, rid), problem in zip(pooled_baselines, outcomes[:len(pooled_baselines)]):
+        for (key, rid), problem in zip(pooled_baselines, outcomes[:len(pooled_baselines)]):
             if problem is not None:  # judged again alone before it can fail the run
-                again = self._baseline(list(argv), rid, "serial-recheck")
+                again = self._baseline(key, rid, "serial-recheck")
                 if again is not None:
                     raise KitError(again)
-                doubted.add(argv)
+                doubted.add(key)
         results: dict[str, dict] = {}
         for item, (row, output) in zip(pooled, outcomes[len(pooled_baselines):]):
-            if self._doubtful(row, output) or tuple(self._argv(item)) in doubted:
+            if self._doubtful(row, output) or self._key(item) in doubted:
                 row, _ = self._judge(item, "serial-recheck")
             results[item["id"]] = row
-        checked = {argv for argv, _ in pooled_baselines}
+        checked = {key for key, _ in pooled_baselines}
         for item in self.rows:
             if not item["serial"]:
                 continue
-            argv = tuple(self._argv(item))
-            if argv not in checked:
-                problem = self._baseline(list(argv), item["id"], "serial")
+            key = self._key(item)
+            if key not in checked:
+                problem = self._baseline(key, item["id"], "serial")
                 if problem is not None:
                     raise KitError(problem)
-                checked.add(argv)
+                checked.add(key)
             results[item["id"]], _ = self._judge(item, "serial")
-        return [results[item["id"]] for item in self.rows] + [self._self_test()]
+        return [results[item["id"]] for item in self.rows] + ([self._self_test()] if self.self_test else [])
 
     def _self_test(self) -> dict:
         started = time.monotonic()
-        first = self.rows[0]
+        first = self.first
         row = self._in_mirror(
             lambda slot, mirror: self.ev._self_test(mirror, first, self.build, self._argv(first), self.timeout, slot),
             lambda found: f"the self-test row gave {found['kill_reason']}")
@@ -1188,6 +1265,14 @@ def validate_results(data) -> list[str]:
     shaped, seen = [], set()
     for index, row in enumerate(rows):
         where = f"planted_bugs[{index}]"
+        if is_deferred(row):  # 0.5.3: recorded with its definition, judged later by `pk gate plants`
+            problem = _deferred_problem(row)
+            if problem:
+                bad(where, problem)
+            elif row["id"] in seen:
+                bad(where, f"repeats id {row['id']}")
+            seen.add(row.get("id"))
+            continue
         if not (isinstance(row, dict) and isinstance(row.get("id"), str) and isinstance(row.get("builds"), bool)
                 and isinstance(row.get("killed"), bool)):
             bad(where, "needs a string id and boolean builds and killed")
@@ -1215,11 +1300,12 @@ def validate_results(data) -> list[str]:
         shaped.append(row)
     selfs = [row for row in shaped if row["id"] == SELF_TEST_ID]
     bugs = [row for row in shaped if row["id"] != SELF_TEST_ID]
+    deferred = [row for row in rows if is_deferred(row)]
     if len(selfs) != 1:
         bad("planted_bugs", f"needs exactly one {SELF_TEST_ID} row (found {len(selfs)})")
     elif selfs[0]["builds"] or selfs[0]["killed"]:
         bad("planted_bugs", f"the {SELF_TEST_ID} row must have builds: false and killed: false")
-    if not bugs:
+    if not bugs and not deferred:
         bad("planted_bugs", "needs at least one planted-bug row besides the self-test row")
     if isinstance(data["planted_bugs_all_killed"], bool) and data["planted_bugs_all_killed"] != all(
             row["killed"] for row in bugs):
@@ -1235,6 +1321,21 @@ def validate_results(data) -> list[str]:
                                       and isinstance(reused["digest"], str) and _HEX64.match(reused["digest"])
                                       and isinstance(reused["head"], str) and _HEX40.match(reused["head"])):
         bad("reused_from", "must be {path, digest: sha256, head: 40-hex sha} of the record this one copied")
+    timing = data.get("planted_bugs_timing")
+    if "planted_bugs_timing" in data and not (
+            isinstance(timing, dict) and set(timing) == set(TIMING_KEYS)
+            and isinstance(timing["seconds"], (int, float)) and not isinstance(timing["seconds"], bool)
+            and timing["seconds"] >= 0 and _is_int(timing["rows"]) and timing["rows"] >= 1
+            and _is_int(timing["workers"]) and 1 <= timing["workers"] <= MAX_WORKERS):
+        bad("planted_bugs_timing", "must be {seconds: >= 0, rows: >= 1, workers: 1 to 64} of the judged rows")
+    reused_plants = data.get("plants_reused_from")
+    if "plants_reused_from" in data and not (isinstance(reused_plants, list) and all(
+            isinstance(item, dict) and set(item) == {"path", "digest"} and isinstance(item["path"], str)
+            and item["path"] and isinstance(item["digest"], str) and _HEX64.match(item["digest"])
+            for item in reused_plants)):
+        bad("plants_reused_from", "must be a list of {path, digest: sha256} of the plants records of the reused record")
+    if "plants_reused_from" in data and "reused_from" not in data:
+        bad("plants_reused_from", "belongs to a record that reused another (reused_from)")
     children = data.get("children", [])
     if not isinstance(children, list) or not all(
             isinstance(child, dict) and set(child) == {"task_id", "kind", "digest", "drift"}
@@ -1244,6 +1345,26 @@ def validate_results(data) -> list[str]:
         bad("children", "must be a list of {task_id, kind: results or acceptance, digest: sha256, "
                         "drift: fresh or drifted}")
     return problems
+
+
+def _deferred_problem(row: dict) -> str | None:
+    """Why a deferred row (`deferred: true`) is not one the runner records, or None."""
+    if set(row) != set(DEFERRED_KEYS):
+        extra, missing = sorted(set(row) - set(DEFERRED_KEYS)), sorted(set(DEFERRED_KEYS) - set(row))
+        return ("a deferred row holds its definition and no verdict: exactly " + ", ".join(DEFERRED_KEYS)
+                + (f" (found {', '.join(extra)})" if extra else f" (missing {', '.join(missing)})"))
+    if not isinstance(row["id"], str) or not row["id"] or row["id"] == SELF_TEST_ID:
+        return "a deferred row needs a string id other than the self-test row's"
+    planted = _planted_problem(row)
+    if planted:
+        return planted
+    if not isinstance(row["find"], str) or not row["find"] or row["test_argv"] is None:
+        return "a deferred row needs a non-empty find and a test_argv"
+    if not isinstance(row["serial"], bool):
+        return "serial must be true or false"
+    if row["definition_sha256"] != definition_digest(row):
+        return "definition_sha256 does not match the row's definition"
+    return None
 
 
 def is_gate(task_id) -> bool:
@@ -1309,6 +1430,184 @@ def validate_acceptance(data) -> list[str]:
     return problems
 
 
+PLANTS_KEYS = ("task_id", "kind", "part_of", "head", "kit_version", "produced_at", "workers", "seconds", "rejudge",
+               "rows", "all_killed")  # a plants record (0.5.3)
+
+
+def validate_plants(data) -> list[str]:
+    """Every problem found in a `plants` record (empty when valid): the verdicts of deferred planted-bug rows that
+    `pk gate plants` judged at the head of the results record it names in `part_of`."""
+    if not isinstance(data, dict):
+        return ["plants must be a JSON object"]
+    problems = [f"missing key: {key}" for key in PLANTS_KEYS if key not in data]
+    if problems:
+        return problems
+    extra = sorted(set(data) - set(PLANTS_KEYS))
+    if extra:
+        problems.append(f"unknown key: {', '.join(extra)}")
+    if not isinstance(data["task_id"], str) or not data["task_id"]:
+        problems.append("task_id: must be a non-empty string")
+    if data["kind"] != store.PLANTS:
+        problems.append("kind: must be plants")
+    part_of = data["part_of"]
+    if not (isinstance(part_of, dict) and set(part_of) == {"path", "digest"} and isinstance(part_of["path"], str)
+            and isinstance(part_of["digest"], str) and _HEX64.match(part_of["digest"])):
+        problems.append("part_of: must be {path, digest: sha256} of the results record whose deferred rows it judged")
+    else:
+        try:
+            if store.check_rel(part_of["path"])[1] != "results":
+                problems.append("part_of: path must name a results record")
+        except KitError as exc:
+            problems.append(f"part_of: {exc}")
+    if not isinstance(data["head"], str) or not _HEX40.match(data["head"]):
+        problems.append("head: must be a 40-character lowercase hex SHA")
+    if not isinstance(data["kit_version"], str) or not data["kit_version"]:
+        problems.append("kit_version: must be a non-empty string")
+    if not isinstance(data["produced_at"], str) or not _STAMP.match(data["produced_at"]):
+        problems.append("produced_at: must be UTC, YYYY-MM-DDTHH:MM:SSZ")
+    if not (_is_int(data["workers"]) and 1 <= data["workers"] <= MAX_WORKERS):
+        problems.append(f"workers: must be a whole number from 1 to {MAX_WORKERS}")
+    seconds = data["seconds"]
+    if not (isinstance(seconds, (int, float)) and not isinstance(seconds, bool) and seconds >= 0):
+        problems.append("seconds: must be a number >= 0")
+    if not isinstance(data["rejudge"], bool):
+        problems.append("rejudge: must be true or false")
+    rows = data["rows"]
+    if not isinstance(rows, list) or not rows:
+        problems.append("rows: must be a non-empty list")
+        rows = []
+    seen, killed = set(), []
+    for index, row in enumerate(rows):
+        where = f"rows[{index}]"
+        if not (isinstance(row, dict) and isinstance(row.get("id"), str) and row["id"] and row["id"] != SELF_TEST_ID
+                and isinstance(row.get("builds"), bool) and isinstance(row.get("killed"), bool)):
+            problems.append(f"{where}: needs a string id (not the self-test row's) and boolean builds and killed")
+            continue
+        if row["id"] in seen:
+            problems.append(f"{where}: repeats id {row['id']}")
+        seen.add(row["id"])
+        missing = [key for key in (*ROW_KEYS, *PLANTED_KEYS, "serial", "definition_sha256") if key not in row]
+        if missing:
+            problems.append(f"{where}: missing {', '.join(missing)}")
+            continue
+        if row["killed"] and not row["builds"]:
+            problems.append(f"{where}: killed although it does not build")
+        expected = "build failed" if not row["builds"] else "test failed" if row["killed"] else "not killed"
+        if row["kill_reason"] != expected:
+            problems.append(f"{where}: kill_reason must be '{expected}' (found {row['kill_reason']!r})")
+        digest = row["test_output_sha256"]
+        if not isinstance(digest, str) or not (digest == "" or _HEX64.match(digest)):
+            problems.append(f"{where}: test_output_sha256 must be 64 lowercase hex characters, or empty")
+        planted = _planted_problem(row)
+        if planted:
+            problems.append(f"{where}: {planted}")
+        elif not isinstance(row["serial"], bool) or row["definition_sha256"] != definition_digest(row):
+            problems.append(f"{where}: definition_sha256 does not match the row's definition")
+        if "judged" in row and row["judged"] not in JUDGED:
+            problems.append(f"{where}: judged must be one of {', '.join(JUDGED)}")
+        killed.append(row["killed"])
+    if isinstance(data["all_killed"], bool) and data["all_killed"] != all(killed):
+        problems.append("all_killed: does not match the rows")
+    return problems
+
+
+def plants_chain(root, entry: dict, data: dict) -> dict[str, str]:
+    """{results digest: head} of the record `entry` names and every record it reused, in turn (`reused_from`).
+
+    A plants record bound to any of them counts for the record: a reuse copies the planted-bug rows of a record
+    whose code is byte-identical (0.5.2), so a verdict judged on that code holds for the new record too (0.5.3)."""
+    chain = {entry["digest"]: data.get("head")}
+    current = data
+    while isinstance(current.get("reused_from"), dict) and len(chain) < 1000:
+        source = current["reused_from"]
+        if source.get("digest") in chain:
+            break
+        current = store.load(root, source["path"], source["digest"])
+        chain[source["digest"]] = current.get("head")
+    return chain
+
+
+def plants_coverage(root, task_id: str, entry: dict, data: dict) -> dict:
+    """How far the `plants` records of the checkout at `root` cover the deferred rows of a results record.
+
+    {deferred: [ids], killed: {id: plants path}, survived: {id: (plants path, kill_reason)}, pending: [ids],
+    problems: [...]}. A row counts as killed when a plants record listed in the task's pointer, bound by `part_of`
+    to the record (or a record it reused), judged at that record's head with the row's definition, says killed.
+    `pending` lists the deferred rows with no killed verdict, in table order.
+    """
+    deferred = {row["id"]: row["definition_sha256"] for row in data.get("planted_bugs", []) if is_deferred(row)}
+    found = {"deferred": list(deferred), "killed": {}, "survived": {}, "pending": [], "problems": []}
+    if not deferred:
+        return found
+    try:
+        chain = plants_chain(root, entry, data)
+        items = store.read_plants(root, task_id)
+    except KitError as exc:
+        found["problems"].append(" ".join(str(exc).split()))
+        items, chain = [], {}
+    for item in items:
+        if item["part_of"] not in chain:
+            continue
+        try:
+            record = store.load(root, item["path"], item["digest"])
+        except KitError as exc:
+            found["problems"].append(" ".join(str(exc).split()))
+            continue
+        problems = validate_plants(record)
+        if problems:
+            found["problems"].append(f"{item['path']}: not a valid plants record: {problems[0]}")
+            continue
+        if record["task_id"] != task_id or record["part_of"]["digest"] != item["part_of"]:
+            found["problems"].append(f"{item['path']}: the pointer's entry does not match the record")
+            continue
+        if record["head"] != chain[item["part_of"]]:
+            found["problems"].append(f"{item['path']}: judged at {record['head']}, not at {chain[item['part_of']]}, "
+                                     "the head of the record it is bound to")
+            continue
+        for row in record["rows"]:
+            if row["id"] not in deferred:
+                continue
+            if row["definition_sha256"] != deferred[row["id"]]:
+                found["problems"].append(f"{item['path']}: row {row['id']} judged another definition than the "
+                                         "deferred row")
+            elif row["killed"]:
+                found["killed"].setdefault(row["id"], item["path"])
+            else:
+                found["survived"][row["id"]] = (item["path"], row["kill_reason"])
+    found["survived"] = {rid: why for rid, why in found["survived"].items() if rid not in found["killed"]}
+    found["pending"] = [rid for rid in deferred if rid not in found["killed"]]
+    return found
+
+
+def _listed(ids: list[str], shown: int = 20) -> str:
+    return ", ".join(ids[:shown]) + (f" and {len(ids) - shown} more" if len(ids) > shown else "")
+
+
+def coverage_problem(root, task_id: str, entry: dict, data: dict) -> str | None:
+    """Why the deferred planted-bug rows of the results record `entry` are not all killed in `plants` records, naming
+    the missing and surviving rows and the command that judges them; None when complete (or none was deferred)."""
+    found = plants_coverage(root, task_id, entry, data)
+    if found["problems"]:
+        return f"{task_id}: the plants records cannot be read: {found['problems'][0]}"
+    if not found["pending"]:
+        return None
+    survived = [rid for rid in found["pending"] if rid in found["survived"]]
+    missing = [rid for rid in found["pending"] if rid not in found["survived"]]
+    parts = []
+    if missing:
+        parts.append(f"not judged yet: {_listed(missing)}")
+    if survived:
+        parts.append("judged and not killed: " + _listed([f"{rid} ({found['survived'][rid][1]})" for rid in survived]))
+    command = f"pk gate plants {task_id} --branch task/{task_id}"
+    how = [f"judge them with: {command} --all-pending"] if missing else []
+    if survived:
+        how.append(f"after a fix, the gate writes a new record; to judge a row again at this head: {command} --rows "
+                   f"{','.join(survived[:20])} --rejudge")
+    return (f"{task_id}: {len(found['pending'])} of {len(found['deferred'])} deferred planted-bug rows of "
+            f"{entry['path']} have no killed verdict in a plants record bound to it ({'; '.join(parts)}); "
+            + "; ".join(how))
+
+
 def gate_problems(data, task_id: str, head: str | None = None, root=None) -> list[str]:
     """Why a results record does not pass the hand-back gate (empty when it does); `head` None skips the head check.
 
@@ -1342,8 +1641,8 @@ def gate_problems(data, task_id: str, head: str | None = None, root=None) -> lis
 # --- command -----------------------------------------------------------------------
 
 def _store_kind(path: Path) -> str | None:
-    """`results` or `acceptance` for a file named like a record in a directory of that kind, else None."""
-    if store._NAME.match(path.name) and path.parent.name in store.KINDS:
+    """`results`, `acceptance` or `plants` for a file named like a record in a directory of that kind, else None."""
+    if store._NAME.match(path.name) and path.parent.name in store.RECORD_KINDS:
         return path.parent.name
     return None
 
@@ -1381,7 +1680,7 @@ def _validate(args) -> int:
         if problem:
             return _errors([problem.replace(path.name, str(path), 1)])
     data = read_json(path)
-    problems = validate_acceptance(data) if kind == "acceptance" else validate_results(data)
+    problems = {"acceptance": validate_acceptance, store.PLANTS: validate_plants}.get(kind, validate_results)(data)
     if problems:
         return _errors(problems)
     print(f"evidence valid: {path}")
@@ -1403,8 +1702,11 @@ def _history(args) -> int:
         print(f"{args.task_id}: no records under program/evidence/{args.task_id}/")
         return 0
     for row in rows:
-        state = "current" if row["current"] else "superseded"
-        when = ("produced_at " if row["kind"] == "results" else "accepted_at ") + (row["at"] or "-")
+        if row["kind"] == store.PLANTS:  # every plants record counts; the pointer lists each one
+            state = "listed" if row["current"] else "not listed"
+        else:
+            state = "current" if row["current"] else "superseded"
+        when = ("accepted_at " if row["kind"] == "acceptance" else "produced_at ") + (row["at"] or "-")
         fields = [state, row["kind"], row["digest"], f"head {row['head'] or '-'}", when]
         if row["kind"] == "acceptance":
             fields.append(f"decision {row['decision'] or '-'}")
@@ -1433,6 +1735,13 @@ def accept(root, task_id: str, data) -> dict:
     if data["source_commit"] != record.get("head"):
         raise KitError(f"acceptance source_commit {data['source_commit']} is not {record.get('head')}, the head "
                        "the latest results record names")
+    if data["decision"] == "accepted_development":
+        import latework  # late: keeps the module graph flat
+
+        problem = coverage_problem(root, task_id, entry, record) \
+            or latework.early_problem(root, task_id, str(record.get("head")), "pk evidence accept")
+        if problem:
+            raise KitError(problem)
     return store.record(root, task_id, "acceptance", data)
 
 
