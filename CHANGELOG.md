@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.5.2 (unreleased)
+## 0.5.2
 
 Faster hand-back gates (R546 in the program it came from). There, one gate took about an hour while the machine (10 cores) mostly idled: the build and test steps 5 to 8 minutes, the producer re-running the same suites about 8 minutes, and the planted bugs 2,946 s for 151 rows, 129 baselines and the self-test row, judged one at a time, close to the evidence step's 3,600 s limit. All three changes are opt-in: nothing in `program/` has to change, every record and producer written before reads and runs as it did, and a program that opts into nothing gets byte-identical rows.
 
