@@ -267,9 +267,10 @@ class ZeroContextReviewTests(unittest.TestCase):
             self.assertIn(needle, step, needle)
         self.assertIn("phase 2", steps[steps.index("7. Start a spec-QA agent"):])
 
-    def test_playbook_08_runs_pk_drift_after_each_merge_batch(self):
+    def test_playbook_08_runs_pk_drift_after_every_controller_event(self):
         steps = sections(read(PLAYBOOK_DIR / "08_execute.md"))["Steps"]
-        self.assertRegex(steps, r"After each merge batch[^\n]*`pk drift`")
+        self.assertRegex(steps, r"After every hand-back, gate, verdict, merge, ruling or dispatch[^\n]*`pk drift`")
+        self.assertRegex(steps, r"`pk drift`[^\n]*D7[^\n]*`pk status ready`[^\n]*`pk hook install <adapter>`")
 
     def test_spec_qa_reviews_blind_then_rules_on_every_lens_row_with_no_synthesizer_or_judge(self):
         text = read(BRIEF_DIR / "spec_qa.md")

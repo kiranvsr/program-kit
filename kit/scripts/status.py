@@ -693,6 +693,15 @@ def cmd_status(args: argparse.Namespace) -> int:
         for record in list_all(_root()):
             print("\t".join([record["task_id"], record["status"], record["role"], record["updated_at"],
                              tier_of(record) + ("+fast" if is_fast(record) else "")]))
+    elif action == "ready":
+        import progress
+
+        found = progress.ready(_root())
+        if args.json:
+            print(json.dumps(found, indent=2))
+        else:
+            for line in progress.ready_lines(found):
+                print(line)
     elif action == "validate":
         problems = validate(_root())
         for problem in problems:  # each on its own line, like every other check that can find several
@@ -701,7 +710,7 @@ def cmd_status(args: argparse.Namespace) -> int:
             return 1
         print("status: ok")
     else:
-        raise KitError("status needs an action: set, reopen, tier, show, list or validate")
+        raise KitError("status needs an action: set, reopen, tier, show, list, ready or validate")
     return 0
 
 
@@ -738,6 +747,9 @@ def _configure(parser: argparse.ArgumentParser) -> None:
                          help="leave the fast path: the task now has SPEC, PLAN and a spec-QA review on main")
     actions.add_parser("show", help="print one record").add_argument("task_id")
     actions.add_parser("list", help="one line per task")
+    ready = actions.add_parser("ready", help="not-started tasks whose dependencies are done or merged (ready) or "
+                                             "wait on one (near-ready), without a worktree or task/wip branch")
+    ready.add_argument("--json", action="store_true", help="print {ready, near_ready} as JSON")
     actions.add_parser("validate", help="check every record")
 
 
