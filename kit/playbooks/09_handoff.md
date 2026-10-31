@@ -13,7 +13,7 @@ What each role reads at start, and nothing more. Sizes are the kit's files as sh
 
 | Role | Reads at start | Kit files, KB |
 |---|---|---|
-| Controller or successor | `program/HANDOFF.md` (60 KB at most), `kit/rules/RULES.md` whole, `kit/briefs/controller.md`, `kit/playbooks/00_START.md`, `kit/playbooks/08_execute.md`, `program/COMMON.md` | 52.0 |
+| Controller or successor | `program/HANDOFF.md` (60 KB at most), `kit/rules/RULES.md` whole, `kit/briefs/controller.md`, `kit/playbooks/00_START.md`, `kit/playbooks/08_execute.md`, `program/COMMON.md` | 52.3 |
 | Implementer, full or standard tier | `kit/rules/RULES.md` parts 1 to 3, `kit/briefs/implementer.md`, `program/COMMON.md`, the task's definition | 19.5 |
 | Implementer, light tier | `kit/rules/RULES.md` parts 1 and 2, `kit/briefs/implementer.md`, `program/COMMON.md`, the task's definition (the fast-path `BRIEF.md`, or its SPEC and PLAN) | 13.9 |
 | QA | `kit/rules/RULES.md` parts 1 to 3, `kit/briefs/qa.md`, `program/COMMON.md`, the task's definition, the diff file and the stat file | 20.4 |
@@ -28,7 +28,7 @@ Rulings are read by number when something cites one (`program/rulings.md`, `kit/
 1. Outgoing controller: finish or park the step you are on. Void any partial evidence by exact path. Leave no dirty worktree, and run `pk worktree finish <ID>` for each merged task.
 2. Update the maintained sections of `program/HANDOFF.md`: how the program works, current environment setup, any hazard met twice under Known hazards, and under Next steps only the order of what comes next (2 KB at most; the generated Now list says what is in flight). Where the rules live stays one line. The hand-off carries state, not rules and not history: a decision goes in a ruling (`pk record --ruling TEXT`), and a ruling that changes the process changes the playbook or rule file in the same commit. Keep the model mapping in `program/COMMON.md`.
 3. Run `pk handoff update`, then `pk handoff check`. It exits 1 while the generated part is stale, while the file is over its budget (60 KB) or while Next steps is over 2 KB. When over budget: close or tag follow-ups (`pk followups close`, `pk followups tag`), move history into rulings, trim the hand-written sections; if it must be raised meanwhile, `pk record --ruling TEXT --handoff-budget BYTES` does it by a ruling and the hand-off then says so. Commit `program/` only when it exits 0.
-4. Give the successor the prompt below, and tell the user who is taking over.
+4. Run `pk drift`: D3 and D7 must be ok (D7 once `progress` is in `checks.yaml`: the progress docs are not behind a state commit). Give the successor the prompt below, and tell the user who is taking over.
 5. Successor: follow the prompt. Do the state check before anything else. Write your own model mapping into `program/COMMON.md`, and use your own attribution line on commits.
 6. A successor never restarts an accepted task and never resumes an agent whose task has since merged.
 
@@ -55,6 +55,8 @@ rules are in one file.
    - The repo-wide suite passes on main: run the test commands of program/checks.yaml
      on a clean checkout. If it fails, stop and tell the user before you dispatch.
    - pk handoff check. If stale, run pk handoff update and commit.
+   - pk drift: D3 and D7 ok, and pk status ready for the free slots. If your agent
+     tool has a stop-hook adapter (pk hook list), run pk hook install <adapter>.
 3. Tell the user in a few lines what you found, what you verified yourself and what
    you will do next.
 4. Resume at the Now list and Next steps of HANDOFF, following
@@ -68,7 +70,7 @@ A current `program/HANDOFF.md` within its budget, a committed `program/`, the su
 
 ## Done when
 
-`pk handoff check` exits 0, the working tree and every task worktree are clean or hold only voided partial evidence you have named, and the successor has confirmed the state check.
+`pk handoff check` exits 0, `pk drift` reports D3 and D7 ok, the working tree and every task worktree are clean or hold only voided partial evidence you have named, and the successor has confirmed the state check.
 
 ## Next playbook
 

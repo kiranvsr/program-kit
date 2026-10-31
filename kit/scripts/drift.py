@@ -14,9 +14,17 @@ detached worktree, so nothing in the checkout is written, and removes that workt
      matches is named in the document, by its name, its stem or its leading number.
   D5 QA evidence: every task whose status is `done` has an acceptance record.
   D6 validators: `pk register validate`, `pk status validate` and `pk trace validate` at the highest approved stage.
+  D7 progress docs behind state: with the optional `progress` section ({docs, state}), no commit on the main branch
+     touching a state path comes after the oldest of the docs' newest commits (progress.py); skipped without it.
+     Like D3 it reads the real checkout and the main branch, whatever REV is.
 
+After the checks it prints, as information and never as drift, the tasks ready to start (`pk status ready`).
 Drift is information: the command exits 0 unless `--strict` is given and a check drifts (for a scheduled run).
 Different from `pk stale`, which compares one task's evidence with the tree.
+
+`pk drift --hook <adapter>` is the adapter for an agent tool's stop hook (hook.py names the adapters): it runs D3 and D7 only, on
+the checkout, and prints nothing when both are clean; otherwise it prints the harness's stop-hook answer, which
+blocks the agent's stop with the reason. A problem is one line on stderr and exit 1, which never blocks.
 """
 from __future__ import annotations
 
@@ -245,6 +253,7 @@ def report(root: Path, rev: str = "HEAD") -> tuple[str, list[tuple[str, bool, st
         head = ""
     # D3 first, on the real checkout: the temporary worktree below would otherwise be listed in the hand-off
     hand_off = _hand_off(root) if sha == head else (True, "skipped: not the checkout's HEAD")
+    progress_docs = _progress(root)
     with tempfile.TemporaryDirectory(prefix="pk-drift-") as tmp:
         tree = Path(tmp) / "tree"
         git(root, "worktree", "add", "--detach", "--quiet", str(tree), sha)
@@ -259,17 +268,46 @@ def report(root: Path, rev: str = "HEAD") -> tuple[str, list[tuple[str, bool, st
         finally:
             subprocess.run(["git", "-C", str(root), "worktree", "remove", "--force", str(tree)], capture_output=True)
             subprocess.run(["git", "-C", str(root), "worktree", "prune"], capture_output=True)
-    return sha, [(cid, *found[cid]) for cid in ("D1", "D2", "D3", "D4", "D5", "D6")]
+    found["D7"] = progress_docs
+    return sha, [(cid, *found[cid]) for cid in ("D1", "D2", "D3", "D4", "D5", "D6", "D7")]
+
+
+def _progress(root: Path) -> tuple[bool, str]:
+    import progress
+
+    try:
+        result = progress.behind(root, progress.config(root))
+    except KitError as exc:
+        return False, _one_line(exc)
+    return result["ok"], result["detail"]
+
+
+def _ready_lines(root: Path) -> list[str]:
+    import progress
+
+    try:
+        return progress.ready_lines(progress.ready(root))
+    except KitError as exc:
+        return [f"not listed: {_one_line(exc)}"]
 
 
 # --- command ------------------------------------------------------------------------
 
 def cmd_drift(args: argparse.Namespace) -> int:
+    if args.hook is not None:
+        import hook
+
+        return hook.stop_check(args.hook)
     started = time.monotonic()
-    sha, results = report(find_root(), args.rev)
+    root = find_root()
+    sha, results = report(root, args.rev)
     print(f"drift report at {sha[:12]} ({time.monotonic() - started:.0f} s)")
     for cid, ok, detail in results:
         print(f"  {cid} {'ok' if ok else 'DRIFT':5} {_one_line(detail)}")
+    lines = _ready_lines(root)
+    print(f"  ready to start (information, not a check): {len(lines) or 'none'}")
+    for line in lines:
+        print(f"    {line}")
     drifted = sum(1 for _, ok, _ in results if not ok)
     print(f"  {drifted} of {len(results)} checks drift")
     return 1 if args.strict and drifted else 0
@@ -278,8 +316,13 @@ def cmd_drift(args: argparse.Namespace) -> int:
 def _configure(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--rev", default="HEAD", metavar="REV", help="the commit to check (default HEAD)")
     parser.add_argument("--strict", action="store_true", help="exit 1 when any check drifts")
+    import hook
+
+    parser.add_argument("--hook", choices=hook.ADAPTERS, metavar="ADAPTER",
+                        help="run as an agent stop hook (D3 and D7 only; reads the hook's JSON on stdin): "
+                             + ", ".join(hook.ADAPTERS))
 
 
 def register(add_command) -> None:
     add_command("drift", cmd_drift, help="report-only: do the documents still agree with their generators, "
-                "approvals and code (D1 to D6)", configure=_configure)
+                "approvals and code, and are the progress docs behind state (D1 to D7)", configure=_configure)

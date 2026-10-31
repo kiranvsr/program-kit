@@ -16,6 +16,7 @@ from unittest import mock
 import evidence as evidence_module
 import gate as gate_module
 import interview
+import hook
 import pk
 import store
 from common import read_json, read_yaml, run_argv, sha256_bytes, sha256_file, utc_now, write_yaml
@@ -503,16 +504,22 @@ class EndToEndTests(unittest.TestCase):
         trees = project.git("worktree", "list", "--porcelain")
         report = project.pk("drift").stdout
         self.assertRegex(report, rf"^drift report at {project.git('rev-parse', 'HEAD')[:12]} ")
-        self.assertEqual(len(re.findall(r"^  D[1-6] (?:ok|DRIFT) ", report, re.M)), 6, report)
+        self.assertEqual(len(re.findall(r"^  D[1-7] (?:ok|DRIFT) ", report, re.M)), 7, report)
         self.assertIn("  D5 ok    every done task has an acceptance record (1 done)", report)
         self.assertIn("  D3 DRIFT program/HANDOFF.md is stale", report)  # the fingerprint landed after the last update
-        self.assertIn("  1 of 6 checks drift", report)
+        self.assertIn("  1 of 7 checks drift", report)
         project.pk("drift", "--strict", expect=1)
         self.assertEqual((project.git("status", "--porcelain"), project.git("worktree", "list", "--porcelain")),
                          ("", trees))
         project.pk("handoff", "update")
         project.commit("hand-off after the fingerprint", "program/HANDOFF.md")
-        self.assertIn("  0 of 6 checks drift", project.pk("drift", "--strict").stdout)
+        self.assertIn("  0 of 7 checks drift", project.pk("drift", "--strict").stdout)
+        # 0.5.4: the ready list and the stop-hook adapter; install refuses a settings file git does not ignore
+        self.assertIn("ready to start (information, not a check)", project.pk("drift").stdout)
+        project.pk("status", "ready", "--json")
+        self.assertIn("not installed", project.pk("hook", "list").stdout)
+        project.pk("hook", "install", hook.ADAPTERS[0], expect=1)
+        self.assertEqual(project.git("status", "--porcelain"), "")
         project.pk("init", expect=1)  # program/ exists: init refuses to overwrite it
 
         pk.build_parser()  # fills pk.COMMANDS: only init and doctor register at import, the rest when it is built

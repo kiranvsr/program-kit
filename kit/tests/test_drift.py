@@ -17,7 +17,7 @@ from test_worktree import commit_all, make_repo, run_cli, sh
 KIT = Path(__file__).resolve().parent.parent
 TID = "P1-M01-S01-T01"
 GEN = "from pathlib import Path\nPath('docs').mkdir(exist_ok=True)\nPath('docs/gen.txt').write_text({text!r})\n"
-LINE = re.compile(r"^  (D[1-6]) (ok|DRIFT) +(.*)$")
+LINE = re.compile(r"^  (D[1-7]) (ok|DRIFT) +(.*)$")
 
 
 class DriftBase(unittest.TestCase):
@@ -63,12 +63,13 @@ class ReportTests(DriftBase):
         code, out, err = self.drift()
         self.assertEqual((code, err), (0, ""), out)
         rows = self.rows(out)
-        self.assertEqual(list(rows), ["D1", "D2", "D3", "D4", "D5", "D6"])
+        self.assertEqual(list(rows), ["D1", "D2", "D3", "D4", "D5", "D6", "D7"])
         self.assertTrue(all(state == "ok" for state, _ in rows.values()), out)
         head = sh(self.root, "git", "rev-parse", "HEAD").strip()
         self.assertRegex(out.splitlines()[0], rf"^drift report at {head[:12]} \(\d+ s\)$")
-        self.assertEqual(out.splitlines()[-1], "  0 of 6 checks drift")
+        self.assertEqual(out.splitlines()[-1], "  0 of 7 checks drift")
         self.assertIn("regeneration is a no-op", rows["D1"][1])
+        self.assertIn("skipped: not configured", rows["D7"][1])  # no progress section: D7 says so (0.5.4)
         self.assertEqual(self.drift("--strict")[0], 0)
         self.assertEqual(self.snapshot(), before)  # report only: nothing written, no worktree left behind
 
@@ -81,7 +82,7 @@ class ReportTests(DriftBase):
         state, detail = self.rows(out)["D1"]
         self.assertEqual(state, "DRIFT")
         self.assertIn("docs/gen.txt", detail)
-        self.assertEqual(out.splitlines()[-1], "  1 of 6 checks drift")
+        self.assertEqual(out.splitlines()[-1], "  1 of 7 checks drift")
         self.assertEqual(self.drift("--strict")[0], 1)
         self.assertEqual(self.snapshot(), before)
         self.assertEqual((self.root / "docs" / "gen.txt").read_text(), "generated\n")

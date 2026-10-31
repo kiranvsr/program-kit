@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.5.4
+
+Progress docs behind state, the tasks ready to start, and a stop hook (R570 in the program it came from). There, controllers let the hand-kept progress docs (a dashboard, a successor prompt) fall behind the program state and left agent slots idle during busy event-driven stretches; the user had to ask four times. The program's stop-gap was a script outside the repository run by its agent tool's stop hook. This release makes the check part of `pk drift`, provider-neutral, with the hook as an adapter. Everything is backward compatible: without the new `progress` section `pk drift` runs as before, with one more line, `D7 ok skipped: not configured`, and the ready list.
+
+What changed:
+
+- `pk drift` D7, progress docs behind state. The optional `progress` section of `program/checks.yaml` names `docs` (paths kept by hand) and `state` (paths whose commits change the program state), and optionally `quiet_when`. D7 drifts when a commit on the main branch touching a `state` path comes after the oldest of the `docs` paths' newest commits, judged by history (`<docs commit>..main`): a branch's state commit merged after the docs counts. It names the newer state commits (short sha and subject, at most six, then a count). Without the section it is skipped and says so. HANDOFF staleness stays D3. The gate and `pk doctor` check the section's shape. `kit/scripts/progress.py`.
+- `pk status ready [--json]`: the not-started register tasks whose `depends_on` are all done or merged (ready), and those with exactly one dependency not yet done (near-ready, naming it and its status), leaving out any task with a worktree or a `task/<ID>` or `wip/<ID>...` branch. `pk drift` prints it after the checks, as information, never as drift.
+- `pk drift --hook <adapter>`, the stop-hook form: D3 and D7 only, on the checkout. It prints nothing and exits 0 when both are clean; otherwise it prints the agent tool's block answer (for the one adapter so far, `{"decision": "block", "reason": ...}`), whose reason names the stale docs, the newer state commits, what to do (run the program's progress pass, republish its tracker, fill free agent slots or say why none fits) and the ready lines. It reads the hook's JSON on standard input and stays silent when the agent is already continuing because of this hook, and when `progress.quiet_when` (a shell command) exits 0. Standard output carries nothing but the answer; a problem is one line on standard error and exit 1, which never blocks.
+- `pk hook install <adapter>`, `pk hook remove <adapter>` and `pk hook list` (`kit/scripts/hook.py`). Install merges a stop hook running `python3 <absolute path>/kit/scripts/pk.py drift --hook <adapter>` into the tool's local settings file, creating it if absent and keeping every other key and array; it is idempotent, re-points an old entry of its own at the current path, and refuses when the file is tracked by git or not git-ignored, saying which line to add to `.gitignore`. Remove deletes only its own entry. Neither ever writes the tool's shared settings file or any git hook.
+- Docs: DESIGN sections 3 and 9.3, playbook 08 (run `pk drift` after every hand-back, gate, verdict, merge, ruling or dispatch; install the hook where the agent tool has an adapter), playbook 09 (D3 and D7 ok before a hand-off and in the successor's state check), README.
+
+Design choices, each with its reason:
+
+- The check lives in `pk drift`, not in the hook: any controller on any agent tool runs the same check by hand; the hook only makes one tool run it at the right moment.
+- Nothing in git hooks: a git hook fires inside merges and pushes, where a refusal leaves a half-done merge or a refused push. Nothing committed: one person's agent tool settings do not belong to everyone, so install refuses a tracked or unignored settings file.
+- History, not clock time, decides "after": commits made in the same second, and a branch's status commits merged after the docs, are judged correctly.
+- The hook runs only D3 and D7, never the full report: it runs every time the agent stops, and the full report builds a temporary worktree and runs the regenerators.
+- The adapter names are written in fragments in the kit's code: the kit names no vendor in its files, yet an adapter has to use the tool's own command and directory names.
+
+Upgrading from 0.5.3: `sh install.sh /path/to/your-repo --upgrade`. Nothing in `program/` has to change. To use D7, add the `progress` section to `program/checks.yaml`; to have your agent tool run it at each stop, run `pk hook install <adapter>` (`pk hook list` names the adapters) and remove any hand-made hook that did the same.
+
 ## 0.5.3
 
 Planted-bug chunks as kit records (R561 in the program it came from). There, a full-tier task carries 150 to 250 planted-bug rows, and gap rows (QA's surviving plants, spec-QA gaps) arrive in fix rounds. Judged as a chunk, 110 gap rows took 863 s; inside a gate they hold the machine for about an hour. The program judged them in a separate run into a side file of the producer's, `program/evidence/<ID>/gap-plants-extra.json`, and `pk merge` refused it after QA had accepted (F-0403): nothing unbound may land after the reviewed commit. That rule stays. The chunk results are now a kit record, bound to the gate record, that acceptance and merge understand. Everything is backward compatible: every record, pointer and producer written before reads and runs as it did, and a producer that marks no row `defer` gets the 0.5.2 rows.

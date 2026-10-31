@@ -77,7 +77,7 @@ from register import GATE_ID, GATE_SHAPE
 
 MAIN = "main"  # the primary branch; fixed, so no caller can choose where the rules are read from
 CHECK_KEYS = ("build", "test", "scan", "compile_check", "extra_gate")
-ALL_KEYS = CHECK_KEYS + ("parallel_steps", "guarded_files", "tiers", "drift", "evidence")  # drift: `pk drift` only
+ALL_KEYS = CHECK_KEYS + ("parallel_steps", "guarded_files", "tiers", "drift", "evidence", "progress")  # drift, progress: `pk drift` only
 TIER_KEYS = ("full_paths", "light_paths", "light_ruling")
 BUILTIN_FULL = ("kit/", "program/checks.yaml", "program/gates.yaml")  # the kit's own gates: always full-tier
 LIGHT_STEPS = ("build", "compile_check", "scan")
@@ -203,6 +203,9 @@ def _parse_checks(data, require: tuple[str, ...]) -> dict:
     import drift  # late: the drift section is pk drift's; the gate only refuses one of the wrong shape
 
     checks["drift"] = drift.parse(data.get("drift"))
+    import progress  # late, like drift: read by pk drift alone
+
+    checks["progress"] = progress.parse(data.get("progress"))
     checks["evidence"] = evidence_module.parse_config(data.get("evidence"))
     for key in require:
         if not checks[key]:
