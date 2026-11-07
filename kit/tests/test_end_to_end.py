@@ -403,11 +403,12 @@ class EndToEndTests(unittest.TestCase):
         register_file.write_text(text.replace("one access log line per request",
                                               "one access log line per request, never with the body", 1),
                                  encoding="utf-8")
-        project.pk("change", "apply", cr, "--note", "task text says the log never holds the request body")
+        applied = project.pk("change", "apply", cr, "--note", "task text says the log never holds the request body")
+        # 0.5.5 (KF-26): apply re-hashes the approval the change made stale (the register, stage 6) and says so
+        self.assertIn("stage 6: re-hashed program/register.yaml", applied.stdout)
         project.pk("briefs", "check")
-        self.assertIn("next stage: 6", project.pk("interview", "next").stdout)  # the approved register changed
-        project.pk("interview", "amend", "6")
         self.assertIn("next stage: 7", project.pk("interview", "next").stdout)
+        self.assertEqual(project.pk("interview", "amend", "6").stdout, "no changes\n")
         project.pk("interview", "validate")
         project.pk("interview", "report", "1")
 
