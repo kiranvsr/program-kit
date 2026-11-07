@@ -195,6 +195,25 @@ def _quiet(function, *args, **kwargs):
     return result, out.getvalue().splitlines()
 
 
+_KILLED = re.compile(r"^FAILED: \S+ .*\(exit -?\d+, killed by (SIG[A-Z]+)")
+
+
+def _merge_check(root: Path, branch: str, inspected: str | None, suite: bool) -> tuple[int, list[str], str]:
+    """`gate.merge_check`, run once more when a command of it was killed by a signal (0.5.5, KF-29).
+
+    A merge check that fails because the machine killed a command (SIGKILL when the web suite ran out of memory, in
+    the program this came from) says nothing about the branch, and a second run usually passes. Any other failure is
+    final at once. Returns (exit, the lines it printed, and what happened the first time, or "" when it ran once).
+    """
+    code, printed = _quiet(gate.merge_check, root, branch, inspected=inspected, suite=suite)
+    killed = next((match.group(1) for line in printed if (match := _KILLED.match(line))), None)
+    if code == 0 or killed is None:
+        return code, printed, ""
+    first = next(line for line in printed if _KILLED.match(line))
+    code, printed = _quiet(gate.merge_check, root, branch, inspected=inspected, suite=suite)
+    return code, printed, f"the first run was killed by {killed} ({first[len('FAILED: '):]}), so it ran once more"
+
+
 # --- integration rounds ----------------------------------------------------------------
 
 def _round_path(root: Path, name: str) -> Path:
@@ -425,10 +444,13 @@ def merge(root: Path, task_id: str, inspected: str | None = None, round_name: st
         if meta["tier"] == "full":
             raise KitError(f"{task_id} is full-tier: it merges through its own merge check, never through a round")
         data = _round_member(root, round_name, task_id, sha)
-    code, printed = _quiet(gate.merge_check, root, branch, inspected=inspected, suite=data is None)
+    code, printed, retried = _merge_check(root, branch, inspected, suite=data is None)
     if code != 0 or (data is None and (not printed or printed[-1] != f"OK: {branch} merges into {MAIN} at {sha}")):
-        raise KitError("; ".join(["the merge check did not pass", *printed[-6:]]))
+        said = f"the merge check did not pass{f' (run twice: {retried})' if retried else ''}"
+        raise KitError("; ".join([said, *printed[-6:]]))
     lines = [printed[-1] if data is None else f"round {round_name}: {branch} at {sha} is in the tested tree"]
+    if retried:
+        lines.insert(0, f"merge check: {retried}; the second run passed")
     message = ["-m", f"Merge {branch} ({tier} tier)"] + [part for line in trailers for part in ("-m", line)]
     code, output = run_argv(["git", "-C", str(root), "merge", "--no-ff", *message, f"refs/heads/{branch}"], root)
     if code != 0:

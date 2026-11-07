@@ -114,6 +114,27 @@ def late_work(root, task_id: str, head: str, sha: str = "HEAD") -> str | None:
     return None
 
 
+def source_problem(root, task_id: str, head: str, source: str) -> str | None:
+    """Why an acceptance's `source` commit cannot stand for the reviewed commit `head`, or None (0.5.5, KF-28).
+
+    `source` is `head` itself, or a later commit of its branch (a descendant) whose commits after `head` change only
+    what this module allows late: the status file and, under `program/evidence/<ID>/`, `latest.json`, `report.md`
+    and records directly in `results/`, `acceptance/` and `plants/` (and clean merges of main). QA reviewing at the
+    commit that added the implementer's report reviews the same work: the program this came from had acceptances
+    refused for naming that commit (AH-0067, AH-0074). Anything else after `head` is unreviewed work, as for merge.
+    """
+    if source == head:
+        return None
+    root = Path(root)
+    if not _commit_exists(root, source):
+        return f"{source} is not a commit here"
+    ancestor = subprocess.run(["git", "-C", str(root), "merge-base", "--is-ancestor", head, source],
+                              capture_output=True).returncode == 0
+    if not ancestor:
+        return f"{source[:12]} does not come after the reviewed commit {head[:12]}"
+    return late_work(root, task_id, head, source)
+
+
 def late_plants(root, task_id: str, head: str, sha: str = "HEAD") -> list[str]:
     """The `plants/` record paths the commits of `head..sha` (not on main) added."""
     root = Path(root)

@@ -11,10 +11,10 @@ from common import read_json, read_yaml
 TEMPLATES = Path(__file__).resolve().parent.parent / "templates"
 NEW_TEMPLATES = ("discovery.md", "product.md", "SPEC.md", "ARCHITECTURE.md", "adr.md", "roadmap.md",
                  "task_SPEC.md", "task_PLAN.md", "freeze_review.md", "signoff.md", "COMMON.md",
-                 "task_FAST_BRIEF.md", "CONTRACT.md")
+                 "task_FAST_BRIEF.md", "CONTRACT.md", "design_acceptance.md")
 BANNED = re.compile("|".join([*map(re.escape, FORBIDDEN), "lorem ipsum", "https?://"]), re.I)
 TASK_SPEC_HEADINGS = ["Summary", "Tier", "Scope In", "Scope Out", "Dependencies", "Consumed Contracts",
-                      "Security And Tenancy", "Failure Modes And Recovery", "Observability", "Module Placement",
+                      "Security And Tenancy", "Failure Modes And Recovery", "Observability", "Design Acceptance", "Module Placement",
                       "Assumptions Checked", "Decided (do not reopen)", "Stop and report when", "Closes"]
 TASK_PLAN_HEADINGS = ["Status And PR Boundary", "Work Breakdown", "Exact Commands", "Definition Of Done",
                       "Gate Evidence", "Rollout And Rollback", "Risks"]
@@ -55,6 +55,21 @@ class TemplateTests(unittest.TestCase):
         self.assertEqual(gate.parse_plan(text), [])  # an unedited template runs nothing
         self.assertRegex(text, r"(?m)^Tier: standard$")
         self.assertIn("never used for the full tier", text)
+
+    def test_a_customer_facing_task_carries_a_design_acceptance_the_implementer_and_qa_both_view(self):
+        # KF-31 (0.5.5): a landing page shipped as a plain document, and an app theme drifted from the brand
+        design = (TEMPLATES / "design_acceptance.md").read_text(encoding="utf-8")
+        self.assertEqual(headings("design_acceptance.md"), ["Surfaces", "Brand checks", "Verdict"])
+        for words in ("Brand kit:", "Widths:", "light and dark", "| Implementer viewed | QA viewed |",
+                      "Logo and wordmark", "Palette", "plain document"):
+            self.assertIn(words, design)
+        for name in ("task_SPEC.md", "task_FAST_BRIEF.md"):
+            text = (TEMPLATES / name).read_text(encoding="utf-8")
+            section = text.split("## Design", 1)[1].split("\n## ", 1)[0]
+            for words in ("kit/templates/design_acceptance.md", "light and dark", "QA", "otherwise `none`"):
+                self.assertIn(words, section, name)
+        qa = (TEMPLATES.parent / "briefs" / "qa.md").read_text(encoding="utf-8")
+        self.assertIn("kit/templates/design_acceptance.md", qa)
 
     def test_the_task_spec_template_states_a_tier_the_gate_can_read_and_defaults_to_full(self):
         import gate
@@ -122,13 +137,16 @@ class YamlTemplateTests(unittest.TestCase):
         checks = example_blocks((TEMPLATES / "checks.yaml").read_text(encoding="utf-8"))
         self.assertEqual([miniyaml.loads(block) for block in checks], [
             {"test": [["go", "test", "./..."]]},
+            {"tiers": {"full_paths": ["src/auth/"], "light_ruling": "R12",  # 0.5.5: globs and the UI fast lane
+                       "light_paths": ["docs/", "web/src/**/*.css", "web/public/site/"]}},
             {"drift": {"regenerate": [["python3", "tools/gen_docs.py"]],  # 0.5.0: the optional pk drift section
                        "docs_vs_migrations": {"glob": "db/migrations/*.sql", "doc": "docs/DATABASE.md"}}},
             {"evidence": {"plant_workers": 4, "reuse_unchanged_code": True,  # 0.5.2: the optional evidence section
-                          "reuse_ignore": ["docs/"], "reuse_compare": ["program/tools/"]}}])
+                          "reuse_ignore": ["docs/"], "reuse_compare": ["program/tools/"],
+                          "step_timeout": 7200}}])  # 0.5.5: the evidence step's limit (KF-23)
         import gate  # the examples are ones the checks loader accepts
-        gate._parse_checks(miniyaml.loads(checks[1]), ())
-        gate._parse_checks(miniyaml.loads(checks[2]), ())
+        for block in checks[1:]:
+            gate._parse_checks(miniyaml.loads(block), ())
         environments = example_blocks((TEMPLATES / "environments.yaml").read_text(encoding="utf-8"))
         entry = miniyaml.loads(environments[0])["environments"]["dev"]
         self.assertEqual(sorted(entry), ["exists", "notes", "owner"])

@@ -85,6 +85,16 @@ class ChangeBase(unittest.TestCase):
             code = pk.main(list(argv))
         return code, out.getvalue(), err.getvalue()
 
+    def approve_stage(self, stage, *names):
+        import interview
+        from common import sha256_file
+
+        write_yaml(self.program / "ledger.yaml", {"entries": [], "sources": {}})
+        write_json(self.program / "approvals" / f"stage-{stage}.json", {
+            "stage": stage, "at": "2026-11-01T00:00:00Z",
+            "artifacts": {f"program/{name}": sha256_file(self.program / name) for name in names},
+            "ledger_sha256": interview._ledger_hash(self.root)})
+
 
 class CreateTests(ChangeBase):
     def test_create_numbers_sequentially(self):
@@ -348,14 +358,14 @@ class ApplyTests(ChangeBase):
             task(T1, closes=["REQ-001"]), task(T2, closes=["J1"]), task(T3, closes=["NFR-001"]),
             task("P1-M01-S01-T04", closes=["REQ-001"])))  # the follow-up task, never synced
         with self.assertRaises(KitError) as caught:
-            change.apply(self.root, cr_id, "added the follow-up")
+            change.apply(self.root, cr_id, "added the follow-up", sync=False)  # --no-sync: the 0.5.4 behaviour
         self.assertEqual(str(caught.exception),
                          f"{cr_id} not applied: program/traceability.yaml: tasks section differs from the "
                          "register; run pk trace sync")
         self.assertEqual(self.snapshot(), before)  # no log line, no regenerated brief
         self.assertEqual(self.text(cr_id), cr_text)
         trace_module.sync(self.root)
-        change.apply(self.root, cr_id, "added the follow-up")
+        change.apply(self.root, cr_id, "added the follow-up", sync=False)
         self.assertIn("added the follow-up", self.section(cr_id, "Applied"))
         self.assertIn("P1-M01-S01-T04", self.snapshot()["program/briefs/CATALOG.md"].decode())
 
@@ -377,7 +387,7 @@ class ApplyTests(ChangeBase):
         before = self.snapshot()
         write_yaml(self.program / "register.yaml", reg(task(T1, closes=["REQ-001"]), task(T2, closes=["J1"])))
         with self.assertRaises(KitError) as caught:
-            change.apply(self.root, cr_id, "dropped the task")
+            change.apply(self.root, cr_id, "dropped the task", sync=False)
         self.assertIn("run pk trace sync", str(caught.exception))  # the sync guard comes first
         self.assertEqual(self.snapshot(), before)
         trace_module.sync(self.root)
@@ -390,6 +400,63 @@ class ApplyTests(ChangeBase):
         self.assertEqual((code, out), (1, ""))
         self.assertTrue(err.startswith(f"error: {cr_id} not applied: ") and err.count("\n") == 1, err)
         self.assertEqual(self.snapshot(), before)
+
+    def test_apply_syncs_the_trace_and_puts_it_back_when_a_later_check_fails(self):
+        # KF-26 (0.5.5): CR-034 in the program this came from failed until pk trace sync after a generator run
+        cr_id = self.start_from_a_logged_register()
+        matrix = (self.program / "traceability.yaml").read_bytes()
+        before = self.snapshot()
+        write_yaml(self.program / "register.yaml", reg(task(T1, closes=["REQ-001"]), task(T2, closes=["J1"])))
+        with self.assertRaises(KitError) as caught:
+            change.apply(self.root, cr_id, "dropped the task")
+        self.assertIn("NFR-001: first-release requirement is not closed by any task", str(caught.exception))
+        self.assertEqual((self.program / "traceability.yaml").read_bytes(), matrix)  # the sync is put back
+        self.assertEqual(self.snapshot(), before)
+        write_yaml(self.program / "register.yaml", reg(
+            task(T1, closes=["REQ-001"]), task(T2, closes=["J1"]), task(T3, closes=["NFR-001"]),
+            task("P1-M01-S01-T04", closes=["REQ-001"])))  # the follow-up task, never synced
+        code, out, err = self.run_cli("change", "apply", cr_id, "--note", "added the follow-up")
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(out.splitlines(), [
+            "trace: synced the tasks section of program/traceability.yaml from the register (4 task(s); what pk "
+            "trace sync writes)", f"{cr_id} applied"])
+        self.assertEqual(trace_module.unsynced(self.root), [])
+        self.assertIn("added the follow-up", self.section(cr_id, "Applied"))
+
+    def test_apply_re_hashes_the_approved_stages_whose_files_changed_and_names_them(self):
+        # KF-26: after CR-034's generator run, D2 drifted until pk interview amend <stage>
+        import interview
+
+        (self.program / "SPEC.md").write_text("REQ-001: the old text\n")
+        (self.program / "product.md").write_text("product\n")
+        self.approve_stage(3, "SPEC.md")
+        self.approve_stage(2, "product.md")
+        cr_id = self.approved()
+        (self.program / "SPEC.md").write_text("REQ-001: the amended text\n")  # what the change's generator wrote
+        self.assertEqual(interview.stale_approvals(self.root), [(3, ["program/SPEC.md"])])
+        code, out, err = self.run_cli("change", "apply", cr_id, "--note", "REQ-001 amended")
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(out.splitlines(), [
+            "stage 3: re-hashed program/SPEC.md into program/approvals/stage-3.json (what pk interview amend 3 does)",
+            f"{cr_id} applied"])
+        self.assertEqual(interview.stale_approvals(self.root), [])
+
+    def test_no_sync_leaves_the_approvals_as_they_were(self):
+        import interview
+
+        (self.program / "SPEC.md").write_text("old\n")
+        self.approve_stage(3, "SPEC.md")
+        cr_id = self.approved()
+        (self.program / "SPEC.md").write_text("new\n")
+        self.assertEqual(change.apply(self.root, cr_id, "amended", sync=False), [])
+        self.assertEqual(interview.stale_approvals(self.root), [(3, ["program/SPEC.md"])])
+
+    def test_apply_refuses_an_approval_record_it_cannot_re_hash_before_writing(self):
+        write_json(self.program / "approvals" / "stage-3.json", ["not", "a", "record"])
+        cr_id = self.approved()
+        with self.assertRaisesRegex(KitError, "stage-3.json is not an approval record that can be re-hashed"):
+            change.apply(self.root, cr_id, "amended")
+        self.assertEqual(self.section(cr_id, "Applied"), "")
 
     def test_apply_refuses_a_bad_note(self):
         cr_id = self.approved()
@@ -405,6 +472,43 @@ class ApplyTests(ChangeBase):
         change.apply(self.root, cr_id, "amended SPEC")
         self.assertEqual(self.evidence_digest(), self.before)
         self.assertNotIn("program/evidence", Path(change.__file__).read_text())
+
+
+class CheckTests(ChangeBase):
+    """KF-27 (0.5.5): a cheap warning when an approved file is edited outside a change request."""
+
+    def test_check_is_quiet_while_every_approval_is_current(self):
+        (self.program / "SPEC.md").write_text("spec\n")
+        self.approve_stage(3, "SPEC.md")
+        self.assertEqual(change.check(self.root), [])
+        self.assertEqual(self.run_cli("change", "check"), (0, "approved files: unchanged since their approvals\n", ""))
+
+    def test_a_hand_edit_of_an_approved_file_is_named_with_pk_change_create(self):
+        (self.program / "SPEC.md").write_text("spec\n")
+        (self.program / "ARCHITECTURE.md").write_text("arch\n")
+        self.approve_stage(3, "SPEC.md")
+        self.approve_stage(4, "ARCHITECTURE.md", "gates.yaml")
+        (self.program / "SPEC.md").write_text("spec, edited by hand\n")
+        (self.program / "ARCHITECTURE.md").write_text("arch, edited by hand\n")
+        code, out, err = self.run_cli("change", "check")
+        self.assertEqual((code, err), (0, ""))  # a warning: it never stops anything
+        lines = out.splitlines()
+        self.assertEqual(lines[:2], ["warning: program/SPEC.md changed since the stage 3 approval",
+                                     "warning: program/ARCHITECTURE.md changed since the stage 4 approval"])
+        for words in ("no change request covers this edit", "pk change create --title", "pk interview amend N",
+                      "stage 3 4"):
+            self.assertIn(words, lines[2])
+        self.assertEqual(self.run_cli("change", "check", "--strict")[0], 1)
+
+    def test_an_approved_request_not_yet_applied_is_named_instead(self):
+        (self.program / "SPEC.md").write_text("spec\n")
+        self.approve_stage(3, "SPEC.md")
+        cr_id = self.approved()
+        (self.program / "SPEC.md").write_text("spec, as the request says\n")
+        warnings = change.check(self.root)
+        self.assertIn(f"{cr_id} approved and not applied: when the edit is that change, pk change apply", warnings[-1])
+        change.apply(self.root, cr_id, "SPEC amended")
+        self.assertEqual(change.check(self.root), [])
 
 
 class DocsTests(unittest.TestCase):

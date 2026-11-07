@@ -54,6 +54,8 @@ Limits:
 from __future__ import annotations
 
 import argparse
+import functools
+import math
 import os
 import re
 import shlex
@@ -82,7 +84,7 @@ TIER_KEYS = ("full_paths", "light_paths", "light_ruling")
 BUILTIN_FULL = ("kit/", "program/checks.yaml", "program/gates.yaml")  # the kit's own gates: always full-tier
 LIGHT_STEPS = ("build", "compile_check", "scan")
 FAST_BRIEF_HEADINGS = ("## Scope", "## Assumptions checked", "## Decided (do not reopen)", "## Stop and report when")
-STEP_TIMEOUT = 3600  # seconds per command
+STEP_TIMEOUT = evidence_module.STEP_TIMEOUT_FLOOR  # seconds per command; the evidence step's may be longer (0.5.5)
 TAIL_LINES = 20
 TAIL_PREFIX = "    | "
 PLAN_SECTION = "## Exact Commands"
@@ -350,7 +352,7 @@ def trial_merge(root, branch: str, main: str = MAIN) -> Path:
 # --- running steps -----------------------------------------------------------------
 
 def _step_lines(step: str, commands: list[tuple[list[str], int]], cwd: Path, env: dict | None = None,
-                sink: list | None = None) -> tuple[bool, list[str]]:
+                sink: list | None = None, timeout: int = STEP_TIMEOUT) -> tuple[bool, list[str]]:
     """Run (argv, expected exit) pairs in order; return (passed, the lines to print) without printing.
 
     Output tail lines are indented with `    | ` so a command can never print a line that looks like
@@ -360,23 +362,52 @@ def _step_lines(step: str, commands: list[tuple[list[str], int]], cwd: Path, env
     if not commands:
         return True, []
     for argv, expect in commands:
-        code, output = run_argv(argv, cwd, env=env, timeout=STEP_TIMEOUT)
+        code, output = run_argv(argv, cwd, env=env, timeout=timeout)
         if sink is not None:
             sink.append({"argv": list(argv), "exit": code, "output": output})
         if code == expect:
             continue
         if code == 127:
             return False, [f"FAILED: {step} missing tool: {argv[0]}"]
-        lines = [f"FAILED: {step} {' '.join(argv)} (exit {code})"]
+        lines = [f"FAILED: {step} {' '.join(argv)} ({exit_text(code)})"]
         lines.extend(TAIL_PREFIX + line for line in output.splitlines()[-TAIL_LINES:])
         return False, lines
     return True, [f"step {step}: ok"]
 
 
+KILL_SIGNALS = ("SIGKILL", "SIGTERM", "SIGSEGV", "SIGBUS", "SIGABRT")  # what the machine, not the code, usually sends
+
+
+def signal_name(code: int) -> str | None:
+    """The signal that ended a command with exit `code`, or None (0.5.5, KF-29).
+
+    A negative code is Python's report of a direct child killed by that signal; 128+n is the shell's (a wrapper
+    such as a package manager's script runner exits 137 when its child got SIGKILL). Only the signals in
+    KILL_SIGNALS count from 128+n, so a program's own exit code in that range is not taken for one.
+    """
+    import signal
+
+    number = -code if code < 0 else code - 128 if 128 < code < 160 else None
+    try:
+        name = signal.Signals(number).name if number is not None else None
+    except ValueError:
+        return None
+    return name if code < 0 or name in KILL_SIGNALS else None
+
+
+def exit_text(code: int) -> str:
+    """`exit <code>`, and the signal behind it when there is one: `exit 137, killed by SIGKILL (...)`."""
+    name = signal_name(code)
+    if name is None:
+        return f"exit {code}"
+    return (f"exit {code}, killed by {name}" + (" (often the machine running out of memory, not the code)"
+                                                if name == "SIGKILL" else ""))
+
+
 def _run_commands(step: str, commands: list[tuple[list[str], int]], cwd: Path, env: dict | None = None,
-                  sink: list | None = None) -> bool:
+                  sink: list | None = None, timeout: int = STEP_TIMEOUT) -> bool:
     """Run (argv, expected exit) pairs in order; print the first failure and return False."""
-    passed, lines = _step_lines(step, commands, cwd, env, sink)
+    passed, lines = _step_lines(step, commands, cwd, env, sink, timeout)
     for line in lines:
         _out(line)
     return passed
@@ -537,13 +568,47 @@ def _guarded_changes(root: Path, task_id: str, branch: str, main: str, guarded: 
     return [path for path, entry in touched if path not in allowed and entry not in allowed]
 
 
+def is_glob(entry: str) -> bool:
+    """Whether a tiers path entry is a glob (0.5.5): it holds `*` or `?`."""
+    return "*" in entry or "?" in entry
+
+
+@functools.lru_cache(maxsize=256)
+def _glob(entry: str) -> re.Pattern:
+    """The pattern of a glob entry: `**/` any number of directories (none too), `**` anything, `*` anything within
+    one path segment, `?` one character within a segment; every other character stands for itself."""
+    out, index = [], 0
+    while index < len(entry):
+        if entry.startswith("**/", index):
+            out.append("(?:[^/]+/)*")
+            index += 3
+        elif entry.startswith("**", index):
+            out.append(".*")
+            index += 2
+        else:
+            char = entry[index]
+            out.append("[^/]*" if char == "*" else "[^/]" if char == "?" else re.escape(char))
+            index += 1
+    return re.compile("".join(out) + r"\Z")
+
+
 def _under(path: str, entries) -> str | None:
     """The entry of `entries` that covers `path`, or None: the path itself, or a directory above it.
 
     The trailing `/` of a directory entry is optional: `auth` and `auth/` both cover `auth/policy.py`, so an
-    entry written without the slash still guards the directory. Neither covers `authz/x.py`.
+    entry written without the slash still guards the directory. Neither covers `authz/x.py`. An entry with `*` or
+    `?` is a glob (0.5.5, KF-32): it covers a path it matches whole, or a path under a directory it matches, so
+    `apps/web/src/**/*.css` covers every stylesheet under `apps/web/src/` and `apps/*/public/` everything under
+    each app's `public/`. `*` never crosses a `/`; `**` does.
     """
-    return next((e for e in entries if path == e or path.startswith(e.rstrip("/") + "/")), None)
+    for entry in entries:
+        if is_glob(entry):
+            pattern, parts = _glob(entry.rstrip("/")), path.split("/")
+            if any(pattern.match("/".join(parts[:end])) for end in range(len(parts), 0, -1)):
+                return entry
+        elif path == entry or path.startswith(entry.rstrip("/") + "/"):
+            return entry
+    return None
 
 
 def status_at(root: Path, task_id: str, ref: str = MAIN) -> dict | None:
@@ -686,7 +751,8 @@ def _unexpected_changes(wt: Path, allowed: str) -> list[str]:
     return [path for path in _changes(wt) if path != allowed]
 
 
-def _evidence_step(wt: Path, task_id: str, env: dict | None = None, reused: dict | None = None) -> bool:
+def _evidence_step(wt: Path, task_id: str, env: dict | None = None, reused: dict | None = None,
+                   limit: int = STEP_TIMEOUT) -> bool:
     """Run produce.py (with `env`), or write the reused record when `reused` names one, then judge the task's
     latest results record.
 
@@ -695,6 +761,7 @@ def _evidence_step(wt: Path, task_id: str, env: dict | None = None, reused: dict
     since (a task whose own source changed needs a new record; a shared input changed by another task does not
     make it refresh anything else). The record history must be intact since the branch left main. The new record
     and the task's own pointer (`program/evidence/<ID>/latest.json`) are the only changes allowed in the worktree.
+    produce.py runs under `limit` seconds (`evidence_limit`).
     """
     produce = f"program/evidence/{task_id}/produce.py"
     if not (wt / produce).is_file():
@@ -712,7 +779,7 @@ def _evidence_step(wt: Path, task_id: str, env: dict | None = None, reused: dict
             _out("FAILED: evidence " + " ".join(str(exc).replace(str(wt) + "/", "").split()))
             return False
         _out(f"step evidence: reused {reused['entry']['path']}, wrote {written['path']}")
-    elif not _run_commands("evidence", [(["python3", produce], 0)], wt, env=env):
+    elif not _run_commands("evidence", [(["python3", produce], 0)], wt, env=env, timeout=limit):
         return False
     head = git(wt, "rev-parse", "HEAD")
     try:
@@ -788,19 +855,41 @@ def _frozen_brief(root: Path, tree: Path, task_id: str, meta: dict) -> bytes | N
     if (own.read_bytes() if own.is_file() else None) != authoritative:
         _out(f"FAILED: brief {rel} differs from {MAIN} {FIX_ON_MAIN}")
         return None
-    lines = {line.strip() for line in drop_bom(authoritative.decode("utf-8", "replace")).splitlines()}
+    problems = brief_problems(authoritative.decode("utf-8", "replace"), meta["tier"], meta["ruling"],
+                              where=f"on {MAIN} ", against="the status record says")
+    if problems:
+        _out(f"FAILED: brief {rel} {problems[0]}")
+        return None
+    return authoritative
+
+
+def brief_problems(text: str, tier: str, ruling: str, where: str = "", against: str = "the status record says",
+                   commands: bool = False) -> list[str]:
+    """What stops a fast-path brief `text` from standing for a task of `tier` by `ruling`, in the gate's order.
+
+    The four fast-path sections (one problem naming every missing one); then exactly one `Tier:` and one `Ruling:`
+    line saying `tier` and `ruling`; with `commands` (0.5.5, the dispatch check) a standard-tier brief must list at
+    least one exact command that parses. The hand-back gate and the merge check print the first; `pk status set
+    <ID> in_progress --fast` (KF-24) refuses with all of them, before anything is committed.
+    """
+    lines = {line.strip() for line in drop_bom(text).splitlines()}
+    problems = []
     missing = [heading for heading in FAST_BRIEF_HEADINGS if heading not in lines]
     if missing:
-        _out(f"FAILED: brief {rel} lacks the section(s) {', '.join(missing)}")
-        return None
-    for label, pattern, recorded in (("Tier", _TIER_LINE, meta["tier"]), ("Ruling", _RULING_LINE, meta["ruling"])):
+        problems.append(f"lacks the section(s) {', '.join(missing)}")
+    for label, pattern, recorded in (("Tier", _TIER_LINE, tier), ("Ruling", _RULING_LINE, ruling)):
         stated = sorted(m.group(1) for m in map(pattern.match, lines) if m)
         if stated != [recorded]:
-            _out(f"FAILED: brief {rel} on {MAIN} says "
-                 f"{', '.join(f'{label}: {_show(value)}' for value in stated) if stated else f'no {label}: line'}, "
-                 f"the status record says {recorded or 'none'}")
-            return None
-    return authoritative
+            problems.append(f"{where}says "
+                            f"{', '.join(f'{label}: {_show(value)}' for value in stated) if stated else f'no {label}: line'}, "
+                            f"{against} {recorded or 'none'}")
+    if commands and tier != "light":
+        try:
+            if not parse_plan(drop_bom(text)):
+                problems.append(f'lists no command under "{PLAN_SECTION}" (a {tier}-tier brief lists at least one)')
+        except KitError as exc:
+            problems.append(str(exc))
+    return problems
 
 
 def _spec_tier_ok(root: Path, task_id: str, tier: str) -> bool:
@@ -901,6 +990,54 @@ def _reusable(checks: dict, task_id: str, wt: Path, no_reuse: bool) -> dict | No
 
 
 ESTIMATE_SHARE = 0.8  # warn when the planted bugs alone are estimated to take this share of the evidence step's limit
+LIMIT_MARGIN = 2  # the scaled evidence limit is this many times the planted-bug estimate (0.5.5)
+ROW_SECONDS = 120  # seconds per judged row and worker when no record timed its planted bugs (0.5.5)
+
+
+def _last_rows(wt: Path, task_id: str) -> tuple[str, int, float | None] | None:
+    """(path, judged planted-bug rows, measured seconds per row and worker or None) of the task's latest results
+    record, or None when there is none or it does not read."""
+    try:
+        entry = store.read_pointer(wt, task_id).get("results")
+        data = store.load(wt, entry["path"], entry["digest"]) if entry is not None else None
+    except KitError:
+        return None
+    if not isinstance(data, dict) or evidence_module.validate_results(data):
+        return None
+    rows = sum(1 for row in data["planted_bugs"] if not evidence_module.is_deferred(row))
+    timing = data.get("planted_bugs_timing")
+    per_row = timing["seconds"] * timing["workers"] / timing["rows"] if isinstance(timing, dict) else None
+    return entry["path"], rows, per_row
+
+
+def evidence_limit(wt: Path, task_id: str, config: dict | None = None, workers: int | None = None) -> tuple[int, str]:
+    """The evidence step's time limit in seconds and the line that says where it came from (0.5.5, KF-23).
+
+    `evidence.step_timeout` of checks.yaml (`config`, the parsed `evidence` section) when set. Otherwise it scales
+    with the task's latest results record: LIMIT_MARGIN times its judged planted-bug rows, times the seconds per row
+    and worker that record measured (ROW_SECONDS when it timed nothing), divided by this run's workers. Never below
+    STEP_TIMEOUT, the 3600 s every gate step had before; a task without a record gets exactly that.
+    """
+    configured = (config or {}).get("step_timeout")
+    if configured is not None:
+        limit = max(STEP_TIMEOUT, configured)
+        return limit, f"evidence limit: {limit} s (evidence.step_timeout in program/checks.yaml)"
+    last = _last_rows(wt, task_id)
+    try:
+        count = evidence_module.plant_workers(wt, workers)
+    except KitError:
+        count = 1
+    if last is None:
+        return STEP_TIMEOUT, f"evidence limit: {STEP_TIMEOUT} s (no results record to scale from)"
+    path, rows, measured = last
+    per_row = measured if measured is not None else ROW_SECONDS
+    scaled = math.ceil(LIMIT_MARGIN * rows * per_row / count)
+    how = (f"{LIMIT_MARGIN} x {rows} judged planted-bug rows in {path} x {per_row:.1f} s per row and worker "
+           f"({'measured' if measured is not None else 'no timing recorded: the default'}) / {count} worker(s) "
+           f"is {scaled} s")
+    if scaled <= STEP_TIMEOUT:
+        return STEP_TIMEOUT, f"evidence limit: {STEP_TIMEOUT} s, the floor ({how})"
+    return scaled, f"evidence limit: {scaled} s ({how}; evidence.step_timeout in program/checks.yaml sets it)"
 
 
 def plant_estimate(wt: Path, task_id: str, workers: int | None = None, limit: int = STEP_TIMEOUT) -> str | None:
@@ -936,8 +1073,12 @@ def _run_steps(checks: dict, task_id: str, wt: Path, trial: Path, authoritative:
     if meta["tier"] == "light":
         return _run_light(checks, trial)
     reused = _reusable(checks, task_id, wt, no_reuse)
+    limit = STEP_TIMEOUT
     if reused is None:
-        warning = plant_estimate(wt, task_id)
+        limit, said = evidence_limit(wt, task_id, checks["evidence"])
+        if limit != STEP_TIMEOUT:  # the 3600 s every gate printed nothing about stays silent
+            _out(said)
+        warning = plant_estimate(wt, task_id, limit=limit)
         if warning:
             _out(warning)
     for step in ("build", "compile_check"):
@@ -945,13 +1086,13 @@ def _run_steps(checks: dict, task_id: str, wt: Path, trial: Path, authoritative:
             return 1
     results = Path(tempfile.mkdtemp(prefix="pk-gate-test-"))  # outside the worktree, removed below
     try:
-        return _late_and_evidence(checks, task_id, wt, authoritative, meta, reused, results)
+        return _late_and_evidence(checks, task_id, wt, authoritative, meta, reused, results, limit)
     finally:
         shutil.rmtree(results, ignore_errors=True)
 
 
 def _late_and_evidence(checks: dict, task_id: str, wt: Path, authoritative: bytes, meta: dict, reused: dict | None,
-                       results: Path) -> int:
+                       results: Path, limit: int = STEP_TIMEOUT) -> int:
     sink: list = []
     if reused is not None:
         _out("step test: skipped (the reused record holds its results)")
@@ -970,7 +1111,7 @@ def _late_and_evidence(checks: dict, task_id: str, wt: Path, authoritative: byte
     if not _run_commands("plan", plan, wt):
         return 1
     env = dict(os.environ, **{evidence_module.GATE_TEST_ENV: str(path)})
-    if not _evidence_step(wt, task_id, env=env, reused=reused):
+    if not _evidence_step(wt, task_id, env=env, reused=reused, limit=limit):
         return 1
     return 0 if _stale_step(wt) else 1
 

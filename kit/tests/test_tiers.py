@@ -65,6 +65,12 @@ class TierStatusTests(unittest.TestCase):
     def ruling(self) -> str:
         return f"R{rulings.add(self.root, 'controller', 'q', 'd')}"
 
+    def brief(self, text=None, task_id=TID):
+        """The fast-path brief, written before the dispatch as playbook 07 says (checked at dispatch from 0.5.5)."""
+        path = self.root / "program" / "tasks" / task_id / "BRIEF.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(BRIEF if text is None else text)
+
     def git(self, *argv):
         return subprocess.run(["git", *argv], cwd=str(self.root), check=True, capture_output=True, text=True).stdout
 
@@ -108,9 +114,55 @@ class TierStatusTests(unittest.TestCase):
         self.checks(full_paths=["auth/"])
         self.refused("needs --ruling", TID, "in_progress", "controller", tier="standard", fast=True)
         self.refused("R7 is not a ruling", TID, "in_progress", "controller", tier="standard", fast=True, ruling="R7")
+        self.brief()
         record = status.transition(self.root, TID, "in_progress", "controller", tier="standard", fast=True,
                                    ruling=self.ruling())
         self.assertEqual((record["tier"], record["fast"], record["ruling"]), ("standard", True, "R1"))
+
+    def test_fast_without_a_tier_is_refused_with_the_command_and_never_falls_back_to_full(self):
+        # KF-25 (0.5.5): the program's AH-0065 was dispatched without --tier, went full and its gate wanted a SPEC
+        self.checks(full_paths=["auth/"])
+        ruling = self.ruling()
+        self.refused("--fast needs --tier standard or --tier light: without --tier a task is full-tier", TID,
+                     "in_progress", "controller", fast=True, ruling=ruling)
+        self.brief(brief(tier="light"))
+        self.refused(r"BRIEF.md says Tier: light\).*--tier light --fast --ruling R<n>", TID, "in_progress",
+                     "controller", fast=True, ruling=ruling)
+        code, out, err = run_cli("status", self.root, "status", "set", TID, "in_progress", "--role", "controller",
+                                 "--fast", "--ruling", ruling)
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("--fast needs --tier standard or --tier light", err)
+
+    def test_a_full_dispatch_over_a_fast_brief_without_a_spec_is_refused(self):
+        self.checks(full_paths=["auth/"])
+        self.brief()
+        self.refused(r"BRIEF.md is a fast-path brief \(Tier: standard\) and the task has no SPEC.md.*--tier standard "
+                     "--fast", TID, "in_progress", "controller")
+        self.refused("is a fast-path brief", TID, "in_progress", "controller", tier="full")
+        spec = self.root / "program" / "tasks" / TID / "SPEC.md"
+        spec.write_text("# Spec\n")  # a task with its SPEC is a full-tier task with a stray brief: allowed
+        self.assertEqual(status.transition(self.root, TID, "in_progress", "controller")["tier"], "full")
+
+    def test_a_fast_dispatch_names_every_section_its_brief_lacks_before_anything_is_written(self):
+        # KF-24 (0.5.5): the program's AH-0069 lost a gate run to a brief without `## Assumptions checked`
+        self.checks(full_paths=["auth/"])
+        ruling = self.ruling()
+        self.refused(f"the fast path needs its brief: write program/tasks/{TID}/BRIEF.md", TID, "in_progress",
+                     "controller", tier="standard", fast=True, ruling=ruling)
+        self.brief(BRIEF.replace("## Assumptions checked", "## Notes").replace("## Stop and report when", "## Stop"))
+        self.refused(r"BRIEF.md is not ready for the fast path, and the gate would refuse it: lacks the section\(s\) "
+                     r"## Assumptions checked, ## Stop and report when", TID, "in_progress", "controller",
+                     tier="standard", fast=True, ruling=ruling)
+        self.brief(brief(tier="light"))
+        self.refused("says Tier: light, the dispatch says standard", TID, "in_progress", "controller",
+                     tier="standard", fast=True, ruling=ruling)
+        self.brief(BRIEF.split("## Exact Commands")[0])
+        self.refused('lists no command under "## Exact Commands"', TID, "in_progress", "controller",
+                     tier="standard", fast=True, ruling=ruling)
+        self.brief()
+        record = status.transition(self.root, TID, "in_progress", "controller", tier="standard", fast=True,
+                                   ruling=ruling)
+        self.assertEqual((record["tier"], record["fast"]), ("standard", True))
 
     def test_the_light_tier_needs_its_ruling_and_its_paths_in_checks(self):
         self.checks(full_paths=["auth/"])
@@ -333,6 +385,7 @@ class TierStatusTests(unittest.TestCase):
     def test_a_fast_task_is_raised_to_full_only_by_leaving_the_fast_path(self):
         self.checks(full_paths=["auth/"])
         ruling = self.ruling()
+        self.brief()
         status.transition(self.root, TID, "in_progress", "controller", tier="standard", fast=True, ruling=ruling)
         with self.assertRaisesRegex(KitError, "never available for the full tier"):
             status.set_tier(self.root, TID, "full", ruling)
@@ -342,6 +395,7 @@ class TierStatusTests(unittest.TestCase):
     def test_the_command_line_sets_and_changes_the_tier(self):
         self.checks(full_paths=["auth/"])
         ruling = self.ruling()
+        self.brief()
         code, out, err = run_cli("status", self.root, "status", "set", TID, "in_progress", "--role", "controller",
                                  "--tier", "standard", "--fast", "--ruling", ruling)
         self.assertEqual((code, out, err), (0, f"{TID}: in_progress (tier standard, fast path)\n", ""))
@@ -623,6 +677,17 @@ class LightTierGateTests(TierGateBase):
         sh(self.wt, "git", "merge", "-q", "main")
         return sh(self.wt, "git", "rev-parse", "HEAD").strip()
 
+    def test_a_glob_light_path_lets_the_files_it_matches_through_and_nothing_else(self):
+        # KF-32 (0.5.5): the program's UI lane listed every stylesheet by path because globs were not read
+        self.LIGHT = dict(self.LIGHT, light_paths=["web/**/*.txt"])
+        tip = self.switch_on()
+        rc, out = self.merge_check(inspected=tip)
+        self.assertEqual(rc, 0, out)
+        self.work("web/page.py")
+        rc, out = self.merge_check(inspected=sh(self.wt, "git", "rev-parse", "HEAD").strip())
+        self.assertEqual(rc, 1)
+        self.assertIn("is light but changes paths outside tiers.light_paths: web/page.py", out)
+
     def test_a_light_merge_check_needs_the_controllers_inspection_of_the_tip(self):
         tip = self.switch_on()
         rc, out = self.merge_check()
@@ -703,6 +768,55 @@ class ChecksTiersTests(unittest.TestCase):
                     found = pk._tier_path_warnings(root, {"tiers": tiers})
                     self.assertEqual([line.split(": check the")[0] for line in found], expected)
             self.assertEqual(pk._tier_path_warnings(root, {"tiers": "nope"}), [])  # an error elsewhere, not a warning
+
+
+    def test_doctor_judges_a_glob_entry_against_the_tracked_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            (root / "web" / "src" / "theme").mkdir(parents=True)
+            (root / "web" / "src" / "theme" / "base.css").write_text("x\n")
+            git_repo(root)
+            found = pk._tier_path_warnings(root, {"tiers": {"full_paths": ["auth/**"], "light_paths": [
+                "web/src/**/*.css", "web/src/*.css", "web/*/theme/"]}})
+            self.assertEqual([line.split(": check the")[0] for line in found],
+                             ["checks.yaml: tiers.full_paths entry 'auth/**' covers no tracked file",
+                              "checks.yaml: tiers.light_paths entry 'web/src/*.css' covers no tracked file"])
+
+
+class GlobPathTests(unittest.TestCase):
+    """KF-32 (0.5.5): tiers paths may be globs, so a UI-only lane need not list every stylesheet by path."""
+
+    def test_star_stays_in_one_directory_and_double_star_crosses_them(self):
+        css = ["apps/web/src/**/*.css"]
+        for path in ("apps/web/src/a.css", "apps/web/src/theme/base.css", "apps/web/src/studio/x/y/shell.css"):
+            self.assertEqual(gate._under(path, css), css[0], path)
+        for path in ("apps/web/src/theme/base.ts", "apps/web/src/a.css.map", "apps/web/public/a.css",
+                     "apps/web/srcx/a.css", "apps/api/src/a.css"):
+            self.assertIsNone(gate._under(path, css), path)
+        self.assertEqual(gate._under("apps/web/src/a.css", ["apps/web/src/*.css"]), "apps/web/src/*.css")
+        self.assertIsNone(gate._under("apps/web/src/theme/a.css", ["apps/web/src/*.css"]))
+        self.assertEqual(gate._under("docs/a/b.md", ["**/*.md"]), "**/*.md")
+        self.assertEqual(gate._under("a.md", ["**/*.md"]), "**/*.md")  # **/ matches no directory too
+
+    def test_a_glob_that_names_directories_covers_everything_under_them(self):
+        public = ["apps/*/public/"]
+        self.assertEqual(gate._under("apps/web/public/site/hero.webp", public), public[0])
+        self.assertIsNone(gate._under("apps/web/src/public.ts", public))
+        self.assertEqual(gate._under("apps/web/src/theme/base.css", ["apps/web/src/th?me"]), "apps/web/src/th?me")
+
+    def test_prefix_and_exact_entries_work_as_before_and_other_characters_are_literal(self):
+        self.assertEqual(gate._under("auth/policy.py", ["auth"]), "auth")
+        self.assertEqual(gate._under("auth/policy.py", ["auth/policy.py"]), "auth/policy.py")
+        self.assertIsNone(gate._under("authz/policy.py", ["auth/"]))
+        self.assertIsNone(gate._under("docs/a+b.md", ["docs/a.b*.md"]))  # the dot is a dot, not any character
+        self.assertEqual(gate._under("docs/a.b1.md", ["docs/a.b*.md"]), "docs/a.b*.md")
+
+    def test_the_light_merge_guard_reads_globs_from_checks(self):
+        tiers = gate._parse_tiers({"full_paths": ["apps/api/"], "light_paths": ["./apps/web/src/**/*.css"]})
+        self.assertEqual(tiers["light_paths"], ["apps/web/src/**/*.css"])
+        changed = ["apps/web/src/theme/base.css", "apps/web/src/studio/shell.tsx"]
+        self.assertEqual([path for path in changed if not gate._under(path, tiers["light_paths"])],
+                         ["apps/web/src/studio/shell.tsx"])
 
 
 if __name__ == "__main__":

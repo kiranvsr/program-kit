@@ -60,6 +60,11 @@ elif mode == "flaky-kill" and mutant and count(tag) == 0:
     code = 1
 elif mode == "flaky-kill" and mutant:
     code = 0  # alone, the mutant is not caught: the serial verdict must be the one recorded
+elif mode == "teardown-kill" and mutant and count(tag) == 0:  # a routed request answered after the page closed
+    print("Error: route.fulfill: Fetch response has been disposed")
+    code = 1
+elif mode == "teardown-kill" and mutant:
+    code = 0
 elif mode == "flaky-base" and not mutant and count(tag) == 0:
     code = 1
 elif mode == "bad-base":
@@ -118,7 +123,8 @@ class Base(unittest.TestCase):
 class Configuration(unittest.TestCase):
     def test_the_evidence_section_defaults_to_one_worker_and_no_reuse(self):
         self.assertEqual(evidence.parse_config(None), {"plant_workers": 1, "reuse_unchanged_code": False,
-                                                       "reuse_ignore": [], "reuse_compare": []})
+                                                       "reuse_ignore": [], "reuse_compare": [],
+                                                       "step_timeout": None})
         self.assertEqual(evidence.parse_config({"plant_workers": 4})["plant_workers"], 4)
 
     def test_a_bad_evidence_section_is_refused_by_name(self):
@@ -262,6 +268,21 @@ class Pool(Base):
                          [("busy", False, "not killed", "serial-recheck"), ("fine", True, "test failed", "parallel")])
         self.assertIn("plant busy: test failed (parallel", printed)
         self.assertIn("plant busy: not killed (serial-recheck", printed)
+
+    def test_a_kill_showing_a_browser_teardown_race_is_judged_once_more_alone(self):
+        # KF-30 (0.5.5): producers that repeat e2e runs meet teardown races (F-0613 in the program this came from)
+        table = [self.row("routed", mode="teardown-kill"), self.row("e2e", mode="teardown-kill", serial=True),
+                 self.row("fine", replace="return 0")]
+        rows, printed = self.plants(table, 2)
+        self.assertEqual([(row["id"], row["killed"], row["judged"]) for row in rows[:3]],
+                         [("routed", False, "serial-recheck"), ("e2e", False, "serial-recheck"),
+                          ("fine", True, "parallel")])
+        self.assertIn("plant e2e: test failed (serial", printed)
+        self.assertIn("plant e2e: not killed (serial-recheck", printed)
+        for text in ("Error: route.fulfill: Fetch response has been disposed",
+                     "Target page, context or browser has been closed", "browser has been closed"):
+            self.assertTrue(evidence.TEARDOWN_RACE.search(text), text)
+        self.assertIsNone(evidence.TEARDOWN_RACE.search("AssertionError: expected 5, got 6"))
 
     def test_a_baseline_failing_in_the_pool_is_run_again_alone_and_puts_its_kills_in_doubt(self):
         rows, printed = self.plants([self.row("first", mode="flaky-base", tag="b"),

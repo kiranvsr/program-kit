@@ -18,6 +18,8 @@ import io
 import os
 import shutil
 import subprocess
+import tempfile
+import unittest
 from pathlib import Path
 from unittest import mock
 
@@ -364,6 +366,57 @@ class FinishTests(LandBase):
         self.assertTrue(self.wt.is_dir())
 
 
+class SignalKillTests(unittest.TestCase):
+    """KF-29 (0.5.5): a command the machine killed is named, and pk merge runs its merge check once more."""
+
+    def test_a_command_killed_by_a_signal_is_named_directly_and_through_a_wrapper(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        kill = "import os, signal; os.kill(os.getpid(), signal.SIGKILL)"
+        passed, lines = gate._step_lines("test", [([PY, "-c", kill], 0)], tmp)
+        self.assertFalse(passed)
+        self.assertIn("(exit -9, killed by SIGKILL (often the machine running out of memory", lines[0])
+        passed, lines = gate._step_lines("test", [(["sh", "-c", f"{PY} -c '{kill}'; exit $?"], 0)], tmp)
+        self.assertIn("(exit 137, killed by SIGKILL", lines[0])
+        passed, lines = gate._step_lines("test", [([PY, "-c", "raise SystemExit(3)"], 0)], tmp)
+        self.assertEqual(lines[0], f"FAILED: test {PY} -c raise SystemExit(3) (exit 3)")  # an ordinary failure
+        self.assertIsNone(gate.signal_name(130))  # 128+SIGINT: a program's own code in that range is not a kill
+        self.assertEqual(gate.signal_name(143), "SIGTERM")
+
+    def fake_checks(self, *runs):
+        calls = []
+
+        def merge_check(root, branch, inspected=None, suite=True):
+            calls.append(branch)
+            code, lines = runs[len(calls) - 1]
+            for line in lines:
+                print(line)
+            return code
+
+        return calls, mock.patch.object(land.gate, "merge_check", merge_check)
+
+    def test_the_merge_check_runs_once_more_after_a_signal_kill_and_says_so(self):
+        killed = (1, ["step build: ok", "FAILED: test pnpm test (exit 137, killed by SIGKILL (often ...))"])
+        calls, patch = self.fake_checks(killed, (0, ["step test: ok", f"OK: {BRANCH} merges into main at abc"]))
+        with patch:
+            code, printed, retried = land._merge_check(Path("."), BRANCH, None, True)
+        self.assertEqual((code, len(calls)), (0, 2))
+        self.assertEqual(printed[-1], f"OK: {BRANCH} merges into main at abc")
+        self.assertIn("the first run was killed by SIGKILL (test pnpm test (exit 137", retried)
+
+    def test_any_other_failure_and_a_second_kill_are_final(self):
+        calls, patch = self.fake_checks((1, ["FAILED: test pnpm test (exit 1)"]))
+        with patch:
+            self.assertEqual(land._merge_check(Path("."), BRANCH, None, True)[::2], (1, ""))
+        self.assertEqual(len(calls), 1)  # an ordinary failure is the branch's: never run again
+        killed = (1, ["FAILED: test pnpm test (exit -9, killed by SIGKILL)"])
+        calls, patch = self.fake_checks(killed, killed)
+        with patch:
+            code, _, retried = land._merge_check(Path("."), BRANCH, None, True)
+        self.assertEqual((code, len(calls)), (1, 2))  # once more, not in a loop
+        self.assertTrue(retried)
+
+
 @skip_unless_slow()
 class MergeTests(LandBase):
     def test_a_branch_qa_has_not_accepted_is_never_merged(self):
@@ -525,6 +578,38 @@ class MergeTests(LandBase):
         commit(self.wt, "a late results file")
         code, out, err = self.pk("merge", TASK)
         self.assertEqual((code, err), (0, ""), out)
+
+    def test_qa_may_name_the_commit_that_added_only_the_report_as_its_source_commit(self):
+        # KF-28 (0.5.5): AH-0067 and AH-0074 in the program this came from were refused for exactly this
+        self.standard(done=False)
+        reviewed = self.evidenced(self.wt, TASK)
+        put(self.wt, f"program/evidence/{TASK}/report.md", "# Report\n")
+        report = commit(self.wt, "the implementer's report")
+        entry, record = store.load_latest(self.wt, TASK, "results")
+        self.assertNotEqual(report, record["head"])
+        accepted = {"task_id": TASK, "decision": "accepted_development", "evidence_sha256": entry["digest"],
+                    "source_commit": report, "accepted_at": "2026-11-07T00:00:00Z", "role": "qa",
+                    "commands": [], "planted_bugs": [], "findings": [], "blocked_by": []}
+        evidence.accept(self.wt, TASK, accepted)
+        status.transition(self.wt, TASK, "done", "qa")
+        commit(self.wt, "accepted at the report commit")
+        code, out, err = self.pk("merge", TASK)
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertIsNone(latework.source_problem(self.root, TASK, record["head"], report))
+        self.assertIn(reviewed[:12], latework.source_problem(self.root, TASK, report, record["head"]))
+
+    def test_a_source_commit_after_work_nobody_reviewed_is_still_refused(self):
+        self.standard(done=False)
+        self.evidenced(self.wt, TASK)
+        put(self.wt, "calc.py", (self.wt / "calc.py").read_text() + "\n\ndef div(a, b):\n    return a / b\n")
+        late = commit(self.wt, "late work")
+        entry, record = store.load_latest(self.wt, TASK, "results")
+        accepted = {"task_id": TASK, "decision": "accepted_development", "evidence_sha256": entry["digest"],
+                    "source_commit": late, "accepted_at": "2026-11-07T00:00:00Z", "role": "qa",
+                    "commands": [], "planted_bugs": [], "findings": [], "blocked_by": []}
+        with self.assertRaisesRegex(KitError, r"nor a later commit that adds only the task's own late files.*"
+                                              r"changes calc.py"):
+            evidence.accept(self.wt, TASK, accepted)
 
     def test_a_late_acceptance_record_is_one_the_kit_writes_and_lands(self):
         self.standard()

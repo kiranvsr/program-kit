@@ -74,7 +74,8 @@ _RECORD_NAMES = ("results.json", "acceptance.json")
 DECISIONS = ("accepted_development", "rejected")
 
 # --- the `evidence` section of checks.yaml (0.5.2) ---------------------------------------------------------------
-EVIDENCE_KEYS = ("plant_workers", "reuse_unchanged_code", "reuse_ignore", "reuse_compare")
+EVIDENCE_KEYS = ("plant_workers", "reuse_unchanged_code", "reuse_ignore", "reuse_compare", "step_timeout")
+STEP_TIMEOUT_FLOOR = 3600  # the evidence step's limit is never below this (seconds); evidence.step_timeout raises it
 PLANT_WORKERS_ENV = "PK_PLANT_WORKERS"  # overrides evidence.plant_workers; an explicit `workers=` overrides both
 GATE_TEST_ENV = "PK_GATE_TEST_RESULTS"  # the hand-back gate's test-step results, for `Evidence.reuse_gate_test`
 MAX_WORKERS = 64
@@ -85,6 +86,12 @@ RESOURCE_ERROR = re.compile(
     r"|ECONNREFUSED[^\n]*(?:127\.\d+\.\d+\.\d+|localhost|::1)"
     r"|out of memory|cannot allocate memory|ENOMEM|ENOSPC|no space left on device|EMFILE|too many open files"
     r"|timed out", re.IGNORECASE)
+# A browser test that failed while tearing down, not because of the mutant (0.5.5, KF-30): a routed request answered
+# after its page, context or browser closed. Producers that repeat e2e runs once per planted bug meet it often; a kill
+# whose output shows it is judged once more, alone.
+TEARDOWN_RACE = re.compile(
+    r"response has been disposed|request context (?:has been )?disposed"
+    r"|(?:target )?(?:page|context|browser)(?:, context or browser)? has been closed|target closed", re.IGNORECASE)
 
 
 def _config_paths(value, key: str, under_program: bool) -> list[str]:
@@ -113,9 +120,11 @@ def _config_paths(value, key: str, under_program: bool) -> list[str]:
 
 
 def parse_config(value) -> dict:
-    """The `evidence` section of checks.yaml: {plant_workers, reuse_unchanged_code, reuse_ignore, reuse_compare}.
+    """The `evidence` section of checks.yaml: {plant_workers, reuse_unchanged_code, reuse_ignore, reuse_compare,
+    step_timeout}.
 
-    Absent means one worker, no reuse and no paths, which is how every program ran before 0.5.2.
+    Absent means one worker, no reuse and no paths, which is how every program ran before 0.5.2, and (0.5.5) no
+    `step_timeout`: the gate scales the evidence step's limit from the last record (`gate.evidence_limit`).
     """
     if value is None:
         value = {}
@@ -134,9 +143,15 @@ def parse_config(value) -> dict:
         reuse = False
     if not isinstance(reuse, bool):
         raise KitError("checks.yaml: evidence.reuse_unchanged_code must be true or false")
+    limit = value.get("step_timeout")
+    if limit is not None and not (isinstance(limit, int) and not isinstance(limit, bool)
+                                  and limit >= STEP_TIMEOUT_FLOOR):
+        raise KitError(f"checks.yaml: evidence.step_timeout must be a whole number of seconds, at least "
+                       f"{STEP_TIMEOUT_FLOOR}")
     return {"plant_workers": workers, "reuse_unchanged_code": reuse,
             "reuse_ignore": _config_paths(value.get("reuse_ignore"), "reuse_ignore", False),
-            "reuse_compare": _config_paths(value.get("reuse_compare"), "reuse_compare", True)}
+            "reuse_compare": _config_paths(value.get("reuse_compare"), "reuse_compare", True),
+            "step_timeout": limit}
 
 
 def config_at(root, ref: str = "HEAD") -> dict:
@@ -948,8 +963,9 @@ class _PlantPool:
 
     @staticmethod
     def _doubtful(row: dict, output: str) -> bool:
-        """Whether a pool verdict must be judged again alone: anything but a kill with no sign of a resource error."""
-        return not row["killed"] or RESOURCE_ERROR.search(output) is not None
+        """Whether a pool verdict must be judged again alone: anything but a kill with no sign of a resource error
+        or (0.5.5) of a browser-test teardown race."""
+        return not row["killed"] or RESOURCE_ERROR.search(output) is not None or TEARDOWN_RACE.search(output) is not None
 
     def _pool(self, jobs: list[Callable[[], object]]) -> list:
         """Every job's result in job order; the first failure in job order is raised once every running job ended."""
@@ -1004,7 +1020,10 @@ class _PlantPool:
                 if problem is not None:
                     raise KitError(problem)
                 checked.add(key)
-            results[item["id"]], _ = self._judge(item, "serial")
+            row, output = self._judge(item, "serial")
+            if row["killed"] and TEARDOWN_RACE.search(output):  # the test may have failed in its teardown only
+                row, _ = self._judge(item, "serial-recheck")
+            results[item["id"]] = row
         return [results[item["id"]] for item in self.rows] + ([self._self_test()] if self.self_test else [])
 
     def _self_test(self) -> dict:
@@ -1733,8 +1752,13 @@ def accept(root, task_id: str, data) -> dict:
         raise KitError(f"acceptance does not bind the latest results record: it binds {data['evidence_sha256']}, "
                        f"the latest is {entry['digest']}")
     if data["source_commit"] != record.get("head"):
-        raise KitError(f"acceptance source_commit {data['source_commit']} is not {record.get('head')}, the head "
-                       "the latest results record names")
+        import latework  # late: keeps the module graph flat
+
+        late = latework.source_problem(root, task_id, str(record.get("head")), data["source_commit"])
+        if late:
+            raise KitError(f"acceptance source_commit {data['source_commit']} is not {record.get('head')}, the head "
+                           "the latest results record names, nor a later commit that adds only the task's own late "
+                           f"files (its status, latest.json, report.md, results/, acceptance/, plants/): {late}")
     if data["decision"] == "accepted_development":
         import latework  # late: keeps the module graph flat
 

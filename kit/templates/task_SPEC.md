@@ -40,6 +40,10 @@ Tier: full
 
 *The logs, metrics and alerts this change adds or relies on.*
 
+## Design Acceptance
+
+*Only for a task that changes what a customer sees (a page, a screen, an email, a widget); otherwise `none`. Name each surface, the brand kit's path and the widths. The implementer fills `kit/templates/design_acceptance.md` as `program/evidence/<ID>/design.md`, with screenshots at each width in light and dark, viewed before handing back; QA views them again. A customer-facing task without it is not ready for dispatch.*
+
 ## Module Placement
 
 *The paths where the new code lives and the modules that may and may not depend on it.*

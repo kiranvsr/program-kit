@@ -30,6 +30,18 @@ guarded_files:
 # kinds of change it covers, light_paths says where they live. An entry is a path and covers everything under
 # it: write a directory with its trailing slash (`auth/`); `auth` guards the same. `pk doctor` warns about an
 # entry that covers no tracked file.
+# An entry may also be a glob (0.5.5): `*` stays within one directory, `**` crosses them, and a glob covers
+# what it matches and everything under a directory it matches. The UI fast lane (playbook 07, step 10) is the
+# light tier on the stylesheets and static site assets, switched on by a ruling of the user's; for example:
+#
+#   tiers:
+#     full_paths:
+#       - src/auth/
+#     light_paths:
+#       - docs/
+#       - web/src/**/*.css
+#       - web/public/site/
+#     light_ruling: R12
 tiers:
   full_paths: []
   light_paths: []
@@ -54,3 +66,5 @@ tiers:
 #       - docs/
 #     reuse_compare:              # paths under program/ the producer reads, compared like code
 #       - program/tools/
+#     step_timeout: 7200          # (0.5.5) produce.py's limit in seconds, at least 3600; absent, the gate scales
+#                                 # it from the last record's planted-bug rows, timing and this run's workers

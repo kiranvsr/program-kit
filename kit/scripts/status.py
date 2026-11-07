@@ -35,7 +35,7 @@ import evidence as evidence_module
 import register as register_module
 import rulings as rulings_module
 import store
-from common import KitError, PRIMARY_BRANCH, find_root, git, read_json, run_argv, utc_now, write_json
+from common import KitError, PRIMARY_BRANCH, find_root, git, read_json, read_text, run_argv, utc_now, write_json
 
 STATUSES = ("not_started", "in_progress", "review", "done", "blocked", "parked", "merged")
 ROLES = ("controller", "implementer", "qa")
@@ -346,6 +346,67 @@ def _merged_problem(root: Path, task_id: str, inspected: str) -> str | None:
     return None
 
 
+def _brief_tier(root: Path, task_id: str) -> str | None:
+    """The `Tier:` value of the task's fast-path brief in the working tree, when it has the brief and one such line."""
+    import gate  # lazy: gate imports this module
+
+    path = Path(root) / "program" / "tasks" / task_id / "BRIEF.md"
+    try:
+        lines = read_text(path).splitlines() if path.is_file() else []
+    except KitError:
+        return None
+    stated = [m.group(1) for m in map(gate._TIER_LINE.match, (line.strip() for line in lines)) if m]
+    return stated[0] if len(stated) == 1 else None
+
+
+def _fast_without_tier(root: Path, task_id: str) -> str:
+    """The refusal of `--fast` without `--tier` (0.5.5, KF-25): it never falls back to full, and never guesses."""
+    said = _brief_tier(root, task_id)
+    hint = f" (program/tasks/{task_id}/BRIEF.md says Tier: {said})" if said else ""
+    return (f"{task_id}: --fast needs --tier standard or --tier light{hint}: without --tier a task is full-tier, and "
+            f"the fast path is never available for the full tier; dispatch with: pk status set {task_id} in_progress "
+            f"--role controller --tier {said if said in ('standard', 'light') else '<standard|light>'} --fast "
+            "--ruling R<n>")
+
+
+def _full_without_spec(root: Path, task_id: str) -> None:
+    """Refuse a full-tier dispatch of a task whose definition is a fast-path brief and no SPEC (0.5.5, KF-25).
+
+    That dispatch was meant for the fast path and lost its `--tier` and `--fast` (the program's AH-0065): the gate
+    would refuse it for the missing SPEC only after the implementer's work, so it is refused here, with the command.
+    """
+    folder = Path(root) / "program" / "tasks" / task_id
+    if not (folder / "BRIEF.md").is_file() or (folder / "SPEC.md").exists():
+        return
+    said = _brief_tier(root, task_id)
+    if said is None:
+        return
+    raise KitError(f"{task_id}: program/tasks/{task_id}/BRIEF.md is a fast-path brief (Tier: {said}) and the task "
+                   f"has no SPEC.md, so a full-tier dispatch would fail its gate; dispatch with: pk status set "
+                   f"{task_id} in_progress --role controller --tier {said} --fast --ruling R<n> (or write the SPEC, "
+                   "PLAN and spec-QA review for the full tier)")
+
+
+def _brief_problem(root: Path, task_id: str, tier: str, ruling: str) -> None:
+    """Refuse (KitError) a fast-path dispatch whose `program/tasks/<ID>/BRIEF.md` the gate would refuse (0.5.5, KF-24).
+
+    The brief goes to main in the dispatch commit, so it is written first; the check is the gate's own
+    (`gate.brief_problems`): the four sections, the `Tier:` and `Ruling:` lines, and a standard-tier brief's
+    exact commands. Every problem is named, so one edit fixes them all before a gate run is spent on them.
+    """
+    import gate  # lazy: gate imports this module
+
+    rel = f"program/tasks/{task_id}/BRIEF.md"
+    path = Path(root) / rel
+    if not path.is_file():
+        raise KitError(f"{task_id}: the fast path needs its brief: write {rel} from kit/templates/task_FAST_BRIEF.md "
+                       "first (it goes to main in the dispatch commit)")
+    problems = gate.brief_problems(read_text(path), tier, ruling, against="the dispatch says", commands=True)
+    if problems:
+        raise KitError(f"{task_id}: {rel} is not ready for the fast path, and the gate would refuse it: "
+                       + "; ".join(problems) + " (fix the brief, then dispatch)")
+
+
 def _full_tier(root: Path, task_id: str) -> bool:
     """Whether the task's status record in `root` says in so many words that it is full-tier.
 
@@ -406,8 +467,13 @@ def _acceptance_problem(root: Path, task_id: str, full: bool | None = None) -> s
         more = f" (and {len(problems) - 1} more; run pk evidence validate)" if len(problems) > 1 else ""
         return f"{task_id}: {results['path']}: {problems[0]}{more}"
     if bound["source_commit"] != record["head"]:
-        return (f"{task_id}: {label}: source_commit is {bound['source_commit']!r}, not {record['head']}, "
-                f"the head {results['path']} names")
+        import latework  # late: keeps the module graph flat
+
+        late = latework.source_problem(root, task_id, record["head"], bound["source_commit"])
+        if late:
+            return (f"{task_id}: {label}: source_commit is {bound['source_commit']!r}, not {record['head']}, "
+                    f"the head {results['path']} names, nor a later commit that adds only the task's own late "
+                    f"files: {late}")
     code, _ = run_argv(["git", "-C", str(root), "merge-base", "--is-ancestor", record["head"], "HEAD"], Path(root))
     if code != 0:
         return f"{task_id}: {results['path']}: head {record['head']} is not an ancestor of HEAD"
@@ -466,7 +532,13 @@ def transition(root: Path, task_id: str, to: str, role: str, note: str = "",
         if to != "in_progress" or dispatched:
             raise KitError(f"{task_id}: the tier and the fast path are set at dispatch (the first move to "
                            f"in_progress); change the tier with: pk status tier {task_id} <tier> --ruling R<n>")
+        if fast and tier is None:
+            raise KitError(_fast_without_tier(root, task_id))
         _tier_problem(root, task_id, tier or "full", fast, ruling)
+        if fast:
+            _brief_problem(root, task_id, tier, ruling)
+    if to == "in_progress" and not dispatched and not fast and (tier or "full") == "full":
+        _full_without_spec(root, task_id)
     if dispatched or to != "in_progress":
         tier, fast, ruling = tier_of(record), is_fast(record), record.get("ruling", "")
     else:
@@ -726,7 +798,7 @@ def _configure(parser: argparse.ArgumentParser) -> None:
     setter.add_argument("--tier", choices=TIERS, help="at dispatch: the verification tier (default full)")
     setter.add_argument("--fast", action="store_true",
                         help="at dispatch: the fast path (BRIEF.md and a ruling replace SPEC, PLAN and spec QA); "
-                             "never with --tier full")
+                             "needs --tier standard or --tier light (without --tier it is refused, never full)")
     setter.add_argument("--ruling", default="", metavar="R<n>", help="at dispatch: the ruling that allows the "
                                                                    "fast path or the lower tier")
     setter.add_argument("--inspected", default="", metavar="SHA",

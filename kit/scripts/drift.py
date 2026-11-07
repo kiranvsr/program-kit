@@ -120,7 +120,9 @@ def _approvals(root: Path) -> tuple[bool, str]:
     except KitError as exc:
         return False, _one_line(exc)
     if changed:
-        return False, f"stage {stage} was approved and its files changed: {', '.join(changed)}"
+        return False, (f"stage {stage} was approved and its files changed: {', '.join(changed)}; a change of meaning "
+                       f"is a change request (pk change create; pk change apply re-hashes it), a correction is pk "
+                       f"interview amend {stage}")
     return True, f"approvals current; next stage {stage}"
 
 
@@ -235,7 +237,10 @@ def _regeneration(root: Path, sha: str, commands: list[list[str]], stage: int) -
     ran = f"{len(commands)} command(s)" + (", trace sync and briefs check" if kit else "")
     if not failures and not changed:
         return True, f"regeneration is a no-op ({ran})"
-    return False, "; ".join(([f"regeneration changes {', '.join(changed)}"] if changed else []) + failures)
+    hint = ("regeneration changes " + ", ".join(changed) + " (a generated file edited by hand, or a source changed "
+            "without its generator run: edit the source and regenerate; a change of meaning after the freeze starts "
+            "with pk change create)")
+    return False, "; ".join(([hint] if changed else []) + failures)
 
 
 def report(root: Path, rev: str = "HEAD") -> tuple[str, list[tuple[str, bool, str]]]:
