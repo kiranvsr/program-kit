@@ -750,6 +750,24 @@ def _first_open(root: Path, last: int) -> tuple[int, list[str]] | None:
     return None
 
 
+def stale_approvals(root: Path) -> list[tuple[int, list[str]]]:
+    """Every approved stage 1 to 6 whose files changed since its approval, with the paths, in stage order (0.5.5).
+
+    The same comparison `next` makes for the first such stage (`_first_open`), made for all of them: what `pk change
+    apply` re-hashes, and what `pk change check` warns about. A record of the wrong shape names its own file.
+    """
+    approved = [stage for stage in range(1, PER_TASK_STAGE) if _approval_path(root, stage).exists()]
+    frozen = [stage for stage in approved if stage >= FREEZE_STAGE]
+    found = []
+    for stage in approved:
+        record = read_json(_approval_path(root, stage))
+        digest = stage == FREEZE_STAGE and isinstance(record, dict) and isinstance(record.get(FROZEN_ENTRIES), str)
+        changed = _changes(root, record, bool(frozen) and (stage == frozen[-1] or digest), stage)
+        if changed:
+            found.append((stage, changed))
+    return found
+
+
 def next_stage(root: Path) -> int:
     """First stage 1..6 that is unapproved or whose approved files changed; 7 once all six are current.
 

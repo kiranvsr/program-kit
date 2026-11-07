@@ -183,8 +183,9 @@ def approve(root: Path, cr_id: str, by: str) -> None:
     write_text(path, _replace(text, "Approval", f"{utc_now()[:10]}: {by}", cr_id))
 
 
-def apply(root: Path, cr_id: str, note: str) -> None:
-    """Check the register and the matrix at stage 6, record the register change, then fill Applied.
+def apply(root: Path, cr_id: str, note: str, sync: bool = True) -> list[str]:
+    """Check the register and the matrix at stage 6, record the register change, fill Applied; with `sync` (the
+    default from 0.5.5) also sync the matrix first and re-hash the approvals the change made stale afterwards.
 
     Refused without Approval or when already applied. Every check runs before anything is written: the register
     must be valid, the matrix's copy of the tasks must equal what `pk trace sync` would write (the stage 6
@@ -192,7 +193,16 @@ def apply(root: Path, cr_id: str, note: str) -> None:
     one fails KitError says why and the register log, the briefs and the change request are as they were. Only
     then are the log line (`<CR-id>: <note>`) and the briefs written and Applied filled; if a write fails part-way
     the log and the briefs are put back.
+
+    With `sync` (KF-26: CR-034 in the program this came from failed until `pk trace sync`, then left D2 drift until
+    `pk interview amend`), a matrix whose `tasks` section is behind the register is synced before those checks
+    (and put back when one fails), and once Applied is filled every approved stage whose files changed is
+    re-hashed as `pk interview amend` does: the approved change request is the approval of the new text. Returns
+    one line per thing it did, naming each re-hashed path, so nothing is absorbed unseen. `sync=False` (`--no-sync`)
+    is the 0.5.4 behaviour: refuse an unsynced matrix, re-hash nothing.
     """
+    import interview  # lazy: only apply re-hashes approvals
+
     note = _text("note", note)
     path, text = _read(root, cr_id)
     if section(text, "Applied", cr_id):
@@ -203,15 +213,41 @@ def apply(root: Path, cr_id: str, note: str) -> None:
     if invalid:
         raise KitError(f"{cr_id} not applied: program/register.yaml has {len(invalid)} problem(s); "
                        "run pk register validate")
-    unsynced = trace_module.unsynced(root)
-    if unsynced:
-        raise KitError(f"{cr_id} not applied: {unsynced[0]}")
-    problems = trace_module.validate(root, 6)
-    if problems:
-        raise KitError(f"{cr_id} not applied: traceability at stage 6 has {len(problems)} problem(s): "
-                       + "; ".join(problems))
-    register_module.change(root, f"{cr_id}: {note}",
-                           after=lambda: write_text(path, _replace(text, "Applied", f"{utc_now()[:10]}: {note}", cr_id)))
+    if sync:
+        broken = [f"program/approvals/stage-{stage}.json" for stage, changed in interview.stale_approvals(root)
+                  if f"program/approvals/stage-{stage}.json" in changed]
+        if broken:
+            raise KitError(f"{cr_id} not applied: {', '.join(broken)} is not an approval record that can be re-hashed")
+    lines: list[str] = []
+    matrix = Path(root) / "program" / "traceability.yaml"
+    saved = matrix.read_bytes() if matrix.is_file() else None
+    synced = False
+    try:
+        unsynced = trace_module.unsynced(root)
+        if unsynced and sync:
+            count = trace_module.sync(root)
+            synced = True
+            lines.append(f"trace: synced the tasks section of program/traceability.yaml from the register "
+                         f"({count} task(s); what pk trace sync writes)")
+        elif unsynced:
+            raise KitError(f"{cr_id} not applied: {unsynced[0]}")
+        problems = trace_module.validate(root, 6)
+        if problems:
+            raise KitError(f"{cr_id} not applied: traceability at stage 6 has {len(problems)} problem(s): "
+                           + "; ".join(problems))
+        register_module.change(root, f"{cr_id}: {note}",
+                               after=lambda: write_text(path, _replace(text, "Applied", f"{utc_now()[:10]}: {note}",
+                                                                       cr_id)))
+    except BaseException:
+        if synced and saved is not None:
+            matrix.write_bytes(saved)
+        raise
+    if sync:
+        for stage, changed in interview.stale_approvals(root):
+            interview.amend(root, stage)
+            lines.append(f"stage {stage}: re-hashed {', '.join(changed)} into program/approvals/stage-{stage}.json "
+                         f"(what pk interview amend {stage} does)")
+    return lines
 
 
 def open_requests(root: Path) -> list[dict]:
@@ -245,8 +281,8 @@ def cmd_change(args: argparse.Namespace) -> int:
         approve(root, args.cr_id, args.by)
         output = f"{args.cr_id} approved by {args.by.strip()}"
     else:
-        apply(root, args.cr_id, args.note)
-        output = f"{args.cr_id} applied"
+        done = apply(root, args.cr_id, args.note, sync=not args.no_sync)
+        output = "\n".join([*done, f"{args.cr_id} applied"])
     print(output)
     return 0
 
@@ -266,6 +302,8 @@ def _configure(parser: argparse.ArgumentParser) -> None:
     applier = actions.add_parser("apply", help="record the register change, re-check the matrix, mark applied")
     applier.add_argument("cr_id", metavar="CR-nnn")
     applier.add_argument("--note", required=True, help="what was amended, one line")
+    applier.add_argument("--no-sync", action="store_true", dest="no_sync",
+                         help="neither sync the trace nor re-hash approvals; refuse an unsynced matrix (0.5.4)")
 
 
 def register(add_command) -> None:
