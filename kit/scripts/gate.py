@@ -54,6 +54,7 @@ Limits:
 from __future__ import annotations
 
 import argparse
+import functools
 import math
 import os
 import re
@@ -567,13 +568,47 @@ def _guarded_changes(root: Path, task_id: str, branch: str, main: str, guarded: 
     return [path for path, entry in touched if path not in allowed and entry not in allowed]
 
 
+def is_glob(entry: str) -> bool:
+    """Whether a tiers path entry is a glob (0.5.5): it holds `*` or `?`."""
+    return "*" in entry or "?" in entry
+
+
+@functools.lru_cache(maxsize=256)
+def _glob(entry: str) -> re.Pattern:
+    """The pattern of a glob entry: `**/` any number of directories (none too), `**` anything, `*` anything within
+    one path segment, `?` one character within a segment; every other character stands for itself."""
+    out, index = [], 0
+    while index < len(entry):
+        if entry.startswith("**/", index):
+            out.append("(?:[^/]+/)*")
+            index += 3
+        elif entry.startswith("**", index):
+            out.append(".*")
+            index += 2
+        else:
+            char = entry[index]
+            out.append("[^/]*" if char == "*" else "[^/]" if char == "?" else re.escape(char))
+            index += 1
+    return re.compile("".join(out) + r"\Z")
+
+
 def _under(path: str, entries) -> str | None:
     """The entry of `entries` that covers `path`, or None: the path itself, or a directory above it.
 
     The trailing `/` of a directory entry is optional: `auth` and `auth/` both cover `auth/policy.py`, so an
-    entry written without the slash still guards the directory. Neither covers `authz/x.py`.
+    entry written without the slash still guards the directory. Neither covers `authz/x.py`. An entry with `*` or
+    `?` is a glob (0.5.5, KF-32): it covers a path it matches whole, or a path under a directory it matches, so
+    `apps/web/src/**/*.css` covers every stylesheet under `apps/web/src/` and `apps/*/public/` everything under
+    each app's `public/`. `*` never crosses a `/`; `**` does.
     """
-    return next((e for e in entries if path == e or path.startswith(e.rstrip("/") + "/")), None)
+    for entry in entries:
+        if is_glob(entry):
+            pattern, parts = _glob(entry.rstrip("/")), path.split("/")
+            if any(pattern.match("/".join(parts[:end])) for end in range(len(parts), 0, -1)):
+                return entry
+        elif path == entry or path.startswith(entry.rstrip("/") + "/"):
+            return entry
+    return None
 
 
 def status_at(root: Path, task_id: str, ref: str = MAIN) -> dict | None:

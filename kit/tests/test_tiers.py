@@ -677,6 +677,17 @@ class LightTierGateTests(TierGateBase):
         sh(self.wt, "git", "merge", "-q", "main")
         return sh(self.wt, "git", "rev-parse", "HEAD").strip()
 
+    def test_a_glob_light_path_lets_the_files_it_matches_through_and_nothing_else(self):
+        # KF-32 (0.5.5): the program's UI lane listed every stylesheet by path because globs were not read
+        self.LIGHT = dict(self.LIGHT, light_paths=["web/**/*.txt"])
+        tip = self.switch_on()
+        rc, out = self.merge_check(inspected=tip)
+        self.assertEqual(rc, 0, out)
+        self.work("web/page.py")
+        rc, out = self.merge_check(inspected=sh(self.wt, "git", "rev-parse", "HEAD").strip())
+        self.assertEqual(rc, 1)
+        self.assertIn("is light but changes paths outside tiers.light_paths: web/page.py", out)
+
     def test_a_light_merge_check_needs_the_controllers_inspection_of_the_tip(self):
         tip = self.switch_on()
         rc, out = self.merge_check()
@@ -757,6 +768,55 @@ class ChecksTiersTests(unittest.TestCase):
                     found = pk._tier_path_warnings(root, {"tiers": tiers})
                     self.assertEqual([line.split(": check the")[0] for line in found], expected)
             self.assertEqual(pk._tier_path_warnings(root, {"tiers": "nope"}), [])  # an error elsewhere, not a warning
+
+
+    def test_doctor_judges_a_glob_entry_against_the_tracked_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            (root / "web" / "src" / "theme").mkdir(parents=True)
+            (root / "web" / "src" / "theme" / "base.css").write_text("x\n")
+            git_repo(root)
+            found = pk._tier_path_warnings(root, {"tiers": {"full_paths": ["auth/**"], "light_paths": [
+                "web/src/**/*.css", "web/src/*.css", "web/*/theme/"]}})
+            self.assertEqual([line.split(": check the")[0] for line in found],
+                             ["checks.yaml: tiers.full_paths entry 'auth/**' covers no tracked file",
+                              "checks.yaml: tiers.light_paths entry 'web/src/*.css' covers no tracked file"])
+
+
+class GlobPathTests(unittest.TestCase):
+    """KF-32 (0.5.5): tiers paths may be globs, so a UI-only lane need not list every stylesheet by path."""
+
+    def test_star_stays_in_one_directory_and_double_star_crosses_them(self):
+        css = ["apps/web/src/**/*.css"]
+        for path in ("apps/web/src/a.css", "apps/web/src/theme/base.css", "apps/web/src/studio/x/y/shell.css"):
+            self.assertEqual(gate._under(path, css), css[0], path)
+        for path in ("apps/web/src/theme/base.ts", "apps/web/src/a.css.map", "apps/web/public/a.css",
+                     "apps/web/srcx/a.css", "apps/api/src/a.css"):
+            self.assertIsNone(gate._under(path, css), path)
+        self.assertEqual(gate._under("apps/web/src/a.css", ["apps/web/src/*.css"]), "apps/web/src/*.css")
+        self.assertIsNone(gate._under("apps/web/src/theme/a.css", ["apps/web/src/*.css"]))
+        self.assertEqual(gate._under("docs/a/b.md", ["**/*.md"]), "**/*.md")
+        self.assertEqual(gate._under("a.md", ["**/*.md"]), "**/*.md")  # **/ matches no directory too
+
+    def test_a_glob_that_names_directories_covers_everything_under_them(self):
+        public = ["apps/*/public/"]
+        self.assertEqual(gate._under("apps/web/public/site/hero.webp", public), public[0])
+        self.assertIsNone(gate._under("apps/web/src/public.ts", public))
+        self.assertEqual(gate._under("apps/web/src/theme/base.css", ["apps/web/src/th?me"]), "apps/web/src/th?me")
+
+    def test_prefix_and_exact_entries_work_as_before_and_other_characters_are_literal(self):
+        self.assertEqual(gate._under("auth/policy.py", ["auth"]), "auth")
+        self.assertEqual(gate._under("auth/policy.py", ["auth/policy.py"]), "auth/policy.py")
+        self.assertIsNone(gate._under("authz/policy.py", ["auth/"]))
+        self.assertIsNone(gate._under("docs/a+b.md", ["docs/a.b*.md"]))  # the dot is a dot, not any character
+        self.assertEqual(gate._under("docs/a.b1.md", ["docs/a.b*.md"]), "docs/a.b*.md")
+
+    def test_the_light_merge_guard_reads_globs_from_checks(self):
+        tiers = gate._parse_tiers({"full_paths": ["apps/api/"], "light_paths": ["./apps/web/src/**/*.css"]})
+        self.assertEqual(tiers["light_paths"], ["apps/web/src/**/*.css"])
+        changed = ["apps/web/src/theme/base.css", "apps/web/src/studio/shell.tsx"]
+        self.assertEqual([path for path in changed if not gate._under(path, tiers["light_paths"])],
+                         ["apps/web/src/studio/shell.tsx"])
 
 
 if __name__ == "__main__":

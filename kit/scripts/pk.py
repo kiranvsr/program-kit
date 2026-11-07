@@ -184,12 +184,21 @@ def _tier_path_warnings(root: Path, data) -> list[str]:
     except KitError:
         return []  # reported as a problem by _checks_problems
     warnings = []
+    tracked = None
     for key in ("full_paths", "light_paths"):
         for entry in tiers[key]:
-            code, listed = run_argv(["git", "-C", str(root), "ls-files", "--", entry.rstrip("/")], root)
-            if code == 0 and not listed.strip():
+            if gate.is_glob(entry):  # 0.5.5: judged with the gate's own rule, against every tracked file
+                if tracked is None:
+                    code, listed = run_argv(["git", "-C", str(root), "ls-files", "-z"], root)
+                    tracked = [name for name in listed.split("\0") if name] if code == 0 else []
+                covered = any(gate._under(name, [entry]) for name in tracked)
+            else:
+                code, listed = run_argv(["git", "-C", str(root), "ls-files", "--", entry.rstrip("/")], root)
+                covered = code != 0 or bool(listed.strip())
+            if not covered:
                 warnings.append(f"checks.yaml: tiers.{key} entry {entry!r} covers no tracked file: check the "
-                                "spelling (a directory is written with or without its trailing /)")
+                                "spelling (a directory is written with or without its trailing /; in a glob, * "
+                                "stays within one directory and ** crosses them)")
     return warnings
 
 
