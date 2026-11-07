@@ -65,6 +65,12 @@ class TierStatusTests(unittest.TestCase):
     def ruling(self) -> str:
         return f"R{rulings.add(self.root, 'controller', 'q', 'd')}"
 
+    def brief(self, text=None, task_id=TID):
+        """The fast-path brief, written before the dispatch as playbook 07 says (checked at dispatch from 0.5.5)."""
+        path = self.root / "program" / "tasks" / task_id / "BRIEF.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(BRIEF if text is None else text)
+
     def git(self, *argv):
         return subprocess.run(["git", *argv], cwd=str(self.root), check=True, capture_output=True, text=True).stdout
 
@@ -108,9 +114,31 @@ class TierStatusTests(unittest.TestCase):
         self.checks(full_paths=["auth/"])
         self.refused("needs --ruling", TID, "in_progress", "controller", tier="standard", fast=True)
         self.refused("R7 is not a ruling", TID, "in_progress", "controller", tier="standard", fast=True, ruling="R7")
+        self.brief()
         record = status.transition(self.root, TID, "in_progress", "controller", tier="standard", fast=True,
                                    ruling=self.ruling())
         self.assertEqual((record["tier"], record["fast"], record["ruling"]), ("standard", True, "R1"))
+
+    def test_a_fast_dispatch_names_every_section_its_brief_lacks_before_anything_is_written(self):
+        # KF-24 (0.5.5): the program's AH-0069 lost a gate run to a brief without `## Assumptions checked`
+        self.checks(full_paths=["auth/"])
+        ruling = self.ruling()
+        self.refused(f"the fast path needs its brief: write program/tasks/{TID}/BRIEF.md", TID, "in_progress",
+                     "controller", tier="standard", fast=True, ruling=ruling)
+        self.brief(BRIEF.replace("## Assumptions checked", "## Notes").replace("## Stop and report when", "## Stop"))
+        self.refused(r"BRIEF.md is not ready for the fast path, and the gate would refuse it: lacks the section\(s\) "
+                     r"## Assumptions checked, ## Stop and report when", TID, "in_progress", "controller",
+                     tier="standard", fast=True, ruling=ruling)
+        self.brief(brief(tier="light"))
+        self.refused("says Tier: light, the dispatch says standard", TID, "in_progress", "controller",
+                     tier="standard", fast=True, ruling=ruling)
+        self.brief(BRIEF.split("## Exact Commands")[0])
+        self.refused('lists no command under "## Exact Commands"', TID, "in_progress", "controller",
+                     tier="standard", fast=True, ruling=ruling)
+        self.brief()
+        record = status.transition(self.root, TID, "in_progress", "controller", tier="standard", fast=True,
+                                   ruling=ruling)
+        self.assertEqual((record["tier"], record["fast"]), ("standard", True))
 
     def test_the_light_tier_needs_its_ruling_and_its_paths_in_checks(self):
         self.checks(full_paths=["auth/"])
@@ -333,6 +361,7 @@ class TierStatusTests(unittest.TestCase):
     def test_a_fast_task_is_raised_to_full_only_by_leaving_the_fast_path(self):
         self.checks(full_paths=["auth/"])
         ruling = self.ruling()
+        self.brief()
         status.transition(self.root, TID, "in_progress", "controller", tier="standard", fast=True, ruling=ruling)
         with self.assertRaisesRegex(KitError, "never available for the full tier"):
             status.set_tier(self.root, TID, "full", ruling)
@@ -342,6 +371,7 @@ class TierStatusTests(unittest.TestCase):
     def test_the_command_line_sets_and_changes_the_tier(self):
         self.checks(full_paths=["auth/"])
         ruling = self.ruling()
+        self.brief()
         code, out, err = run_cli("status", self.root, "status", "set", TID, "in_progress", "--role", "controller",
                                  "--tier", "standard", "--fast", "--ruling", ruling)
         self.assertEqual((code, out, err), (0, f"{TID}: in_progress (tier standard, fast path)\n", ""))

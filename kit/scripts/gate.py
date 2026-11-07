@@ -791,19 +791,41 @@ def _frozen_brief(root: Path, tree: Path, task_id: str, meta: dict) -> bytes | N
     if (own.read_bytes() if own.is_file() else None) != authoritative:
         _out(f"FAILED: brief {rel} differs from {MAIN} {FIX_ON_MAIN}")
         return None
-    lines = {line.strip() for line in drop_bom(authoritative.decode("utf-8", "replace")).splitlines()}
+    problems = brief_problems(authoritative.decode("utf-8", "replace"), meta["tier"], meta["ruling"],
+                              where=f"on {MAIN} ", against="the status record says")
+    if problems:
+        _out(f"FAILED: brief {rel} {problems[0]}")
+        return None
+    return authoritative
+
+
+def brief_problems(text: str, tier: str, ruling: str, where: str = "", against: str = "the status record says",
+                   commands: bool = False) -> list[str]:
+    """What stops a fast-path brief `text` from standing for a task of `tier` by `ruling`, in the gate's order.
+
+    The four fast-path sections (one problem naming every missing one); then exactly one `Tier:` and one `Ruling:`
+    line saying `tier` and `ruling`; with `commands` (0.5.5, the dispatch check) a standard-tier brief must list at
+    least one exact command that parses. The hand-back gate and the merge check print the first; `pk status set
+    <ID> in_progress --fast` (KF-24) refuses with all of them, before anything is committed.
+    """
+    lines = {line.strip() for line in drop_bom(text).splitlines()}
+    problems = []
     missing = [heading for heading in FAST_BRIEF_HEADINGS if heading not in lines]
     if missing:
-        _out(f"FAILED: brief {rel} lacks the section(s) {', '.join(missing)}")
-        return None
-    for label, pattern, recorded in (("Tier", _TIER_LINE, meta["tier"]), ("Ruling", _RULING_LINE, meta["ruling"])):
+        problems.append(f"lacks the section(s) {', '.join(missing)}")
+    for label, pattern, recorded in (("Tier", _TIER_LINE, tier), ("Ruling", _RULING_LINE, ruling)):
         stated = sorted(m.group(1) for m in map(pattern.match, lines) if m)
         if stated != [recorded]:
-            _out(f"FAILED: brief {rel} on {MAIN} says "
-                 f"{', '.join(f'{label}: {_show(value)}' for value in stated) if stated else f'no {label}: line'}, "
-                 f"the status record says {recorded or 'none'}")
-            return None
-    return authoritative
+            problems.append(f"{where}says "
+                            f"{', '.join(f'{label}: {_show(value)}' for value in stated) if stated else f'no {label}: line'}, "
+                            f"{against} {recorded or 'none'}")
+    if commands and tier != "light":
+        try:
+            if not parse_plan(drop_bom(text)):
+                problems.append(f'lists no command under "{PLAN_SECTION}" (a {tier}-tier brief lists at least one)')
+        except KitError as exc:
+            problems.append(str(exc))
+    return problems
 
 
 def _spec_tier_ok(root: Path, task_id: str, tier: str) -> bool:

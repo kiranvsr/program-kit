@@ -35,7 +35,7 @@ import evidence as evidence_module
 import register as register_module
 import rulings as rulings_module
 import store
-from common import KitError, PRIMARY_BRANCH, find_root, git, read_json, run_argv, utc_now, write_json
+from common import KitError, PRIMARY_BRANCH, find_root, git, read_json, read_text, run_argv, utc_now, write_json
 
 STATUSES = ("not_started", "in_progress", "review", "done", "blocked", "parked", "merged")
 ROLES = ("controller", "implementer", "qa")
@@ -346,6 +346,26 @@ def _merged_problem(root: Path, task_id: str, inspected: str) -> str | None:
     return None
 
 
+def _brief_problem(root: Path, task_id: str, tier: str, ruling: str) -> None:
+    """Refuse (KitError) a fast-path dispatch whose `program/tasks/<ID>/BRIEF.md` the gate would refuse (0.5.5, KF-24).
+
+    The brief goes to main in the dispatch commit, so it is written first; the check is the gate's own
+    (`gate.brief_problems`): the four sections, the `Tier:` and `Ruling:` lines, and a standard-tier brief's
+    exact commands. Every problem is named, so one edit fixes them all before a gate run is spent on them.
+    """
+    import gate  # lazy: gate imports this module
+
+    rel = f"program/tasks/{task_id}/BRIEF.md"
+    path = Path(root) / rel
+    if not path.is_file():
+        raise KitError(f"{task_id}: the fast path needs its brief: write {rel} from kit/templates/task_FAST_BRIEF.md "
+                       "first (it goes to main in the dispatch commit)")
+    problems = gate.brief_problems(read_text(path), tier, ruling, against="the dispatch says", commands=True)
+    if problems:
+        raise KitError(f"{task_id}: {rel} is not ready for the fast path, and the gate would refuse it: "
+                       + "; ".join(problems) + " (fix the brief, then dispatch)")
+
+
 def _full_tier(root: Path, task_id: str) -> bool:
     """Whether the task's status record in `root` says in so many words that it is full-tier.
 
@@ -467,6 +487,8 @@ def transition(root: Path, task_id: str, to: str, role: str, note: str = "",
             raise KitError(f"{task_id}: the tier and the fast path are set at dispatch (the first move to "
                            f"in_progress); change the tier with: pk status tier {task_id} <tier> --ruling R<n>")
         _tier_problem(root, task_id, tier or "full", fast, ruling)
+        if fast:
+            _brief_problem(root, task_id, tier, ruling)
     if dispatched or to != "in_progress":
         tier, fast, ruling = tier_of(record), is_fast(record), record.get("ruling", "")
     else:
