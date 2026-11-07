@@ -1,6 +1,6 @@
 # program-kit: a governed delivery framework for agent-run software programs
 
-This is the standing design document for program-kit. It describes the kit as built (version 0.5.4): what it is for, how a program moves from a few lines of intent to a frozen specification and a task register, how tasks are executed and accepted, and why each rule exists. `README.md` has the commands to start; `docs/FAQ.md` answers the questions newcomers ask most. Throughout, `pk` means `python3 kit/scripts/pk.py`.
+This is the standing design document for program-kit. It describes the kit as built (version 0.5.5): what it is for, how a program moves from a few lines of intent to a frozen specification and a task register, how tasks are executed and accepted, and why each rule exists. `README.md` has the commands to start; `docs/FAQ.md` answers the questions newcomers ask most. Throughout, `pk` means `python3 kit/scripts/pk.py`.
 
 ## 1. Purpose
 
@@ -331,6 +331,7 @@ evidence:                 # optional (0.5.2)
     - docs/
   reuse_compare:          # paths under program/ that are (the producer's tools)
     - program/tools/
+  step_timeout: 7200      # optional (0.5.5): produce.py's limit, at least 3600; absent, scaled (section 5, step 4)
 drift:                    # optional; read by pk drift only
   regenerate:
     - - go

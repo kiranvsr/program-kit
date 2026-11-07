@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.5.5
+
+Ten findings from running a program on the kit (KF-23 to KF-32 there): a gate step that ran out of time, dispatch mistakes caught only at the gate, change requests that needed two manual follow-ups, acceptances refused for naming the commit that added the report, merges failed by an out-of-memory kill, browser-test teardown races in producers, customer-facing pages shipped without a design check, and a UI fast lane that had to list every stylesheet by path. Everything is backward compatible: every record, pointer, producer and `checks.yaml` written before reads and runs as it did.
+
+What changed:
+
+- The evidence step's limit (KF-23). `produce.py` runs under `evidence.step_timeout` of `checks.yaml` when set (at least 3,600 s), otherwise twice the planted-bug estimate of the latest results record (its judged rows times its measured seconds per row and worker, 120 s when it timed nothing, divided by this run's workers), never below the 3,600 s every gate step had. A limit above 3,600 s is printed with how it was reached; the 80% estimate warning reads the same limit.
+- The brief at dispatch (KF-24). `pk status set <ID> in_progress --fast` reads `program/tasks/<ID>/BRIEF.md` and refuses, naming every problem, a brief the gate would refuse: a missing section, a `Tier:` or `Ruling:` line that is not the dispatch's, a standard-tier brief without an exact command, or no brief at all. The gate's own check is the same function (`gate.brief_problems`).
+- `--fast` needs `--tier` (KF-25). `--fast` without `--tier` is refused, naming the brief's `Tier:` line and the exact command; a dispatch without `--tier` of a task whose definition is a fast-path brief and no SPEC is refused the same way.
+- `pk change apply` finishes the job (KF-26). By default it syncs a traceability matrix that is behind the register before its checks (put back when one fails) and, once the request is applied, re-hashes every approved stage whose files changed, as `pk interview amend` does, printing each path. `--no-sync` is the 0.5.4 behaviour.
+- `pk change check [--strict]` (KF-27): a cheap warning, before a commit, for approved files changed since their approval, pointing to the approved request not yet applied or to `pk change create` (a correction: `pk interview amend N`). `pk drift` D1 and D2 name the same way out.
+- Late files after the reviewed commit (KF-28). An acceptance's `source_commit` may be a later commit of the branch whose commits after the results record's `head` add only the status file, `latest.json`, `report.md` and records in `results/`, `acceptance/` and `plants/` (and clean merges of main). `pk evidence accept`, `pk status set done` and so `pk merge` accept it; anything else is still unreviewed work.
+- Signal kills (KF-29). A gate `FAILED:` line names a command killed by a signal (`exit -9, killed by SIGKILL`, or `exit 137, killed by SIGKILL` through a wrapper, with the out-of-memory note), and `pk merge` runs a merge check failed that way once more, saying so. Any other failure is final.
+- Browser-test teardown races (KF-30). Playbook 07 says how a browser test in a producer avoids answering a routed request after its page closed; with more than one plant worker, a kill whose output shows such a race (`evidence.TEARDOWN_RACE`) is judged once more alone (`judged: serial-recheck`).
+- Design acceptance (KF-31). `kit/templates/design_acceptance.md` (the brand kit, the widths, every surface at each width in light and dark, before and after, viewed by the implementer and by QA, the brand checks); the task SPEC and fast-brief templates gain a design-acceptance section (`none` when nothing customer-facing changes), and the QA brief says to view the screenshots.
+- Globs in the tier paths and the UI fast lane (KF-32). A `tiers.full_paths` or `tiers.light_paths` entry with `*` or `?` is a glob (`apps/web/src/**/*.css`); prefix and exact entries work as before, and `pk doctor` judges a glob against the tracked files. Playbook 07 step 10 documents the UI fast lane: the light tier on the stylesheets and static assets, what it covers, the light gate, the controller's targeted tests and screenshots, and `pk merge --inspected`; the `checks.yaml` template carries the commented example.
+- Docs: DESIGN sections 4.3, 5, 6, 9.2, 9.3, 10.1 and 12, playbooks 07, 08, 09 and 10, the QA brief, the `checks.yaml`, SPEC and fast-brief templates.
+
+Design choices, each with its reason:
+
+- `--fast` without `--tier` is refused, not defaulted to standard: the tier decides whether QA runs at all (light has none), so the kit does not choose it for the controller; the refusal names the brief's own tier and the command, so the fix is one copy.
+- `pk change apply` syncs and re-hashes by default, with `--no-sync` to opt out: an approved change request is the approval of the new text, and both steps were always run by hand right after; each re-hashed path is printed, so an unrelated hand edit is seen rather than absorbed silently.
+- The scaled evidence limit is twice the estimate from a measured record, with a 3,600 s floor: the first run of a task has no measurement and keeps the old limit, and a producer's own commands share the step.
+- `pk change check` is a command, not a git hook: as for the stop hook (0.5.4), a git hook fires inside merges and pushes, where a refusal leaves work half done.
+- Only kill signals count from exit 128+n, and the merge check runs at most twice: a program's own exit code in that range is not taken for a kill, and a branch that really fails is never retried in a loop.
+
+Upgrading from 0.5.4: `sh install.sh /path/to/your-repo --upgrade`. Nothing in `program/` has to change. A program that listed each stylesheet under `tiers.light_paths` may replace them with one glob (a guarded edit of `checks.yaml`, with the user's word); a program whose evidence step needs a fixed limit sets `evidence.step_timeout`.
+
 ## 0.5.4
 
 Progress docs behind state, the tasks ready to start, and a stop hook (R570 in the program it came from). There, controllers let the hand-kept progress docs (a dashboard, a successor prompt) fall behind the program state and left agent slots idle during busy event-driven stretches; the user had to ask four times. The program's stop-gap was a script outside the repository run by its agent tool's stop hook. This release makes the check part of `pk drift`, provider-neutral, with the hook as an adapter. Everything is backward compatible: without the new `progress` section `pk drift` runs as before, with one more line, `D7 ok skipped: not configured`, and the ready list.
