@@ -266,13 +266,46 @@ def open_requests(root: Path) -> list[dict]:
     return found
 
 
+def check(root: Path) -> list[str]:
+    """Warning lines for approved files changed since their approval, or [] when every approval is current (0.5.5).
+
+    KF-27: nothing warned before a hand edit of an approved file (SPEC.md, ARCHITECTURE.md) except `pk drift` later.
+    This reads only the approval records and hashes their files, so it is cheap enough to run before every commit
+    that touches `program/`. It names each changed path and its stage, then what to do: apply the change request
+    already approved for it, or start one with `pk change create` (a correction that does not change meaning is
+    `pk interview amend N`). It writes nothing.
+    """
+    import interview  # lazy: only check reads approvals
+
+    stale = interview.stale_approvals(root)
+    if not stale:
+        return []
+    lines = [f"warning: {path} changed since the stage {stage} approval" for stage, changed in stale
+             for path in changed]
+    pending = [item["id"] for item in open_requests(root) if item["approved"]]
+    stages = " ".join(str(stage) for stage, _ in stale)
+    if pending:
+        lines.append(f"{', '.join(pending)} approved and not applied: when the edit is that change, pk change apply "
+                     f"re-hashes the approvals; otherwise undo the edit or start a request: pk change create")
+    else:
+        lines.append(f"no change request covers this edit: a change of meaning after the freeze starts with pk change "
+                     f"create --title TEXT --why TEXT --asked-by NAME (impact, the user's approval, then pk change "
+                     f"apply re-hashes the approvals); a correction that does not change meaning: pk interview amend "
+                     f"N (stage {stages})")
+    return lines
+
+
 # --- command -----------------------------------------------------------------
 
 def cmd_change(args: argparse.Namespace) -> int:
     action = getattr(args, "change_action", None)
-    if action not in ("create", "impact", "approve", "apply"):
-        raise KitError("change needs an action: create, impact, approve or apply")
+    if action not in ("create", "impact", "approve", "apply", "check"):
+        raise KitError("change needs an action: create, impact, approve, apply or check")
     root = find_root()
+    if action == "check":
+        warnings = check(root)
+        print("\n".join(warnings) if warnings else "approved files: unchanged since their approvals")
+        return 1 if warnings and args.strict else 0
     if action == "create":
         output = create(root, args.title, args.why, args.asked_by)
     elif action == "impact":
@@ -302,9 +335,12 @@ def _configure(parser: argparse.ArgumentParser) -> None:
     applier = actions.add_parser("apply", help="record the register change, re-check the matrix, mark applied")
     applier.add_argument("cr_id", metavar="CR-nnn")
     applier.add_argument("--note", required=True, help="what was amended, one line")
+    checker = actions.add_parser("check", help="warn about approved files edited since their approval (cheap)")
+    checker.add_argument("--strict", action="store_true", help="exit 1 when there is a warning")
     applier.add_argument("--no-sync", action="store_true", dest="no_sync",
                          help="neither sync the trace nor re-hash approvals; refuse an unsynced matrix (0.5.4)")
 
 
 def register(add_command) -> None:
-    add_command("change", cmd_change, help="change requests: create, impact, approve, apply", configure=_configure)
+    add_command("change", cmd_change, help="change requests: create, impact, approve, apply, check",
+                configure=_configure)

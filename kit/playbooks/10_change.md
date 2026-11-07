@@ -11,6 +11,8 @@ Change the meaning of anything approved at stage 5 or later without silently bre
 
 A correction that does not change meaning (a typo, a clarified sentence) is not a CR: edit the file and run `pk interview amend N`.
 
+Before committing an edit under `program/`, run `pk change check` (0.5.5; it only hashes the approved files, so it takes a moment). It names every approved file (SPEC.md, ARCHITECTURE.md, the register and the rest) changed since its approval and says what to do: the approved request that carries the edit (`pk change apply` re-hashes it), or `pk change create` for a change of meaning, or `pk interview amend N` for a correction. It warns and exits 0; `--strict` exits 1, for an agent tool's pre-commit step. A generated file edited by hand shows in `pk drift` D1, and an approved one in D2, both naming `pk change create`.
+
 ## Steps
 
 1. Create the CR: `pk change create --title T --why W --asked-by A`. It writes `program/changes/CR-NNN.md`. Edit the file to say exactly what changes.

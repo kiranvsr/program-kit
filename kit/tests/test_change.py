@@ -85,6 +85,16 @@ class ChangeBase(unittest.TestCase):
             code = pk.main(list(argv))
         return code, out.getvalue(), err.getvalue()
 
+    def approve_stage(self, stage, *names):
+        import interview
+        from common import sha256_file
+
+        write_yaml(self.program / "ledger.yaml", {"entries": [], "sources": {}})
+        write_json(self.program / "approvals" / f"stage-{stage}.json", {
+            "stage": stage, "at": "2026-11-01T00:00:00Z",
+            "artifacts": {f"program/{name}": sha256_file(self.program / name) for name in names},
+            "ledger_sha256": interview._ledger_hash(self.root)})
+
 
 class CreateTests(ChangeBase):
     def test_create_numbers_sequentially(self):
@@ -413,16 +423,6 @@ class ApplyTests(ChangeBase):
         self.assertEqual(trace_module.unsynced(self.root), [])
         self.assertIn("added the follow-up", self.section(cr_id, "Applied"))
 
-    def approve_stage(self, stage, *names):
-        import interview
-        from common import sha256_file
-
-        write_yaml(self.program / "ledger.yaml", {"entries": [], "sources": {}})
-        write_json(self.program / "approvals" / f"stage-{stage}.json", {
-            "stage": stage, "at": "2026-11-01T00:00:00Z",
-            "artifacts": {f"program/{name}": sha256_file(self.program / name) for name in names},
-            "ledger_sha256": interview._ledger_hash(self.root)})
-
     def test_apply_re_hashes_the_approved_stages_whose_files_changed_and_names_them(self):
         # KF-26: after CR-034's generator run, D2 drifted until pk interview amend <stage>
         import interview
@@ -472,6 +472,43 @@ class ApplyTests(ChangeBase):
         change.apply(self.root, cr_id, "amended SPEC")
         self.assertEqual(self.evidence_digest(), self.before)
         self.assertNotIn("program/evidence", Path(change.__file__).read_text())
+
+
+class CheckTests(ChangeBase):
+    """KF-27 (0.5.5): a cheap warning when an approved file is edited outside a change request."""
+
+    def test_check_is_quiet_while_every_approval_is_current(self):
+        (self.program / "SPEC.md").write_text("spec\n")
+        self.approve_stage(3, "SPEC.md")
+        self.assertEqual(change.check(self.root), [])
+        self.assertEqual(self.run_cli("change", "check"), (0, "approved files: unchanged since their approvals\n", ""))
+
+    def test_a_hand_edit_of_an_approved_file_is_named_with_pk_change_create(self):
+        (self.program / "SPEC.md").write_text("spec\n")
+        (self.program / "ARCHITECTURE.md").write_text("arch\n")
+        self.approve_stage(3, "SPEC.md")
+        self.approve_stage(4, "ARCHITECTURE.md", "gates.yaml")
+        (self.program / "SPEC.md").write_text("spec, edited by hand\n")
+        (self.program / "ARCHITECTURE.md").write_text("arch, edited by hand\n")
+        code, out, err = self.run_cli("change", "check")
+        self.assertEqual((code, err), (0, ""))  # a warning: it never stops anything
+        lines = out.splitlines()
+        self.assertEqual(lines[:2], ["warning: program/SPEC.md changed since the stage 3 approval",
+                                     "warning: program/ARCHITECTURE.md changed since the stage 4 approval"])
+        for words in ("no change request covers this edit", "pk change create --title", "pk interview amend N",
+                      "stage 3 4"):
+            self.assertIn(words, lines[2])
+        self.assertEqual(self.run_cli("change", "check", "--strict")[0], 1)
+
+    def test_an_approved_request_not_yet_applied_is_named_instead(self):
+        (self.program / "SPEC.md").write_text("spec\n")
+        self.approve_stage(3, "SPEC.md")
+        cr_id = self.approved()
+        (self.program / "SPEC.md").write_text("spec, as the request says\n")
+        warnings = change.check(self.root)
+        self.assertIn(f"{cr_id} approved and not applied: when the edit is that change, pk change apply", warnings[-1])
+        change.apply(self.root, cr_id, "SPEC amended")
+        self.assertEqual(change.check(self.root), [])
 
 
 class DocsTests(unittest.TestCase):
