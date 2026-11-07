@@ -368,10 +368,39 @@ def _step_lines(step: str, commands: list[tuple[list[str], int]], cwd: Path, env
             continue
         if code == 127:
             return False, [f"FAILED: {step} missing tool: {argv[0]}"]
-        lines = [f"FAILED: {step} {' '.join(argv)} (exit {code})"]
+        lines = [f"FAILED: {step} {' '.join(argv)} ({exit_text(code)})"]
         lines.extend(TAIL_PREFIX + line for line in output.splitlines()[-TAIL_LINES:])
         return False, lines
     return True, [f"step {step}: ok"]
+
+
+KILL_SIGNALS = ("SIGKILL", "SIGTERM", "SIGSEGV", "SIGBUS", "SIGABRT")  # what the machine, not the code, usually sends
+
+
+def signal_name(code: int) -> str | None:
+    """The signal that ended a command with exit `code`, or None (0.5.5, KF-29).
+
+    A negative code is Python's report of a direct child killed by that signal; 128+n is the shell's (a wrapper
+    such as a package manager's script runner exits 137 when its child got SIGKILL). Only the signals in
+    KILL_SIGNALS count from 128+n, so a program's own exit code in that range is not taken for one.
+    """
+    import signal
+
+    number = -code if code < 0 else code - 128 if 128 < code < 160 else None
+    try:
+        name = signal.Signals(number).name if number is not None else None
+    except ValueError:
+        return None
+    return name if code < 0 or name in KILL_SIGNALS else None
+
+
+def exit_text(code: int) -> str:
+    """`exit <code>`, and the signal behind it when there is one: `exit 137, killed by SIGKILL (...)`."""
+    name = signal_name(code)
+    if name is None:
+        return f"exit {code}"
+    return (f"exit {code}, killed by {name}" + (" (often the machine running out of memory, not the code)"
+                                                if name == "SIGKILL" else ""))
 
 
 def _run_commands(step: str, commands: list[tuple[list[str], int]], cwd: Path, env: dict | None = None,
