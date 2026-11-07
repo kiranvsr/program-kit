@@ -467,8 +467,13 @@ def _acceptance_problem(root: Path, task_id: str, full: bool | None = None) -> s
         more = f" (and {len(problems) - 1} more; run pk evidence validate)" if len(problems) > 1 else ""
         return f"{task_id}: {results['path']}: {problems[0]}{more}"
     if bound["source_commit"] != record["head"]:
-        return (f"{task_id}: {label}: source_commit is {bound['source_commit']!r}, not {record['head']}, "
-                f"the head {results['path']} names")
+        import latework  # late: keeps the module graph flat
+
+        late = latework.source_problem(root, task_id, record["head"], bound["source_commit"])
+        if late:
+            return (f"{task_id}: {label}: source_commit is {bound['source_commit']!r}, not {record['head']}, "
+                    f"the head {results['path']} names, nor a later commit that adds only the task's own late "
+                    f"files: {late}")
     code, _ = run_argv(["git", "-C", str(root), "merge-base", "--is-ancestor", record["head"], "HEAD"], Path(root))
     if code != 0:
         return f"{task_id}: {results['path']}: head {record['head']} is not an ancestor of HEAD"

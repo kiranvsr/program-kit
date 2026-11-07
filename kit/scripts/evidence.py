@@ -1742,8 +1742,13 @@ def accept(root, task_id: str, data) -> dict:
         raise KitError(f"acceptance does not bind the latest results record: it binds {data['evidence_sha256']}, "
                        f"the latest is {entry['digest']}")
     if data["source_commit"] != record.get("head"):
-        raise KitError(f"acceptance source_commit {data['source_commit']} is not {record.get('head')}, the head "
-                       "the latest results record names")
+        import latework  # late: keeps the module graph flat
+
+        late = latework.source_problem(root, task_id, str(record.get("head")), data["source_commit"])
+        if late:
+            raise KitError(f"acceptance source_commit {data['source_commit']} is not {record.get('head')}, the head "
+                           "the latest results record names, nor a later commit that adds only the task's own late "
+                           f"files (its status, latest.json, report.md, results/, acceptance/, plants/): {late}")
     if data["decision"] == "accepted_development":
         import latework  # late: keeps the module graph flat
 

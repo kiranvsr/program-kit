@@ -526,6 +526,38 @@ class MergeTests(LandBase):
         code, out, err = self.pk("merge", TASK)
         self.assertEqual((code, err), (0, ""), out)
 
+    def test_qa_may_name_the_commit_that_added_only_the_report_as_its_source_commit(self):
+        # KF-28 (0.5.5): AH-0067 and AH-0074 in the program this came from were refused for exactly this
+        self.standard(done=False)
+        reviewed = self.evidenced(self.wt, TASK)
+        put(self.wt, f"program/evidence/{TASK}/report.md", "# Report\n")
+        report = commit(self.wt, "the implementer's report")
+        entry, record = store.load_latest(self.wt, TASK, "results")
+        self.assertNotEqual(report, record["head"])
+        accepted = {"task_id": TASK, "decision": "accepted_development", "evidence_sha256": entry["digest"],
+                    "source_commit": report, "accepted_at": "2026-11-07T00:00:00Z", "role": "qa",
+                    "commands": [], "planted_bugs": [], "findings": [], "blocked_by": []}
+        evidence.accept(self.wt, TASK, accepted)
+        status.transition(self.wt, TASK, "done", "qa")
+        commit(self.wt, "accepted at the report commit")
+        code, out, err = self.pk("merge", TASK)
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertIsNone(latework.source_problem(self.root, TASK, record["head"], report))
+        self.assertIn(reviewed[:12], latework.source_problem(self.root, TASK, report, record["head"]))
+
+    def test_a_source_commit_after_work_nobody_reviewed_is_still_refused(self):
+        self.standard(done=False)
+        self.evidenced(self.wt, TASK)
+        put(self.wt, "calc.py", (self.wt / "calc.py").read_text() + "\n\ndef div(a, b):\n    return a / b\n")
+        late = commit(self.wt, "late work")
+        entry, record = store.load_latest(self.wt, TASK, "results")
+        accepted = {"task_id": TASK, "decision": "accepted_development", "evidence_sha256": entry["digest"],
+                    "source_commit": late, "accepted_at": "2026-11-07T00:00:00Z", "role": "qa",
+                    "commands": [], "planted_bugs": [], "findings": [], "blocked_by": []}
+        with self.assertRaisesRegex(KitError, r"nor a later commit that adds only the task's own late files.*"
+                                              r"changes calc.py"):
+            evidence.accept(self.wt, TASK, accepted)
+
     def test_a_late_acceptance_record_is_one_the_kit_writes_and_lands(self):
         self.standard()
         entry, record = store.load_latest(self.wt, TASK, "results")
