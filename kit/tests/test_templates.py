@@ -125,7 +125,8 @@ class YamlTemplateTests(unittest.TestCase):
             {"drift": {"regenerate": [["python3", "tools/gen_docs.py"]],  # 0.5.0: the optional pk drift section
                        "docs_vs_migrations": {"glob": "db/migrations/*.sql", "doc": "docs/DATABASE.md"}}},
             {"evidence": {"plant_workers": 4, "reuse_unchanged_code": True,  # 0.5.2: the optional evidence section
-                          "reuse_ignore": ["docs/"], "reuse_compare": ["program/tools/"]}}])
+                          "reuse_ignore": ["docs/"], "reuse_compare": ["program/tools/"],
+                          "step_timeout": 7200}}])  # 0.5.5: the evidence step's limit (KF-23)
         import gate  # the examples are ones the checks loader accepts
         gate._parse_checks(miniyaml.loads(checks[1]), ())
         gate._parse_checks(miniyaml.loads(checks[2]), ())

@@ -437,5 +437,58 @@ class Estimate(PlantBase):
         self.assertIsNone(gate.plant_estimate(self.root, TASK, workers=1))
 
 
+class EvidenceLimit(Estimate):
+    """KF-23 (0.5.5): the evidence step's limit scales with the rows and the workers, or comes from checks.yaml."""
+
+    def test_the_limit_is_the_3600_s_floor_without_a_record_and_for_a_small_task(self):
+        self.assertEqual(gate.evidence_limit(self.root, TASK, workers=1)[0], 3600)
+        self.record(seconds=200.0, rows=11, workers=1, judged=10)  # 11 rows of about 18 s: far below the floor
+        limit, said = gate.evidence_limit(self.root, TASK, workers=1)
+        self.assertEqual(limit, 3600)
+        self.assertIn("the floor", said)
+
+    def test_the_limit_scales_with_the_judged_rows_and_the_workers(self):
+        # the program's AH-0067: 3 workers stopped at row 43 of 56 under 3600 s, about 251 s per row and worker
+        self.record(seconds=3600.0, rows=43, workers=3, judged=55)
+        limit, said = gate.evidence_limit(self.root, TASK, workers=3)
+        self.assertEqual(limit, 9377)  # 2 x 56 rows x 251.2 s / 3 workers
+        for words in ("56 judged planted-bug rows", "3 worker(s)", "measured", "evidence.step_timeout"):
+            self.assertIn(words, said)
+        self.assertLess(gate.evidence_limit(self.root, TASK, workers=6)[0], limit)  # more workers, less time
+        self.assertIsNone(gate.plant_estimate(self.root, TASK, workers=3, limit=limit))  # it fits the scaled limit
+
+    def test_a_record_without_timing_scales_with_the_default_seconds_per_row(self):
+        self.record(seconds=1.0, rows=1, workers=1, judged=60)
+        data = store.load_latest(self.root, TASK, "results")[1]
+        del data["planted_bugs_timing"]
+        store.record(self.root, TASK, "results", data)
+        limit, said = gate.evidence_limit(self.root, TASK, workers=2)
+        self.assertEqual(limit, 2 * 61 * gate.ROW_SECONDS // 2)
+        self.assertIn("no timing recorded", said)
+
+    def test_checks_yaml_sets_the_limit_and_never_below_the_floor(self):
+        self.record(seconds=3600.0, rows=43, workers=3, judged=55)
+        config = evidence.parse_config({"step_timeout": 5400})
+        self.assertEqual(gate.evidence_limit(self.root, TASK, config, workers=3),
+                         (5400, "evidence limit: 5400 s (evidence.step_timeout in program/checks.yaml)"))
+        for bad in (600, "7200", True, 0):
+            with self.assertRaisesRegex(KitError, "step_timeout must be a whole number of seconds, at least 3600"):
+                evidence.parse_config({"step_timeout": bad})
+        self.assertIsNone(evidence.parse_config(None)["step_timeout"])
+
+    def test_the_evidence_step_runs_the_producer_under_the_limit(self):
+        seen = []
+        real = gate.run_argv
+        put(self.root, f"program/evidence/{TASK}/produce.py", "")
+
+        def spy(argv, cwd, env=None, timeout=None):
+            seen.append(timeout)
+            return real(argv, cwd, env=env, timeout=timeout)
+
+        with mock.patch.object(gate, "run_argv", spy), contextlib.redirect_stdout(io.StringIO()):
+            gate._evidence_step(self.root, TASK, limit=7777)
+        self.assertEqual(seen[0], 7777)
+
+
 if __name__ == "__main__":
     unittest.main()
