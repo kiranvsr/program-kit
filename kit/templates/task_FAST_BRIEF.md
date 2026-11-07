@@ -22,6 +22,10 @@ Tier: standard
 
 *The conditions under which the implementer stops instead of deciding: a guarded or full-tier path must change, a dependency is needed, the scope turns out larger than stated.*
 
+## Design acceptance
+
+*Only for a task that changes what a customer sees; otherwise `none`. The surfaces, the brand kit's path and the widths. The implementer fills `kit/templates/design_acceptance.md` as `program/evidence/<ID>/design.md` (light-tier: the report's folder), with screenshots at each width in light and dark, viewed before handing back; QA, or on the light tier the controller, views them again.*
+
 ## Exact Commands
 
 *One command per line, each beginning with a dollar sign and a space, optionally ending with ` # expect N`. They run without a shell. A standard-tier brief lists at least one; a light-tier brief may list none.*
