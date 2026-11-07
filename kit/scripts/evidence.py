@@ -86,6 +86,12 @@ RESOURCE_ERROR = re.compile(
     r"|ECONNREFUSED[^\n]*(?:127\.\d+\.\d+\.\d+|localhost|::1)"
     r"|out of memory|cannot allocate memory|ENOMEM|ENOSPC|no space left on device|EMFILE|too many open files"
     r"|timed out", re.IGNORECASE)
+# A browser test that failed while tearing down, not because of the mutant (0.5.5, KF-30): a routed request answered
+# after its page, context or browser closed. Producers that repeat e2e runs once per planted bug meet it often; a kill
+# whose output shows it is judged once more, alone.
+TEARDOWN_RACE = re.compile(
+    r"response has been disposed|request context (?:has been )?disposed"
+    r"|(?:target )?(?:page|context|browser)(?:, context or browser)? has been closed|target closed", re.IGNORECASE)
 
 
 def _config_paths(value, key: str, under_program: bool) -> list[str]:
@@ -957,8 +963,9 @@ class _PlantPool:
 
     @staticmethod
     def _doubtful(row: dict, output: str) -> bool:
-        """Whether a pool verdict must be judged again alone: anything but a kill with no sign of a resource error."""
-        return not row["killed"] or RESOURCE_ERROR.search(output) is not None
+        """Whether a pool verdict must be judged again alone: anything but a kill with no sign of a resource error
+        or (0.5.5) of a browser-test teardown race."""
+        return not row["killed"] or RESOURCE_ERROR.search(output) is not None or TEARDOWN_RACE.search(output) is not None
 
     def _pool(self, jobs: list[Callable[[], object]]) -> list:
         """Every job's result in job order; the first failure in job order is raised once every running job ended."""
@@ -1013,7 +1020,10 @@ class _PlantPool:
                 if problem is not None:
                     raise KitError(problem)
                 checked.add(key)
-            results[item["id"]], _ = self._judge(item, "serial")
+            row, output = self._judge(item, "serial")
+            if row["killed"] and TEARDOWN_RACE.search(output):  # the test may have failed in its teardown only
+                row, _ = self._judge(item, "serial-recheck")
+            results[item["id"]] = row
         return [results[item["id"]] for item in self.rows] + ([self._self_test()] if self.self_test else [])
 
     def _self_test(self) -> dict:
