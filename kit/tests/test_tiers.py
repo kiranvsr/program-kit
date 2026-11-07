@@ -119,6 +119,30 @@ class TierStatusTests(unittest.TestCase):
                                    ruling=self.ruling())
         self.assertEqual((record["tier"], record["fast"], record["ruling"]), ("standard", True, "R1"))
 
+    def test_fast_without_a_tier_is_refused_with_the_command_and_never_falls_back_to_full(self):
+        # KF-25 (0.5.5): the program's AH-0065 was dispatched without --tier, went full and its gate wanted a SPEC
+        self.checks(full_paths=["auth/"])
+        ruling = self.ruling()
+        self.refused("--fast needs --tier standard or --tier light: without --tier a task is full-tier", TID,
+                     "in_progress", "controller", fast=True, ruling=ruling)
+        self.brief(brief(tier="light"))
+        self.refused(r"BRIEF.md says Tier: light\).*--tier light --fast --ruling R<n>", TID, "in_progress",
+                     "controller", fast=True, ruling=ruling)
+        code, out, err = run_cli("status", self.root, "status", "set", TID, "in_progress", "--role", "controller",
+                                 "--fast", "--ruling", ruling)
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("--fast needs --tier standard or --tier light", err)
+
+    def test_a_full_dispatch_over_a_fast_brief_without_a_spec_is_refused(self):
+        self.checks(full_paths=["auth/"])
+        self.brief()
+        self.refused(r"BRIEF.md is a fast-path brief \(Tier: standard\) and the task has no SPEC.md.*--tier standard "
+                     "--fast", TID, "in_progress", "controller")
+        self.refused("is a fast-path brief", TID, "in_progress", "controller", tier="full")
+        spec = self.root / "program" / "tasks" / TID / "SPEC.md"
+        spec.write_text("# Spec\n")  # a task with its SPEC is a full-tier task with a stray brief: allowed
+        self.assertEqual(status.transition(self.root, TID, "in_progress", "controller")["tier"], "full")
+
     def test_a_fast_dispatch_names_every_section_its_brief_lacks_before_anything_is_written(self):
         # KF-24 (0.5.5): the program's AH-0069 lost a gate run to a brief without `## Assumptions checked`
         self.checks(full_paths=["auth/"])
