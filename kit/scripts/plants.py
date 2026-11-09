@@ -43,8 +43,8 @@ command judges deferred rows afterwards, in chunks, at any time after the gate (
 - QA's acceptance (`pk evidence accept`), `pk status set <ID> done` and `pk merge` need every deferred row killed in
   such a record.
 
-The kit takes no machine lock here, as in the gate; a program that serialises heavy runs wraps this command in its
-own lock.
+The kit takes no machine lock here, as in the gate; a program that serialises heavy runs wraps this command in
+`pk lock run <owner> -- ...` (0.6.0), or runs it on another machine with `pk remote plants`.
 """
 from __future__ import annotations
 
