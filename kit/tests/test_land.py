@@ -849,6 +849,55 @@ class StatusConflictTests(LandBase):
             status.reopen(self.wt, TASK, "too late")
 
 
+@skip_unless_slow()
+class DirtyMainTests(LandBase):
+    """0.6.0, KF-39: an uncommitted change on main stops pk merge only where the merge or its bookkeeping writes."""
+
+    def test_an_unrelated_uncommitted_file_on_main_stays_uncommitted_and_out_of_every_commit(self):
+        self.standard()
+        before = self.head()
+        put(self.root, "notes.txt", "the user's own edit\n")  # tracked, and the branch never touches it
+        put(self.root, "scratch.txt", "the user's own file\n")  # untracked, at a path the merge does not write
+        code, out, err = self.pk("merge", TASK)
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertEqual(sh(self.root, "git", "status", "--porcelain").splitlines(), [" M notes.txt", "?? scratch.txt"])
+        self.assertEqual((self.root / "notes.txt").read_text(), "the user's own edit\n")
+        committed = sh(self.root, "git", "log", "--format=", "--name-only", "-m", f"{before}..HEAD").split()
+        self.assertNotIn("notes.txt", committed)
+        self.assertNotIn("scratch.txt", committed)
+        self.assertEqual(sh(self.root, "git", "show", "HEAD:notes.txt"), "one\n")
+        self.assertEqual(status.read(self.root, TASK)["status"], "done")
+
+    def test_an_uncommitted_change_where_the_merge_writes_is_refused_and_named(self):
+        self.standard()
+        before = self.head()
+        produce = f"program/evidence/{TASK}/produce.py"
+        for name in ("calc.py", produce, f"program/status/{TASK}.json"):
+            with self.subTest(name):
+                put(self.root, name, "the user's own edit\n")  # calc.py: changed by the branch; produce.py: added
+                put(self.root, "notes.txt", "an unrelated edit\n")
+                code, out, err = self.pk("merge", TASK)
+                self.assertEqual((code, out), (1, ""))
+                self.assertIn(f"pk merge: the main checkout has uncommitted changes: {name}, which this merge or its "
+                              "bookkeeping writes", err)
+                self.assertNotIn("notes.txt", err)
+                self.assertEqual(self.head(), before)
+                sh(self.root, "git", "checkout", "--", "notes.txt")
+                if name == produce:
+                    (self.root / name).unlink()
+                else:
+                    sh(self.root, "git", "checkout", "--", name)
+        self.untouched(before)
+
+    def test_a_staged_change_is_still_refused_wherever_it_is(self):
+        self.standard()
+        put(self.root, "notes.txt", "staged\n")
+        sh(self.root, "git", "add", "notes.txt")
+        code, _, err = self.pk("merge", TASK)
+        self.assertEqual(code, 1)
+        self.assertIn("unstage what is staged first", err)
+
+
 JOURNAL = "db/migrations/journal.txt"
 
 
@@ -1000,6 +1049,17 @@ class RoundTests(LandBase):
         self.assertEqual(sh(self.root, "git", "status", "--porcelain").strip(), "")
         self.assertTrue((self.root / "second.py").is_file())
         self.assertNotIn("round r1", handoff.render(self.root).split("#### Tasks by status")[0])
+
+    def test_an_unrelated_uncommitted_file_on_main_stays_out_of_the_whole_round(self):
+        """0.6.0, KF-39: integrate start and close, and each merge, leave a file none of them writes alone."""
+        put(self.root, "notes.txt", "the user's own edit\n")
+        self.start_and_check()
+        for task_id in (TASK, T2):
+            code, out, err = self.pk("merge", task_id, "--round", "r1")
+            self.assertEqual((code, err), (0, ""), out)
+        code, out, err = self.pk("integrate", "close", "r1")
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertEqual(sh(self.root, "git", "status", "--porcelain").splitlines(), [" M notes.txt"])
 
     def test_a_full_tier_task_is_never_a_member(self):
         sh(self.root, "git", "rm", "-q", f"program/status/{T2}.json")

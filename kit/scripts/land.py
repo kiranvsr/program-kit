@@ -61,8 +61,16 @@ def _controller_path(path: str, status_of=()) -> bool:
             or path in {f"program/status/{task_id}.json" for task_id in status_of})
 
 
-def _main_checkout(root: Path, what: str) -> None:
-    """KitError unless `root` is the main checkout with nothing staged and no change outside the controller's files."""
+def _main_checkout(root: Path, what: str, touches=()) -> None:
+    """KitError unless `root` is the main checkout, on main, with nothing staged and no uncommitted change where the
+    command writes.
+
+    `touches` is what the command writes besides the controller's own files: for `pk merge` the paths the merge
+    changes and the task's status file (`_merge_writes`). From 0.6.0 (KF-39) an uncommitted or untracked file
+    anywhere else is left alone: it stays uncommitted and goes into no commit. The controller's own files (the
+    hand-off, the state, rulings, costs, progress, claims, rounds) may be dirty as before and are committed with the
+    bookkeeping, unless the merge itself changes one. Anything staged is refused, because the command commits.
+    """
     try:
         here = git(root, "symbolic-ref", "HEAD")
     except KitError:
@@ -71,9 +79,22 @@ def _main_checkout(root: Path, what: str) -> None:
         raise KitError(f"run {what} from the main checkout, on {MAIN}")
     if git(root, "diff", "--cached", "--name-only"):
         raise KitError(f"{what}: unstage what is staged first; it commits only the files it writes")
-    other = [name for name in git(root, "diff", "--name-only").splitlines() if not _controller_path(name)]
-    if other:
-        raise KitError(f"{what}: the main checkout has uncommitted changes: {', '.join(other)}")
+    written = set(touches)
+    if not written:
+        return
+    dirty = {*gate._git_fields(root, "diff", "--name-only", "--no-renames", "-z"),
+             *gate._git_fields(root, "ls-files", "--others", "--exclude-standard", "-z")}
+    hit = sorted(dirty & written)
+    if hit:
+        raise KitError(f"{what}: the main checkout has uncommitted changes: {', '.join(hit)}, which this merge or its "
+                       "bookkeeping writes; commit them or set them aside (uncommitted changes elsewhere may stay)")
+
+
+def _merge_writes(root: Path, branch: str, task_id: str) -> list[str]:
+    """The paths `pk merge` writes outside the controller's own files: what the merge changes, and the task's status
+    file (a light task is recorded merged)."""
+    changed = gate._git_fields(root, "diff", "--name-only", "--no-renames", "-z", f"{MAIN}...refs/heads/{branch}")
+    return [*changed, conflicts.status_path(task_id)]
 
 
 def _tip_status(root: Path, task_id: str, sha: str) -> str:
@@ -454,9 +475,9 @@ def merge(root: Path, task_id: str, inspected: str | None = None, round_name: st
           commit: bool = True, trailers=()) -> list[str]:
     """Land one task: check, merge, record, claims, hand-off, commit. Returns the lines to print (under ten)."""
     root = Path(root).resolve()
-    _main_checkout(root, "pk merge")
     branch = f"task/{task_id}"
     sha = gate._branch_head(root, branch)
+    _main_checkout(root, "pk merge", touches=_merge_writes(root, branch, task_id))
     meta = gate.task_meta(root, task_id)
     tier = meta["tier"] + ("+fast" if meta["fast"] else "")
     problem = rulings_module.rewritten(root) or _accepted_problem(root, task_id, sha, meta["tier"])
