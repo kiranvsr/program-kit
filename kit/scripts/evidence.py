@@ -75,7 +75,7 @@ DECISIONS = ("accepted_development", "rejected")
 
 # --- the `evidence` section of checks.yaml (0.5.2) ---------------------------------------------------------------
 EVIDENCE_KEYS = ("plant_workers", "reuse_unchanged_code", "reuse_ignore", "reuse_compare", "step_timeout",
-                 "plan_reuse_test")
+                 "plan_reuse_test", "plant_row_seconds")
 STEP_TIMEOUT_FLOOR = 3600  # the evidence step's limit is never below this (seconds); evidence.step_timeout raises it
 PLANT_WORKERS_ENV = "PK_PLANT_WORKERS"  # overrides evidence.plant_workers; an explicit `workers=` overrides both
 GATE_TEST_ENV = "PK_GATE_TEST_RESULTS"  # the hand-back gate's test-step results, for `Evidence.reuse_gate_test`
@@ -122,11 +122,13 @@ def _config_paths(value, key: str, under_program: bool) -> list[str]:
 
 def parse_config(value) -> dict:
     """The `evidence` section of checks.yaml: {plant_workers, reuse_unchanged_code, reuse_ignore, reuse_compare,
-    step_timeout, plan_reuse_test}.
+    step_timeout, plan_reuse_test, plant_row_seconds}.
 
     Absent means one worker, no reuse and no paths, which is how every program ran before 0.5.2, (0.5.5) no
     `step_timeout`: the gate scales the evidence step's limit from the last record (`gate.evidence_limit`), and
     (0.6.0, KF-33) `plan_reuse_test` false: the plan step runs every command of `## Exact Commands` itself.
+    `plant_row_seconds` (0.6.0) is the seconds one row slot of `pk gate plants --chunk-seconds` takes when no
+    plants record or results record of the program measured it; absent, the kit's default.
     """
     if value is None:
         value = {}
@@ -155,10 +157,15 @@ def parse_config(value) -> dict:
                                   and limit >= STEP_TIMEOUT_FLOOR):
         raise KitError(f"checks.yaml: evidence.step_timeout must be a whole number of seconds, at least "
                        f"{STEP_TIMEOUT_FLOOR}")
+    row_seconds = value.get("plant_row_seconds")
+    if row_seconds is not None and not (isinstance(row_seconds, (int, float)) and not isinstance(row_seconds, bool)
+                                        and row_seconds > 0):
+        raise KitError("checks.yaml: evidence.plant_row_seconds must be a number of seconds above 0 (one row slot of "
+                       "pk gate plants --chunk-seconds)")
     return {"plant_workers": workers, "reuse_unchanged_code": reuse,
             "reuse_ignore": _config_paths(value.get("reuse_ignore"), "reuse_ignore", False),
             "reuse_compare": _config_paths(value.get("reuse_compare"), "reuse_compare", True),
-            "step_timeout": limit, "plan_reuse_test": plan_reuse}
+            "step_timeout": limit, "plan_reuse_test": plan_reuse, "plant_row_seconds": row_seconds}
 
 
 def config_at(root, ref: str = "HEAD") -> dict:

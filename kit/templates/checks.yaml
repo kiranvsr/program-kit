@@ -70,6 +70,8 @@ tiers:
 #                                 # it from the last record's planted-bug rows, timing and this run's workers
 #     plan_reuse_test: true       # (0.6.0) a PLAN command identical to a test command takes the test step's
 #                                 # result in the hand-back gate instead of running again (default false)
+#     plant_row_seconds: 110      # (0.6.0) one row slot of pk gate plants --chunk-seconds when no plants or
+#                                 # results record measured it yet; absent, 120
 # Optional (0.6.0): files that merge as a union of both sides' lines when a task branch and main both changed
 # them (append-only lists, such as a migrations journal each side added an entry to). An entry is a path, a
 # directory or a glob, as for tiers. pk merge, the gates' trial merge, pk merge check and the late-work rule
@@ -78,3 +80,34 @@ tiers:
 #   merge:
 #     union_files:
 #       - db/migrations/journal.txt
+# Optional (0.6.0), read by `pk remote` only: heavy steps on lanes of another machine, over plain ssh, git and tar.
+# The ssh destination is never in this file: export it in the variable host_env names (default PK_REMOTE_HOST).
+# On the remote, <dir>/repo.git is a bare mirror the runner pushes main and the task branch to (only there, never to
+# origin) and each lane, <dir>/<lane>, is a clone of it with its own `pk lock`. setup runs in the lane's task
+# worktree before the step (an offline dependency install, say), lane_wrap and wrap prefix the step's argv, env is
+# exported on the lane (PK_LOCK_NAME there shares a lock the lanes' own scripts already take), and workers sets
+# PK_PLANT_WORKERS. Then `pk remote status`, `pk remote gate <ID>`, `pk remote plants <ID> --all-pending
+# --chunk-seconds N` (add `--plan` to see the chunks; start `--chunk K/M` runs at once, each takes a free lane) and
+# `pk remote run <owner> -- <command>` (the current worktree, uncommitted changes included). Commit the evidence that
+# comes back on the task branch as after a local run. For example:
+#
+#   remote:
+#     dir: lanes
+#     lanes:
+#       - lane1
+#       - lane2
+#     setup:
+#       - - make
+#         - deps
+#     env:
+#       PK_LOCK_NAME: pk-heavy
+#     wrap:
+#       - nice
+#       - "-n"
+#       - "5"
+#     lane_wrap:
+#       lane1:
+#         - taskset
+#         - "-c"
+#         - 0-5
+#     workers: 3

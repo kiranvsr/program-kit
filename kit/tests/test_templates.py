@@ -144,8 +144,12 @@ class YamlTemplateTests(unittest.TestCase):
             {"evidence": {"plant_workers": 4, "reuse_unchanged_code": True,  # 0.5.2: the optional evidence section
                           "reuse_ignore": ["docs/"], "reuse_compare": ["program/tools/"],
                           "step_timeout": 7200,  # 0.5.5: the evidence step's limit (KF-23)
-                          "plan_reuse_test": True}},  # 0.6.0: the plan step reuses the test step (KF-33)
-             {"merge": {"union_files": ["db/migrations/journal.txt"]}}])  # 0.6.0: union merges (KF-38)
+                          "plan_reuse_test": True,  # 0.6.0: the plan step reuses the test step (KF-33)
+                          "plant_row_seconds": 110}},  # 0.6.0: one row slot of pk gate plants (KF-34)
+            {"merge": {"union_files": ["db/migrations/journal.txt"]}},  # 0.6.0: union merges (KF-38)
+            {"remote": {"dir": "lanes", "lanes": ["lane1", "lane2"], "setup": [["make", "deps"]],  # 0.6.0: pk remote
+                        "env": {"PK_LOCK_NAME": "pk-heavy"}, "wrap": ["nice", "-n", "5"],
+                        "lane_wrap": {"lane1": ["taskset", "-c", "0-5"]}, "workers": 3}}])
         import gate  # the examples are ones the checks loader accepts
         for block in checks[1:]:
             gate._parse_checks(miniyaml.loads(block), ())
