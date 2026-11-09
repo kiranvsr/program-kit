@@ -353,5 +353,131 @@ class Integrity(Base):
             self.assertEqual(pk.main(["doctor"]), 1)
         self.assertIn("immutable record altered", err2.getvalue())
 
+EMPTY = sha256_bytes(b"")
+
+
+def valid_results(task_id="T-1", head="a" * 40):
+    """A results record the kit's schema accepts, as a producer writes one (KF-36 tests need records that validate)."""
+    row = {"builds": True, "killed": True, "kill_reason": "test failed", "test_output_sha256": EMPTY,
+           "path": "a.txt", "find": "a", "replace": "b", "build_argv": ["true"], "test_argv": ["false"]}
+    return {"task_id": task_id, "head": head, "main": head, "merge_base": head, "produced_at": "2026-01-01T00:00:00Z",
+            "inputs": [{"path": "a.txt", "sha256": EMPTY}],
+            "commands": [{"label": "unit", "argv": ["true"], "exit": 0, "expected_exit": 0, "as_expected": True,
+                          "derived": {}, "output_sha256": EMPTY, "output_tail": ""}],
+            "planted_bugs": [dict(row, id="made-up"),
+                             dict(row, id="self-test-noncompiling", builds=False, killed=False,
+                                  kill_reason="build failed", test_output_sha256="")],
+            "planted_bugs_all_killed": True, "all_commands_as_expected": True, "tree_unchanged_by_run": True,
+            "blocked_by": [], "deviations": []}
+
+
+class CheckTree(Base):
+    """KF-36 (0.6.0): run outputs written into the kit's record folders are refused before they are committed."""
+
+    def setUp(self):
+        super().setUp()
+        self.base = sh(self.root, "git", "rev-parse", "HEAD").strip()
+        sh(self.root, "git", "checkout", "-q", "-b", "task/T-1")
+        self.results = self.root / store.BASE / "T-1" / "results"
+
+    def problems(self, **kwargs):
+        return store.tree_problems(self.root, **kwargs)
+
+    def test_records_the_kit_wrote_pass_committed_and_uncommitted(self):
+        store.record(self.root, "T-1", "results", valid_results())
+        self.assertEqual(self.problems(), [])  # the gate's new record and pointer, not committed yet
+        self.commit("evidence")
+        store.record(self.root, "T-1", "results", valid_results(head="b" * 40))
+        self.commit("a second record")
+        self.assertEqual(self.problems(), [])
+
+    def test_a_run_output_in_results_is_refused_before_and_after_its_commit(self):
+        self.results.mkdir(parents=True)
+        (self.results / "run.log").write_text("output\n")
+        rel = f"{store.BASE}/T-1/results/run.log"
+        found = self.problems()
+        self.assertEqual(len(found), 1, found)
+        self.assertTrue(found[0].startswith(f"{rel}: not a kit record (not a record name"), found)
+        self.assertIn("in the uncommitted state", found[0])
+        self.assertIn("outside the repository", found[0])
+        sha = self.commit("run output")
+        found = self.problems()
+        self.assertEqual(len(found), 1, found)
+        self.assertIn(f"{rel}: not a kit record", found[0])
+        self.assertIn(f"added in {sha}", found[0])
+        self.assertIn(f"rebuild the branch from {self.base[:12]}", found[0])
+
+    def test_a_file_in_a_subdirectory_or_a_digest_named_non_record_is_refused(self):
+        raw = b'{"hello": "world"}\n'
+        name = f"20000101T000000000000Z-{sha256_bytes(raw)[:12]}.json"
+        (self.results / "sub").mkdir(parents=True)
+        (self.results / "sub" / name).write_bytes(raw)
+        (self.results / name).write_bytes(raw)
+        (self.results / "20000101T000000000001Z-000000000000.json").write_bytes(raw)
+        found = "\n".join(self.problems())
+        self.assertIn(f"results/sub/{name}: not a kit record (in a subdirectory of results/", found)
+        self.assertIn(f"results/{name}: not a kit record (not a valid results record: missing key", found)
+        self.assertIn("results/20000101T000000000001Z-000000000000.json: not a kit record (its bytes hash to", found)
+
+    def test_a_record_modified_or_deleted_is_refused_with_its_commit(self):
+        appended = store.record(self.root, "T-1", "results", valid_results())
+        self.commit("evidence")
+        appended["file"].chmod(0o644)
+        appended["file"].write_text("{}\n")
+        self.assertEqual(self.problems(), [f"{appended['path']}: a committed record modified in the uncommitted "
+                                           f"state: restore it with git checkout -- {appended['path']}"])
+        sha = self.commit("rewrite")
+        found = self.problems()
+        self.assertEqual(len(found), 1, found)
+        self.assertTrue(found[0].startswith(f"evidence history rewritten: {appended['path']} modified in {sha}"))
+        self.assertIn("the kit never changes a record", found[0])
+
+    def test_a_changed_pointer_that_is_not_a_pointer_is_refused(self):
+        store.record(self.root, "T-1", "results", valid_results())
+        self.commit("evidence")
+        pointer = self.root / store.pointer_path("T-1")
+        pointer.write_text('{"results": "mine"}\n')
+        found = self.problems()
+        self.assertEqual(len(found), 1, found)
+        self.assertTrue(found[0].startswith(f"{store.pointer_path('T-1')}: changed in the uncommitted state and "
+                                            "does not read as a pointer"), found)
+        sha = self.commit("hand-edited pointer")
+        self.assertIn(f"changed in {sha} and does not read as a pointer", self.problems()[0])
+
+    def test_a_task_id_limits_the_check_to_that_task(self):
+        other = self.root / store.BASE / "T-2" / "results"
+        other.mkdir(parents=True)
+        (other / "run.log").write_text("x\n")
+        self.assertEqual(self.problems(task_id="T-1"), [])
+        self.assertEqual(len(self.problems()), 1)
+
+    def test_the_check_and_the_reader_see_a_file_in_a_subdirectory(self):
+        # the reader globbed direct children only: results/sub/ was invisible to pk evidence validate (a bug)
+        raw = store.encode(valid_results())
+        (self.results / "sub").mkdir(parents=True)
+        (self.results / "sub" / f"20000101T000000000000Z-{sha256_bytes(raw)[:12]}.json").write_bytes(raw)
+        problems, _ = store.check(self.root, schema=True)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("in a subdirectory of results/", problems[0])
+
+    def test_the_command_prints_one_line_when_ok_and_one_per_problem(self):
+        store.record(self.root, "T-1", "results", valid_results())
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch("evidence.find_root", return_value=self.root), contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(err):
+            code = pk.main(["evidence", "check-tree", "T-1"])
+        self.assertEqual((code, err.getvalue()), (0, ""))
+        self.assertEqual(out.getvalue(), f"evidence tree of T-1 ok: 0 commit(s) since {self.base[:12]} and the "
+                                         "uncommitted state\n")
+        (self.results / "run.log").write_text("x\n")
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch("evidence.find_root", return_value=self.root), contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(err):
+            code = pk.main(["evidence", "check-tree", "--base", "main"])
+        self.assertEqual((code, out.getvalue()), (1, ""))
+        self.assertEqual(len(err.getvalue().splitlines()), 1, err.getvalue())
+        self.assertTrue(err.getvalue().startswith(f"error: {store.BASE}/T-1/results/run.log: not a kit record"))
+
+
 if __name__ == "__main__":
     unittest.main()

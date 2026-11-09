@@ -9,19 +9,19 @@ You own one task. You work in its own git worktree on branch `task/<ID>`, test f
 1. `kit/rules/RULES.md`: parts 1 and 2, and part 3 unless your task is light-tier. Stop where your part ends.
 2. `program/COMMON.md`: how to run the project, its constraints, the report contract and the failures already known on main.
 3. Your task's definition: `program/tasks/<ID>/SPEC.md` and `PLAN.md` with your task brief in `program/briefs/`, or, on the fast path, `program/tasks/<ID>/BRIEF.md` alone.
-4. The rulings your definition or dispatch cites, by number. Nothing else: not the ruling log, not the hand-off, not the other briefs.
+4. The rulings your definition or dispatch cites, by number. Nothing else: not the ruling log, the hand-off or other briefs.
 
 ## What you do
 
 1. Confirm you are in the task worktree, on `task/<ID>`, with a clean tree, and that `pk status show <ID>` says `in_progress` and the tier your dispatch named. If anything differs, stop and report.
 2. Write the failing tests first and show them failing. Every failure-mode row of the SPEC needs a test that passes at the end.
-3. Build exactly the boundary of the definition. What it lists under "Decided (do not reopen)" is settled; when a "Stop and report when" condition occurs, stop. A task with a server part and a client part builds against `program/tasks/<ID>/CONTRACT.md`, which the controller committed to main with the definition: you never edit it. If the contract must change, stop and report (the rule on `program/tasks/<ID>/` below).
+3. Build exactly the boundary of the definition. What it lists under "Decided (do not reopen)" is settled; when a "Stop and report when" condition occurs, stop. A task with a server and a client part builds against `program/tasks/<ID>/CONTRACT.md` on main and never edits it; if it must change, stop and report.
 4. Full and standard tier: write the evidence producer `program/evidence/<ID>/produce.py` with `kit/scripts/evidence.py`: literal commands, parsed derived fields, complete input hashes (inputs only, evidence rule 12) and one planted bug for each guard you added or edited, plus the non-building self-test row. Mark a row `serial: true` when its test uses a browser, an e2e server or a fixed port, and `defer: true` when your brief says so; take a row for a command identical to a `checks.yaml` test command with `ev.reuse_gate_test(label, argv, parse)` instead of `run_command`. Check the record with `pk evidence validate` and `pk evidence lint`. Commit the producer with the work. Light tier: no producer and no evidence.
-5. Merge current main into your branch with a merge commit (`git merge main`). Make sure the tree is clean and the project's ignore file covers what your commands write.
+5. Merge current main into your branch with a merge commit (`git merge main`). Keep the tree clean; the project's ignore file must cover what your commands write.
 6. From the main checkout, run the gate in the background: `pk gate handback <ID> --branch task/<ID>`. A failed gate can leave a new record and a changed pointer behind: delete the record and restore the pointer by exact path before you run it again. If it stops at `FAILED: review program/tasks/<ID>/review.md is missing on main` (or the same for `BRIEF.md`), stop and tell the controller: only a commit on main fixes it.
 7. If the last line is not exactly `OK: <branch> passes the hand-back gate at <sha>`, read the failing step, fix it, commit, and run the gate again. Between runs, `pk gate rejudge <ID> --branch task/<ID> --rows <IDs>` re-judges changed planted bugs; never evidence.
 8. Full and standard tier: write your report to `program/evidence/<ID>/report.md`, run `pk status set <ID> review --role implementer` in your worktree, and make one commit of the new record, `program/evidence/<ID>/latest.json`, `report.md` and the status file, and nothing else. That is the evidence commit. For deferred rows, run the `pk gate plants` command the gate prints; commit each `plants/` record with `latest.json` only. Light tier: change no status and commit nothing more; put the report in your scratch folder.
-9. Stop, and return the four things of the return contract. Commit nothing more on the branch while it is under review: anything else added after the reviewed commit is refused until the gate has run on it and QA has accepted that record. Fix rounds come back to you in the same session; answer them with the finding-to-fix table.
+9. Stop, and return the four things of the return contract. Commit nothing more while it is under review: work added after the reviewed commit is refused until it is gated and accepted again. Fix rounds come back to you in the same session; answer them with the finding-to-fix table.
 
 ## Needs context
 
@@ -51,6 +51,7 @@ The file your dispatch names (step 8). Fixed headings, under 25 lines:
 - Never edit anything under `program/tasks/<ID>/` on the task branch, your status record's tier, or a guarded file without a `Guarded edit: <path>` line in the SPEC on main. A needed SPEC, PLAN or table change goes in your hand-back; the controller makes it on main and you merge main.
 - Never set `done`. Only QA does.
 - Never produce evidence from a dirty tree, hand-edit a hash, or substitute a command.
+- Never write under `program/evidence/<ID>/results/`, `acceptance/` or `plants/`, or edit `latest.json`: the kit does. Run outputs go outside the repository; run `pk evidence check-tree <ID>` before each commit.
 - Never rebase, reset, force-push or use a bare `git stash`.
 - Never run a destructive command except on a literal path you created.
 - Never work around a denied action. Stop and report it.

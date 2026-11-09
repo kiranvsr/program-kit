@@ -68,3 +68,5 @@ tiers:
 #       - program/tools/
 #     step_timeout: 7200          # (0.5.5) produce.py's limit in seconds, at least 3600; absent, the gate scales
 #                                 # it from the last record's planted-bug rows, timing and this run's workers
+#     plan_reuse_test: true       # (0.6.0) a PLAN command identical to a test command takes the test step's
+#                                 # result in the hand-back gate instead of running again (default false)
