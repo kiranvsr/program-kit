@@ -124,7 +124,7 @@ class Configuration(unittest.TestCase):
     def test_the_evidence_section_defaults_to_one_worker_and_no_reuse(self):
         self.assertEqual(evidence.parse_config(None), {"plant_workers": 1, "reuse_unchanged_code": False,
                                                        "reuse_ignore": [], "reuse_compare": [],
-                                                       "step_timeout": None})
+                                                       "step_timeout": None, "plant_row_seconds": None})
         self.assertEqual(evidence.parse_config({"plant_workers": 4})["plant_workers"], 4)
 
     def test_a_bad_evidence_section_is_refused_by_name(self):
