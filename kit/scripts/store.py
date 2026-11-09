@@ -405,14 +405,20 @@ def load_latest(root, task_id: str, kind: str, index: dict | None = None) -> tup
 # --- history ------------------------------------------------------------------------
 
 def _record_files(root) -> list[str]:
-    """Repository-relative paths of every file in a `results/`, `acceptance/` or `plants/` directory under
-    program/evidence."""
+    """Repository-relative paths of every file in or under a `results/`, `acceptance/` or `plants/` directory under
+    program/evidence.
+
+    Until 0.6.0 only direct children were listed, so a file in `results/sub/` was invisible to every check (a bug,
+    KF-36); the kit writes records directly in the folder, so no record a program holds is new to the check. A hidden
+    direct child is the temporary file of an append in flight and is left out, as before.
+    """
     base = Path(root) / BASE
     found = []
     for kind in RECORD_KINDS:
-        for path in base.glob(f"*/{kind}/*"):
-            if path.is_file() and not path.name.startswith("."):
-                found.append(path.relative_to(root).as_posix())
+        for folder in base.glob(f"*/{kind}"):
+            for path in folder.rglob("*"):
+                if path.is_file() and not (path.parent == folder and path.name.startswith(".")):
+                    found.append(path.relative_to(root).as_posix())
     return sorted(found)
 
 
@@ -520,7 +526,9 @@ def check(root, base: str | None = None, schema: bool = False) -> tuple[list[str
     for rel in _record_files(root):
         problem = altered(rel, (root / rel).read_bytes()) if _NAME.match(PurePosixPath(rel).name) else \
             f"{rel}: not a record name (<utc>-<sha256[:12]>.json)"
-        if schema and not problem and _NAME.match(PurePosixPath(rel).name):
+        if len(PurePosixPath(rel).parts) != 5:
+            problem = f"{rel}: {_SUBDIRECTORY.format(kind=PurePosixPath(rel).parts[3])}"
+        if schema and not problem and _NAME.match(PurePosixPath(rel).name) and len(PurePosixPath(rel).parts) == 5:
             problem = _schema_problem(rel, (root / rel).read_bytes())
         if problem:
             problems.append(problem)
@@ -567,3 +575,131 @@ def check(root, base: str | None = None, schema: bool = False) -> tuple[list[str
         if entry["path"] not in tracked:
             pending.append((entry["path"], pointer_path(task)))
     return problems, pending
+
+
+# --- the reserved folders of a task worktree (0.6.0, KF-36) ----------------------------------------------------
+
+_SUBDIRECTORY = "in a subdirectory of {kind}/ (the kit writes records directly in it)"
+RESERVED = "results/, acceptance/ and plants/"
+_OUTSIDE = (f"run outputs go outside the repository; program/evidence/<ID>/{RESERVED.replace(' and ', ', ')} and "
+            "latest.json are written only by the kit (the gate, pk gate plants, pk evidence accept)")
+
+
+def _added_problem(rel: str, raw: bytes) -> str | None:
+    """Why a file added under a record folder is not a kit record (its place, name, bytes and schema), else None."""
+    parts = PurePosixPath(rel).parts
+    if len(parts) != 5:
+        return _SUBDIRECTORY.format(kind=parts[3])
+    if not _NAME.match(parts[4]):
+        return "not a record name (<utc>-<sha256[:12]>.json)"
+    if altered(rel, raw):
+        return f"its bytes hash to {sha256_bytes(raw)}, not the digest its name carries"
+    problem = _schema_problem(rel, raw)
+    return problem.removeprefix(f"{rel}: ") if problem else None
+
+
+def _reserved(rel: str, prefix: str) -> str | None:
+    """`record` for a path under a task's record folder, `pointer` for a task's latest.json, else None."""
+    parts = PurePosixPath(rel).parts
+    if not rel.startswith(prefix) or len(parts) < 4 or "/".join(parts[:2]) != BASE or parts[2] == "fingerprint":
+        return None
+    if len(parts) == 4 and parts[3] == POINTER:
+        return "pointer"
+    return "record" if len(parts) >= 5 and parts[3] in RECORD_KINDS else None
+
+
+def _pointer_problem(rel: str, text: str | None) -> str | None:
+    if text is None:
+        return "deleted"
+    try:
+        pointer_from_text(text, PurePosixPath(rel).parts[2], rel)
+        plants_from_text(text, PurePosixPath(rel).parts[2], rel)
+    except KitError as exc:
+        return " ".join(str(exc).removeprefix(f"{rel}: ").split())
+    return None
+
+
+def tree_base(root) -> str:
+    """The default base of `tree_problems`: the merge-base of HEAD with main."""
+    from common import PRIMARY_BRANCH
+
+    try:
+        return git(root, "merge-base", PRIMARY_BRANCH, "HEAD")
+    except KitError as exc:
+        raise KitError(f"no merge-base of HEAD with {PRIMARY_BRANCH}: name the base with --base REF") from exc
+
+
+def tree_problems(root, base: str | None = None, task_id: str | None = None) -> list[str]:
+    """Every way the commits `base..HEAD` and the uncommitted state of the worktree `root` break the kit's ownership
+    of the reserved evidence files (0.6.0, KF-36); empty when they do not. `task_id` limits it to that task.
+
+    Refused, one line each naming the path, the commit (or the uncommitted state) and the fix: a modification or
+    deletion of a file under `results/`, `acceptance/` or `plants/` (committed: the history check `rewritten`); an
+    added file there that is not a digest-named record directly in its folder whose bytes match its name and that
+    validates for its kind; and a changed `latest.json` that does not read as a pointer. `pk evidence check-tree`
+    prints them, and the hand-back gate runs the same check before the build.
+    """
+    root = Path(root)
+    base = base or tree_base(root)
+    short = git(root, "rev-parse", "--short=12", base)
+    prefix = f"{BASE}/{check_task(task_id)}/" if task_id else f"{BASE}/"
+    rebuild = f"rebuild the branch from {short} without it (removing it in a later commit is a deletion too)"
+    problems = [f"{line} (the kit never changes a record: rebuild the branch from {short} without that change)"
+                for line in rewritten(root, base) if line.split(": ", 1)[1].startswith(prefix)]
+    fields = [f for f in git(root, "diff", "--name-status", "--no-renames", "-z", base, "HEAD", "--", BASE).split("\0")
+              if f]
+    for status, rel in zip(fields[0::2], fields[1::2]):
+        what = _reserved(rel, prefix)
+        if what is None or (what == "record" and (status != "A" or any(f": {rel} " in line for line in problems))):
+            continue  # a committed modification or deletion of a record is the history check's line
+        commit = git(root, "log", "-1", "--format=%H", f"--diff-filter={'A' if what == 'record' else 'ADM'}",
+                     f"{base}..HEAD", "--", rel) or "a merge commit"
+        raw = None if status == "D" else _git_raw(root, "cat-file", "blob", f"HEAD:{rel}")
+        if what == "record":
+            problem = _added_problem(rel, raw)
+            if problem:
+                problems.append(f"{rel}: not a kit record ({problem}), added in {commit}: {_OUTSIDE}; {rebuild}")
+        else:
+            problem = _pointer_problem(rel, None if raw is None else raw.decode("utf-8", "replace"))
+            if problem:
+                problems.append(f"{rel}: changed in {commit} and does not read as a pointer ({problem}): only the kit "
+                                f"writes it; restore it with git checkout {short} -- {rel} and commit")
+    listing = _git_raw(root, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames", "--", BASE)
+    entries = [e for e in listing.decode("utf-8", "surrogateescape").split("\0") if e]  # raw: a leading space counts
+    for entry in entries:
+        state, rel = entry[:2], entry[3:]
+        what = _reserved(rel, prefix)
+        path = root / rel
+        if what == "pointer":
+            problem = _pointer_problem(rel, path.read_text(encoding="utf-8", errors="replace")
+                                       if path.is_file() else None)
+            if problem:
+                problems.append(f"{rel}: changed in the uncommitted state and does not read as a pointer ({problem}): "
+                                f"only the kit writes it; restore it with git checkout -- {rel}")
+        elif what == "record" and state[0] not in "A?":
+            how = "deleted" if "D" in state else "modified"
+            problems.append(f"{rel}: a committed record {how} in the uncommitted state: restore it with "
+                            f"git checkout -- {rel}")
+        elif what == "record" and path.is_file():
+            parts = PurePosixPath(rel).parts
+            if len(parts) == 5 and parts[4].startswith("."):
+                continue  # the temporary file of an append in flight
+            problem = _added_problem(rel, path.read_bytes())
+            if problem:
+                problems.append(f"{rel}: not a kit record ({problem}), in the uncommitted state: move it out; "
+                                f"{_OUTSIDE}")
+    return problems
+
+
+def _git_raw(root: Path, *args: str) -> bytes:
+    """git's stdout as bytes, never stripped (a status line may start with a space, a blob is exact bytes)."""
+    import subprocess
+
+    try:
+        proc = subprocess.run(["git", "-C", str(root), *args], capture_output=True)
+    except OSError as exc:
+        raise KitError(f"cannot run git: {exc.strerror or exc}") from exc
+    if proc.returncode != 0:
+        said = proc.stderr.decode("utf-8", "replace").strip().splitlines()
+        raise KitError(f"git {' '.join(args)} failed: {said[0] if said else f'exit {proc.returncode}'}")
+    return proc.stdout

@@ -1722,6 +1722,20 @@ def _lint(args) -> int:
     return 0
 
 
+def _check_tree(args) -> int:
+    """`pk evidence check-tree [ID] [--base REF]` (0.6.0, KF-36): the reserved evidence files of this worktree."""
+    root = find_root()
+    base = args.base or store.tree_base(root)
+    problems = store.tree_problems(root, base, args.task_id)
+    if problems:
+        return _errors(problems)
+    count = git(root, "rev-list", "--count", f"{base}..HEAD")
+    short = git(root, "rev-parse", "--short=12", base)
+    print(f"evidence tree{f' of {args.task_id}' if args.task_id else ''} ok: {count} commit(s) since {short} and "
+          "the uncommitted state")
+    return 0
+
+
 def _history(args) -> int:
     rows = store.history(find_root(), args.task_id)
     if not rows:
@@ -1843,7 +1857,7 @@ def _init(args) -> int:
 
 
 ACTIONS = {"init": _init, "validate": _validate, "lint": _lint, "history": _history, "accept": _accept,
-           "import": _import}
+           "import": _import, "check-tree": _check_tree}
 
 
 def cmd_evidence(args: argparse.Namespace) -> int:
@@ -1869,6 +1883,10 @@ def _configure(parser: argparse.ArgumentParser) -> None:
     accepter.add_argument("acceptance", metavar="acceptance.json", help="the acceptance QA wrote, outside the repo")
     actions.add_parser("import", help="copy 0.1 program/evidence/<ID>/*.json into the append-only layout and build "
                                       "the pointers")
+    tree = actions.add_parser("check-tree", help="in a task worktree: refuse a commit since BASE or an uncommitted "
+                                                 "change that edits the kit's record folders or pointer by hand")
+    tree.add_argument("task_id", metavar="ID", nargs="?", help="only this task's folders (default: every task's)")
+    tree.add_argument("--base", metavar="REF", help="the first commit not checked (default: the merge-base with main)")
 
 
 def register(add_command) -> None:
