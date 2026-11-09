@@ -17,6 +17,8 @@ detached worktree, so nothing in the checkout is written, and removes that workt
   D7 progress docs behind state: with the optional `progress` section ({docs, state}), no commit on the main branch
      touching a state path comes after the oldest of the docs' newest commits (progress.py); skipped without it.
      Like D3 it reads the real checkout and the main branch, whatever REV is.
+  D8 research citations (0.6.0): with the optional `research` section, no file of `research.guard` cites a research
+     item that has not graduated (research.py, `pk research check`); without the section there is no D8 line.
 
 After the checks it prints, as information and never as drift, the tasks ready to start (`pk status ready`).
 Drift is information: the command exits 0 unless `--strict` is given and a check drifts (for a scheduled run).
@@ -36,6 +38,7 @@ import tempfile
 import time
 from pathlib import Path, PurePosixPath
 
+import research
 from common import KitError, find_root, git, read_json, read_yaml, run_argv
 
 KEYS = ("regenerate", "docs_vs_migrations")
@@ -269,12 +272,15 @@ def report(root: Path, rev: str = "HEAD") -> tuple[str, list[tuple[str, bool, st
             stage = _approved_stage(tree)
             found = {"D2": _approvals(tree), "D3": hand_off, "D4": _docs(tree, config["docs_vs_migrations"]),
                      "D5": _evidence(tree), "D6": _validators(tree, stage)}
+            guard = research.drift_check(tree)  # D8 (0.6.0): only with the research section, so 0.5 reports stay
+            if guard is not None:
+                found["D8"] = guard
             found["D1"] = _regeneration(tree, sha, config["regenerate"], stage)  # last: it writes into the tree
         finally:
             subprocess.run(["git", "-C", str(root), "worktree", "remove", "--force", str(tree)], capture_output=True)
             subprocess.run(["git", "-C", str(root), "worktree", "prune"], capture_output=True)
     found["D7"] = progress_docs
-    return sha, [(cid, *found[cid]) for cid in ("D1", "D2", "D3", "D4", "D5", "D6", "D7")]
+    return sha, [(cid, *found[cid]) for cid in ("D1", "D2", "D3", "D4", "D5", "D6", "D7", "D8") if cid in found]
 
 
 def _progress(root: Path) -> tuple[bool, str]:
@@ -330,4 +336,5 @@ def _configure(parser: argparse.ArgumentParser) -> None:
 
 def register(add_command) -> None:
     add_command("drift", cmd_drift, help="report-only: do the documents still agree with their generators, "
-                "approvals and code, and are the progress docs behind state (D1 to D7)", configure=_configure)
+                "approvals and code, and are the progress docs behind state (D1 to D7; D8 with research)",
+                configure=_configure)

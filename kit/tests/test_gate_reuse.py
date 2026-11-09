@@ -113,6 +113,31 @@ class GateTestOutput(unittest.TestCase):
         self.assertEqual((row["exit"], row["as_expected"], row["from_gate_step"]), (1, False, "test"))
 
 
+class PlanReuseUnit(unittest.TestCase):
+    """KF-33 (0.6.0): the plan step takes a command identical to a test-step command from the test step."""
+
+    def test_the_key_defaults_to_off_and_takes_only_true_or_false(self):
+        self.assertIs(evidence.parse_config(None)["plan_reuse_test"], False)
+        self.assertIs(evidence.parse_config({"plan_reuse_test": True})["plan_reuse_test"], True)
+        with self.assertRaisesRegex(KitError, "evidence.plan_reuse_test must be true or false"):
+            evidence.parse_config({"plan_reuse_test": "yes"})
+
+    def test_a_recorded_command_is_judged_against_the_plans_own_expected_exit_without_running(self):
+        recorded = [{"argv": ["unit"], "exit": 0, "output": "Ran 3 tests\nOK\n"}]
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(gate, "run_argv", return_value=(0, "")) as run:
+            passed, lines = gate._step_lines("plan", [(["unit"], 0), (["other"], 0)], Path(tmp), recorded=recorded)
+            self.assertEqual(run.call_args_list, [mock.call(["other"], Path(tmp), env=None, timeout=gate.STEP_TIMEOUT)])
+            self.assertTrue(passed)
+            self.assertEqual(lines, ["step plan: unit reused from the test step (exit 0)", "step plan: ok"])
+            run.reset_mock()
+            passed, lines = gate._step_lines("plan", [(["unit"], 1)], Path(tmp), recorded=recorded)
+            run.assert_not_called()
+        self.assertFalse(passed)
+        self.assertEqual(lines[:2], ["step plan: unit reused from the test step (exit 0)",
+                                     "FAILED: plan unit (exit 0)"])
+        self.assertEqual(lines[2:], ["    | Ran 3 tests", "    | OK"])
+
+
 class ReuseBase(HandbackBase):
     def setUp(self):
         super().setUp()
@@ -259,6 +284,25 @@ class GateTestStepTests(ReuseBase):
                          ("unit", "test", {"ran": True}, True))
         self.assertNotIn("from_gate_step", again)
         self.assertEqual([p.name for p in self.tmpdir.iterdir()], [])  # the step's results file is removed
+
+    def test_a_plan_command_identical_to_a_test_command_runs_again_without_the_key(self):
+        self.set_plan("## Exact Commands\n$ unit\n$ unit -v\n")
+        rc, out = self.handback()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.units(), ["unit", "unit", "unit -v"])  # 0.5.5: the plan runs the suite again
+        self.assertNotIn("reused from the test step", out)
+
+    def test_a_plan_command_identical_to_a_test_command_takes_its_result_when_the_key_is_on(self):
+        # KF-33 (0.6.0): the program's suite ran twice per gate, once in the test step and once as a PLAN command
+        self.write_checks(test=[["unit"]], evidence={"plan_reuse_test": True})
+        commit(self.root, "opt in to plan reuse")
+        self.set_plan("## Exact Commands\n$ unit\n$ unit -v\n")
+        rc, out = self.handback()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.units(), ["unit", "unit -v"])  # the test step's run stands for the plan's
+        self.assertIn("step plan: unit reused from the test step (exit 0)", out.splitlines())
+        self.assertEqual(out.splitlines().index("step plan: unit reused from the test step (exit 0)") + 1,
+                         out.splitlines().index("step plan: ok"))
 
     def test_an_unchanged_producer_runs_its_commands_as_before(self):
         rc, out = self.handback()

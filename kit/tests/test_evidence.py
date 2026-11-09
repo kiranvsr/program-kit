@@ -1016,6 +1016,53 @@ class StoreCommands(Base):
         self.assertIn("does not parse as JSON", "\n".join(store.check(self.root, schema=True)[0]))
 
 
+class TaskIdArguments(unittest.TestCase):
+    """KF-40 (0.6.0): validate and lint take a task ID and read the records its pointer names."""
+
+    def setUp(self):
+        from test_store import valid_results
+
+        tmp, self.root = make_repo()
+        self.addCleanup(tmp.cleanup)
+        self.results = store.record(self.root, "T-1", "results", valid_results())
+        self.acceptance = store.record(self.root, "T-1", "acceptance", {
+            "task_id": "T-1", "decision": "accepted_development", "evidence_sha256": self.results["digest"],
+            "source_commit": "a" * 40, "accepted_at": "2026-10-08T00:00:00Z", "role": "qa", "commands": [],
+            "planted_bugs": [], "findings": [], "blocked_by": []})
+
+    def pk(self, *argv):
+        with mock.patch.object(evidence, "find_root", return_value=self.root):
+            return run_pk("evidence", *argv)
+
+    def test_validate_with_a_task_id_checks_every_record_its_pointer_names(self):
+        code, out, err = self.pk("validate", "T-1")
+        self.assertEqual((code, err), (0, ""), err)
+        self.assertEqual(out.splitlines(), [f"evidence valid: {self.results['path']}",
+                                            f"evidence valid: {self.acceptance['path']}"])
+        self.acceptance["file"].chmod(0o644)
+        self.acceptance["file"].write_text("{}\n")  # the planted defect: an altered acceptance record
+        code, out, err = self.pk("validate", "T-1")
+        self.assertEqual(code, 1)
+        self.assertEqual(out.splitlines(), [f"evidence valid: {self.results['path']}"])
+        self.assertEqual(len(err.splitlines()), 1, err)
+        self.assertTrue(err.startswith(f"error: {self.acceptance['path']}: immutable record altered"), err)
+
+    def test_lint_with_a_task_id_lints_the_latest_results_record(self):
+        code, out, err = self.pk("lint", "T-1")
+        self.assertEqual((code, out, err), (0, f"lint: {self.results['path']} binds only inputs\n", ""))
+
+    def test_a_path_still_works_and_a_bad_id_says_what_was_tried(self):
+        code, out, err = self.pk("validate", str(self.results["file"]))
+        self.assertEqual((code, out, err), (0, f"evidence valid: {self.results['file']}\n", ""))
+        for action in ("validate", "lint"):
+            code, out, err = self.pk(action, "T-9")
+            self.assertEqual((code, out), (1, ""))
+            self.assertIn("T-9 is not a file, and program/evidence/T-9/latest.json does not exist", err)
+        code, out, err = self.pk("validate", "no/such.json")
+        self.assertEqual(code, 1)
+        self.assertNotIn("latest.json", err)  # not a task ID: the path's own error, as before
+
+
 # The generic-key rule of a common secret scanner, as it ships: a keyword, up to 20 word characters, an operator,
 # then a long token. A record line holding a path such as `auth/token.py` and its hex digest matches it.
 GENERIC_KEY = re.compile(

@@ -74,7 +74,8 @@ _RECORD_NAMES = ("results.json", "acceptance.json")
 DECISIONS = ("accepted_development", "rejected")
 
 # --- the `evidence` section of checks.yaml (0.5.2) ---------------------------------------------------------------
-EVIDENCE_KEYS = ("plant_workers", "reuse_unchanged_code", "reuse_ignore", "reuse_compare", "step_timeout")
+EVIDENCE_KEYS = ("plant_workers", "reuse_unchanged_code", "reuse_ignore", "reuse_compare", "step_timeout",
+                 "plan_reuse_test", "plant_row_seconds")
 STEP_TIMEOUT_FLOOR = 3600  # the evidence step's limit is never below this (seconds); evidence.step_timeout raises it
 PLANT_WORKERS_ENV = "PK_PLANT_WORKERS"  # overrides evidence.plant_workers; an explicit `workers=` overrides both
 GATE_TEST_ENV = "PK_GATE_TEST_RESULTS"  # the hand-back gate's test-step results, for `Evidence.reuse_gate_test`
@@ -121,10 +122,13 @@ def _config_paths(value, key: str, under_program: bool) -> list[str]:
 
 def parse_config(value) -> dict:
     """The `evidence` section of checks.yaml: {plant_workers, reuse_unchanged_code, reuse_ignore, reuse_compare,
-    step_timeout}.
+    step_timeout, plan_reuse_test, plant_row_seconds}.
 
-    Absent means one worker, no reuse and no paths, which is how every program ran before 0.5.2, and (0.5.5) no
-    `step_timeout`: the gate scales the evidence step's limit from the last record (`gate.evidence_limit`).
+    Absent means one worker, no reuse and no paths, which is how every program ran before 0.5.2, (0.5.5) no
+    `step_timeout`: the gate scales the evidence step's limit from the last record (`gate.evidence_limit`), and
+    (0.6.0, KF-33) `plan_reuse_test` false: the plan step runs every command of `## Exact Commands` itself.
+    `plant_row_seconds` (0.6.0) is the seconds one row slot of `pk gate plants --chunk-seconds` takes when no
+    plants record or results record of the program measured it; absent, the kit's default.
     """
     if value is None:
         value = {}
@@ -143,15 +147,25 @@ def parse_config(value) -> dict:
         reuse = False
     if not isinstance(reuse, bool):
         raise KitError("checks.yaml: evidence.reuse_unchanged_code must be true or false")
+    plan_reuse = value.get("plan_reuse_test", False)
+    if plan_reuse is None:
+        plan_reuse = False
+    if not isinstance(plan_reuse, bool):
+        raise KitError("checks.yaml: evidence.plan_reuse_test must be true or false")
     limit = value.get("step_timeout")
     if limit is not None and not (isinstance(limit, int) and not isinstance(limit, bool)
                                   and limit >= STEP_TIMEOUT_FLOOR):
         raise KitError(f"checks.yaml: evidence.step_timeout must be a whole number of seconds, at least "
                        f"{STEP_TIMEOUT_FLOOR}")
+    row_seconds = value.get("plant_row_seconds")
+    if row_seconds is not None and not (isinstance(row_seconds, (int, float)) and not isinstance(row_seconds, bool)
+                                        and row_seconds > 0):
+        raise KitError("checks.yaml: evidence.plant_row_seconds must be a number of seconds above 0 (one row slot of "
+                       "pk gate plants --chunk-seconds)")
     return {"plant_workers": workers, "reuse_unchanged_code": reuse,
             "reuse_ignore": _config_paths(value.get("reuse_ignore"), "reuse_ignore", False),
             "reuse_compare": _config_paths(value.get("reuse_compare"), "reuse_compare", True),
-            "step_timeout": limit}
+            "step_timeout": limit, "plan_reuse_test": plan_reuse, "plant_row_seconds": row_seconds}
 
 
 def config_at(root, ref: str = "HEAD") -> dict:
@@ -1678,7 +1692,48 @@ def _root_or_none():
         return None
 
 
+def _task_records(argument: str, kinds: tuple[str, ...]) -> tuple[Path, list[dict]] | None:
+    """(root, [{kind, path, digest}]) when `argument` is not an existing file but a task ID with a pointer (0.6.0,
+    KF-40): the records the pointer names of `kinds`, `plants` meaning each item of its plants list. None when the
+    argument is no task ID (a path keeps its own error); KitError naming what was tried for an ID without a pointer.
+    """
+    if Path(argument).exists() or not store._TASK.match(argument) or argument == "fingerprint":
+        return None
+    root = find_root()
+    rel = store.pointer_path(argument)
+    if not (root / rel).is_file():
+        raise KitError(f"{argument} is not a file, and {rel} does not exist in {root}: name a record path, or the ID of "
+                       "a task with a pointer")
+    pointer = store.read_pointer(root, argument)
+    found = [dict(pointer[kind], kind=kind) for kind in kinds if kind in store.KINDS and kind in pointer]
+    if store.PLANTS in kinds:
+        found += [dict(item, kind=store.PLANTS) for item in store.read_plants(root, argument)]
+    return root, found
+
+
+def _validate_task(root: Path, records: list[dict]) -> int:
+    """One line per record a task's pointer names: `evidence valid: <path>`, or an error naming its first problem."""
+    failed = 0
+    for item in records:
+        try:
+            data = store.load(root, item["path"], item["digest"])
+            problems = {"acceptance": validate_acceptance, store.PLANTS: validate_plants}.get(
+                item["kind"], validate_results)(data)
+        except KitError as exc:
+            problems = [str(exc).removeprefix(f"{item['path']}: ")]
+        if problems:
+            more = f" (and {len(problems) - 1} more)" if len(problems) > 1 else ""
+            print(f"error: {item['path']}: {' '.join(problems[0].split())}{more}", file=sys.stderr)
+            failed = 1
+        else:
+            print(f"evidence valid: {item['path']}")
+    return failed
+
+
 def _validate(args) -> int:
+    task = _task_records(args.record, (*store.KINDS, store.PLANTS)) if args.record is not None else None
+    if task is not None:
+        return _validate_task(*task)
     if args.record is None:  # the whole evidence tree: names, history and pointers
         root = find_root()
         problems, pending = store.check(root, args.base, schema=True)
@@ -1707,11 +1762,36 @@ def _validate(args) -> int:
 
 
 def _lint(args) -> int:
+    task = _task_records(args.record, ("results",))
+    if task is not None:  # 0.6.0 (KF-40): a task ID lints its latest results record
+        root, records = task
+        if not records:
+            raise KitError(f"{store.pointer_path(args.record)} names no results record")
+        path = Path(records[0]["path"])
+        problems = lint_record(store.load(root, records[0]["path"], records[0]["digest"]), root)
+        if problems:
+            return _errors(problems)
+        print(f"lint: {path} binds only inputs")
+        return 0
     path = Path(args.record)
     problems = lint_record(read_json(path), _root_or_none())
     if problems:
         return _errors(problems)
     print(f"lint: {path} binds only inputs")
+    return 0
+
+
+def _check_tree(args) -> int:
+    """`pk evidence check-tree [ID] [--base REF]` (0.6.0, KF-36): the reserved evidence files of this worktree."""
+    root = find_root()
+    base = args.base or store.tree_base(root)
+    problems = store.tree_problems(root, base, args.task_id)
+    if problems:
+        return _errors(problems)
+    count = git(root, "rev-list", "--count", f"{base}..HEAD")
+    short = git(root, "rev-parse", "--short=12", base)
+    print(f"evidence tree{f' of {args.task_id}' if args.task_id else ''} ok: {count} commit(s) since {short} and "
+          "the uncommitted state")
     return 0
 
 
@@ -1769,10 +1849,37 @@ def accept(root, task_id: str, data) -> dict:
     return store.record(root, task_id, "acceptance", data)
 
 
+def _inside_repository(root: Path, path: Path) -> Path | None:
+    """The checkout of this repository (the main one or any of its worktrees) that holds `path`, or None."""
+    listing = git(root, "worktree", "list", "--porcelain")
+    trees = [Path(root), *(Path(line[len("worktree "):]) for line in listing.splitlines()
+                           if line.startswith("worktree "))]
+    target = path.resolve()
+    return next((tree for tree in trees if target.is_relative_to(tree.resolve())), None)
+
+
 def _accept(args) -> int:
+    """`pk evidence accept <ID> <file> [--done]`. With --done (0.6.0, the QA record step in one command): the file must
+    live outside the repository and its worktrees, and after the append the task is set done as QA, with every check
+    of `pk status set <ID> done --role qa`. Without it, exactly as 0.5.5."""
     root = find_root()
-    appended = accept(root, args.task_id, read_json(Path(args.acceptance)))
+    source = Path(args.acceptance)
+    if args.done:
+        holder = _inside_repository(root, source)
+        if holder is not None:
+            raise KitError(f"{source} lives inside {holder}, a checkout of this repository: QA's acceptance file is "
+                           "its own, so write it outside the repository (your scratch folder) and run this again")
+    appended = accept(root, args.task_id, read_json(source))
     print(f"acceptance {appended['digest']} appended: {appended['path']}")
+    if args.done:
+        import status  # late: status imports this module
+
+        try:
+            record = status.transition(root, args.task_id, "done", "qa")
+        except KitError as exc:
+            raise KitError(f"{exc} (the acceptance is appended; fix that, then run: pk status set {args.task_id} done "
+                           "--role qa)") from exc
+        print(f"{record['task_id']}: {record['status']}")
     return 0
 
 
@@ -1836,7 +1943,7 @@ def _init(args) -> int:
 
 
 ACTIONS = {"init": _init, "validate": _validate, "lint": _lint, "history": _history, "accept": _accept,
-           "import": _import}
+           "import": _import, "check-tree": _check_tree}
 
 
 def cmd_evidence(args: argparse.Namespace) -> int:
@@ -1851,17 +1958,26 @@ def _configure(parser: argparse.ArgumentParser) -> None:
     actions.add_parser("init", help="nothing to create: a task's pointer appears with its first record")
     checker = actions.add_parser("validate", help="check one record against its schema and invariants (and its "
                                                   "name), or, with no record, every record, the history and the pointers")
-    checker.add_argument("record", metavar="record.json", nargs="?", help="path to one record")
+    checker.add_argument("record", metavar="record.json|ID", nargs="?",
+                         help="path to one record, or a task ID: every record its latest.json names")
     checker.add_argument("--base", metavar="REF", help="check the history from REF only (default: all of it)")
     linter = actions.add_parser("lint", help="refuse a results record that binds a derived output")
-    linter.add_argument("record", metavar="results.json", help="path to the results record")
+    linter.add_argument("record", metavar="results.json|ID",
+                        help="path to the results record, or a task ID: its latest results record")
     lister = actions.add_parser("history", help="every record of a task, newest first")
     lister.add_argument("task_id", metavar="ID")
     accepter = actions.add_parser("accept", help="append QA's acceptance record (it must bind the latest results)")
     accepter.add_argument("task_id", metavar="ID")
     accepter.add_argument("acceptance", metavar="acceptance.json", help="the acceptance QA wrote, outside the repo")
+    accepter.add_argument("--done", action="store_true",
+                          help="then set the task done as QA (pk status set <ID> done --role qa); the acceptance file "
+                               "must live outside the repository and its worktrees")
     actions.add_parser("import", help="copy 0.1 program/evidence/<ID>/*.json into the append-only layout and build "
                                       "the pointers")
+    tree = actions.add_parser("check-tree", help="in a task worktree: refuse a commit since BASE or an uncommitted "
+                                                 "change that edits the kit's record folders or pointer by hand")
+    tree.add_argument("task_id", metavar="ID", nargs="?", help="only this task's folders (default: every task's)")
+    tree.add_argument("--base", metavar="REF", help="the first commit not checked (default: the merge-base with main)")
 
 
 def register(add_command) -> None:

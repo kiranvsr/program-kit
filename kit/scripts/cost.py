@@ -2,7 +2,11 @@
 """The cost log, `program/costs.jsonl`: one line per subagent run, append-only (standard library only).
 
 `pk cost add` refuses a task that is neither in the register nor an ad-hoc task (`unknown_task`) unless
-`--allow-unknown` is given. `add` appends one JSON object: when, task, role, agent (a label for one agent session,
+`--allow-unknown` is given. Work that is not a task (research, operations) is logged with `--item <ID> --category
+<word>` in place of `--task` (0.6.0, KF-41): the line carries `item` and `category`, and `task` holds the item's ID
+so that every reader of a 0.5 log reads it; `pk cost report` lists such lines per category and item after the task
+lines, which are printed as before.
+`add` appends one JSON object: when, task, role, agent (a label for one agent session,
 so its resumes add up), model, tokens, tool calls, seconds and whether the run resumed an earlier one. The model
 is required: every dispatch names the model it ran on. Earlier lines are never rewritten. `totals` sums per task;
 `flagged` names each agent of a task that has passed the fresh-agent threshold (TOKEN_THRESHOLD tokens in all,
@@ -13,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 
 from common import KitError, find_root, read_text, utc_now
@@ -23,6 +28,8 @@ RESUME_THRESHOLD = 3
 _KEYS = ("at", "task", "role", "agent", "model", "tokens", "tool_calls", "seconds", "resume")
 _TEXT = ("at", "task", "role", "agent", "model")
 _NUMBERS = ("tokens", "tool_calls", "seconds")
+CATEGORY = re.compile(r"[a-z][a-z0-9-]*")  # one lower-case word: research, ops, ...
+ITEM = re.compile(r"[A-Za-z0-9][\w.-]*")  # one token: RI-07, W-1, ...
 
 
 def _word(value: str, what: str) -> str:
@@ -56,15 +63,27 @@ def read(root: Path) -> list[dict]:
                 and all(isinstance(record[key], int) and not isinstance(record[key], bool) for key in _NUMBERS)
                 and isinstance(record["resume"], bool)):
             raise KitError(f"{COST_FILE} line {number}: not a cost record ({', '.join(_KEYS)})")
+        if ("item" in record) != ("category" in record) or not all(
+                isinstance(record.get(key, ""), str) for key in ("item", "category")):
+            raise KitError(f"{COST_FILE} line {number}: item and category go together, each a string (0.6.0)")
         found.append(record)
     return found
 
 
 def add(root: Path, task: str, role: str, model: str, tokens: int, tool_calls: int = 0, seconds: int = 0,
-        agent: str = "", resume: bool = False) -> dict:
-    """Append one run and return its record; nothing is written on a refusal."""
+        agent: str = "", resume: bool = False, category: str | None = None) -> dict:
+    """Append one run and return its record; nothing is written on a refusal.
+
+    With `category`, `task` is the ID of an item that is not a task, and the record carries both (KF-41)."""
     role = _word(role, "a role")
-    record = {"at": utc_now(), "task": _word(task, "a task"), "role": role,
+    extra = {}
+    if category is not None:
+        if not CATEGORY.fullmatch(category or ""):
+            raise KitError(f"--category {category!r} must be one lower-case word, such as research")
+        if not ITEM.fullmatch(task or ""):
+            raise KitError(f"--item {task!r} must be one ID without spaces, such as RI-07")
+        extra = {"item": task, "category": category}
+    record = {"at": utc_now(), "task": _word(task, "a task"), "role": role, **extra,
               "agent": _word(agent or role, "an agent label"),
               "model": _word(model, "the model the agent ran on (every dispatch names its model)"),
               "tokens": _count(tokens, "tokens"), "tool_calls": _count(tool_calls, "tool calls"),
@@ -99,6 +118,20 @@ def unknown_task(root: Path, task: str) -> str | None:
     return (f"--task {task} is not a task in program/register.yaml or an ad-hoc task in program/controller-state.json; "
             "check the ID, add the ad-hoc task first (pk adhoc add, or pk record --adhoc), or pass --allow-unknown "
             "to log it anyway")
+
+
+def item_totals(records: list[dict]) -> dict[str, dict[str, dict]]:
+    """{category: {item: {tokens, tool_calls, seconds, runs}}} of the item lines: categories sorted, items in the
+    order first seen."""
+    found: dict[str, list[dict]] = {}
+    for record in records:
+        if "category" in record:
+            found.setdefault(record["category"], []).append(dict(record, task=record["item"]))
+    return {category: totals(found[category]) for category in sorted(found)}
+
+
+def _total_line(name: str, row: dict) -> str:
+    return f"{name}\t{row['tokens']} tokens\t{row['tool_calls']} tool calls\t{row['seconds']} s\t{row['runs']} run(s)"
 
 
 def totals(records: list[dict]) -> dict[str, dict]:
@@ -142,6 +175,20 @@ def cmd_cost(args: argparse.Namespace) -> int:
     action = getattr(args, "cost_action", None)
     root = find_root()
     if action == "add":
+        if args.item is not None and args.task is not None:
+            raise KitError("cost add takes either --task or --item with --category, not both")
+        if args.item is not None:
+            if args.category is None:
+                raise KitError("--item needs --category (a word for the kind of work, such as research)")
+            record = add(root, args.item, args.role, args.model, args.tokens, args.tools, args.seconds,
+                         agent=args.agent, resume=args.resume, category=args.category)
+            print(f"cost: {record['category']} {record['item']} {record['agent']} ({record['model']}) "
+                  f"{record['tokens']} tokens")
+            return 0
+        if args.category is not None:
+            raise KitError("--category goes with --item (work that is not a task), not with --task")
+        if args.task is None:
+            raise KitError("cost add needs --task <ID>, or --item <ID> with --category for work that is not a task")
         problem = None if args.allow_unknown else unknown_task(root, args.task)
         if problem:
             raise KitError(problem)
@@ -152,10 +199,16 @@ def cmd_cost(args: argparse.Namespace) -> int:
             if (row["task"], row["agent"]) == (record["task"], record["agent"]):
                 print("past the threshold: " + _flag_line(row))
     elif action == "report":
-        records = [r for r in read(root) if args.task in (None, r["task"])]
-        for task, row in totals(records).items():
-            print(f"{task}\t{row['tokens']} tokens\t{row['tool_calls']} tool calls\t{row['seconds']} s\t"
-                  f"{row['runs']} run(s)")
+        records = [r for r in read(root) if args.task in (None, r["task"])
+                   and args.category in (None, r.get("category")) and args.item in (None, r.get("item"))]
+        for task, row in totals([r for r in records if "category" not in r]).items():
+            print(_total_line(task, row))
+        for category, by_item in item_totals(records).items():
+            for item, row in by_item.items():
+                print(_total_line(f"{category}/{item}", row))
+            if len(by_item) > 1:
+                print(_total_line(f"{category} (all items)", totals([dict(r, task=category) for r in records
+                                                                     if r.get("category") == category])[category]))
         for row in flagged(records, args.tokens, args.resumes):
             print("past the threshold: " + _flag_line(row))
     else:
@@ -166,7 +219,9 @@ def cmd_cost(args: argparse.Namespace) -> int:
 def _configure(parser: argparse.ArgumentParser) -> None:
     actions = parser.add_subparsers(dest="cost_action", metavar="action", parser_class=type(parser))
     adder = actions.add_parser("add", help="append one subagent run to program/costs.jsonl")
-    adder.add_argument("--task", required=True, help="task ID (register or ad hoc)")
+    adder.add_argument("--task", help="task ID (register or ad hoc)")
+    adder.add_argument("--item", help="in place of --task: the ID of work that is not a task (with --category)")
+    adder.add_argument("--category", help="with --item: one word for the kind of work, such as research")
     adder.add_argument("--role", required=True, help="implementer, qa, spec_qa, ...")
     adder.add_argument("--model", required=True, help="the model the agent ran on")
     adder.add_argument("--tokens", required=True, type=int)
@@ -178,6 +233,8 @@ def _configure(parser: argparse.ArgumentParser) -> None:
                        help="log a task ID that is neither in the register nor an ad-hoc task")
     report = actions.add_parser("report", help="totals per task, and the agents past the fresh-agent threshold")
     report.add_argument("--task")
+    report.add_argument("--category", help="only the item lines of this category")
+    report.add_argument("--item", help="only the lines of this item")
     report.add_argument("--tokens", type=int, default=TOKEN_THRESHOLD, help="token threshold per agent")
     report.add_argument("--resumes", type=int, default=RESUME_THRESHOLD, help="resume threshold per agent")
 

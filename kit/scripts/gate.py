@@ -66,6 +66,7 @@ import tempfile
 import threading
 from pathlib import Path, PurePosixPath
 
+import conflicts
 import evidence as evidence_module
 import latework
 import reuse as reuse_module
@@ -79,7 +80,9 @@ from register import GATE_ID, GATE_SHAPE
 
 MAIN = "main"  # the primary branch; fixed, so no caller can choose where the rules are read from
 CHECK_KEYS = ("build", "test", "scan", "compile_check", "extra_gate")
-ALL_KEYS = CHECK_KEYS + ("parallel_steps", "guarded_files", "tiers", "drift", "evidence", "progress")  # drift, progress: `pk drift` only
+ALL_KEYS = CHECK_KEYS + ("parallel_steps", "guarded_files", "tiers", "drift", "evidence", "progress", "merge",
+                         "research", "remote")  # drift, progress: `pk drift` only; research, remote: their commands (0.6.0)
+MERGE_KEYS = ("union_files",)  # the `merge` section (0.6.0)
 TIER_KEYS = ("full_paths", "light_paths", "light_ruling")
 BUILTIN_FULL = ("kit/", "program/checks.yaml", "program/gates.yaml")  # the kit's own gates: always full-tier
 LIGHT_STEPS = ("build", "compile_check", "scan")
@@ -180,6 +183,27 @@ def _parse_tiers(value) -> dict:
     return tiers
 
 
+def _parse_merge(value) -> dict:
+    """The `merge` section of checks.yaml (0.6.0) as {union_files: [str]}; absent means no file merges as a union.
+
+    `union_files` lists paths, directories and globs (`_under` rules): a conflict in such a file is merged as the
+    union of both sides' lines wherever the kit merges a task (`conflicts`), KF-38.
+    """
+    if value is None:
+        value = {}
+    if not isinstance(value, dict):
+        raise KitError("checks.yaml: merge must be a mapping of " + ", ".join(MERGE_KEYS))
+    unknown = sorted(str(key) for key in value if key not in MERGE_KEYS)
+    if unknown:
+        raise KitError(f"checks.yaml: merge: unknown key {_show(', '.join(unknown))} (expected {', '.join(MERGE_KEYS)})")
+    union = value.get("union_files")
+    if union is None:
+        union = []
+    if not isinstance(union, list) or not all(isinstance(path, str) and path for path in union):
+        raise KitError("checks.yaml: merge.union_files must be a list of paths")
+    return {"union_files": [_norm_guard(path) for path in union]}
+
+
 def _parse_checks(data, require: tuple[str, ...]) -> dict:
     if data is None:
         data = {}
@@ -209,6 +233,13 @@ def _parse_checks(data, require: tuple[str, ...]) -> dict:
 
     checks["progress"] = progress.parse(data.get("progress"))
     checks["evidence"] = evidence_module.parse_config(data.get("evidence"))
+    checks["merge"] = _parse_merge(data.get("merge"))
+    import research  # late, like drift: read by `pk research` alone (0.6.0)
+
+    checks["research"] = research.parse(data.get("research"))
+    import remote  # late, like drift: read by `pk remote` alone (0.6.0)
+
+    checks["remote"] = remote.parse(data.get("remote"))
     for key in require:
         if not checks[key]:
             raise KitError(f"checks.yaml: {key} must list at least one command")
@@ -308,11 +339,13 @@ def _remove_trial(root: Path, trial: Path) -> str | None:
     return None
 
 
-def trial_merge(root, branch: str, main: str = MAIN) -> Path:
+def trial_merge(root, branch: str, main: str = MAIN, resolved: list | None = None) -> Path:
     """Merge `branch` into a temporary detached worktree of `main` without committing; return its path.
 
-    The caller removes the worktree. A conflict aborts the merge, removes the worktree and raises
-    KitError listing the conflicted paths. The main checkout is never touched.
+    The caller removes the worktree. A conflict the kit resolves itself (`conflicts`, 0.6.0: the task's own status
+    file takes the branch's record, KF-37; a file of `merge.union_files` merges as a line union, KF-38) is resolved
+    as `pk merge` resolves it, so the gates judge the tree the merge makes; each is said in a line, appended to `resolved` or else printed. Any other conflict aborts the
+    merge, removes the worktree and raises KitError listing the conflicted paths. The main checkout is never touched.
     """
     root = Path(root).resolve()
     _check_ref(main, "main branch")
@@ -329,10 +362,19 @@ def trial_merge(root, branch: str, main: str = MAIN) -> Path:
                                  f"refs/heads/{branch}"], trial)
         if code == 0:
             return trial
-        try:
-            conflicted = _git_fields(trial, "diff", "--name-only", "-z", "--diff-filter=U")
-        except KitError:
-            conflicted = []
+        lines, conflicted = conflicts.resolve_index(trial, branch, conflicts.task_of(branch), ref=main)
+        if lines and not conflicted:
+            if resolved is None:
+                for line in lines:
+                    _out(line)
+            else:
+                resolved.extend(lines)
+            return trial
+        if not conflicted:
+            try:
+                conflicted = _git_fields(trial, "diff", "--name-only", "-z", "--diff-filter=U")
+            except KitError:
+                conflicted = []
         run_argv(["git", "-C", str(trial), "merge", "--abort"], trial)
         if conflicted:
             raise KitError(f"merge of {_show(branch)} into {_show(main)} conflicts in: "
@@ -352,27 +394,37 @@ def trial_merge(root, branch: str, main: str = MAIN) -> Path:
 # --- running steps -----------------------------------------------------------------
 
 def _step_lines(step: str, commands: list[tuple[list[str], int]], cwd: Path, env: dict | None = None,
-                sink: list | None = None, timeout: int = STEP_TIMEOUT) -> tuple[bool, list[str]]:
+                sink: list | None = None, timeout: int = STEP_TIMEOUT,
+                recorded: list | None = None) -> tuple[bool, list[str]]:
     """Run (argv, expected exit) pairs in order; return (passed, the lines to print) without printing.
 
     Output tail lines are indented with `    | ` so a command can never print a line that looks like
     the gate's own `OK:` line. An empty list runs nothing and yields no lines. `sink`, when given, receives
-    `{argv, exit, output}` of every command run (the test step's, for `Evidence.reuse_gate_test`).
+    `{argv, exit, output}` of every command run (the test step's, for `Evidence.reuse_gate_test`). `recorded`
+    (0.6.0, KF-33: the plan step with `evidence.plan_reuse_test`) is such a list from the test step of this gate
+    run, in the same `cwd`: a command whose argv equals one there is not run again; its recorded exit and output
+    are judged against this command's own expected exit, and a line says so.
     """
     if not commands:
         return True, []
+    lines = []
     for argv, expect in commands:
-        code, output = run_argv(argv, cwd, env=env, timeout=timeout)
+        found = next((item for item in recorded or () if item["argv"] == list(argv)), None)
+        if found is not None:
+            code, output = found["exit"], found["output"]
+            lines.append(f"step {step}: {' '.join(argv)} reused from the test step ({exit_text(code)})")
+        else:
+            code, output = run_argv(argv, cwd, env=env, timeout=timeout)
         if sink is not None:
             sink.append({"argv": list(argv), "exit": code, "output": output})
         if code == expect:
             continue
         if code == 127:
-            return False, [f"FAILED: {step} missing tool: {argv[0]}"]
-        lines = [f"FAILED: {step} {' '.join(argv)} ({exit_text(code)})"]
+            return False, [*lines, f"FAILED: {step} missing tool: {argv[0]}"]
+        lines.append(f"FAILED: {step} {' '.join(argv)} ({exit_text(code)})")
         lines.extend(TAIL_PREFIX + line for line in output.splitlines()[-TAIL_LINES:])
         return False, lines
-    return True, [f"step {step}: ok"]
+    return True, [*lines, f"step {step}: ok"]
 
 
 KILL_SIGNALS = ("SIGKILL", "SIGTERM", "SIGSEGV", "SIGBUS", "SIGABRT")  # what the machine, not the code, usually sends
@@ -405,9 +457,9 @@ def exit_text(code: int) -> str:
 
 
 def _run_commands(step: str, commands: list[tuple[list[str], int]], cwd: Path, env: dict | None = None,
-                  sink: list | None = None, timeout: int = STEP_TIMEOUT) -> bool:
+                  sink: list | None = None, timeout: int = STEP_TIMEOUT, recorded: list | None = None) -> bool:
     """Run (argv, expected exit) pairs in order; print the first failure and return False."""
-    passed, lines = _step_lines(step, commands, cwd, env, sink, timeout)
+    passed, lines = _step_lines(step, commands, cwd, env, sink, timeout, recorded)
     for line in lines:
         _out(line)
     return passed
@@ -1108,7 +1160,10 @@ def _late_and_evidence(checks: dict, task_id: str, wt: Path, authoritative: byte
     if not plan:
         _out(f'FAILED: {"brief" if meta["fast"] else "plan"} no commands under "{PLAN_SECTION}"')
         return 1
-    if not _run_commands("plan", plan, wt):
+    # KF-33 (0.6.0): with evidence.plan_reuse_test, a PLAN command identical to a test command of this run's test step
+    # (same argv, same worktree) takes its result; the test step's results file for produce.py stays as it was.
+    recorded = sink if checks["evidence"]["plan_reuse_test"] and reused is None else None
+    if not _run_commands("plan", plan, wt, recorded=recorded):
         return 1
     env = dict(os.environ, **{evidence_module.GATE_TEST_ENV: str(path)})
     if not _evidence_step(wt, task_id, env=env, reused=reused, limit=limit):
@@ -1136,6 +1191,8 @@ def handback(root, task_id: str, branch: str, worktree=None, no_reuse: bool = Fa
     authoritative = _definition(root, wt, task_id, meta)
     if authoritative is None:
         return 1
+    if meta["tier"] != "light" and not _early_evidence(wt, task_id):
+        return 1
     _accepted_late_work(wt, task_id)
     trial = trial_merge(root, branch)
     code = _with_trial(root, trial, lambda: _run_steps(checks, task_id, wt, trial, authoritative, meta, no_reuse))
@@ -1147,6 +1204,30 @@ def handback(root, task_id: str, branch: str, worktree=None, no_reuse: bool = Fa
     _deferred_lines(wt, task_id, branch)
     _print_ok("handback", branch, sha)
     return 0
+
+
+EARLY = "(checked before the build)"
+
+
+def _early_evidence(wt: Path, task_id: str) -> bool:
+    """The evidence step's cheap refusals, before the trial merge, the build and the test step (0.6.0, KF-35).
+
+    The producer must exist, and the branch since it left main must keep the kit's ownership of the record folders
+    and pointers (`store.tree_problems`, what `pk evidence check-tree` prints: no record modified or deleted, no file
+    there that is not a valid record, no hand-made pointer). Both were refused before only after the test step; the
+    lines are the evidence step's, with EARLY appended. Prints the failure and returns False.
+    """
+    produce = f"program/evidence/{task_id}/produce.py"
+    if not (wt / produce).is_file():
+        _out(f"FAILED: evidence {produce} is missing {EARLY}")
+        return False
+    problems = store.tree_problems(wt, git(wt, "merge-base", MAIN, "HEAD"))
+    if problems:
+        _out(f"FAILED: evidence {EARLY}")
+        for problem in problems:
+            _out(_show(problem))
+        return False
+    return True
 
 
 def _accepted_late_work(wt: Path, task_id: str) -> None:

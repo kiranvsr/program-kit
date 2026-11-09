@@ -295,7 +295,9 @@ class EndToEndTests(unittest.TestCase):
         self.assertNotIn("program/evidence", diff)
         # what the diff leaves out is said, and the stat file still shows every path the branch changed
         self.assertIn("left out of the diff: program/evidence, program/status, program/tasks", review)
-        stat = Path(review[-1].removeprefix("stat of every path: ")).read_text(encoding="utf-8")
+        stat_line = next(line for line in review if line.startswith("stat of every path: "))
+        stat = Path(stat_line.removeprefix("stat of every path: ")).read_text(encoding="utf-8")
+        self.assertEqual(review[-1], f"merge with main: no conflicts at {project.git('rev-parse', 'main')[:12]}")  # 0.6.0
         self.assertIn(f"commit under review: {project.git('rev-parse', BRANCH)}", stat)
         self.assertIn(f"program/evidence/{TASK}/report.md", stat)
         self.assertEqual(project.git("status", "--porcelain"), "")  # nothing tracked was touched on main
@@ -520,6 +522,14 @@ class EndToEndTests(unittest.TestCase):
         project.pk("status", "ready", "--json")
         self.assertIn("not installed", project.pk("hook", "list").stdout)
         project.pk("hook", "install", hook.ADAPTERS[0], expect=1)
+        self.assertEqual(project.git("status", "--porcelain"), "")
+        # 0.6.0: the research track, the feedback register and the progress pass are opt-in: without their
+        # configuration or file each says so and changes nothing
+        self.assertIn("research is not configured", project.pk("research", "list", expect=1).stderr)
+        self.assertIn("no program/beta-feedback.md", project.pk("feedback", "check").stdout)
+        self.assertIn("progress section", project.pk("progress", expect=1).stderr)
+        self.assertEqual(project.pk("lock", "status").stdout.strip(), "free")  # 0.6.0: nothing holds the lock
+        self.assertIn("remote", project.pk("remote", "status", expect=1).stderr)  # no remote section: refused
         self.assertEqual(project.git("status", "--porcelain"), "")
         project.pk("init", expect=1)  # program/ exists: init refuses to overwrite it
 

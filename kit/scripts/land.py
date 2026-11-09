@@ -3,7 +3,8 @@
 
 `pk merge <ID>` is the whole per-merge chain in one command, for exactly one task: it refuses a branch QA has
 not accepted (a light-tier task instead needs the controller's `--inspected <tip>`), runs the merge check
-and requires it to pass, merges with `git merge --no-ff`, records a light-tier task `merged` with the commit
+and requires it to pass, merges with `git merge --no-ff` (from 0.6.0 a conflict on the task's own status file takes
+the branch's record, as the trial merge did: `conflicts`), records a light-tier task `merged` with the commit
 that was inspected, rewrites the claim documents of the gates that name the task, regenerates the hand-off
 block and commits exactly the bookkeeping files it wrote. Merges stay one at a time: the command takes one ID
 and merges one branch.
@@ -34,6 +35,7 @@ import shutil
 import tempfile
 from pathlib import Path
 
+import conflicts
 import ctlstate
 import evidence as evidence_module
 import gate
@@ -59,8 +61,16 @@ def _controller_path(path: str, status_of=()) -> bool:
             or path in {f"program/status/{task_id}.json" for task_id in status_of})
 
 
-def _main_checkout(root: Path, what: str) -> None:
-    """KitError unless `root` is the main checkout with nothing staged and no change outside the controller's files."""
+def _main_checkout(root: Path, what: str, touches=()) -> None:
+    """KitError unless `root` is the main checkout, on main, with nothing staged and no uncommitted change where the
+    command writes.
+
+    `touches` is what the command writes besides the controller's own files: for `pk merge` the paths the merge
+    changes and the task's status file (`_merge_writes`). From 0.6.0 (KF-39) an uncommitted or untracked file
+    anywhere else is left alone: it stays uncommitted and goes into no commit. The controller's own files (the
+    hand-off, the state, rulings, costs, progress, claims, rounds) may be dirty as before and are committed with the
+    bookkeeping, unless the merge itself changes one. Anything staged is refused, because the command commits.
+    """
     try:
         here = git(root, "symbolic-ref", "HEAD")
     except KitError:
@@ -69,9 +79,22 @@ def _main_checkout(root: Path, what: str) -> None:
         raise KitError(f"run {what} from the main checkout, on {MAIN}")
     if git(root, "diff", "--cached", "--name-only"):
         raise KitError(f"{what}: unstage what is staged first; it commits only the files it writes")
-    other = [name for name in git(root, "diff", "--name-only").splitlines() if not _controller_path(name)]
-    if other:
-        raise KitError(f"{what}: the main checkout has uncommitted changes: {', '.join(other)}")
+    written = set(touches)
+    if not written:
+        return
+    dirty = {*gate._git_fields(root, "diff", "--name-only", "--no-renames", "-z"),
+             *gate._git_fields(root, "ls-files", "--others", "--exclude-standard", "-z")}
+    hit = sorted(dirty & written)
+    if hit:
+        raise KitError(f"{what}: the main checkout has uncommitted changes: {', '.join(hit)}, which this merge or its "
+                       "bookkeeping writes; commit them or set them aside (uncommitted changes elsewhere may stay)")
+
+
+def _merge_writes(root: Path, branch: str, task_id: str) -> list[str]:
+    """The paths `pk merge` writes outside the controller's own files: what the merge changes, and the task's status
+    file (a light task is recorded merged)."""
+    changed = gate._git_fields(root, "diff", "--name-only", "--no-renames", "-z", f"{MAIN}...refs/heads/{branch}")
+    return [*changed, conflicts.status_path(task_id)]
 
 
 def _tip_status(root: Path, task_id: str, sha: str) -> str:
@@ -214,6 +237,27 @@ def _merge_check(root: Path, branch: str, inspected: str | None, suite: bool) ->
     return code, printed, f"the first run was killed by {killed} ({first[len('FAILED: '):]}), so it ran once more"
 
 
+def _merge_resolving(where: Path, branch: str, ref: str, task_id: str, message: list[str]) -> list[str]:
+    """`git merge --no-ff` of `ref` in the checkout `where`; the lines saying which conflicts were resolved.
+
+    A conflict `conflicts` resolves (the task's own status file takes the branch's record, 0.6.0, KF-37) is
+    resolved and staged, and the merge is committed with the same message and trailers, so it is the tree the
+    trial merge judged. Any other conflict aborts the merge and is a KitError naming it.
+    """
+    code, output = run_argv(["git", "-C", str(where), "merge", "--no-ff", *message, ref], where)
+    if code == 0:
+        return []
+    lines, remaining = conflicts.resolve_index(where, branch, task_id)
+    if lines and not remaining:
+        code, output = run_argv(["git", "-C", str(where), "commit", "-q", *message], where)
+        if code == 0:
+            return lines
+    run_argv(["git", "-C", str(where), "merge", "--abort"], where)
+    if remaining:
+        raise KitError(f"git merge of {branch} conflicts in: {', '.join(remaining)}")
+    raise KitError(f"git merge of {branch} failed: {(output.strip().splitlines() or [f'exit {code}'])[-1]}")
+
+
 # --- integration rounds ----------------------------------------------------------------
 
 def _round_path(root: Path, name: str) -> Path:
@@ -274,12 +318,12 @@ def round_start(root: Path, name: str, task_ids: list[str]) -> Path:
     git(root, "worktree", "add", "--detach", str(trial), MAIN)
     try:
         for member in members:
-            code, output = run_argv(["git", "-C", str(trial), "merge", "--no-ff", "-m",
-                                     f"round {name}: merge {member['branch']}", member["sha"]], trial)
-            if code != 0:
-                run_argv(["git", "-C", str(trial), "merge", "--abort"], trial)
+            try:
+                _merge_resolving(trial, member["branch"], member["sha"], member["id"],
+                                 ["-m", f"round {name}: merge {member['branch']}"])
+            except KitError as exc:
                 raise KitError(f"round {name}: {member['branch']} does not merge after the members before it: "
-                               f"{(output.strip().splitlines() or ['conflict'])[-1]}")
+                               f"{exc}") from None
         head = git(trial, "rev-parse", "HEAD")
     finally:
         problem = gate._remove_trial(root, trial)
@@ -431,9 +475,9 @@ def merge(root: Path, task_id: str, inspected: str | None = None, round_name: st
           commit: bool = True, trailers=()) -> list[str]:
     """Land one task: check, merge, record, claims, hand-off, commit. Returns the lines to print (under ten)."""
     root = Path(root).resolve()
-    _main_checkout(root, "pk merge")
     branch = f"task/{task_id}"
     sha = gate._branch_head(root, branch)
+    _main_checkout(root, "pk merge", touches=_merge_writes(root, branch, task_id))
     meta = gate.task_meta(root, task_id)
     tier = meta["tier"] + ("+fast" if meta["fast"] else "")
     problem = rulings_module.rewritten(root) or _accepted_problem(root, task_id, sha, meta["tier"])
@@ -452,10 +496,7 @@ def merge(root: Path, task_id: str, inspected: str | None = None, round_name: st
     if retried:
         lines.insert(0, f"merge check: {retried}; the second run passed")
     message = ["-m", f"Merge {branch} ({tier} tier)"] + [part for line in trailers for part in ("-m", line)]
-    code, output = run_argv(["git", "-C", str(root), "merge", "--no-ff", *message, f"refs/heads/{branch}"], root)
-    if code != 0:
-        run_argv(["git", "-C", str(root), "merge", "--abort"], root)
-        raise KitError(f"git merge of {branch} failed: {(output.strip().splitlines() or [f'exit {code}'])[-1]}")
+    lines += _merge_resolving(root, branch, f"refs/heads/{branch}", task_id, message)
     lines.append(f"merged: {branch} into {MAIN} at {git(root, 'rev-parse', 'HEAD')}")
     wrote = ["program/HANDOFF.md", ctlstate.STATE_FILE, "program/costs.jsonl", "program/rulings.md"]
     problems = []
@@ -497,7 +538,37 @@ def merge(root: Path, task_id: str, inspected: str | None = None, round_name: st
 
 # --- commands ---------------------------------------------------------------------------
 
+def merge_check(root: Path, task_id: str) -> int:
+    """`pk merge check <ID>` (0.6.0, KF-38): whether task/<ID> merges into main without a conflict the kit leaves.
+
+    Run before QA starts (and again when main moves during QA), so a conflict that only `pk merge` would find after
+    the acceptance is found while it is still cheap. It merges as `git merge-tree` does, with the resolutions pk merge
+    applies (the task's status file, `merge.union_files`); no checkout, no suite, no acceptance needed, nothing
+    written. Prints the resolved lines and `OK: task/<ID> merges into main at <sha> without conflicts`, or a
+    `FAILED:` line naming the conflicting files (exit 1).
+    """
+    branch = f"task/{task_id}"
+    gate._branch_head(Path(root).resolve(), branch)
+    sha, resolved, remaining = conflicts.check(Path(root).resolve(), branch)
+    for line in resolved:
+        gate._out(line)
+    if remaining:
+        gate._out(f"FAILED: merge {branch} into {MAIN} at {sha} conflicts in: {', '.join(remaining)}")
+        return 1
+    print(f"OK: {branch} merges into {MAIN} at {sha} without conflicts")  # a checked branch name and a sha
+    return 0
+
+
 def cmd_merge(args: argparse.Namespace) -> int:
+    if args.task_id == "check":
+        if args.more is None:
+            raise KitError("pk merge check <ID>: name the task whose branch task/<ID> to check against main")
+        if args.inspected or args.round or args.no_commit or args.trailer:
+            raise KitError("pk merge check takes only the ID: it merges nothing and commits nothing")
+        return merge_check(find_root(), args.more)
+    if args.more is not None:
+        raise KitError(f"pk merge lands one task at a time: one ID, not {args.task_id} and {args.more} "
+                       "(pk merge check <ID> checks one against main)")
     print("\n".join(merge(find_root(), args.task_id, inspected=args.inspected, round_name=args.round,
                           commit=not args.no_commit, trailers=args.trailer)))
     return 0
@@ -519,7 +590,9 @@ def cmd_integrate(args: argparse.Namespace) -> int:
 
 
 def _configure_merge(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("task_id", metavar="ID", help="the one task to land; its branch is task/<ID>")
+    parser.add_argument("task_id", metavar="ID", help="the one task to land; its branch is task/<ID>; or the word "
+                                                      "check, then the ID: pk merge check <ID> only tries the merge")
+    parser.add_argument("more", metavar="CHECKED_ID", nargs="?", help=argparse.SUPPRESS)
     parser.add_argument("--inspected", metavar="SHA", help="light tier: the branch tip whose diff you read")
     parser.add_argument("--round", metavar="NAME", help="the integration round whose combined check covers it")
     parser.add_argument("--no-commit", action="store_true", dest="no_commit",

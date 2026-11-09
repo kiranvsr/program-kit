@@ -151,6 +151,7 @@ class ReviewWorktreeTests(LandBase):
         for name in ("generated.lock", f"program/status/{TASK}.json", "calc.py"):
             self.assertRegex(stat, rf"(?m)^ {name} +\| ")
         self.assertEqual(sh(self.root, "git", "status", "--porcelain").strip(), "")  # nothing tracked was touched
+        self.assertEqual(out.splitlines()[-1], f"merge with main: no conflicts at {self.head()[:12]}")  # KF-38
 
     def test_a_second_review_moves_the_clean_worktree_to_the_new_commit(self):
         """The re-review after a fix round (M1, second form): one command puts the reviewer on the new commit."""
@@ -761,6 +762,198 @@ class MergeTests(LandBase):
         self.assertEqual((code, err), (0, ""), out)
 
 
+STATUS = f"program/status/{TASK}.json"
+
+
+@skip_unless_slow()
+class StatusConflictTests(LandBase):
+    """0.6.0, KF-37: a conflict on the task's own status file takes the branch's record, in the trial and the merge."""
+
+    def main_moves_the_record(self, note="main's copy", **over):
+        """Main changes the task's record after the branch forked: the conflict the program it came from saw."""
+        write_json(self.root / STATUS, status_record(TASK, tier="standard", note=note, **over))
+        return commit(self.root, "main changes the status record")
+
+    def test_a_status_file_conflict_with_main_takes_the_branchs_record_and_lands(self):
+        self.standard()
+        self.main_moves_the_record()
+        branch_record = sh(self.root, "git", "show", f"{BRANCH}:{STATUS}")
+        tip = self.head(self.wt)
+        code, out, err = self.pk("merge", TASK, "--trailer", "Co-Authored-By: Test Agent")
+        self.assertEqual((code, err), (0, ""), out)
+        lines = out.splitlines()
+        self.assertLess(len(lines), 10)
+        self.assertEqual(lines[0], f"OK: {BRANCH} merges into main at {tip}")
+        self.assertIn(f"resolved: {STATUS}: took {BRANCH}'s record (the task's own status file)", lines)
+        self.assertEqual((self.root / STATUS).read_text(), branch_record)
+        self.assertEqual(sh(self.root, "git", "status", "--porcelain").strip(), "")
+        log = sh(self.root, "git", "log", "--format=%s%n%(trailers)", "-2").splitlines()
+        self.assertIn(f"Merge {BRANCH} (standard tier)", log)
+        self.assertEqual(log.count("Co-Authored-By: Test Agent"), 2)
+        parents = sh(self.root, "git", "rev-list", "--parents", "-n", "1", "HEAD~1").split()
+        self.assertEqual(parents[2], tip)  # a real merge of the tip
+        self.assertEqual(status.read(self.root, TASK)["status"], "done")
+        self.assertEqual(status.validate(self.root), [])
+        self.assert_no_trial_left()
+
+    def test_the_merge_check_resolves_the_status_file_in_its_trial_merge_and_says_so(self):
+        self.standard()
+        self.main_moves_the_record()
+        rc, out = self.merge_check()
+        self.assertEqual(rc, 0, out)
+        self.assertIn(f"resolved: {STATUS}: took {BRANCH}'s record (the task's own status file)", out.splitlines())
+
+    def test_a_branch_record_that_changes_the_tier_is_still_refused_after_the_conflict_is_resolved(self):
+        self.standard(done=False)
+        write_json(self.wt / STATUS, status_record(TASK, tier="full", note="the branch's"))
+        commit(self.wt, "the branch raises its own tier")
+        self.main_moves_the_record()
+        rc, out = self.merge_check()
+        self.assertEqual(rc, 1)
+        self.assertIn(f"FAILED: tier {STATUS} changes the tier, fast path or ruling recorded on main", out)
+        self.assert_no_trial_left()
+
+    def test_another_conflicted_path_still_stops_the_merge_and_is_named(self):
+        self.standard(done=False)
+        put(self.wt, "notes.txt", "the branch's notes\n")
+        commit(self.wt, "notes on the branch")
+        self.accept(self.wt, TASK)
+        put(self.root, "notes.txt", "main's notes\n")
+        self.main_moves_the_record()
+        before = self.head()
+        code, out, err = self.pk("merge", TASK)
+        self.assertEqual(code, 1)
+        self.assertIn("conflicts in: notes.txt", err)
+        self.assertNotIn(f"conflicts in: {STATUS}", err)
+        self.untouched(before)
+
+    def test_a_done_record_copied_to_main_by_hand_no_longer_blocks_reopen(self):
+        """The 0.5.x workaround: the controller copied the branch's done record to main; the branch is not merged."""
+        self.standard()
+        shutil.copy(self.wt / STATUS, self.root / STATUS)
+        commit(self.root, "the branch's status, copied to main by hand")
+        said = []
+        record = status.reopen(self.wt, TASK, "late work after acceptance", said=said)
+        self.assertEqual(record["status"], "review")
+        self.assertEqual(said, [f"note: main's {STATUS} says done, but {BRANCH} is not merged into main: the record "
+                                f"there is a copy, and pk merge takes the branch's record"])
+
+    def test_reopen_is_refused_once_the_branch_is_merged_even_after_later_commits(self):
+        self.standard()
+        self.assertEqual(self.pk("merge", TASK)[0], 0)
+        with self.assertRaisesRegex(KitError, f"{BRANCH} is merged into main: it has landed"):
+            status.reopen(self.wt, TASK, "too late")
+        put(self.wt, "more.py", "MORE = 1\n")
+        commit(self.wt, "more work on the landed branch")
+        with self.assertRaisesRegex(KitError, f"{BRANCH} is merged into main: it has landed"):
+            status.reopen(self.wt, TASK, "too late")
+
+
+@skip_unless_slow()
+class DirtyMainTests(LandBase):
+    """0.6.0, KF-39: an uncommitted change on main stops pk merge only where the merge or its bookkeeping writes."""
+
+    def test_an_unrelated_uncommitted_file_on_main_stays_uncommitted_and_out_of_every_commit(self):
+        self.standard()
+        before = self.head()
+        put(self.root, "notes.txt", "the user's own edit\n")  # tracked, and the branch never touches it
+        put(self.root, "scratch.txt", "the user's own file\n")  # untracked, at a path the merge does not write
+        code, out, err = self.pk("merge", TASK)
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertEqual(sh(self.root, "git", "status", "--porcelain").splitlines(), [" M notes.txt", "?? scratch.txt"])
+        self.assertEqual((self.root / "notes.txt").read_text(), "the user's own edit\n")
+        committed = sh(self.root, "git", "log", "--format=", "--name-only", "-m", f"{before}..HEAD").split()
+        self.assertNotIn("notes.txt", committed)
+        self.assertNotIn("scratch.txt", committed)
+        self.assertEqual(sh(self.root, "git", "show", "HEAD:notes.txt"), "one\n")
+        self.assertEqual(status.read(self.root, TASK)["status"], "done")
+
+    def test_an_uncommitted_change_where_the_merge_writes_is_refused_and_named(self):
+        self.standard()
+        before = self.head()
+        produce = f"program/evidence/{TASK}/produce.py"
+        for name in ("calc.py", produce, f"program/status/{TASK}.json"):
+            with self.subTest(name):
+                put(self.root, name, "the user's own edit\n")  # calc.py: changed by the branch; produce.py: added
+                put(self.root, "notes.txt", "an unrelated edit\n")
+                code, out, err = self.pk("merge", TASK)
+                self.assertEqual((code, out), (1, ""))
+                self.assertIn(f"pk merge: the main checkout has uncommitted changes: {name}, which this merge or its "
+                              "bookkeeping writes", err)
+                self.assertNotIn("notes.txt", err)
+                self.assertEqual(self.head(), before)
+                sh(self.root, "git", "checkout", "--", "notes.txt")
+                if name == produce:
+                    (self.root / name).unlink()
+                else:
+                    sh(self.root, "git", "checkout", "--", name)
+        self.untouched(before)
+
+    def test_a_staged_change_is_still_refused_wherever_it_is(self):
+        self.standard()
+        put(self.root, "notes.txt", "staged\n")
+        sh(self.root, "git", "add", "notes.txt")
+        code, _, err = self.pk("merge", TASK)
+        self.assertEqual(code, 1)
+        self.assertIn("unstage what is staged first", err)
+
+
+JOURNAL = "db/migrations/journal.txt"
+
+
+@skip_unless_slow()
+class UnionMergeTests(LandBase):
+    """0.6.0, KF-38: a file of `merge.union_files` both sides appended to lands as the union of their lines."""
+
+    def setUp(self):
+        super().setUp()
+        self.standard(done=False)
+        self.write_checks(tiers=FULL_PATHS, merge={"union_files": ["db/migrations/"]})
+        put(self.root, JOURNAL, "0001 init\n")
+        commit(self.root, "union files and the journal")
+        sh(self.wt, "git", "merge", "-q", "main")
+        put(self.wt, JOURNAL, "0001 init\n0002 the branch's table\n")
+        commit(self.wt, "the branch's migration")
+        self.accept(self.wt, TASK)
+        put(self.root, JOURNAL, "0001 init\n0002 main's table\n")
+        commit(self.root, "main's migration")
+
+    def test_the_review_and_pk_merge_check_see_the_conflict_the_kit_resolves(self):
+        code, out, err = self.pk("worktree", "review", TASK)
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(out.splitlines()[-1], f"merge with main: no conflicts at {self.head()[:12]} (1 resolved as pk "
+                                               "merge resolves them)")
+        code, out, err = self.pk("merge", "check", TASK)
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertEqual(out.splitlines(), [
+            f"resolved: {JOURNAL}: merged as the line union of both sides (merge.union_files)",
+            f"OK: {BRANCH} merges into main at {self.head()} without conflicts"])
+
+    def test_pk_merge_lands_the_union_of_both_sides(self):
+        code, out, err = self.pk("merge", TASK)
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertIn(f"resolved: {JOURNAL}: merged as the line union of both sides (merge.union_files)",
+                      out.splitlines())
+        self.assertEqual((self.root / JOURNAL).read_text(), "0001 init\n0002 main's table\n0002 the branch's table\n")
+        self.assertEqual(sh(self.root, "git", "status", "--porcelain").strip(), "")
+        self.assertEqual(sh(self.root, "git", "log", "-1", "--format=%s", "HEAD~1").strip(),
+                         f"Merge {BRANCH} (standard tier)")
+        self.assert_no_trial_left()
+
+    def test_a_conflict_outside_the_union_files_is_named_by_the_review_line(self):
+        put(self.root, "calc.py", "main's calc\n")
+        commit(self.root, "main rewrites calc.py")
+        code, out, _ = self.pk("worktree", "review", TASK)
+        self.assertEqual(code, 0)
+        self.assertIn(f"merge with main: conflicts at {self.head()[:12]} in: calc.py (1 resolved as pk merge resolves "
+                      f"them); merge main into the branch and re-run the hand-back gate before QA (pk merge check "
+                      f"{TASK})", out.splitlines())
+        code, out, _ = self.pk("merge", "check", TASK)
+        self.assertEqual((code, out), (1, f"resolved: {JOURNAL}: merged as the line union of both sides "
+                                          f"(merge.union_files)\nFAILED: merge {BRANCH} into main at {self.head()} "
+                                          "conflicts in: calc.py\n"))
+
+
 @skip_unless_slow()
 class LightMergeTests(LandBase):
     LIGHT = {"full_paths": ["auth/"], "light_paths": ["web/"], "light_ruling": "R1"}
@@ -856,6 +1049,17 @@ class RoundTests(LandBase):
         self.assertEqual(sh(self.root, "git", "status", "--porcelain").strip(), "")
         self.assertTrue((self.root / "second.py").is_file())
         self.assertNotIn("round r1", handoff.render(self.root).split("#### Tasks by status")[0])
+
+    def test_an_unrelated_uncommitted_file_on_main_stays_out_of_the_whole_round(self):
+        """0.6.0, KF-39: integrate start and close, and each merge, leave a file none of them writes alone."""
+        put(self.root, "notes.txt", "the user's own edit\n")
+        self.start_and_check()
+        for task_id in (TASK, T2):
+            code, out, err = self.pk("merge", task_id, "--round", "r1")
+            self.assertEqual((code, err), (0, ""), out)
+        code, out, err = self.pk("integrate", "close", "r1")
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertEqual(sh(self.root, "git", "status", "--porcelain").splitlines(), [" M notes.txt"])
 
     def test_a_full_tier_task_is_never_a_member(self):
         sh(self.root, "git", "rm", "-q", f"program/status/{T2}.json")
