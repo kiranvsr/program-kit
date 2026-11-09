@@ -147,7 +147,11 @@ class YamlTemplateTests(unittest.TestCase):
             {"research": {"folder": "research", "archive": "docs/research-archive",  # 0.6.0: the research track
                           "item_pattern": "RI-\\d+", "other_ids": ["RD-\\d+", "H-\\d+"],
                           "guard": ["program/tasks/*/SPEC.md", "program/tasks/*/PLAN.md", "program/tasks/*/BRIEF.md",
-                                    "program/briefs/**/*.md"]}}])
+                                    "program/briefs/**/*.md"]}},
+            {"progress": {"docs": ["program/DASHBOARD.md"],  # 0.6.0: the pass's history and scan keys
+                          "state": ["program/status", "program/rulings.md", "program/controller-state.json"],
+                          "history": {"doc": "program/DASHBOARD.md", "heading": "History"},
+                          "scan": [["tools/secret-scan", "."]]}}])
         import gate  # the examples are ones the checks loader accepts
         for block in checks[1:]:
             gate._parse_checks(miniyaml.loads(block), ())

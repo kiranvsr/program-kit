@@ -86,3 +86,21 @@ tiers:
 #       - program/tasks/*/PLAN.md
 #       - program/tasks/*/BRIEF.md
 #       - program/briefs/**/*.md
+# Optional (0.5.4, 0.6.0), the progress docs a controller keeps by hand: pk drift D7 says when they are behind
+# a commit touching a state path; pk progress (playbook 09) replaces their current-state text in one call. history
+# names where --history adds its dated line; scan lists commands run, in a temporary directory, over copies of the
+# files pk progress would commit (a failure refuses the commit). For example:
+#
+#   progress:
+#     docs:
+#       - program/DASHBOARD.md
+#     state:
+#       - program/status
+#       - program/rulings.md
+#       - program/controller-state.json
+#     history:
+#       doc: program/DASHBOARD.md
+#       heading: History
+#     scan:
+#       - - tools/secret-scan
+#         - .
