@@ -66,6 +66,7 @@ import tempfile
 import threading
 from pathlib import Path, PurePosixPath
 
+import conflicts
 import evidence as evidence_module
 import latework
 import reuse as reuse_module
@@ -334,11 +335,13 @@ def _remove_trial(root: Path, trial: Path) -> str | None:
     return None
 
 
-def trial_merge(root, branch: str, main: str = MAIN) -> Path:
+def trial_merge(root, branch: str, main: str = MAIN, resolved: list | None = None) -> Path:
     """Merge `branch` into a temporary detached worktree of `main` without committing; return its path.
 
-    The caller removes the worktree. A conflict aborts the merge, removes the worktree and raises
-    KitError listing the conflicted paths. The main checkout is never touched.
+    The caller removes the worktree. A conflict the kit resolves itself (`conflicts`: from 0.6.0 the task's own
+    status file takes the branch's record, KF-37) is resolved as `pk merge` resolves it, so the gates judge the tree
+    the merge makes; each is said in a line, appended to `resolved` or else printed. Any other conflict aborts the
+    merge, removes the worktree and raises KitError listing the conflicted paths. The main checkout is never touched.
     """
     root = Path(root).resolve()
     _check_ref(main, "main branch")
@@ -355,10 +358,19 @@ def trial_merge(root, branch: str, main: str = MAIN) -> Path:
                                  f"refs/heads/{branch}"], trial)
         if code == 0:
             return trial
-        try:
-            conflicted = _git_fields(trial, "diff", "--name-only", "-z", "--diff-filter=U")
-        except KitError:
-            conflicted = []
+        lines, conflicted = conflicts.resolve_index(trial, branch, conflicts.task_of(branch))
+        if lines and not conflicted:
+            if resolved is None:
+                for line in lines:
+                    _out(line)
+            else:
+                resolved.extend(lines)
+            return trial
+        if not conflicted:
+            try:
+                conflicted = _git_fields(trial, "diff", "--name-only", "-z", "--diff-filter=U")
+            except KitError:
+                conflicted = []
         run_argv(["git", "-C", str(trial), "merge", "--abort"], trial)
         if conflicted:
             raise KitError(f"merge of {_show(branch)} into {_show(main)} conflicts in: "

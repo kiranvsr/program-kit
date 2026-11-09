@@ -580,14 +580,52 @@ def transition(root: Path, task_id: str, to: str, role: str, note: str = "",
     return updated
 
 
-def reopen(root: Path, task_id: str, reason: str, role: str = "controller", reject: bool = False) -> dict:
+def _landed(root: Path, task_id: str) -> tuple[str | None, str | None]:
+    """(why the task has landed on main, or None; a note for a done record on main that is only a copy, or None).
+
+    From 0.6.0 (KF-37) "landed" is read from git, not from main's status file alone: the branch `task/<ID>` was
+    merged into main (its merge base with main is a commit main took in through a merge, or main says done and holds
+    the tip), or the branch is gone and main says done. A done record on main while the branch is not merged is a
+    copy a controller made by hand (programs did so before 0.6.0, to get round the status file's merge conflict); it
+    no longer blocks a reopen, because `pk merge` takes the branch's record.
+    """
+    code, shown = run_argv(["git", "-C", str(root), "show", f"{PRIMARY_BRANCH}:program/status/{task_id}.json"], root)
+    try:
+        main_done = code == 0 and json.loads(shown).get("status") == "done"
+    except (ValueError, AttributeError):
+        main_done = False
+    branch = f"refs/heads/task/{task_id}"
+    landed = (f"{task_id} is done on {PRIMARY_BRANCH}: it has landed, and new work is a new task (a change request)"
+              if main_done else None)
+    code, tip = run_argv(["git", "-C", str(root), "rev-parse", "--verify", "--quiet", f"{branch}^{{commit}}"], root)
+    if code != 0:
+        return landed, None
+    code, base = run_argv(["git", "-C", str(root), "merge-base", PRIMARY_BRANCH, branch], root)
+    if code != 0:
+        return landed, None  # no main, or no history in common: nothing was merged
+    merged_in = base.strip() not in set(git(root, "rev-list", "--first-parent", PRIMARY_BRANCH).split())
+    holds_tip = run_argv(["git", "-C", str(root), "merge-base", "--is-ancestor", branch, PRIMARY_BRANCH], root)[0] == 0
+    if merged_in or (main_done and holds_tip):
+        return (f"task/{task_id} is merged into {PRIMARY_BRANCH}: it has landed, and new work is a new task "
+                "(a change request)"), None
+    if main_done:
+        return None, (f"note: {PRIMARY_BRANCH}'s program/status/{task_id}.json says done, but task/{task_id} is not "
+                      f"merged into {PRIMARY_BRANCH}: the record there is a copy, and pk merge takes the branch's "
+                      "record")
+    return None, None
+
+
+def reopen(root: Path, task_id: str, reason: str, role: str = "controller", reject: bool = False,
+           said: list | None = None) -> dict:
     """Move a task that is `done` on its branch back for another round; returns the new record.
 
     `done` is terminal for `pk status set`. This is the one documented way out, for late work after QA accepted
     (the acceptance binds the reviewed commit, so more work needs a new review) and for a QA rejection of
     something already marked done. The controller or QA moves it back to `review`; QA with `reject` moves it
     to `in_progress` for the implementer to fix. The reason is required and is kept on the history entry as the
-    audit line. Refused once main holds the task as done (it has landed; new work is a new task). Reopen changes
+    audit line. Refused once the task has landed (`_landed`: its branch is merged into main, or the branch is gone
+    and main says done; new work is a new task); a done record on main that is only a copy adds a note to `said`
+    instead (0.6.0, KF-37). Reopen changes
     only the status: it appends no record and unbinds nothing. The next `done` needs what `done` always needs,
     an acceptance that binds the latest results record; when the late work changed the task's inputs, the gate
     asks for a new results record and QA for a new acceptance of it, but a reopen with no new record can go
@@ -608,15 +646,11 @@ def reopen(root: Path, task_id: str, reason: str, role: str = "controller", reje
     if record["status"] != "done":
         raise KitError(f"{task_id} is {record['status']}, not done; reopen is only for a done task "
                        f"({'a merged task is terminal and new work is a new task' if record['status'] == 'merged' else 'use pk status set'})")
-    code, shown = run_argv(["git", "-C", str(root), "show", f"{PRIMARY_BRANCH}:program/status/{task_id}.json"], root)
-    if code == 0:
-        try:
-            landed = json.loads(shown).get("status") == "done"
-        except (ValueError, AttributeError):
-            landed = False
-        if landed:
-            raise KitError(f"{task_id} is done on {PRIMARY_BRANCH}: it has landed, and new work is a new task "
-                           "(a change request)")
+    landed, note = _landed(root, task_id)
+    if landed:
+        raise KitError(landed)
+    if note and said is not None:
+        said.append(note)
     to = "in_progress" if reject else "review"
     now = utc_now()
     entry = {"status": to, "role": role, "at": now, "reason": reason}
@@ -752,8 +786,10 @@ def cmd_status(args: argparse.Namespace) -> int:
         lower = "" if record["tier"] == "full" else f" (tier {record['tier']}{', fast path' if record['fast'] else ''})"
         print(f"{record['task_id']}: {record['status']}{lower}")
     elif action == "reopen":
-        record = reopen(_root(), args.task_id, args.reason, role=args.role, reject=args.reject)
-        print(f"{record['task_id']}: {record['status']} (reopened by {record['role']}: {record['note']})")
+        said: list[str] = []
+        record = reopen(_root(), args.task_id, args.reason, role=args.role, reject=args.reject, said=said)
+        print("\n".join([f"{record['task_id']}: {record['status']} (reopened by {record['role']}: {record['note']})",
+                         *said]))
     elif action == "tier":
         record = set_tier(_root(), args.task_id, args.tier, args.ruling, role=args.role, spec=args.spec)
         print(f"{record['task_id']}: tier {record['tier']}{', fast path' if record['fast'] else ''} "

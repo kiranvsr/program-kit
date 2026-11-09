@@ -3,7 +3,8 @@
 
 `pk merge <ID>` is the whole per-merge chain in one command, for exactly one task: it refuses a branch QA has
 not accepted (a light-tier task instead needs the controller's `--inspected <tip>`), runs the merge check
-and requires it to pass, merges with `git merge --no-ff`, records a light-tier task `merged` with the commit
+and requires it to pass, merges with `git merge --no-ff` (from 0.6.0 a conflict on the task's own status file takes
+the branch's record, as the trial merge did: `conflicts`), records a light-tier task `merged` with the commit
 that was inspected, rewrites the claim documents of the gates that name the task, regenerates the hand-off
 block and commits exactly the bookkeeping files it wrote. Merges stay one at a time: the command takes one ID
 and merges one branch.
@@ -34,6 +35,7 @@ import shutil
 import tempfile
 from pathlib import Path
 
+import conflicts
 import ctlstate
 import evidence as evidence_module
 import gate
@@ -214,6 +216,27 @@ def _merge_check(root: Path, branch: str, inspected: str | None, suite: bool) ->
     return code, printed, f"the first run was killed by {killed} ({first[len('FAILED: '):]}), so it ran once more"
 
 
+def _merge_resolving(where: Path, branch: str, ref: str, task_id: str, message: list[str]) -> list[str]:
+    """`git merge --no-ff` of `ref` in the checkout `where`; the lines saying which conflicts were resolved.
+
+    A conflict `conflicts` resolves (the task's own status file takes the branch's record, 0.6.0, KF-37) is
+    resolved and staged, and the merge is committed with the same message and trailers, so it is the tree the
+    trial merge judged. Any other conflict aborts the merge and is a KitError naming it.
+    """
+    code, output = run_argv(["git", "-C", str(where), "merge", "--no-ff", *message, ref], where)
+    if code == 0:
+        return []
+    lines, remaining = conflicts.resolve_index(where, branch, task_id)
+    if lines and not remaining:
+        code, output = run_argv(["git", "-C", str(where), "commit", "-q", *message], where)
+        if code == 0:
+            return lines
+    run_argv(["git", "-C", str(where), "merge", "--abort"], where)
+    if remaining:
+        raise KitError(f"git merge of {branch} conflicts in: {', '.join(remaining)}")
+    raise KitError(f"git merge of {branch} failed: {(output.strip().splitlines() or [f'exit {code}'])[-1]}")
+
+
 # --- integration rounds ----------------------------------------------------------------
 
 def _round_path(root: Path, name: str) -> Path:
@@ -274,12 +297,12 @@ def round_start(root: Path, name: str, task_ids: list[str]) -> Path:
     git(root, "worktree", "add", "--detach", str(trial), MAIN)
     try:
         for member in members:
-            code, output = run_argv(["git", "-C", str(trial), "merge", "--no-ff", "-m",
-                                     f"round {name}: merge {member['branch']}", member["sha"]], trial)
-            if code != 0:
-                run_argv(["git", "-C", str(trial), "merge", "--abort"], trial)
+            try:
+                _merge_resolving(trial, member["branch"], member["sha"], member["id"],
+                                 ["-m", f"round {name}: merge {member['branch']}"])
+            except KitError as exc:
                 raise KitError(f"round {name}: {member['branch']} does not merge after the members before it: "
-                               f"{(output.strip().splitlines() or ['conflict'])[-1]}")
+                               f"{exc}") from None
         head = git(trial, "rev-parse", "HEAD")
     finally:
         problem = gate._remove_trial(root, trial)
@@ -452,10 +475,7 @@ def merge(root: Path, task_id: str, inspected: str | None = None, round_name: st
     if retried:
         lines.insert(0, f"merge check: {retried}; the second run passed")
     message = ["-m", f"Merge {branch} ({tier} tier)"] + [part for line in trailers for part in ("-m", line)]
-    code, output = run_argv(["git", "-C", str(root), "merge", "--no-ff", *message, f"refs/heads/{branch}"], root)
-    if code != 0:
-        run_argv(["git", "-C", str(root), "merge", "--abort"], root)
-        raise KitError(f"git merge of {branch} failed: {(output.strip().splitlines() or [f'exit {code}'])[-1]}")
+    lines += _merge_resolving(root, branch, f"refs/heads/{branch}", task_id, message)
     lines.append(f"merged: {branch} into {MAIN} at {git(root, 'rev-parse', 'HEAD')}")
     wrote = ["program/HANDOFF.md", ctlstate.STATE_FILE, "program/costs.jsonl", "program/rulings.md"]
     problems = []

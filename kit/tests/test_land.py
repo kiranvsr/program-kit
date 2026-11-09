@@ -761,6 +761,93 @@ class MergeTests(LandBase):
         self.assertEqual((code, err), (0, ""), out)
 
 
+STATUS = f"program/status/{TASK}.json"
+
+
+@skip_unless_slow()
+class StatusConflictTests(LandBase):
+    """0.6.0, KF-37: a conflict on the task's own status file takes the branch's record, in the trial and the merge."""
+
+    def main_moves_the_record(self, note="main's copy", **over):
+        """Main changes the task's record after the branch forked: the conflict the program it came from saw."""
+        write_json(self.root / STATUS, status_record(TASK, tier="standard", note=note, **over))
+        return commit(self.root, "main changes the status record")
+
+    def test_a_status_file_conflict_with_main_takes_the_branchs_record_and_lands(self):
+        self.standard()
+        self.main_moves_the_record()
+        branch_record = sh(self.root, "git", "show", f"{BRANCH}:{STATUS}")
+        tip = self.head(self.wt)
+        code, out, err = self.pk("merge", TASK, "--trailer", "Co-Authored-By: Test Agent")
+        self.assertEqual((code, err), (0, ""), out)
+        lines = out.splitlines()
+        self.assertLess(len(lines), 10)
+        self.assertEqual(lines[0], f"OK: {BRANCH} merges into main at {tip}")
+        self.assertIn(f"resolved: {STATUS}: took {BRANCH}'s record (the task's own status file)", lines)
+        self.assertEqual((self.root / STATUS).read_text(), branch_record)
+        self.assertEqual(sh(self.root, "git", "status", "--porcelain").strip(), "")
+        log = sh(self.root, "git", "log", "--format=%s%n%(trailers)", "-2").splitlines()
+        self.assertIn(f"Merge {BRANCH} (standard tier)", log)
+        self.assertEqual(log.count("Co-Authored-By: Test Agent"), 2)
+        parents = sh(self.root, "git", "rev-list", "--parents", "-n", "1", "HEAD~1").split()
+        self.assertEqual(parents[2], tip)  # a real merge of the tip
+        self.assertEqual(status.read(self.root, TASK)["status"], "done")
+        self.assertEqual(status.validate(self.root), [])
+        self.assert_no_trial_left()
+
+    def test_the_merge_check_resolves_the_status_file_in_its_trial_merge_and_says_so(self):
+        self.standard()
+        self.main_moves_the_record()
+        rc, out = self.merge_check()
+        self.assertEqual(rc, 0, out)
+        self.assertIn(f"resolved: {STATUS}: took {BRANCH}'s record (the task's own status file)", out.splitlines())
+
+    def test_a_branch_record_that_changes_the_tier_is_still_refused_after_the_conflict_is_resolved(self):
+        self.standard(done=False)
+        write_json(self.wt / STATUS, status_record(TASK, tier="full", note="the branch's"))
+        commit(self.wt, "the branch raises its own tier")
+        self.main_moves_the_record()
+        rc, out = self.merge_check()
+        self.assertEqual(rc, 1)
+        self.assertIn(f"FAILED: tier {STATUS} changes the tier, fast path or ruling recorded on main", out)
+        self.assert_no_trial_left()
+
+    def test_another_conflicted_path_still_stops_the_merge_and_is_named(self):
+        self.standard(done=False)
+        put(self.wt, "notes.txt", "the branch's notes\n")
+        commit(self.wt, "notes on the branch")
+        self.accept(self.wt, TASK)
+        put(self.root, "notes.txt", "main's notes\n")
+        self.main_moves_the_record()
+        before = self.head()
+        code, out, err = self.pk("merge", TASK)
+        self.assertEqual(code, 1)
+        self.assertIn("conflicts in: notes.txt", err)
+        self.assertNotIn(f"conflicts in: {STATUS}", err)
+        self.untouched(before)
+
+    def test_a_done_record_copied_to_main_by_hand_no_longer_blocks_reopen(self):
+        """The 0.5.x workaround: the controller copied the branch's done record to main; the branch is not merged."""
+        self.standard()
+        shutil.copy(self.wt / STATUS, self.root / STATUS)
+        commit(self.root, "the branch's status, copied to main by hand")
+        said = []
+        record = status.reopen(self.wt, TASK, "late work after acceptance", said=said)
+        self.assertEqual(record["status"], "review")
+        self.assertEqual(said, [f"note: main's {STATUS} says done, but {BRANCH} is not merged into main: the record "
+                                f"there is a copy, and pk merge takes the branch's record"])
+
+    def test_reopen_is_refused_once_the_branch_is_merged_even_after_later_commits(self):
+        self.standard()
+        self.assertEqual(self.pk("merge", TASK)[0], 0)
+        with self.assertRaisesRegex(KitError, f"{BRANCH} is merged into main: it has landed"):
+            status.reopen(self.wt, TASK, "too late")
+        put(self.wt, "more.py", "MORE = 1\n")
+        commit(self.wt, "more work on the landed branch")
+        with self.assertRaisesRegex(KitError, f"{BRANCH} is merged into main: it has landed"):
+            status.reopen(self.wt, TASK, "too late")
+
+
 @skip_unless_slow()
 class LightMergeTests(LandBase):
     LIGHT = {"full_paths": ["auth/"], "light_paths": ["web/"], "light_ruling": "R1"}
