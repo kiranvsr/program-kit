@@ -29,7 +29,11 @@ there is none. `note:` lines say what was skipped and why; they are not findings
 
 The code is the stand-in (`standin.patch` applied to main) or, without one, the tip of the task branch
 (`task/<folder name>`, else `origin/task/<folder name>`); with neither, the checks that need the code are skipped
-with a note. The stand-in is applied to a private index and object directory, never to a checkout, so the
+with a note, except one (0.6.0, KF-42): when the SPEC has a `## Prescribed Code` section, each plant's find must
+occur exactly once in the fenced blocks prescribed for its file (a `### P-1` heading naming the path in
+backticks, or a line right before a block starting with the backticked file and a colon, under the heading's
+folder), or, when those blocks lack it, once in main's file; a file with no block is named once in a note as not
+checkable. The stand-in is applied to a private index and object directory, never to a checkout, so the
 repository is not written to. `--build` adds and removes a detached worktree per run (`evidence.PlantJudge`, the
 evidence runner's mirror) and runs main's build commands in it, one row at a time; a plants.py is imported in a
 separate Python process. Standard library only.
@@ -399,8 +403,131 @@ def _other_scripts(folder, source):
                      if source is None or path.resolve() != Path(source).resolve())
 
 
+# ---------------------------------------------------------------- prescribed code (KF-42)
+
+FENCE = re.compile(r"^[ \t]*(```|~~~)")
+PATH_TOKEN = re.compile(r"`([^`\s]+)`")
+PATH_TOKEN_ANY = re.compile(r"`([^`]+)`")  # an inline code span of a prose line
+FILE_LIKE = re.compile(r"[\w.@+-]+(?:/[\w.@+-]+)*\.[A-Za-z0-9]+")
+DIR_LIKE = re.compile(r"[\w.@+-]+(?:/[\w.@+-]+)*/?")
+
+
+def _heading_target(text):
+    """('file', path) or ('dir', path) named by a heading's backticked path, or (None, None)."""
+    tokens = PATH_TOKEN.findall(text)
+    files = [t for t in tokens if FILE_LIKE.fullmatch(t) and not t.endswith("/")]
+    if len(files) == 1:
+        return "file", files[0]
+    dirs = [t.rstrip("/") for t in tokens if DIR_LIKE.fullmatch(t) and ("/" in t)]
+    if len(dirs) == 1 and not files:
+        return "dir", dirs[0]
+    return None, None
+
+
+def _lead_in_path(line):
+    """The file a prose line starts with (`name.ext`: or `name.ext`, ...), or None."""
+    line = re.sub(r"^\s*[-*]\s+", "", line)
+    m = re.match(r"`([^`\s]+)`[,:]", line)
+    if m and FILE_LIKE.fullmatch(m.group(1)):
+        return m.group(1)
+    return None
+
+
+def prescribed_blocks(spec_text):
+    """The fenced blocks of the SPEC's `## Prescribed Code` section, each {file, resolved, text, line}.
+
+    A block's file is named by its heading (### P-n and the backticked path), or by the prose line right before it
+    when that line starts with a backticked file and a colon or comma, taken under the heading's folder when the
+    heading names one; later blocks keep that file until the next such line or heading. The inline code spans of a
+    prose line are a block of their own (`inline` True) of the file current there: a short change is often
+    prescribed in a sentence. `resolved` is False for a lead-in path with no folder to put it under: it is matched
+    by its end. A block with no file is left out."""
+    blocks = []
+    for name, lines in sections(spec_text):
+        if not name.lower().startswith("prescribed code"):
+            continue
+        kind = base = current = None
+        resolved = False
+        inside, start, body = False, 0, []
+        for n, line in lines:
+            if inside:
+                if FENCE.match(line):
+                    if current:
+                        blocks.append({"file": current, "resolved": resolved, "text": "".join(body), "line": start,
+                                       "inline": False})
+                    inside = False
+                else:
+                    body.append(line + "\n")
+                continue
+            if re.match(r"^#{3,6}\s", line):
+                kind, base = _heading_target(line)
+                current, resolved = (base, True) if kind == "file" else (None, False)
+                continue
+            if FENCE.match(line):
+                inside, start, body = True, n, []
+                continue
+            if not line.strip():
+                continue
+            lead = _lead_in_path(line)
+            if lead:  # a prose line naming its file: the blocks and inline code from here on are that file's
+                if kind == "dir":
+                    current, resolved = (lead if lead.startswith(base + "/") else f"{base}/{lead}"), True
+                else:
+                    current, resolved = lead, False  # no folder to put it under: matched by its end
+            spans = PATH_TOKEN_ANY.findall(line)[1 if lead else 0:]
+            if current and spans:
+                blocks.append({"file": current, "resolved": resolved, "text": "".join(f"{x}\n" for x in spans),
+                               "line": n, "inline": True})
+    return blocks
+
+
+def _prescribed_for(blocks, path):
+    """(the text of the fenced blocks of `path`, the text of its inline code), or None when nothing names it."""
+    hit = [b for b in blocks if b["file"] == path or (not b["resolved"] and path.endswith("/" + b["file"]))]
+    if not hit:
+        return None
+    return "".join(b["text"] for b in hit if not b["inline"]), "".join(b["text"] for b in hit if b["inline"])
+
+
+def check_prescribed(plants, blocks, repo, loc, findings, notes):
+    """PC-1 without the code (KF-42): each find occurs exactly once in its file's fenced prescribed code, else once
+    in its inline code, else once in main's file; a file nothing prescribes is named once as not checkable."""
+    main_env = None
+    base = "main" if repo.ref_ok("main") else ("HEAD" if repo.ref_ok("HEAD") else None)
+    if base:
+        main_env = repo.index_env("main-tree")
+        repo.run(["read-tree", base], env=main_env)
+    unchecked, checked = {}, 0
+    for p in plants:
+        if p.find is None or not p.file:
+            continue
+        text = _prescribed_for(blocks, p.file)
+        if text is None:
+            unchecked.setdefault(p.file, []).append(p.id)
+            continue
+        checked += 1
+        if p.find == "":
+            findings.append(Finding("PC-1", loc(p), f"{p.id} has an empty find"))
+            continue
+        fenced, inline = text
+        count = fenced.count(p.find)
+        if count == 0 and inline.count(p.find) == 1:
+            continue  # a line prescribed in the prose, as inline code
+        if count == 0 and main_env is not None:
+            on_main = repo.show(main_env, p.file)
+            if on_main is not None and on_main.count(p.find) == 1:
+                continue  # an existing line of main's file the prescribed code builds around
+        if count != 1:
+            findings.append(Finding("PC-1", loc(p), f"{p.id} find occurs {count} times in the prescribed code of "
+                                                    f"{p.file} (SPEC.md ## Prescribed Code; must be once)"))
+    notes.append(f"no standin.patch and no task branch: {checked} find(s) checked against the SPEC's Prescribed Code; "
+                 "the needle and label checks need the code and were not run")
+    for path, ids in unchecked.items():
+        notes.append(f"not checkable: {path} has no block in the SPEC's Prescribed Code ({', '.join(ids)})")
+
+
 def check_plants(folder, plants, source, plan_text, repo, env, files, findings, notes, unavailable,
-                 require_plants=False):
+                 require_plants=False, prescribed=None):
     plan_name = "PLAN.md"
     rows = plan_rows(plan_text)
     by_row = {r["id"]: r for r in rows}
@@ -438,7 +565,9 @@ def check_plants(folder, plants, source, plan_text, repo, env, files, findings, 
         if unavailable or require_plants:
             findings.append(Finding("PC-1", folder.name, unavailable or "no standin.patch and no task branch: the "
                                     "find, needle and label checks need the code"))
-        elif plants:
+        if plants and prescribed and not unavailable:  # KF-42: the finds against the SPEC's Prescribed Code
+            check_prescribed(plants, prescribed, repo, loc, findings, notes)
+        elif plants and not (unavailable or require_plants):
             notes.append("no standin.patch and no task branch: the find, needle and label checks need the code "
                          "and were skipped")
         return
@@ -656,8 +785,10 @@ def precheck(folder, root, build=False, timeout=None, notes=None, require_plants
                     break
         if env is not None:
             files = repo.ls(env)
+        spec = folder / "SPEC.md"
+        prescribed = prescribed_blocks(read_text(spec)) if env is None and spec.exists() else None
         check_plants(folder, plants, source, plan_text, repo, env, files, findings, notes, unavailable,
-                     require_plants)
+                     require_plants, prescribed)
         if not plants and not require_plants:
             notes.append("no plant table in PLAN.md and no plants.py or plants.json: the plant checks were skipped "
                          "(--require-plants makes that a finding)")
