@@ -4,7 +4,9 @@
 The page shows what the kit already knows, read only from kit-managed files: the generated hand-off block (rendered
 now, exactly as `pk handoff update` would write it), the register with each task's status and tier, the status
 counts, the gates of `program/gates.yaml` with the status of the tasks whose records prove them, the cost log
-(totals per task and per model, the agents past the fresh-agent threshold) and the open follow-ups. It adds no
+(totals per task and per model, the agents past the fresh-agent threshold), the open follow-ups and, when
+`program/beta-feedback.md` exists (0.6.0), a Feedback panel: the open items by urgency then number and the five most
+recently done, declined ones hidden; a row that does not read fails the page, naming the row and the field. It adds no
 state of its own and decides nothing: the hand-off stays the document a successor reads, and every check stays a
 command. The page carries no script, no external asset and no wall-clock time, so the same commit and state give
 the same bytes; it names the commit it was made at.
@@ -20,6 +22,7 @@ from pathlib import Path
 
 import cost as cost_module
 import ctlstate
+import feedback as feedback_module
 import handoff as handoff_module
 import register as register_module
 import status as status_module
@@ -163,8 +166,10 @@ def render(root: Path) -> tuple[str, dict]:
     followups_html = "".join(f"<li><code>{_e(item['id'])}</code> <b>{_e(item['area'])}</b>: {_e(item['item'])}"
                              + (f" <span class=meta>[{_e(', '.join(item['tags']))}]</span>" if item["tags"] else "")
                              + "</li>" for item in followups)
+    feedback_html = feedback_module.panel_html(root)  # 0.6.0: '' without the register; a bad row raises
     page = TEMPLATE
-    for key, value in (("COMMIT", _e(commit)), ("TILES", tiles), ("BAR", _bar(counts)), ("LEGEND", legend),
+    for key, value in (("COMMIT", _e(commit)), ("FEEDBACK", feedback_html), ("TILES", tiles), ("BAR", _bar(counts)),
+                       ("LEGEND", legend),
                        ("HANDOFF", _block_html(block)), ("REGISTER", register_html), ("GATES", gates_html),
                        ("COSTS", costs_html), ("FLAGGED", f"<ul>{flagged}</ul>" if flagged else ""),
                        ("FOLLOWUPS", f"<ul>{followups_html}</ul>" if followups_html
@@ -211,6 +216,7 @@ table{border-collapse:collapse;width:100%;font-size:.86rem;margin-top:6px}
 th{text-align:left;font-size:.72rem;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);
 padding:5px 8px;border-bottom:1px solid var(--line)}
 td{padding:5px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+.u-urgent{color:var(--crit)}.u-high{color:var(--warn)}.u-polish{color:var(--idle)}
 .panel{overflow-x:auto}ul{padding-left:1.2em;margin:4px 0}li{margin:3px 0}.empty{color:var(--muted);font-style:italic}
 </style>
 </head>
@@ -232,7 +238,7 @@ kit's files; the hand-off and the commands are the record</span></header>
 </div>
 </div>
 <h2>Gates</h2>
-<div class="panel">@@GATES@@</div>
+<div class="panel">@@GATES@@</div>@@FEEDBACK@@
 <div class="grid">
 <div><h2>Costs</h2><div class="panel">@@COSTS@@@@FLAGGED@@</div></div>
 <div><h2>Open follow-ups</h2><div class="panel">@@FOLLOWUPS@@</div></div>

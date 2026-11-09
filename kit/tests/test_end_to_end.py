@@ -521,6 +521,12 @@ class EndToEndTests(unittest.TestCase):
         self.assertIn("not installed", project.pk("hook", "list").stdout)
         project.pk("hook", "install", hook.ADAPTERS[0], expect=1)
         self.assertEqual(project.git("status", "--porcelain"), "")
+        # 0.6.0: the research track, the feedback register and the progress pass are opt-in: without their
+        # configuration or file each says so and changes nothing
+        self.assertIn("research is not configured", project.pk("research", "list", expect=1).stderr)
+        self.assertIn("no program/beta-feedback.md", project.pk("feedback", "check").stdout)
+        self.assertIn("progress section", project.pk("progress", expect=1).stderr)
+        self.assertEqual(project.git("status", "--porcelain"), "")
         project.pk("init", expect=1)  # program/ exists: init refuses to overwrite it
 
         pk.build_parser()  # fills pk.COMMANDS: only init and doctor register at import, the rest when it is built
