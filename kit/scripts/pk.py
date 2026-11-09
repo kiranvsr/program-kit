@@ -32,7 +32,7 @@ TEMPLATE_FILES = ("BRIEF.md", "checks.yaml", "environments.yaml", "CLAIM_BOUNDAR
 COMMAND_MODULES: tuple[str, ...] = ("status", "rulings", "register", "briefs", "trace", "interview", "evidence",
                                     "stale", "fetch", "gate", "worktree", "handoff", "change", "manifest",
                                     "cost", "tracker", "land", "fingerprint", "dashboard", "drift", "precheck",
-                                    "hook")
+                                    "hook", "research", "remote", "lock", "feedback", "progress")
 
 COMMANDS: dict[str, Callable[[argparse.Namespace], int]] = {}
 CONFIGURERS: dict[str, tuple[str, Callable[[argparse.ArgumentParser], None] | None]] = {}
@@ -160,6 +160,8 @@ def _checks_problems(data) -> list[str]:
         parts.append(({"drift": data.get("drift")}, ()))
         parts.append(({"evidence": data.get("evidence")}, ()))
         parts.append(({"progress": data.get("progress")}, ()))
+        for key in ("merge", "research", "remote"):  # 0.6.0
+            parts.append(({key: data.get(key)}, ()))
         parts.append(({key: value for key, value in data.items() if key not in gate.ALL_KEYS}, ()))
     problems = []
     for part, require in parts:

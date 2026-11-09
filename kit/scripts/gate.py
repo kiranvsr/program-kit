@@ -79,7 +79,9 @@ from register import GATE_ID, GATE_SHAPE
 
 MAIN = "main"  # the primary branch; fixed, so no caller can choose where the rules are read from
 CHECK_KEYS = ("build", "test", "scan", "compile_check", "extra_gate")
-ALL_KEYS = CHECK_KEYS + ("parallel_steps", "guarded_files", "tiers", "drift", "evidence", "progress")  # drift, progress: `pk drift` only
+ALL_KEYS = CHECK_KEYS + ("parallel_steps", "guarded_files", "tiers", "drift", "evidence", "progress", "merge",
+                         "research", "remote")  # drift, progress: `pk drift` only; research, remote: their commands (0.6.0)
+MERGE_KEYS = ("union_files",)  # the `merge` section (0.6.0)
 TIER_KEYS = ("full_paths", "light_paths", "light_ruling")
 BUILTIN_FULL = ("kit/", "program/checks.yaml", "program/gates.yaml")  # the kit's own gates: always full-tier
 LIGHT_STEPS = ("build", "compile_check", "scan")
@@ -180,6 +182,23 @@ def _parse_tiers(value) -> dict:
     return tiers
 
 
+def _parse_merge(value) -> dict:
+    """The `merge` section of checks.yaml (0.6.0) as {union_files: [str]}; absent means no file merges as a union."""
+    if value is None:
+        value = {}
+    if not isinstance(value, dict):
+        raise KitError("checks.yaml: merge must be a mapping of " + ", ".join(MERGE_KEYS))
+    unknown = sorted(str(key) for key in value if key not in MERGE_KEYS)
+    if unknown:
+        raise KitError(f"checks.yaml: merge: unknown key {_show(', '.join(unknown))} (expected {', '.join(MERGE_KEYS)})")
+    union = value.get("union_files")
+    if union is None:
+        union = []
+    if not isinstance(union, list) or not all(isinstance(path, str) and path for path in union):
+        raise KitError("checks.yaml: merge.union_files must be a list of paths")
+    return {"union_files": [_norm_guard(path) for path in union]}
+
+
 def _parse_checks(data, require: tuple[str, ...]) -> dict:
     if data is None:
         data = {}
@@ -209,6 +228,13 @@ def _parse_checks(data, require: tuple[str, ...]) -> dict:
 
     checks["progress"] = progress.parse(data.get("progress"))
     checks["evidence"] = evidence_module.parse_config(data.get("evidence"))
+    checks["merge"] = _parse_merge(data.get("merge"))
+    import research  # late, like drift: read by `pk research` alone (0.6.0)
+
+    checks["research"] = research.parse(data.get("research"))
+    import remote  # late, like drift: read by `pk remote` alone (0.6.0)
+
+    checks["remote"] = remote.parse(data.get("remote"))
     for key in require:
         if not checks[key]:
             raise KitError(f"checks.yaml: {key} must list at least one command")

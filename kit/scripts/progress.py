@@ -185,3 +185,7 @@ def ready_lines(found: dict) -> list[str]:
     lines += [f"{item['id']} near-ready, after {item['waiting_on']} ({item['waiting_status']}): {item['title']}"
               for item in found["near_ready"]]
     return lines
+
+
+def register(add_command) -> None:
+    """Placeholder (0.6.0 scaffold): `pk progress`."""
