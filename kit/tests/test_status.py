@@ -780,5 +780,80 @@ class StatusCliTests(unittest.TestCase):
         self.assertFalse((self.root / "program" / "status").exists())
 
 
+class AcceptDoneTests(unittest.TestCase):
+    """`pk evidence accept <ID> <file> --done` (0.6.0): the acceptance, then done as QA; the file lives outside."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.outside = Path(tmp.name).resolve() / "qa"
+        self.outside.mkdir()
+        self.root = Path(tmp.name).resolve() / "repo"
+        self.root.mkdir()
+        write_register(self.root)
+        (self.root / ".gitignore").write_text(".worktrees/\nscratch/\n")
+        self.head = git_repo(self.root)
+        self.results = store.record(self.root, TID, "results", results_record(head=self.head))
+
+    def acceptance_file(self, folder):
+        path = Path(folder) / "acceptance.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"task_id": TID, "decision": "accepted_development",
+                                    "evidence_sha256": self.results["digest"], "source_commit": self.head,
+                                    "accepted_at": "2026-01-01T00:00:00Z", "role": "qa", **full_review(),
+                                    "findings": [], "blocked_by": []}))
+        return path
+
+    def accept(self, *argv):
+        import evidence
+
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(evidence, "find_root", return_value=self.root), contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(err):
+            code = pk.main(["evidence", "accept", TID, *map(str, argv)])
+        return code, out.getvalue(), err.getvalue()
+
+    def to_review(self):
+        status.transition(self.root, TID, "in_progress", "controller")
+        status.transition(self.root, TID, "review", "implementer")
+
+    def test_done_appends_the_acceptance_and_sets_the_task_done_as_qa(self):
+        self.to_review()
+        code, out, err = self.accept(self.acceptance_file(self.outside), "--done")
+        self.assertEqual((code, err), (0, ""), err)
+        self.assertTrue(out.splitlines()[0].startswith("acceptance "), out)
+        self.assertEqual(out.splitlines()[1], f"{TID}: done")
+        record = status.read(self.root, TID)
+        self.assertEqual((record["status"], record["role"]), ("done", "qa"))
+
+    def test_done_refuses_an_acceptance_file_inside_the_repository_or_one_of_its_worktrees(self):
+        self.to_review()
+        wt = self.root.parent / "elsewhere-wt"
+        subprocess.run(["git", "-C", str(self.root), "worktree", "add", "-q", "-b", "other", str(wt)], check=True,
+                       capture_output=True)
+        for folder in (self.root / "scratch", wt / "notes"):
+            code, out, err = self.accept(self.acceptance_file(folder), "--done")
+            self.assertEqual((code, out), (1, ""), folder)
+            self.assertIn("lives inside", err)
+            self.assertIn("write it outside the repository", err)
+        self.assertIsNone(store.latest(store.read_index(self.root), TID, "acceptance"))
+        self.assertEqual(status.read(self.root, TID)["status"], "review")
+
+    def test_without_done_accept_behaves_as_before(self):
+        self.to_review()
+        code, out, err = self.accept(self.acceptance_file(self.root / "scratch"))
+        self.assertEqual((code, err), (0, ""), err)
+        self.assertEqual(len(out.splitlines()), 1)
+        self.assertEqual(status.read(self.root, TID)["status"], "review")
+
+    def test_a_refused_done_says_the_acceptance_is_appended_and_how_to_finish(self):
+        status.transition(self.root, TID, "in_progress", "controller")  # not in review: done is refused
+        code, out, err = self.accept(self.acceptance_file(self.outside), "--done")
+        self.assertEqual(code, 1)
+        self.assertTrue(out.startswith("acceptance "), out)
+        self.assertIn("in_progress -> done is not allowed", err)
+        self.assertIn(f"the acceptance is appended; fix that, then run: pk status set {TID} done --role qa", err)
+
+
 if __name__ == "__main__":
     unittest.main()

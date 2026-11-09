@@ -1842,10 +1842,37 @@ def accept(root, task_id: str, data) -> dict:
     return store.record(root, task_id, "acceptance", data)
 
 
+def _inside_repository(root: Path, path: Path) -> Path | None:
+    """The checkout of this repository (the main one or any of its worktrees) that holds `path`, or None."""
+    listing = git(root, "worktree", "list", "--porcelain")
+    trees = [Path(root), *(Path(line[len("worktree "):]) for line in listing.splitlines()
+                           if line.startswith("worktree "))]
+    target = path.resolve()
+    return next((tree for tree in trees if target.is_relative_to(tree.resolve())), None)
+
+
 def _accept(args) -> int:
+    """`pk evidence accept <ID> <file> [--done]`. With --done (0.6.0, the QA record step in one command): the file must
+    live outside the repository and its worktrees, and after the append the task is set done as QA, with every check
+    of `pk status set <ID> done --role qa`. Without it, exactly as 0.5.5."""
     root = find_root()
-    appended = accept(root, args.task_id, read_json(Path(args.acceptance)))
+    source = Path(args.acceptance)
+    if args.done:
+        holder = _inside_repository(root, source)
+        if holder is not None:
+            raise KitError(f"{source} lives inside {holder}, a checkout of this repository: QA's acceptance file is "
+                           "its own, so write it outside the repository (your scratch folder) and run this again")
+    appended = accept(root, args.task_id, read_json(source))
     print(f"acceptance {appended['digest']} appended: {appended['path']}")
+    if args.done:
+        import status  # late: status imports this module
+
+        try:
+            record = status.transition(root, args.task_id, "done", "qa")
+        except KitError as exc:
+            raise KitError(f"{exc} (the acceptance is appended; fix that, then run: pk status set {args.task_id} done "
+                           "--role qa)") from exc
+        print(f"{record['task_id']}: {record['status']}")
     return 0
 
 
@@ -1935,6 +1962,9 @@ def _configure(parser: argparse.ArgumentParser) -> None:
     accepter = actions.add_parser("accept", help="append QA's acceptance record (it must bind the latest results)")
     accepter.add_argument("task_id", metavar="ID")
     accepter.add_argument("acceptance", metavar="acceptance.json", help="the acceptance QA wrote, outside the repo")
+    accepter.add_argument("--done", action="store_true",
+                          help="then set the task done as QA (pk status set <ID> done --role qa); the acceptance file "
+                               "must live outside the repository and its worktrees")
     actions.add_parser("import", help="copy 0.1 program/evidence/<ID>/*.json into the append-only layout and build "
                                       "the pointers")
     tree = actions.add_parser("check-tree", help="in a task worktree: refuse a commit since BASE or an uncommitted "
