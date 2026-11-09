@@ -7,6 +7,7 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -639,7 +640,9 @@ class ChunkOptionRefusals(unittest.TestCase):
                              "--per-row-seconds must be above 0"),
                             (["--all-pending", "--chunk-seconds", "60", "--chunk", "3/2"], "--chunk must be K/M"),
                             (["--all-pending", "--chunk-seconds", "60", "--plan", "--chunk", "1/2"],
-                             "--plan or --chunk, not both")):
+                             "--plan or --chunk, not both"),
+                            (["--adopt", "--all-pending"], "--adopt takes no rows or chunk options"),
+                            (["--adopt", "--chunk-seconds", "60"], "--adopt takes no rows or chunk options")):
             rc, said = self.run_pk(*argv)
             self.assertEqual(rc, 1, argv)
             self.assertIn(words, said, argv)
@@ -732,6 +735,97 @@ class ChunkedStops(SplitBase):
                       "row(s) have no killed verdict: sub-plus, add-more-2", said)
         self.assertIn(f"continue with: pk gate plants {TASK} --branch {BRANCH} --all-pending --chunk-seconds 10 "
                       "--per-row-seconds 5", said)
+
+
+# --- 0.6.0: plants records judged in another checkout, listed here by --adopt -----------------------------------------
+
+class AdoptBase(SplitBase):
+    """Plants records judged in another checkout (another machine) are listed in this pointer by --adopt."""
+
+    def elsewhere(self, *argv):
+        """Judge in a second clone of the task branch, as another machine would; the new plants files there."""
+        other = self.root.parent / "elsewhere"
+        if not other.exists():
+            sh(self.root.parent, "git", "clone", "-q", str(self.root), str(other))
+            sh(other, "git", "worktree", "add", "-q", "-B", BRANCH, f".worktrees/{TASK.lower()}", f"origin/{BRANCH}")
+        before = {item["path"] for item in store.read_plants(other / ".worktrees" / TASK.lower(), TASK)}
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(gate, "find_root", return_value=other), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = pk.main(["gate", "plants", TASK, "--branch", BRANCH, *argv])
+        self.assertEqual(rc, 0, out.getvalue() + err.getvalue())
+        owt = other / ".worktrees" / TASK.lower()
+        return [owt / item["path"] for item in store.read_plants(owt, TASK) if item["path"] not in before]
+
+    def bring(self, files):
+        for path in files:
+            target = self.wt / path.relative_to(path.parents[4])
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, target)
+
+
+class Adopt(AdoptBase):
+    def test_records_judged_elsewhere_are_listed_by_adopt_and_count_for_the_record(self):
+        _, entry, data = self.gate_record()
+        base = ["--all-pending", "--chunk-seconds", "10", "--per-row-seconds", "5", "--workers", "1"]
+        self.assertEqual(self.gate_plants(*base, "--chunk", "1/2")[0], 0)  # here: chunk 1, listed in this pointer
+        files = self.elsewhere(*base, "--chunk", "2/2")
+        self.assertEqual(len(files), 1)
+        self.bring(files)
+        rc, said, err = self.gate_plants("--adopt")
+        self.assertEqual((rc, err), (0, ""), said)
+        rel = files[0].relative_to(files[0].parents[4]).as_posix()
+        self.assertIn(f"plants: adopted {rel}", said)
+        self.assertEqual(self.chunks_of(), [ROWS[:2], ROWS[2:]])
+        self.assertIsNone(evidence.coverage_problem(self.wt, TASK, entry, data))
+        listed = {item["path"] for item in store.read_plants(self.wt, TASK)}
+        self.assertEqual(store.integrity(self.wt, uncommitted=listed), [])
+        rc, said, err = self.gate_plants("--adopt")
+        self.assertEqual((rc, err), (0, ""), said)
+        self.assertIn("plants: nothing to adopt", said)
+
+
+
+@skip_unless_slow()
+class AdoptRefusals(AdoptBase):
+    def test_a_file_that_is_not_a_plants_record_of_this_record_is_refused_and_nothing_is_adopted(self):
+        _, entry, data = self.gate_record()
+        good = self.elsewhere("--rows", "add-times")
+        self.bring(good)
+        folder = self.wt / f"program/evidence/{TASK}/plants"
+        record = json.loads(good[0].read_text())
+        for name, body, words in (
+                ("20261109T000000000000Z-000000000000.json", good[0].read_bytes(), "immutable record altered"),
+                (None, {**record, "task_id": T2}, "is a record of"),
+                (None, {**record, "part_of": {"path": entry["path"].replace(entry["digest"][:12], "1" * 12),
+                                              "digest": "1" * 64}}, "not bound to"),
+                (None, {**record, "head": "b" * 40}, "judged at"),
+                (None, {**record, "seconds": -1}, "not a valid plants record"),
+                (None, {**record, "rows": [{**record["rows"][0], "id": "add-minus"}]}, "not a deferred row")):
+            raw = body if isinstance(body, bytes) else store.encode(body)
+            if name is None:
+                name = f"20261109T000000000000Z-{evidence.sha256_bytes(raw)[:12]}.json"
+            path = folder / name
+            path.write_bytes(raw)
+            rc, said, err = self.gate_plants("--adopt")
+            self.assertEqual(rc, 1, words)
+            self.assertIn(f"program/evidence/{TASK}/plants/{name}", err, words)
+            self.assertIn(words, err)
+            self.assertEqual(store.read_plants(self.wt, TASK), [], words)  # the good one is not adopted either
+            path.unlink()
+        self.assertEqual(self.gate_plants("--adopt")[0], 0)
+        self.assertEqual(len(store.read_plants(self.wt, TASK)), 1)
+
+    def test_a_record_bound_to_a_record_this_one_reused_is_adopted(self):
+        _, entry, data = self.gate_record()
+        files = self.elsewhere("--rows", "add-times")
+        reused = minimal_record(data["planted_bugs"], head=data["head"],
+                                reused_from={"path": entry["path"], "digest": entry["digest"], "head": data["head"]})
+        store.record(self.wt, TASK, "results", reused)
+        self.bring(files)
+        rc, said, err = self.gate_plants("--adopt")
+        self.assertEqual((rc, err), (0, ""), said)
+        self.assertEqual(len(store.read_plants(self.wt, TASK)), 1)
 
 
 if __name__ == "__main__":

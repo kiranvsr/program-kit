@@ -7,6 +7,7 @@ command judges deferred rows afterwards, in chunks, at any time after the gate (
 
     pk gate plants <ID> --branch task/<ID> (--rows ID,ID,... | --all-pending) [--workers N] [--rejudge]
     pk gate plants <ID> --branch task/<ID> --all-pending --chunk-seconds N [--per-row-seconds S] [--plan | --chunk K/M]
+    pk gate plants <ID> --branch task/<ID> --adopt
 
 - The rows are judged at the `head` of the task's latest results record, never at the branch tip, each in a clean
   detached mirror of that commit, with the 0.5.2 pool: `--workers` (else PK_PLANT_WORKERS, else
@@ -29,6 +30,11 @@ command judges deferred rows afterwards, in chunks, at any time after the gate (
   the same everywhere, and prints each chunk with its rows, estimate and exact command, pinning S and the workers;
   it judges nothing. `--chunk K/M` judges chunk K's rows not killed yet, and refuses when the plan with these
   settings does not have M chunks. Each machine writes its own plants record and its own copy of the pointer.
+- Adopting (0.6.0): `pk gate plants <ID> --branch task/<ID> --adopt` lists in this pointer every plants record file
+  of `program/evidence/<ID>/plants/` it does not list yet (one judged elsewhere and copied here, never its pointer),
+  after checking its name and digest, its schema, its task, that it is bound to the latest results record or one it
+  reused and judged at that record's head, and that its rows are deferred rows of it; anything else refuses the
+  whole adoption. `pk remote plants` copies new plants records back and adopts them.
 - The verdicts are appended through the store as a new immutable record of kind `plants`,
   `program/evidence/<ID>/plants/<utc>-<sha256[:12]>.json`, in the task worktree, and listed in the task's pointer.
   It names the task, the results record it judged (`part_of`: path and digest), the head, the kit version and each
@@ -296,6 +302,79 @@ def _summary(found: dict, task_id: str, branch: str) -> list[str]:
     return []
 
 
+def adopt(root, task_id: str, branch: str, worktree=None) -> int:
+    """List in the task's pointer every plants record file of its `plants/` folder that the pointer does not list
+    yet: records judged in another checkout (another machine, `pk remote plants`) and copied here. Each must be
+    a record under its own name (the digest in the name is the file's), of the plants schema, of this task, bound by
+    `part_of` to the latest results record or a record it reused, judged at that record's head, and hold only
+    deferred rows of it with their definitions. Any file that is not refuses the whole adoption, naming it; nothing
+    is listed then. 0 when done (or nothing was new)."""
+    root = Path(root).resolve()
+    gate._task_branch(task_id, branch)
+    found = _context(root, task_id, branch, worktree)
+    wt, entry, data = found["wt"], found["entry"], found["data"]
+    chain = evidence_module.plants_chain(wt, entry, data)
+    deferred = {row["id"]: row["definition_sha256"] for row in data["planted_bugs"] if evidence_module.is_deferred(row)}
+    listed = {item["path"] for item in store.read_plants(wt, task_id)}
+    folder = wt / store.BASE / task_id / store.PLANTS
+    names = sorted(path.name for path in folder.iterdir() if path.is_file() and not path.name.startswith(".")) \
+        if folder.is_dir() else []
+    new = [f"{store.BASE}/{task_id}/{store.PLANTS}/{name}" for name in names]
+    new = [rel for rel in new if rel not in listed]
+    if not new:
+        gate._out(f"plants: nothing to adopt: every plants record in {store.BASE}/{task_id}/{store.PLANTS}/ is "
+                  f"listed in {store.pointer_path(task_id)}")
+        return 0
+    adopted, problems = [], []
+    for rel in new:
+        problem, record = _adoptable(wt, task_id, rel, chain, deferred)
+        if problem:
+            problems.append(f"{gate._show(rel)}: {problem}")
+        else:
+            adopted.append((rel, record))
+    if problems:
+        raise KitError(f"pk gate plants --adopt: nothing adopted; {len(problems)} file(s) in "
+                       f"{store.BASE}/{task_id}/{store.PLANTS}/ are not plants records of {entry['path']} or a record "
+                       f"it reused: " + "; ".join(problems) + " (remove what does not belong there, then adopt again)")
+    for rel, record in adopted:
+        store.add_plants_entry(wt, task_id, store.plants_entry({"digest": evidence_module.sha256_bytes(
+            (wt / rel).read_bytes()), "path": rel}, record))
+        killed = sum(row["killed"] for row in record["rows"])
+        gate._out(f"plants: adopted {rel} ({killed} of {len(record['rows'])} killed, judged at "
+                  f"{record['head'][:12]})")
+    gate._out(f"plants: commit the adopted records and {store.pointer_path(task_id)} on {branch}")
+    pending = _summary(found, task_id, branch)
+    if pending:
+        gate._out(f"plants: {len(pending)} of {len(deferred)} deferred rows have no killed verdict yet")
+    return 0
+
+
+def _adoptable(wt: Path, task_id: str, rel: str, chain: dict, deferred: dict) -> tuple[str | None, dict | None]:
+    """(why `rel` may not be adopted or None, the record)."""
+    try:
+        record = store.load(wt, rel)
+    except KitError as exc:
+        return " ".join(str(exc).split()), None
+    problems = evidence_module.validate_plants(record)
+    if problems:
+        return f"not a valid plants record: {problems[0]}", None
+    if record["task_id"] != task_id:
+        return f"is a record of {gate._show(record['task_id'])}, not of {task_id}", None
+    part_of = record["part_of"]
+    if part_of["digest"] not in chain or store.check_rel(part_of["path"])[0] != task_id \
+            or not part_of["path"].endswith(f"-{part_of['digest'][:12]}.json"):
+        return (f"not bound to the latest results record or a record it reused (part_of "
+                f"{gate._show(part_of['path'])})"), None
+    if record["head"] != chain[part_of["digest"]]:
+        return f"judged at {record['head']}, not at {chain[part_of['digest']]}, the head of the record it is bound to", None
+    for row in record["rows"]:
+        if row["id"] not in deferred:
+            return f"row {gate._show(row['id'])} is not a deferred row of the record", None
+        if row["definition_sha256"] != deferred[row["id"]]:
+            return f"row {gate._show(row['id'])} judged another definition than the deferred row", None
+    return None, record
+
+
 def _check_options(names, all_pending, chunk_seconds, per_row, plan, chunk) -> None:
     """KitError for a combination of the chunk options that has no meaning, before anything is read."""
     if all_pending and names:
@@ -425,6 +504,15 @@ def _chunked(root: Path, task_id: str, branch: str, workers, rejudge: bool, time
 
 def cmd_plants(args) -> int:
     names = [name.strip() for part in args.rows or [] for name in part.split(",")]
+    if args.adopt:
+        if args.rows or args.all_pending or args.rejudge or args.workers is not None or any(
+                value not in (None, False) for value in (args.chunk_seconds, args.per_row_seconds, args.plan,
+                                                         args.chunk)):
+            raise KitError("--adopt takes no rows or chunk options: it judges nothing and lists the plants records "
+                           "of the folder that the pointer does not list yet")
+        return adopt(gate.find_root(), args.task_id, args.branch, worktree=args.worktree)
+    if not args.rows and not args.all_pending:
+        raise KitError("one of the arguments --rows --all-pending is required (or --adopt)")
     return plants(gate.find_root(), args.task_id, args.branch, names=names, all_pending=args.all_pending,
                   workers=args.workers, rejudge=args.rejudge, timeout=args.timeout, worktree=args.worktree,
                   chunk_seconds=args.chunk_seconds, per_row=args.per_row_seconds, plan=args.plan, chunk=args.chunk)
@@ -436,7 +524,7 @@ def configure(actions) -> None:
                                                "record at its head and append a plants record bound to it")
     parser.add_argument("task_id", metavar="ID", help="task ID, for example P0-M01-S01-T01")
     parser.add_argument("--branch", required=True, help="the task branch, task/<ID>")
-    which = parser.add_mutually_exclusive_group(required=True)
+    which = parser.add_mutually_exclusive_group()
     which.add_argument("--rows", action="append", metavar="ID[,ID...]",
                        help="the deferred rows to judge (repeat or separate with commas)")
     which.add_argument("--all-pending", action="store_true",
@@ -450,6 +538,9 @@ def configure(actions) -> None:
                              f"evidence.plant_row_seconds, else {gate.ROW_SECONDS})")
     parser.add_argument("--plan", action="store_true",
                         help="print the chunks over every deferred row, with the command of each; judge nothing")
+    parser.add_argument("--adopt", action="store_true",
+                        help="list in the pointer the plants records of the plants/ folder it does not list yet "
+                             "(judged in another checkout and copied here), after checking each; judges nothing")
     parser.add_argument("--chunk", metavar="K/M", help="judge only chunk K of the plan of M chunks (its rows not "
                                                        "killed yet), for chunks spread over several machines")
     parser.add_argument("--workers", type=int, metavar="N", help="rows judged at once (default: PK_PLANT_WORKERS, "
