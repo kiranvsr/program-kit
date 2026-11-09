@@ -19,7 +19,7 @@ import pk
 import plants
 import status
 import store
-from common import KitError, read_json
+from common import KitError, read_json, read_yaml, write_yaml
 from test_gate import BRANCH, PRODUCE, PY, TASK, commit, put, run_quiet, sh
 from test_land import LandBase
 from test_parallel_plants import BUILD, PY as PLANT_PY, Base as PlantBase
@@ -826,6 +826,80 @@ class AdoptRefusals(AdoptBase):
         rc, said, err = self.gate_plants("--adopt")
         self.assertEqual((rc, err), (0, ""), said)
         self.assertEqual(len(store.read_plants(self.wt, TASK)), 1)
+
+
+# --- 0.6.0: a chunk judged on a lane of another machine through pk remote, and adopted here ------------------------
+
+@skip_unless_slow()
+class RemoteChunk(SplitBase):
+    """`pk remote plants --chunk K/M` against a fake remote machine (a local directory with the bare mirror and a lane
+    clone, reached through the fake ssh of test_remote), then the other chunk here."""
+
+    def machine(self):
+        """The fake remote machine with one lane; the environment pk remote needs to reach it."""
+        from test_remote import FAKE_SSH
+        machine, bin_dir = self.root.parent / "machine", self.root.parent / "fake-bin"
+        bin_dir.mkdir()
+        ssh = bin_dir / "ssh"
+        ssh.write_text(FAKE_SSH)
+        ssh.chmod(0o755)
+        (bin_dir / "python3").symlink_to(PY)
+        shutil.copytree(Path(plants.__file__).parent.parent, self.root / "kit",
+                        ignore=shutil.ignore_patterns("__pycache__", "tests"))
+        checks = read_yaml(self.root / "program" / "checks.yaml")
+        checks["remote"] = {"dir": str(machine), "lanes": ["lane1"], "workers": 1}
+        write_yaml(self.root / "program" / "checks.yaml", checks)
+        commit(self.root, "the kit and the remote section on main")
+        # --no-local: no hard links into a repository whose background gc may repack its objects meanwhile
+        sh(self.root.parent, "git", "clone", "-q", "--no-local", "--bare", str(self.root), str(machine / "repo.git"))
+        sh(self.root.parent, "git", "clone", "-q", "--no-local", str(machine / "repo.git"), str(machine / "lane1"))
+        env = {"PK_REMOTE_HOST": "lanes-host", "PK_REMOTE_SSH": str(ssh), "FAKE_SSH_LOG": str(self.root.parent / "log"),
+               "FAKE_BIN": str(bin_dir), "PK_REMOTE_POLL": "0.1", "PK_LOCK_POLL": "0.1",
+               "PATH": os.environ["PATH"] + os.pathsep + os.defpath}  # the gate fixture's PATH, and sh, tar, sed
+        return machine, env
+
+    def remote(self, env, *argv):
+        import remote
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, env), mock.patch.object(remote, "find_root", return_value=self.root), \
+                mock.patch.object(gate, "find_root", return_value=self.root), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            os.environ.pop("GIT_SSH_COMMAND", None)
+            rc = pk.main(["remote", *argv])
+        return rc, out.getvalue() + err.getvalue()
+
+    def test_a_chunk_judged_on_a_lane_comes_back_as_a_plants_record_and_is_adopted(self):
+        _, entry, data = self.gate_record()
+        machine, env = self.machine()
+        rc, said = self.remote(env, "plants", TASK, "--all-pending", "--chunk-seconds", "10", "--per-row-seconds", "5",
+                               "--chunk", "2/2", "--lane", "lane1")
+        self.assertEqual(rc, 0, said)
+        [item] = store.read_plants(self.wt, TASK)
+        self.assertIn(f"plants: adopted {item['path']}", said)
+        self.assertIn(f"remote: copied back {item['path']}", said)
+        self.assertEqual(self.chunks_of(), [ROWS[2:]])
+        self.assertEqual(evidence.plants_coverage(self.wt, TASK, entry, data)["pending"], ROWS[:2])
+        log = (machine / "lane1.log").read_text().splitlines()
+        tip = sh(self.wt, "git", "rev-parse", "HEAD").strip()
+        self.assertIn(f"start remote-plants-{TASK} at {tip[:12]}", log[0])
+        self.assertTrue(any("plants: chunk 2/2: 2 row(s)" in line for line in log), log)
+        self.assertIn(f"end remote-plants-{TASK} exit 0", log[-1])
+        self.assertFalse((machine / "lane1" / ".git" / "pk-heavy.lock").exists())
+        self.assertEqual(self.gate_plants("--all-pending", "--chunk-seconds", "10", "--per-row-seconds", "5",
+                                          "--workers", "1", "--chunk", "1/2")[0], 0)
+        self.assertIsNone(evidence.coverage_problem(self.wt, TASK, entry, data))
+
+    def test_a_gate_on_a_lane_brings_its_results_record_and_pointer_back(self):
+        _, old_entry, _ = self.gate_record()
+        machine, env = self.machine()
+        rc, said = self.remote(env, "gate", TASK, "--lane", "lane1", "--", "--no-reuse")
+        self.assertEqual(rc, 0, said)
+        entry, data = store.load_latest(self.wt, TASK, "results")
+        self.assertNotEqual(entry["digest"], old_entry["digest"])
+        self.assertIn(f"remote: copied back {entry['path']}", said)
+        self.assertIn(f"remote: copied back {store.pointer_path(TASK)}", said)
+        self.assertEqual(evidence.validate_results(data), [])
+        self.assertIn("OK: task/", (machine / "lane1.log").read_text())
 
 
 if __name__ == "__main__":
