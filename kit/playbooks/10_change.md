@@ -13,6 +13,8 @@ A correction that does not change meaning (a typo, a clarified sentence) is not 
 
 Before committing an edit under `program/`, run `pk change check` (0.5.5; it only hashes the approved files, so it takes a moment). It names every approved file (SPEC.md, ARCHITECTURE.md, the register and the rest) changed since its approval and says what to do: the approved request that carries the edit (`pk change apply` re-hashes it), or `pk change create` for a change of meaning, or `pk interview amend N` for a correction. It warns and exits 0; `--strict` exits 1, for an agent tool's pre-commit step. A generated file edited by hand shows in `pk drift` D1, and an approved one in D2, both naming `pk change create`.
 
+Research is not a change until it graduates (0.6.0, opt-in with the `research` section of `program/checks.yaml`). A folder of strategy items (`pk research init` writes its index from `kit/templates/research-README.md`) is isolated: no brief, spec or plan cites an item until the user has decided it should be built. Then record a ruling that quotes the item's ID and what was decided, run `pk research graduate <ID> --ruling R<n>` (with `--archive` to move the item's file to `research.archive`), and carry the meaning through the steps below. `pk research check` (and D8 of `pk drift`) names, as `<file>:<line>: <why>`, every guarded file that cites an item not yet graduated; `pk research list` shows each item's state.
+
 ## Steps
 
 1. Create the CR: `pk change create --title T --why W --asked-by A`. It writes `program/changes/CR-NNN.md`. Edit the file to say exactly what changes.

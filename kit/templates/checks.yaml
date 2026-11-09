@@ -68,3 +68,21 @@ tiers:
 #       - program/tools/
 #     step_timeout: 7200          # (0.5.5) produce.py's limit in seconds, at least 3600; absent, the gate scales
 #                                 # it from the last record's planted-bug rows, timing and this run's workers
+# Optional (0.6.0), the research track (playbook 08): an isolated folder of strategy items that graduate into
+# work only by a ruling that names them. `pk research check` (and D8 of pk drift) refuses a task or brief file that
+# cites an item not yet graduated. An empty mapping takes every default (folder research, its README.md as the
+# index, items RI- and digits, no archive, no other IDs, the task SPEC, PLAN and BRIEF files and program/briefs as
+# the guarded files); for example:
+#
+#   research:
+#     folder: research
+#     archive: docs/research-archive
+#     item_pattern: 'RI-\d+'
+#     other_ids:
+#       - 'RD-\d+'
+#       - 'H-\d+'
+#     guard:
+#       - program/tasks/*/SPEC.md
+#       - program/tasks/*/PLAN.md
+#       - program/tasks/*/BRIEF.md
+#       - program/briefs/**/*.md
