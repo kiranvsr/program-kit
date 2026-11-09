@@ -336,4 +336,5 @@ def _configure(parser: argparse.ArgumentParser) -> None:
 
 def register(add_command) -> None:
     add_command("drift", cmd_drift, help="report-only: do the documents still agree with their generators, "
-                "approvals and code, and are the progress docs behind state (D1 to D7; D8 with research)", configure=_configure)
+                "approvals and code, and are the progress docs behind state (D1 to D7; D8 with research)",
+                configure=_configure)

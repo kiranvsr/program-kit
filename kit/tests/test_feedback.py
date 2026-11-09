@@ -61,7 +61,8 @@ class RegisterTests(FeedbackBase):
         self.assertEqual(self.path.read_text(encoding="utf-8"), ORIGINAL + ROWS)
 
     def test_a_malformed_row_names_the_row_and_the_field(self):
-        for old, new, needle in (("| high | Export", "| soon | Export", "BF-2: urgency 'soon' is not urgent | high | polish"),
+        for old, new, needle in (("| high | Export", "| soon | Export",
+                                  "BF-2: urgency 'soon' is not urgent | high | polish"),
                                  ("| 2026-11-02 |", "| 2 Nov |", "BF-2: date '2 Nov' is not YYYY-MM-DD"),
                                  ("| follow-up | open |", "| later | open |", "BF-2: decision 'later'"),
                                  ("| open | - |\n| BF-3", "| waiting | - |\n| BF-3", "BF-2: state 'waiting'"),
@@ -81,7 +82,8 @@ class RegisterTests(FeedbackBase):
         self.assertEqual(out, "feedback: added BF-1 (high, follow-up, open)\n")
         text = self.path.read_text(encoding="utf-8")
         template = (KIT / "templates" / "beta-feedback.md").read_text(encoding="utf-8")
-        self.assertEqual(text, template + f"| BF-1 | {TODAY} | high | The timer is too fast | none | follow-up | open | - |\n")
+        self.assertEqual(text, template + f"| BF-1 | {TODAY} | high | The timer is too fast | none | follow-up | open "
+                                          "| - |\n")
         self.cli("add", "--urgency", "urgent", "--summary", "Crash on join", "--touches", "T1,T2",
                  "--decision", "pull-forward")
         rows = feedback.read(self.root)
@@ -91,7 +93,8 @@ class RegisterTests(FeedbackBase):
         self.path.write_text(ORIGINAL + ROWS + "\nNotes below the table.\n", encoding="utf-8")
         self.assertEqual(self.cli("add", "--urgency", "polish", "--summary", "Wider margins")[0], 0)
         text = self.path.read_text(encoding="utf-8")
-        self.assertIn(ROWS + f"| BF-6 | {TODAY} | polish | Wider margins | none | batched | open | - |\n\nNotes below", text)
+        self.assertIn(ROWS + f"| BF-6 | {TODAY} | polish | Wider margins | none | batched | open | - |\n\nNotes below",
+                      text)
 
     def test_add_and_set_refuse_bad_values_and_write_nothing(self):
         self.path.write_text(ORIGINAL + ROWS, encoding="utf-8")
@@ -136,7 +139,8 @@ class PanelTests(FeedbackBase):
         self.assertIn("3 open, 1 done", panel)
 
     def test_only_the_five_most_recently_done_are_shown(self):
-        rows = "".join(f"| BF-{n} | 2026-10-{n:02d} | polish | item {n} | none | batched | done | - |\n" for n in range(1, 9))
+        rows = "".join(f"| BF-{n} | 2026-10-{n:02d} | polish | item {n} | none | batched | done | - |\n"
+                       for n in range(1, 9))
         self.path.write_text(ORIGINAL + rows, encoding="utf-8")
         page, _ = dashboard.render(self.root)
         self.assertEqual(re.findall(r"item (\d)", page), ["8", "7", "6", "5", "4"])

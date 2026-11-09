@@ -168,7 +168,8 @@ def render(root: Path) -> tuple[str, dict]:
                              + "</li>" for item in followups)
     feedback_html = feedback_module.panel_html(root)  # 0.6.0: '' without the register; a bad row raises
     page = TEMPLATE
-    for key, value in (("COMMIT", _e(commit)), ("FEEDBACK", feedback_html), ("TILES", tiles), ("BAR", _bar(counts)), ("LEGEND", legend),
+    for key, value in (("COMMIT", _e(commit)), ("FEEDBACK", feedback_html), ("TILES", tiles), ("BAR", _bar(counts)),
+                       ("LEGEND", legend),
                        ("HANDOFF", _block_html(block)), ("REGISTER", register_html), ("GATES", gates_html),
                        ("COSTS", costs_html), ("FLAGGED", f"<ul>{flagged}</ul>" if flagged else ""),
                        ("FOLLOWUPS", f"<ul>{followups_html}</ul>" if followups_html

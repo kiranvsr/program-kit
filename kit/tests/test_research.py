@@ -33,7 +33,7 @@ Isolated: nothing here is a task.
 
 | ID | Item | Status |
 | --- | --- | --- |
-| RI-05 | [Integration](../docs/research-archive/RI-05-integration.md) | graduated by R2 (2026-11-02), amended by CR-002 (R9) after a spike; archived |
+| RI-05 | [Integration](../docs/research-archive/RI-05-integration.md) | graduated by R2, amended by CR-002 (R9) |
 
 Status values: `open`, `graduated` (moved into the pipeline by a ruling), `dropped`.
 """
@@ -44,7 +44,7 @@ class ResearchBase(unittest.TestCase):
     def setUp(self):
         self.root = make_repo(self)
         self.checks(CONFIG)
-        rulings.add(self.root, "controller", "Build the later slices?", "No: something else entirely.")  # R1 does not name it
+        rulings.add(self.root, "controller", "Build the later slices?", "No: something else.")  # R1 names no item
         rulings.add(self.root, "controller", "Build the workflow item?", "Yes: RI-03 and RI-05 become CR-001.")  # R2
         self.write("research/README.md", INDEX)
         for name in ("positioning", "lead-scoring", "workflow", "roadmap", "later"):
@@ -87,7 +87,8 @@ class ConfigTests(ResearchBase):
                 research.parse(value)
 
     def test_doctor_reads_the_section_through_the_gate(self):
-        self.assertEqual(pk._checks_problems({"build": [["x"]], "test": [["x"]], "scan": [["x"]], "research": CONFIG}), [])
+        base = {"build": [["x"]], "test": [["x"]], "scan": [["x"]]}
+        self.assertEqual(pk._checks_problems(dict(base, research=CONFIG)), [])
         problems = pk._checks_problems({"build": [["x"]], "test": [["x"]], "scan": [["x"]], "research": {"bogus": 1}})
         self.assertTrue(any("research: unknown key bogus" in line for line in problems), problems)
 

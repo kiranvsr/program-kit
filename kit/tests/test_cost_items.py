@@ -1,4 +1,5 @@
-"""0.6.0 (KF-41): `pk cost add --item <ID> --category <word>` logs work that is not a task; `pk cost report` groups it."""
+"""0.6.0 (KF-41): `pk cost add --item <ID> --category <word>` logs work that is not a task; `pk cost report`
+groups it."""
 import _paths  # noqa: F401  (must come first: puts kit/scripts on sys.path)
 import json
 import unittest

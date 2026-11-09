@@ -5,7 +5,8 @@
 `--allow-unknown` is given. Work that is not a task (research, operations) is logged with `--item <ID> --category
 <word>` in place of `--task` (0.6.0, KF-41): the line carries `item` and `category`, and `task` holds the item's ID
 so that every reader of a 0.5 log reads it; `pk cost report` lists such lines per category and item after the task
-lines, which are printed as before. `add` appends one JSON object: when, task, role, agent (a label for one agent session,
+lines, which are printed as before.
+`add` appends one JSON object: when, task, role, agent (a label for one agent session,
 so its resumes add up), model, tokens, tool calls, seconds and whether the run resumed an earlier one. The model
 is required: every dispatch names the model it ran on. Earlier lines are never rewritten. `totals` sums per task;
 `flagged` names each agent of a task that has passed the fresh-agent threshold (TOKEN_THRESHOLD tokens in all,
@@ -120,7 +121,8 @@ def unknown_task(root: Path, task: str) -> str | None:
 
 
 def item_totals(records: list[dict]) -> dict[str, dict[str, dict]]:
-    """{category: {item: {tokens, tool_calls, seconds, runs}}} of the item lines, categories sorted, items first-seen."""
+    """{category: {item: {tokens, tool_calls, seconds, runs}}} of the item lines: categories sorted, items in the
+    order first seen."""
     found: dict[str, list[dict]] = {}
     for record in records:
         if "category" in record:
