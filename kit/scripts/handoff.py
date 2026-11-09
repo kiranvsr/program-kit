@@ -21,8 +21,9 @@ commit and every running agent. `update` still writes them as they are.
 
 The block is compact on purpose. It opens with a "Now" list (the controller's one line, every task in
 flight with its verification tier and, when blocked, what it waits on, the ad-hoc tasks that are open, the
-integration rounds that are not closed), it counts the done tasks by tier, lists a parked task with the
-decision it waits on, and it shows the open follow-ups that are
+integration rounds that are not closed, and from 0.6.0 one line counting the open items of `program/beta-feedback.md`
+by urgency when that file exists: without it the block is as it was), it counts the done tasks by tier, lists a
+parked task with the decision it waits on, and it shows the open follow-ups that are
 not deferred by a tag (newest first, counted, at most FOLLOWUPS_SHOWN), the newest RULINGS_SHOWN rulings on one
 line each with the next free number, the newest ADHOC_CLOSED_SHOWN closed ad-hoc tasks and the agents past
 the fresh-agent threshold of the cost log. When `program/ledger.yaml` exists an Interview section follows the Now
@@ -45,6 +46,7 @@ from pathlib import Path
 import change as change_module
 import cost as cost_module
 import ctlstate
+import feedback as feedback_module
 import rulings as rulings_module
 import status as status_module
 import trace as trace_module
@@ -175,6 +177,9 @@ def render(root: Path, main: str = "main") -> str:
             held = f"; status {record['status']}, tier {_tier(record)}" if record else ""
             now.append(_line(f"{item['id']} {item['title']} (ad hoc, {wanted}{held}): {item['note'] or '(no note)'}"))
     now += _round_lines(root)
+    feedback_line = feedback_module.handoff_line(root)  # 0.6.0: only with program/beta-feedback.md
+    if feedback_line:
+        now.append(_line(feedback_line))
     closed = [item for item in reversed(state["adhoc"]) if item["state"] == "closed"]
     closed_lines = [_line(f"{item['id']} {item['title']} ("
                           + (f"status {by_id[item['id']]['status']}" if item["id"] in by_id else "no status record")

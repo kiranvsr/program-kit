@@ -15,6 +15,8 @@ Before committing an edit under `program/`, run `pk change check` (0.5.5; it onl
 
 Research is not a change until it graduates (0.6.0, opt-in with the `research` section of `program/checks.yaml`). A folder of strategy items (`pk research init` writes its index from `kit/templates/research-README.md`) is isolated: no brief, spec or plan cites an item until the user has decided it should be built. Then record a ruling that quotes the item's ID and what was decided, run `pk research graduate <ID> --ruling R<n>` (with `--archive` to move the item's file to `research.archive`), and carry the meaning through the steps below. `pk research check` (and D8 of `pk drift`) names, as `<file>:<line>: <why>`, every guarded file that cites an item not yet graduated; `pk research list` shows each item's state.
 
+The user's feedback during a beta or a pilot is kept in `program/beta-feedback.md` (0.6.0, optional): `pk feedback add --urgency urgent|high|polish --summary TEXT [--touches IDs] [--decision D]` when a message arrives, `pk feedback set BF-n --state S [--decision D] [--ruling R<n>]` as it moves, `pk feedback list --open` for what is waiting. Urgent feedback preempts the lowest-priority work in flight, high takes the next free slot, polish is batched; a decision that changes meaning after the freeze still goes through the steps below. With the file, `pk dashboard` shows a Feedback panel and the hand-off counts the open items by urgency.
+
 ## Steps
 
 1. Create the CR: `pk change create --title T --why W --asked-by A`. It writes `program/changes/CR-NNN.md`. Edit the file to say exactly what changes.
