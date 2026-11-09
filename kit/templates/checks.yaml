@@ -70,3 +70,11 @@ tiers:
 #                                 # it from the last record's planted-bug rows, timing and this run's workers
 #     plan_reuse_test: true       # (0.6.0) a PLAN command identical to a test command takes the test step's
 #                                 # result in the hand-back gate instead of running again (default false)
+# Optional (0.6.0): files that merge as a union of both sides' lines when a task branch and main both changed
+# them (append-only lists, such as a migrations journal each side added an entry to). An entry is a path, a
+# directory or a glob, as for tiers. pk merge, the gates' trial merge, pk merge check and the late-work rule
+# resolve such a conflict alike; a .json file whose union does not parse stays a conflict. Absent, none does:
+#
+#   merge:
+#     union_files:
+#       - db/migrations/journal.txt

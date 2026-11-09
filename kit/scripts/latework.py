@@ -17,6 +17,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+import conflicts
 import store
 from common import KitError, PRIMARY_BRANCH, git
 
@@ -80,17 +81,34 @@ def _late_paths(root: Path, task_id: str, commit: str, parents: list[str]) -> tu
         return ([path for path in _names(root, "diff-tree", "-r", "--no-commit-id", commit)
                  if not own_path(path, task_id)], "was committed after")
     if len(parents) == 2:
-        try:  # exit 1 is a conflict: the tree it still writes holds the conflict markers, so it differs
-            made = subprocess.run(["git", "-C", str(root), "merge-tree", "--write-tree", *parents],
-                                  capture_output=True, text=True)
-        except OSError as exc:
-            raise KitError(f"cannot run git merge-tree: {exc}") from exc
-        tree = made.stdout.split()[0] if made.returncode in (0, 1) and made.stdout.split() else None
+        # a conflict: the tree merge-tree still writes holds the conflict markers, so it differs
+        tree, staged = conflicts.merge_tree(root, *parents)
         if tree is None:
             return "cannot re-derive"
-        return ([path for path in _names(root, "diff", tree, commit) if not own_path(path, task_id)],
+        late = [path for path in _names(root, "diff", tree, commit) if not own_path(path, task_id)]
+        return (_union_resolved(root, commit, parents, late, staged),
                 "is a merge that is not what git makes of its two parents; it was made after")
     return ["(a merge of more than two parents)"], "was made after"
+
+
+def _union_resolved(root: Path, commit: str, parents: list[str], late: list[str], staged: dict) -> list[str]:
+    """`late` without the conflicted files of `merge.union_files` (main's checks.yaml) that the merge `commit`
+    resolved exactly as the kit resolves them, the line union of its two parents (0.6.0, KF-38)."""
+    conflicted = [path for path in late if path in staged]
+    if not conflicted:
+        return late
+    union = conflicts.union_files(root, MAIN) if _commit_exists(root, MAIN) else []
+    if not union:
+        return late
+    kept = []
+    for path in late:
+        if path in conflicted:
+            content, _ = conflicts.resolution(root, path, staged[path], parents[1], None, union)
+            made = subprocess.run(["git", "-C", str(root), "cat-file", "blob", f"{commit}:{path}"], capture_output=True)
+            if content is not None and made.returncode == 0 and made.stdout == content:
+                continue
+        kept.append(path)
+    return kept
 
 
 def late_work(root, task_id: str, head: str, sha: str = "HEAD") -> str | None:
@@ -99,7 +117,8 @@ def late_work(root, task_id: str, head: str, sha: str = "HEAD") -> str | None:
     Every commit of `head..sha` that is not on main is looked at. A commit with one parent may change only the
     task's own evidence and status files. A merge commit must be what git makes of its two parents (outside
     those same files): a merge that carries an edit of its own, or a conflict resolved by hand, is work nobody
-    reviewed.
+    reviewed. A conflict in a file of `merge.union_files` resolved as its line union is what the kit's own merge
+    makes, and is not late work (0.6.0).
     """
     root = Path(root)
     for commit, *parents in _commits(root, head, sha):

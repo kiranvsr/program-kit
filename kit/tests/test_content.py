@@ -33,6 +33,7 @@ NEEDS_CONTEXT = ["a new dependency", "a security boundary with no precedent", "a
 HANDBACK_LINE = "`OK: <branch> passes the hand-back gate at <sha>`"
 MERGE_LINE = "`OK: <branch> merges into main at <sha>`"
 ROUND_LINE = "`OK: round/<NAME> passes the combined check at <sha>`"
+MERGE_CHECK_LINE = "`OK: task/<ID> merges into main at <sha> without conflicts`"  # 0.6.0: pk merge check (KF-38)
 
 
 # FORBIDDEN comes from _tokens (assembled from fragments); these further names are fragments too, so this file
@@ -527,7 +528,8 @@ class NeutralityTests(unittest.TestCase):
             for line in text.splitlines():
                 self.assertFalse(line.lstrip().startswith("OK: "), f"{path.name}: line starts with 'OK: '")
             for line in re.findall(r"`(OK: [^`]*)`", text):
-                self.assertIn(f"`{line}`", (HANDBACK_LINE, MERGE_LINE, ROUND_LINE), f"{path.name}: unexpected OK line")
+                self.assertIn(f"`{line}`", (HANDBACK_LINE, MERGE_LINE, ROUND_LINE, MERGE_CHECK_LINE),
+                              f"{path.name}: unexpected OK line")
 
 
 YAML_FENCE = re.compile(r"^```ya?ml\n(.*?)^```", re.M | re.S)
