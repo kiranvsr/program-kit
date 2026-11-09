@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import gate
 import pk
@@ -163,6 +164,40 @@ class TierStatusTests(unittest.TestCase):
         record = status.transition(self.root, TID, "in_progress", "controller", tier="standard", fast=True,
                                    ruling=ruling)
         self.assertEqual((record["tier"], record["fast"]), ("standard", True))
+
+    def test_a_light_fast_dispatch_refuses_scope_paths_the_light_gate_would_refuse(self):
+        # KF-35 (0.6.0): the program's AH-0093 was dispatched light with a path outside tiers.light_paths in its scope
+        self.checks(full_paths=["auth/"], light_paths=["web/"], light_ruling="R1")
+        ruling = self.ruling()
+        scope = "Edit `web/page.txt`, `server/api.py` and `auth/policy.py`; run `pk gate handback` and see `web/`."
+        self.brief(brief("light", ruling).replace("Add mul.", scope))
+        self.refused(r"brief's ## Scope names full-tier paths: auth/policy.py; .* names paths outside "
+                     r"tiers.light_paths: server/api.py \(", TID, "in_progress", "controller", tier="light", fast=True,
+                     ruling=ruling)
+        self.brief(brief("light", ruling).replace("Add mul.", "Edit `web/page.txt` and `./web/` (see `<ID>/x`)."))
+        record = status.transition(self.root, TID, "in_progress", "controller", tier="light", fast=True, ruling=ruling)
+        self.assertEqual((record["tier"], record["fast"]), ("light", True))
+
+    def test_a_fast_dispatch_checks_the_changes_of_an_existing_task_branch(self):
+        # KF-35 (0.6.0): what the gate would refuse in a branch that already has commits is refused at dispatch
+        self.checks(full_paths=["auth/"])
+        ruling = self.ruling()
+        self.brief()
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "brief")
+        self.git("checkout", "-q", "-b", f"task/{TID}")
+        (self.root / "auth").mkdir()
+        (self.root / "auth" / "policy.py").write_text("x\n")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "early work")
+        self.git("checkout", "-q", "main")
+        self.refused(f"task/{TID} already changes full-tier paths: auth/policy.py", TID, "in_progress", "controller",
+                     tier="standard", fast=True, ruling=ruling)
+        self.git("branch", "-D", f"task/{TID}")
+        self.git("branch", f"task/{TID}")  # a branch without commits of its own changes nothing
+        record = status.transition(self.root, TID, "in_progress", "controller", tier="standard", fast=True,
+                                   ruling=ruling)
+        self.assertEqual(record["tier"], "standard")
 
     def test_the_light_tier_needs_its_ruling_and_its_paths_in_checks(self):
         self.checks(full_paths=["auth/"])
@@ -464,6 +499,17 @@ class StandardTierGateTests(TierGateBase):
             self.assertEqual(rc, 1)
             self.assertIn(f"FAILED: tier {TASK} is standard but changes full-tier paths: auth/policy.py", out)
 
+    def test_a_standard_task_without_its_producer_fails_before_the_build(self):
+        # KF-35 (0.6.0): the program's P6-M03-S01-T01
+        self.on_main(status_record(TASK, tier="standard"), FULL_PATHS,
+                     files={f"program/tasks/{TASK}/SPEC.md": "# Spec\n\nTier: standard\n"})
+        sh(self.wt, "git", "rm", "-q", f"program/evidence/{TASK}/produce.py")
+        commit(self.wt, "no producer")
+        with mock.patch.object(gate, "trial_merge", side_effect=AssertionError("the trial merge ran")):
+            rc, out = self.handback()
+        self.assertEqual((rc, out.splitlines()[-1]), (1, f"FAILED: evidence program/evidence/{TASK}/produce.py is "
+                                                         "missing (checked before the build)"))
+
     def test_a_full_path_written_without_its_trailing_slash_still_guards_the_directory(self):
         self.on_main(status_record(TASK, tier="standard"), dict(FULL_PATHS, full_paths=["auth"]),
                      files={f"program/tasks/{TASK}/SPEC.md": "# Spec\n\nTier: standard\n"})
@@ -707,6 +753,17 @@ class LightTierGateTests(TierGateBase):
         self.assertEqual(rc, 0, out)
         self.assertNotIn("step evidence", out)
         self.assertFalse((self.wt / "program" / "evidence").exists())
+
+    def test_a_light_hand_back_outside_the_light_paths_fails_before_any_build_command(self):
+        # KF-35 (0.6.0): the program's AH-0093 learnt this only after its build and test step
+        self.switch_on()
+        self.work("server/api.py")
+        with mock.patch.object(gate, "trial_merge", side_effect=AssertionError("the trial merge ran")):
+            rc, out = self.handback()
+        self.assertEqual(rc, 1)
+        self.assertEqual(out.splitlines()[-1], f"FAILED: tier {TASK} is light but changes paths outside "
+                                               "tiers.light_paths: server/api.py")
+        self.assertNotIn("step build", out)
 
     def test_a_light_task_that_leaves_the_light_paths_fails(self):
         self.switch_on()

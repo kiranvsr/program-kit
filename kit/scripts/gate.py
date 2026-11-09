@@ -1175,6 +1175,8 @@ def handback(root, task_id: str, branch: str, worktree=None, no_reuse: bool = Fa
     authoritative = _definition(root, wt, task_id, meta)
     if authoritative is None:
         return 1
+    if meta["tier"] != "light" and not _early_evidence(wt, task_id):
+        return 1
     _accepted_late_work(wt, task_id)
     trial = trial_merge(root, branch)
     code = _with_trial(root, trial, lambda: _run_steps(checks, task_id, wt, trial, authoritative, meta, no_reuse))
@@ -1186,6 +1188,30 @@ def handback(root, task_id: str, branch: str, worktree=None, no_reuse: bool = Fa
     _deferred_lines(wt, task_id, branch)
     _print_ok("handback", branch, sha)
     return 0
+
+
+EARLY = "(checked before the build)"
+
+
+def _early_evidence(wt: Path, task_id: str) -> bool:
+    """The evidence step's cheap refusals, before the trial merge, the build and the test step (0.6.0, KF-35).
+
+    The producer must exist, and the branch since it left main must keep the kit's ownership of the record folders
+    and pointers (`store.tree_problems`, what `pk evidence check-tree` prints: no record modified or deleted, no file
+    there that is not a valid record, no hand-made pointer). Both were refused before only after the test step; the
+    lines are the evidence step's, with EARLY appended. Prints the failure and returns False.
+    """
+    produce = f"program/evidence/{task_id}/produce.py"
+    if not (wt / produce).is_file():
+        _out(f"FAILED: evidence {produce} is missing {EARLY}")
+        return False
+    problems = store.tree_problems(wt, git(wt, "merge-base", MAIN, "HEAD"))
+    if problems:
+        _out(f"FAILED: evidence {EARLY}")
+        for problem in problems:
+            _out(_show(problem))
+        return False
+    return True
 
 
 def _accepted_late_work(wt: Path, task_id: str) -> None:

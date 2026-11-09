@@ -609,6 +609,8 @@ def _reserved(rel: str, prefix: str) -> str | None:
 
 
 def _pointer_problem(rel: str, text: str | None) -> str | None:
+    if not _TASK.match(PurePosixPath(rel).parts[2]):
+        return "not a usable task directory name"
     if text is None:
         return "deleted"
     try:

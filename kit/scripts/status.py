@@ -69,6 +69,7 @@ _TEXT_FIELDS = ("task_id", "role", "updated_at", "note")
 _ENTRY_FIELDS = ("status", "role", "at")
 _ENTRY_OPTIONAL = ("tier", "ruling", "reason")  # on the dispatch entry and on each entry `set_tier` appends
 _RULING = re.compile(r"R(\d+)\Z")
+_SCOPE_PATH = re.compile(r"`(?:\./)*([A-Za-z0-9._@+-]+(?:/[A-Za-z0-9._@+-]*)+)`")  # a backticked path with a `/`
 
 
 def tier_of(record) -> str:
@@ -407,6 +408,56 @@ def _brief_problem(root: Path, task_id: str, tier: str, ruling: str) -> None:
                        + "; ".join(problems) + " (fix the brief, then dispatch)")
 
 
+def scope_paths(text: str) -> list[str]:
+    """The backticked path tokens of a brief's `## Scope` section (0.6.0, KF-35): a token with a `/` and only path
+    characters, so a command (`pk gate handback`), a placeholder (`<ID>/x`) or a glob is never taken for one."""
+    lines, inside = [], False
+    for line in text.splitlines():
+        if line.startswith("## "):
+            inside = line.strip() == "## Scope"
+        elif inside:
+            lines.append(line)
+    return list(dict.fromkeys(_SCOPE_PATH.findall("\n".join(lines))))
+
+
+def _dispatch_paths_problem(root: Path, task_id: str, tier: str) -> None:
+    """Refuse (KitError) a fast-path dispatch whose paths the gate's tier check would refuse (0.6.0, KF-35).
+
+    What can be known at dispatch: on the light tier, the paths the brief's `## Scope` names (`scope_paths`) must
+    lie under tiers.light_paths and not under a full-tier path (the kit's own and tiers.full_paths); and when the
+    branch `task/<ID>` already has commits of its own, its changes are judged as the gate's tier check judges them.
+    A directory token (`web/`) counts as everything under it. The tiers are those of the working tree's checks.yaml,
+    as for the rest of the dispatch check.
+    """
+    import gate  # lazy: gate imports this module
+
+    tiers = tier_config(root)
+    full = (*gate.BUILTIN_FULL, *tiers["full_paths"])
+
+    def judge(paths: list[str], where: str) -> list[str]:
+        probe = {path: path.rstrip("/") + "/-" if path.endswith("/") else path for path in paths}
+        hit = [path for path in paths if gate._under(probe[path], full)]
+        found = [f"{where} full-tier paths: {', '.join(hit)}"] if hit else []
+        outside = [path for path in paths if path not in hit and not gate._under(probe[path], tiers["light_paths"])]
+        if tier == "light" and outside:
+            found.append(f"{where} paths outside tiers.light_paths: {', '.join(outside)}")
+        return found
+
+    problems = []
+    if tier == "light":
+        brief = Path(root) / "program" / "tasks" / task_id / "BRIEF.md"
+        problems += judge(scope_paths(read_text(brief)), "its brief's ## Scope names")
+    branch = f"refs/heads/task/{task_id}"
+    code, _ = run_argv(["git", "-C", str(root), "rev-parse", "--verify", "--quiet", f"{branch}^{{commit}}"], Path(root))
+    if code == 0:
+        base = git(root, "merge-base", PRIMARY_BRANCH, branch)
+        changed = sorted(gate._git_fields(root, "diff", "--name-only", "--no-renames", "-z", f"{base}..{branch}"))
+        problems += judge(changed, f"task/{task_id} already changes")
+    if problems:
+        raise KitError(f"{task_id}: the gate would refuse this {tier}-tier fast dispatch: " + "; ".join(problems)
+                       + " (narrow the scope or the branch, or dispatch at a tier that covers these paths)")
+
+
 def _full_tier(root: Path, task_id: str) -> bool:
     """Whether the task's status record in `root` says in so many words that it is full-tier.
 
@@ -537,6 +588,7 @@ def transition(root: Path, task_id: str, to: str, role: str, note: str = "",
         _tier_problem(root, task_id, tier or "full", fast, ruling)
         if fast:
             _brief_problem(root, task_id, tier, ruling)
+            _dispatch_paths_problem(root, task_id, tier)
     if to == "in_progress" and not dispatched and not fast and (tier or "full") == "full":
         _full_without_spec(root, task_id)
     if dispatched or to != "in_progress":

@@ -788,12 +788,27 @@ class HandbackTests(HandbackBase):
         self.assertEqual((rc, out.splitlines()[-1]),
                          (1, f"FAILED: plan program/tasks/{TASK}/PLAN.md differs from main {gate.FIX_ON_MAIN}"))
 
-    def test_missing_produce_script_fails(self):
+    def test_missing_produce_script_fails_before_the_build(self):
+        # KF-35 (0.6.0): the program's P6-M03-S01-T01 lost a whole test step to a producer it never wrote
         (self.wt / "program" / "evidence" / TASK / "produce.py").unlink()
         commit(self.wt, "drop produce")
-        rc, out = self.handback()
+        with mock.patch.object(gate, "trial_merge", side_effect=AssertionError("the trial merge ran")):
+            rc, out = self.handback()
         self.assertEqual((rc, out.splitlines()[-1]),
-                         (1, f"FAILED: evidence program/evidence/{TASK}/produce.py is missing"))
+                         (1, f"FAILED: evidence program/evidence/{TASK}/produce.py is missing (checked before the build)"))
+        self.assertNotIn("step build", out)
+
+    def test_a_run_output_committed_under_results_fails_before_the_build(self):
+        # KF-36 (0.6.0): the same check as pk evidence check-tree, before the trial merge
+        put(self.wt, f"program/evidence/{TASK}/results/run.log", "output\n")
+        sha = commit(self.wt, "a run output in the record folder")
+        with mock.patch.object(gate, "trial_merge", side_effect=AssertionError("the trial merge ran")):
+            rc, out = self.handback()
+        self.assertEqual(rc, 1)
+        lines = out.splitlines()
+        self.assertEqual(lines[-2], "FAILED: evidence (checked before the build)")
+        self.assertTrue(lines[-1].startswith(f"program/evidence/{TASK}/results/run.log: not a kit record (not a record "
+                                             f"name (<utc>-<sha256[:12]>.json)), added in {sha}"), lines[-1])
 
     def test_results_with_a_survivor_fails(self):
         os.environ["PK_SURVIVOR"] = "1"
@@ -832,13 +847,18 @@ class HandbackTests(HandbackBase):
         store.set_entry(self.wt, "OTHER", "results", {"digest": broken["digest"], "path": broken["path"],
                                                        "head": "", "produced_at": ""})
         commit(self.wt, "broken record")
-        rc, out = self.handback()
+        rc, out = self.handback()  # 0.6.0 (KF-35): a record on the branch that does not read is refused first
         self.assertEqual(rc, 1)
+        self.assertIn("FAILED: evidence (checked before the build)", out.splitlines())
+        self.assertIn(f"{broken['path']}: not a kit record (not a results record: it does not parse as JSON)",
+                      out)
+        self.assertNotIn("OK: ", out)
+        self.assert_no_trial_left()
+        rc, out = run_quiet(gate._stale_step, self.wt)  # the drift report still names it, when it gets that far
+        self.assertFalse(rc)
         line = [ln for ln in out.splitlines() if ln.startswith("FAILED: stale unreadable record ")]
         self.assertEqual(len(line), 1, out)
         self.assertIn(f"{broken['path']}: ", line[0])
-        self.assertNotIn("OK: ", out)
-        self.assert_no_trial_left()
 
     def test_a_record_altered_in_the_store_fails_the_evidence_step(self):
         script = self.wt / f"program/evidence/{TASK}/produce.py"
@@ -1016,7 +1036,10 @@ class HandbackTests(HandbackBase):
         removed = commit(self.wt, "drop a record")
         rc, out = self.handback()
         self.assertEqual(rc, 1)
-        self.assertIn(f"evidence history rewritten: {entry['path']} deleted in {removed}", out.splitlines())
+        self.assertIn("FAILED: evidence (checked before the build)", out.splitlines())  # KF-35 (0.6.0)
+        self.assertTrue(out.splitlines()[-1].startswith(f"evidence history rewritten: {entry['path']} deleted in "
+                                                        f"{removed} (the kit never changes a record"), out)
+        self.assertNotIn("step build", out)
 
     def test_tag_named_like_the_branch_changes_nothing(self):
         sh(self.root, "git", "tag", BRANCH, "main")  # an ambiguous name pointing at main
