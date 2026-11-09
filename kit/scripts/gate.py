@@ -378,27 +378,37 @@ def trial_merge(root, branch: str, main: str = MAIN) -> Path:
 # --- running steps -----------------------------------------------------------------
 
 def _step_lines(step: str, commands: list[tuple[list[str], int]], cwd: Path, env: dict | None = None,
-                sink: list | None = None, timeout: int = STEP_TIMEOUT) -> tuple[bool, list[str]]:
+                sink: list | None = None, timeout: int = STEP_TIMEOUT,
+                recorded: list | None = None) -> tuple[bool, list[str]]:
     """Run (argv, expected exit) pairs in order; return (passed, the lines to print) without printing.
 
     Output tail lines are indented with `    | ` so a command can never print a line that looks like
     the gate's own `OK:` line. An empty list runs nothing and yields no lines. `sink`, when given, receives
-    `{argv, exit, output}` of every command run (the test step's, for `Evidence.reuse_gate_test`).
+    `{argv, exit, output}` of every command run (the test step's, for `Evidence.reuse_gate_test`). `recorded`
+    (0.6.0, KF-33: the plan step with `evidence.plan_reuse_test`) is such a list from the test step of this gate
+    run, in the same `cwd`: a command whose argv equals one there is not run again; its recorded exit and output
+    are judged against this command's own expected exit, and a line says so.
     """
     if not commands:
         return True, []
+    lines = []
     for argv, expect in commands:
-        code, output = run_argv(argv, cwd, env=env, timeout=timeout)
+        found = next((item for item in recorded or () if item["argv"] == list(argv)), None)
+        if found is not None:
+            code, output = found["exit"], found["output"]
+            lines.append(f"step {step}: {' '.join(argv)} reused from the test step ({exit_text(code)})")
+        else:
+            code, output = run_argv(argv, cwd, env=env, timeout=timeout)
         if sink is not None:
             sink.append({"argv": list(argv), "exit": code, "output": output})
         if code == expect:
             continue
         if code == 127:
-            return False, [f"FAILED: {step} missing tool: {argv[0]}"]
-        lines = [f"FAILED: {step} {' '.join(argv)} ({exit_text(code)})"]
+            return False, [*lines, f"FAILED: {step} missing tool: {argv[0]}"]
+        lines.append(f"FAILED: {step} {' '.join(argv)} ({exit_text(code)})")
         lines.extend(TAIL_PREFIX + line for line in output.splitlines()[-TAIL_LINES:])
         return False, lines
-    return True, [f"step {step}: ok"]
+    return True, [*lines, f"step {step}: ok"]
 
 
 KILL_SIGNALS = ("SIGKILL", "SIGTERM", "SIGSEGV", "SIGBUS", "SIGABRT")  # what the machine, not the code, usually sends
@@ -431,9 +441,9 @@ def exit_text(code: int) -> str:
 
 
 def _run_commands(step: str, commands: list[tuple[list[str], int]], cwd: Path, env: dict | None = None,
-                  sink: list | None = None, timeout: int = STEP_TIMEOUT) -> bool:
+                  sink: list | None = None, timeout: int = STEP_TIMEOUT, recorded: list | None = None) -> bool:
     """Run (argv, expected exit) pairs in order; print the first failure and return False."""
-    passed, lines = _step_lines(step, commands, cwd, env, sink, timeout)
+    passed, lines = _step_lines(step, commands, cwd, env, sink, timeout, recorded)
     for line in lines:
         _out(line)
     return passed
@@ -1134,7 +1144,10 @@ def _late_and_evidence(checks: dict, task_id: str, wt: Path, authoritative: byte
     if not plan:
         _out(f'FAILED: {"brief" if meta["fast"] else "plan"} no commands under "{PLAN_SECTION}"')
         return 1
-    if not _run_commands("plan", plan, wt):
+    # KF-33 (0.6.0): with evidence.plan_reuse_test, a PLAN command identical to a test command of this run's test step
+    # (same argv, same worktree) takes its result; the test step's results file for produce.py stays as it was.
+    recorded = sink if checks["evidence"]["plan_reuse_test"] and reused is None else None
+    if not _run_commands("plan", plan, wt, recorded=recorded):
         return 1
     env = dict(os.environ, **{evidence_module.GATE_TEST_ENV: str(path)})
     if not _evidence_step(wt, task_id, env=env, reused=reused, limit=limit):

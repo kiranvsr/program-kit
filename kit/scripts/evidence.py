@@ -74,7 +74,8 @@ _RECORD_NAMES = ("results.json", "acceptance.json")
 DECISIONS = ("accepted_development", "rejected")
 
 # --- the `evidence` section of checks.yaml (0.5.2) ---------------------------------------------------------------
-EVIDENCE_KEYS = ("plant_workers", "reuse_unchanged_code", "reuse_ignore", "reuse_compare", "step_timeout")
+EVIDENCE_KEYS = ("plant_workers", "reuse_unchanged_code", "reuse_ignore", "reuse_compare", "step_timeout",
+                 "plan_reuse_test")
 STEP_TIMEOUT_FLOOR = 3600  # the evidence step's limit is never below this (seconds); evidence.step_timeout raises it
 PLANT_WORKERS_ENV = "PK_PLANT_WORKERS"  # overrides evidence.plant_workers; an explicit `workers=` overrides both
 GATE_TEST_ENV = "PK_GATE_TEST_RESULTS"  # the hand-back gate's test-step results, for `Evidence.reuse_gate_test`
@@ -121,10 +122,11 @@ def _config_paths(value, key: str, under_program: bool) -> list[str]:
 
 def parse_config(value) -> dict:
     """The `evidence` section of checks.yaml: {plant_workers, reuse_unchanged_code, reuse_ignore, reuse_compare,
-    step_timeout}.
+    step_timeout, plan_reuse_test}.
 
-    Absent means one worker, no reuse and no paths, which is how every program ran before 0.5.2, and (0.5.5) no
-    `step_timeout`: the gate scales the evidence step's limit from the last record (`gate.evidence_limit`).
+    Absent means one worker, no reuse and no paths, which is how every program ran before 0.5.2, (0.5.5) no
+    `step_timeout`: the gate scales the evidence step's limit from the last record (`gate.evidence_limit`), and
+    (0.6.0, KF-33) `plan_reuse_test` false: the plan step runs every command of `## Exact Commands` itself.
     """
     if value is None:
         value = {}
@@ -143,6 +145,11 @@ def parse_config(value) -> dict:
         reuse = False
     if not isinstance(reuse, bool):
         raise KitError("checks.yaml: evidence.reuse_unchanged_code must be true or false")
+    plan_reuse = value.get("plan_reuse_test", False)
+    if plan_reuse is None:
+        plan_reuse = False
+    if not isinstance(plan_reuse, bool):
+        raise KitError("checks.yaml: evidence.plan_reuse_test must be true or false")
     limit = value.get("step_timeout")
     if limit is not None and not (isinstance(limit, int) and not isinstance(limit, bool)
                                   and limit >= STEP_TIMEOUT_FLOOR):
@@ -151,7 +158,7 @@ def parse_config(value) -> dict:
     return {"plant_workers": workers, "reuse_unchanged_code": reuse,
             "reuse_ignore": _config_paths(value.get("reuse_ignore"), "reuse_ignore", False),
             "reuse_compare": _config_paths(value.get("reuse_compare"), "reuse_compare", True),
-            "step_timeout": limit}
+            "step_timeout": limit, "plan_reuse_test": plan_reuse}
 
 
 def config_at(root, ref: str = "HEAD") -> dict:
