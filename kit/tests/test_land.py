@@ -151,6 +151,7 @@ class ReviewWorktreeTests(LandBase):
         for name in ("generated.lock", f"program/status/{TASK}.json", "calc.py"):
             self.assertRegex(stat, rf"(?m)^ {name} +\| ")
         self.assertEqual(sh(self.root, "git", "status", "--porcelain").strip(), "")  # nothing tracked was touched
+        self.assertEqual(out.splitlines()[-1], f"merge with main: no conflicts at {self.head()[:12]}")  # KF-38
 
     def test_a_second_review_moves_the_clean_worktree_to_the_new_commit(self):
         """The re-review after a fix round (M1, second form): one command puts the reviewer on the new commit."""
@@ -846,6 +847,62 @@ class StatusConflictTests(LandBase):
         commit(self.wt, "more work on the landed branch")
         with self.assertRaisesRegex(KitError, f"{BRANCH} is merged into main: it has landed"):
             status.reopen(self.wt, TASK, "too late")
+
+
+JOURNAL = "db/migrations/journal.txt"
+
+
+@skip_unless_slow()
+class UnionMergeTests(LandBase):
+    """0.6.0, KF-38: a file of `merge.union_files` both sides appended to lands as the union of their lines."""
+
+    def setUp(self):
+        super().setUp()
+        self.standard(done=False)
+        self.write_checks(tiers=FULL_PATHS, merge={"union_files": ["db/migrations/"]})
+        put(self.root, JOURNAL, "0001 init\n")
+        commit(self.root, "union files and the journal")
+        sh(self.wt, "git", "merge", "-q", "main")
+        put(self.wt, JOURNAL, "0001 init\n0002 the branch's table\n")
+        commit(self.wt, "the branch's migration")
+        self.accept(self.wt, TASK)
+        put(self.root, JOURNAL, "0001 init\n0002 main's table\n")
+        commit(self.root, "main's migration")
+
+    def test_the_review_and_pk_merge_check_see_the_conflict_the_kit_resolves(self):
+        code, out, err = self.pk("worktree", "review", TASK)
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(out.splitlines()[-1], f"merge with main: no conflicts at {self.head()[:12]} (1 resolved as pk "
+                                               "merge resolves them)")
+        code, out, err = self.pk("merge", "check", TASK)
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertEqual(out.splitlines(), [
+            f"resolved: {JOURNAL}: merged as the line union of both sides (merge.union_files)",
+            f"OK: {BRANCH} merges into main at {self.head()} without conflicts"])
+
+    def test_pk_merge_lands_the_union_of_both_sides(self):
+        code, out, err = self.pk("merge", TASK)
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertIn(f"resolved: {JOURNAL}: merged as the line union of both sides (merge.union_files)",
+                      out.splitlines())
+        self.assertEqual((self.root / JOURNAL).read_text(), "0001 init\n0002 main's table\n0002 the branch's table\n")
+        self.assertEqual(sh(self.root, "git", "status", "--porcelain").strip(), "")
+        self.assertEqual(sh(self.root, "git", "log", "-1", "--format=%s", "HEAD~1").strip(),
+                         f"Merge {BRANCH} (standard tier)")
+        self.assert_no_trial_left()
+
+    def test_a_conflict_outside_the_union_files_is_named_by_the_review_line(self):
+        put(self.root, "calc.py", "main's calc\n")
+        commit(self.root, "main rewrites calc.py")
+        code, out, _ = self.pk("worktree", "review", TASK)
+        self.assertEqual(code, 0)
+        self.assertIn(f"merge with main: conflicts at {self.head()[:12]} in: calc.py (1 resolved as pk merge resolves "
+                      f"them); merge main into the branch and re-run the hand-back gate before QA (pk merge check "
+                      f"{TASK})", out.splitlines())
+        code, out, _ = self.pk("merge", "check", TASK)
+        self.assertEqual((code, out), (1, f"resolved: {JOURNAL}: merged as the line union of both sides "
+                                          f"(merge.union_files)\nFAILED: merge {BRANCH} into main at {self.head()} "
+                                          "conflicts in: calc.py\n"))
 
 
 @skip_unless_slow()

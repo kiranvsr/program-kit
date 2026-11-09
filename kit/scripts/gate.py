@@ -184,7 +184,11 @@ def _parse_tiers(value) -> dict:
 
 
 def _parse_merge(value) -> dict:
-    """The `merge` section of checks.yaml (0.6.0) as {union_files: [str]}; absent means no file merges as a union."""
+    """The `merge` section of checks.yaml (0.6.0) as {union_files: [str]}; absent means no file merges as a union.
+
+    `union_files` lists paths, directories and globs (`_under` rules): a conflict in such a file is merged as the
+    union of both sides' lines wherever the kit merges a task (`conflicts`), KF-38.
+    """
     if value is None:
         value = {}
     if not isinstance(value, dict):
@@ -338,9 +342,9 @@ def _remove_trial(root: Path, trial: Path) -> str | None:
 def trial_merge(root, branch: str, main: str = MAIN, resolved: list | None = None) -> Path:
     """Merge `branch` into a temporary detached worktree of `main` without committing; return its path.
 
-    The caller removes the worktree. A conflict the kit resolves itself (`conflicts`: from 0.6.0 the task's own
-    status file takes the branch's record, KF-37) is resolved as `pk merge` resolves it, so the gates judge the tree
-    the merge makes; each is said in a line, appended to `resolved` or else printed. Any other conflict aborts the
+    The caller removes the worktree. A conflict the kit resolves itself (`conflicts`, 0.6.0: the task's own status
+    file takes the branch's record, KF-37; a file of `merge.union_files` merges as a line union, KF-38) is resolved
+    as `pk merge` resolves it, so the gates judge the tree the merge makes; each is said in a line, appended to `resolved` or else printed. Any other conflict aborts the
     merge, removes the worktree and raises KitError listing the conflicted paths. The main checkout is never touched.
     """
     root = Path(root).resolve()
@@ -358,7 +362,7 @@ def trial_merge(root, branch: str, main: str = MAIN, resolved: list | None = Non
                                  f"refs/heads/{branch}"], trial)
         if code == 0:
             return trial
-        lines, conflicted = conflicts.resolve_index(trial, branch, conflicts.task_of(branch))
+        lines, conflicted = conflicts.resolve_index(trial, branch, conflicts.task_of(branch), ref=main)
         if lines and not conflicted:
             if resolved is None:
                 for line in lines:

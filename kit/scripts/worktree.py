@@ -37,6 +37,7 @@ from pathlib import Path
 import re
 import subprocess
 
+import conflicts
 import register as register_module
 from common import KitError, PRIMARY_BRANCH, find_root, git, primary_branch_problem, run_argv
 
@@ -317,6 +318,20 @@ def finish(root: Path, task_id: str, symlinks=(), compose_project: str | None = 
     return removed
 
 
+def _merge_line(root: Path, task_id: str) -> str:
+    """The review's last line (0.6.0, KF-38): what `pk merge check <ID>` says of the branch against main now, so a
+    conflict is seen before QA starts rather than at `pk merge` after the acceptance."""
+    try:
+        sha, resolved, remaining = conflicts.check(root, f"task/{task_id}")
+    except KitError as exc:
+        return f"merge with {PRIMARY_BRANCH}: not checked ({exc})"
+    said = f" ({len(resolved)} resolved as pk merge resolves them)" if resolved else ""
+    if remaining:
+        return (f"merge with {PRIMARY_BRANCH}: conflicts at {sha[:12]} in: {', '.join(remaining)}{said}; merge "
+                f"{PRIMARY_BRANCH} into the branch and re-run the hand-back gate before QA (pk merge check {task_id})")
+    return f"merge with {PRIMARY_BRANCH}: no conflicts at {sha[:12]}{said}"
+
+
 # --- command -----------------------------------------------------------------
 
 def cmd_worktree(args: argparse.Namespace) -> int:
@@ -330,7 +345,7 @@ def cmd_worktree(args: argparse.Namespace) -> int:
         made = review(root, args.task_id, commit=args.commit, excludes=args.exclude)
         output = (f"{made['path']}{' (moved to the new commit)' if made['moved'] else ''}\ndiff: {made['diff']}\n"
                   f"commit: {made['commit']}\nleft out of the diff: {', '.join(made['left_out'])}\n"
-                  f"stat of every path: {made['stat']}")
+                  f"stat of every path: {made['stat']}\n{_merge_line(root, args.task_id)}")
     elif action == "finish":
         output = "\n".join(finish(root, args.task_id, symlinks=args.symlink, compose_project=args.compose_project,
                                   tool=args.container_tool, keep_branch=args.keep_branch,

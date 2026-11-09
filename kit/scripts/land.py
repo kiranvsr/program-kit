@@ -517,7 +517,37 @@ def merge(root: Path, task_id: str, inspected: str | None = None, round_name: st
 
 # --- commands ---------------------------------------------------------------------------
 
+def merge_check(root: Path, task_id: str) -> int:
+    """`pk merge check <ID>` (0.6.0, KF-38): whether task/<ID> merges into main without a conflict the kit leaves.
+
+    Run before QA starts (and again when main moves during QA), so a conflict that only `pk merge` would find after
+    the acceptance is found while it is still cheap. It merges as `git merge-tree` does, with the resolutions pk merge
+    applies (the task's status file, `merge.union_files`); no checkout, no suite, no acceptance needed, nothing
+    written. Prints the resolved lines and `OK: task/<ID> merges into main at <sha> without conflicts`, or a
+    `FAILED:` line naming the conflicting files (exit 1).
+    """
+    branch = f"task/{task_id}"
+    gate._branch_head(Path(root).resolve(), branch)
+    sha, resolved, remaining = conflicts.check(Path(root).resolve(), branch)
+    for line in resolved:
+        gate._out(line)
+    if remaining:
+        gate._out(f"FAILED: merge {branch} into {MAIN} at {sha} conflicts in: {', '.join(remaining)}")
+        return 1
+    print(f"OK: {branch} merges into {MAIN} at {sha} without conflicts")  # a checked branch name and a sha
+    return 0
+
+
 def cmd_merge(args: argparse.Namespace) -> int:
+    if args.task_id == "check":
+        if args.more is None:
+            raise KitError("pk merge check <ID>: name the task whose branch task/<ID> to check against main")
+        if args.inspected or args.round or args.no_commit or args.trailer:
+            raise KitError("pk merge check takes only the ID: it merges nothing and commits nothing")
+        return merge_check(find_root(), args.more)
+    if args.more is not None:
+        raise KitError(f"pk merge lands one task at a time: one ID, not {args.task_id} and {args.more} "
+                       "(pk merge check <ID> checks one against main)")
     print("\n".join(merge(find_root(), args.task_id, inspected=args.inspected, round_name=args.round,
                           commit=not args.no_commit, trailers=args.trailer)))
     return 0
@@ -539,7 +569,9 @@ def cmd_integrate(args: argparse.Namespace) -> int:
 
 
 def _configure_merge(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("task_id", metavar="ID", help="the one task to land; its branch is task/<ID>")
+    parser.add_argument("task_id", metavar="ID", help="the one task to land; its branch is task/<ID>; or the word "
+                                                      "check, then the ID: pk merge check <ID> only tries the merge")
+    parser.add_argument("more", metavar="CHECKED_ID", nargs="?", help=argparse.SUPPRESS)
     parser.add_argument("--inspected", metavar="SHA", help="light tier: the branch tip whose diff you read")
     parser.add_argument("--round", metavar="NAME", help="the integration round whose combined check covers it")
     parser.add_argument("--no-commit", action="store_true", dest="no_commit",
