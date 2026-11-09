@@ -1685,7 +1685,48 @@ def _root_or_none():
         return None
 
 
+def _task_records(argument: str, kinds: tuple[str, ...]) -> tuple[Path, list[dict]] | None:
+    """(root, [{kind, path, digest}]) when `argument` is not an existing file but a task ID with a pointer (0.6.0,
+    KF-40): the records the pointer names of `kinds`, `plants` meaning each item of its plants list. None when the
+    argument is no task ID (a path keeps its own error); KitError naming what was tried for an ID without a pointer.
+    """
+    if Path(argument).exists() or not store._TASK.match(argument) or argument == "fingerprint":
+        return None
+    root = find_root()
+    rel = store.pointer_path(argument)
+    if not (root / rel).is_file():
+        raise KitError(f"{argument} is not a file, and {rel} does not exist in {root}: name a record path, or the ID of "
+                       "a task with a pointer")
+    pointer = store.read_pointer(root, argument)
+    found = [dict(pointer[kind], kind=kind) for kind in kinds if kind in store.KINDS and kind in pointer]
+    if store.PLANTS in kinds:
+        found += [dict(item, kind=store.PLANTS) for item in store.read_plants(root, argument)]
+    return root, found
+
+
+def _validate_task(root: Path, records: list[dict]) -> int:
+    """One line per record a task's pointer names: `evidence valid: <path>`, or an error naming its first problem."""
+    failed = 0
+    for item in records:
+        try:
+            data = store.load(root, item["path"], item["digest"])
+            problems = {"acceptance": validate_acceptance, store.PLANTS: validate_plants}.get(
+                item["kind"], validate_results)(data)
+        except KitError as exc:
+            problems = [str(exc).removeprefix(f"{item['path']}: ")]
+        if problems:
+            more = f" (and {len(problems) - 1} more)" if len(problems) > 1 else ""
+            print(f"error: {item['path']}: {' '.join(problems[0].split())}{more}", file=sys.stderr)
+            failed = 1
+        else:
+            print(f"evidence valid: {item['path']}")
+    return failed
+
+
 def _validate(args) -> int:
+    task = _task_records(args.record, (*store.KINDS, store.PLANTS)) if args.record is not None else None
+    if task is not None:
+        return _validate_task(*task)
     if args.record is None:  # the whole evidence tree: names, history and pointers
         root = find_root()
         problems, pending = store.check(root, args.base, schema=True)
@@ -1714,6 +1755,17 @@ def _validate(args) -> int:
 
 
 def _lint(args) -> int:
+    task = _task_records(args.record, ("results",))
+    if task is not None:  # 0.6.0 (KF-40): a task ID lints its latest results record
+        root, records = task
+        if not records:
+            raise KitError(f"{store.pointer_path(args.record)} names no results record")
+        path = Path(records[0]["path"])
+        problems = lint_record(store.load(root, records[0]["path"], records[0]["digest"]), root)
+        if problems:
+            return _errors(problems)
+        print(f"lint: {path} binds only inputs")
+        return 0
     path = Path(args.record)
     problems = lint_record(read_json(path), _root_or_none())
     if problems:
@@ -1872,10 +1924,12 @@ def _configure(parser: argparse.ArgumentParser) -> None:
     actions.add_parser("init", help="nothing to create: a task's pointer appears with its first record")
     checker = actions.add_parser("validate", help="check one record against its schema and invariants (and its "
                                                   "name), or, with no record, every record, the history and the pointers")
-    checker.add_argument("record", metavar="record.json", nargs="?", help="path to one record")
+    checker.add_argument("record", metavar="record.json|ID", nargs="?",
+                         help="path to one record, or a task ID: every record its latest.json names")
     checker.add_argument("--base", metavar="REF", help="check the history from REF only (default: all of it)")
     linter = actions.add_parser("lint", help="refuse a results record that binds a derived output")
-    linter.add_argument("record", metavar="results.json", help="path to the results record")
+    linter.add_argument("record", metavar="results.json|ID",
+                        help="path to the results record, or a task ID: its latest results record")
     lister = actions.add_parser("history", help="every record of a task, newest first")
     lister.add_argument("task_id", metavar="ID")
     accepter = actions.add_parser("accept", help="append QA's acceptance record (it must bind the latest results)")
