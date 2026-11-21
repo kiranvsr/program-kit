@@ -78,8 +78,8 @@ import stale as stale_module
 import status as status_module
 import store
 import miniyaml
-from common import (KitError, drop_bom, find_root, git, read_json, read_text, read_yaml, run_argv, utc_now,
-                    write_json)
+from common import (KitError, drop_bom, find_root, git, read_json, read_text, read_yaml, run_argv, tracking,
+                    utc_now, write_json)
 from register import GATE_ID, GATE_SHAPE
 
 MAIN = "main"  # the primary branch; fixed, so no caller can choose where the rules are read from
@@ -698,7 +698,8 @@ def _step_lines(step: str, commands: list[tuple[list[str], int]], cwd: Path, env
             lines.append(f"step {step}: {' '.join(argv)} reused from the test step ({exit_text(code)})")
         else:
             started = time.monotonic()
-            code, output = run_argv(argv, cwd, env=env, timeout=timeout, track=f"gate step {step}")
+            with tracking(f"gate step {step}"):  # 0.6.2, KF-60: pk sweep finds a step a killed gate left
+                code, output = run_argv(argv, cwd, env=env, timeout=timeout)
             _note_time(step, time.monotonic() - started, code == 124)
         if sink is not None:
             sink.append({"argv": list(argv), "exit": code, "output": output})

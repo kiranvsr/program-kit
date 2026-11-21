@@ -213,6 +213,18 @@ class Registry(unittest.TestCase):
                                          track="slow")[0], 124)
         self.assertFalse(self.folder.exists())
 
+    def test_a_gate_step_runs_tracked(self):
+        import gate
+        seen = []
+        real = sweep.record_child
+        with mock.patch.object(sweep, "record_child", side_effect=lambda *a, **k: seen.append(a[2]) or real(*a, **k)):
+            passed, _ = gate._step_lines("test", [([PY, "-c", "pass"], 0)], self.root)
+        self.assertTrue(passed)
+        self.assertEqual(seen, ["gate step test"])
+        with mock.patch.object(sweep, "record_child") as untracked:
+            common.run_argv([PY, "-c", "pass"], self.root)
+        untracked.assert_not_called()  # outside a tracking block, run_argv registers nothing
+
 
 class Stop(unittest.TestCase):
     def test_a_pid_that_ended_or_was_reused_is_not_signalled_and_a_survivor_gets_kill(self):

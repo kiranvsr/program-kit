@@ -162,7 +162,9 @@ class YamlTemplateTests(unittest.TestCase):
                               "scale": {"steps": ["test"], "margin": 1.5, "cap": 7200}},  # e2e (KF-53), the scanner
              "lock": {"name": "pk-heavy"},  # before commits (KF-21, KF-55)
              "e2e": {"command": [["make", "e2e"]], "paths": ["web/src/"], "specs": ["web/e2e/"], "timeout": 5400},
-             "secret_scan": [["tools/secret-scan", "."]]}])
+             "secret_scan": [["tools/secret-scan", "."]]},
+            {"processes": {"max_age_hours": 24, "paths": ["/tmp/agent-scratch/this-project"],  # 0.6.2: pk sweep
+                           "kill_grace_seconds": 5, "drift": "note"}}])  # and D9 (KF-60)
         import gate  # the examples are ones the checks loader accepts
         for block in checks[1:]:
             gate._parse_checks(miniyaml.loads(block), ())

@@ -180,3 +180,16 @@ tiers:
 #   secret_scan:
 #     - - tools/secret-scan
 #       - .
+# Optional (0.6.2), read by `pk sweep` and `pk drift` only: stale processes of this project. pk sweep lists the
+# children of pk runs that ended (any age), and wait loops (shells given -c that sleep, tail, until or while) and
+# orphaned tails older than max_age_hours (24) whose command line or working directory points into the checkout,
+# a worktree, the git common dir or a paths prefix (an agent tool's scratch folder, say); pk sweep --kill stops
+# exactly those, SIGTERM then SIGKILL after kill_grace_seconds (5). pk drift prints the count as a D9 note; drift:
+# fail makes D9 a check that drifts. Absent: the defaults, report only. For example:
+#
+#   processes:
+#     max_age_hours: 24
+#     paths:
+#       - /tmp/agent-scratch/this-project
+#     kill_grace_seconds: 5
+#     drift: note

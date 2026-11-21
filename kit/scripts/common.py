@@ -6,6 +6,8 @@ import json
 import os
 import secrets
 import subprocess
+import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -249,9 +251,11 @@ def run_argv(argv: list[str], cwd: Path, env: dict | None = None,
     """Run argv directly (never a shell); return (exit code, stdout+stderr combined).
 
     Shell conventions for the two non-exit cases: 124 on timeout, 127 if the
-    executable cannot be started. `track` (0.6.2, KF-60) names the owner under which the child is kept in the
-    registry of pk's long-running children while it runs, so `pk sweep` finds it if this process dies first.
+    executable cannot be started. `track` (0.6.2, KF-60), else the owner a `tracking` block of this thread names,
+    keeps the child in the registry of pk's long-running children while it runs, so `pk sweep` finds it if this
+    process dies first.
     """
+    track = track if track is not None else getattr(_TRACKING, "owner", None)
     if track is not None:
         return _run_tracked(argv, cwd, env, timeout, track)
     try:
@@ -263,6 +267,20 @@ def run_argv(argv: list[str], cwd: Path, env: dict | None = None,
     except OSError as exc:
         return 127, f"cannot run {argv[0]}: {exc.strerror or exc}\n"
     return proc.returncode, proc.stdout.decode("utf-8", errors="replace")
+
+
+_TRACKING = threading.local()
+
+
+@contextmanager
+def tracking(owner: str):
+    """Within the block, `run_argv` in this thread registers its child under `owner` (0.6.2, KF-60)."""
+    before = getattr(_TRACKING, "owner", None)
+    _TRACKING.owner = owner
+    try:
+        yield
+    finally:
+        _TRACKING.owner = before
 
 
 def _run_tracked(argv: list[str], cwd: Path, env: dict | None, timeout: int | None, owner: str) -> tuple[int, str]:
