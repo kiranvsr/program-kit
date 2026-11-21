@@ -532,6 +532,9 @@ class EndToEndTests(unittest.TestCase):
         self.assertIn("remote", project.pk("remote", "status", expect=1).stderr)  # no remote section: refused
         # 0.6.1: pk scan staged needs a scanner the example does not configure, and says so
         self.assertIn("needs a scanner", project.pk("scan", "staged", expect=1).stderr)
+        # 0.6.2: pk sweep reports and writes nothing; drift notes the same as D9 and still counts 7 checks
+        self.assertRegex(project.pk("sweep").stdout, r"^sweep: \d+ stale process\(es\) at ")
+        self.assertIn("  D9 note  ", project.pk("drift").stdout)
         self.assertEqual(project.git("status", "--porcelain"), "")
         project.pk("init", expect=1)  # program/ exists: init refuses to overwrite it
 
