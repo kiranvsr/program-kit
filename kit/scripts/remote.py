@@ -326,7 +326,10 @@ def _remote(settings: dict, script: str, stdin: bytes | None = None, capture: bo
     if capture:
         return subprocess.run(argv, input=stdin, capture_output=True)
     proc = subprocess.Popen(argv, stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL)
-    proc.communicate(stdin)
+    import sweep  # late: the registry of pk's long-running children (0.6.2, KF-60)
+
+    with sweep.tracked(Path.cwd(), proc.pid, "pk remote", [argv[0], settings.get("host", ""), "(lane script)"]):
+        proc.communicate(stdin)
     return proc
 
 

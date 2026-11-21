@@ -86,7 +86,8 @@ MAIN = "main"  # the primary branch; fixed, so no caller can choose where the ru
 CHECK_KEYS = ("build", "test", "scan", "compile_check", "extra_gate")
 ALL_KEYS = CHECK_KEYS + ("parallel_steps", "guarded_files", "tiers", "drift", "evidence", "progress", "merge",
                          "research", "remote",  # drift, progress: `pk drift` only; research, remote: their commands (0.6.0)
-                         "step_timeout", "lock", "e2e", "secret_scan")  # 0.6.1: KF-50, KF-52, KF-53, KF-21 and KF-55
+                         "step_timeout", "lock", "e2e", "secret_scan",  # 0.6.1: KF-50, KF-52, KF-53, KF-21 and KF-55
+                         "processes")  # 0.6.2, KF-60: pk sweep and pk drift's D9 only
 TIMED_STEPS = ("build", "compile_check", "test", "scan", "extra_gate", "plan", "e2e")  # step_timeout's steps (0.6.1)
 STEP_TIMEOUT_KEYS = ("default", *TIMED_STEPS, "scale")
 SCALE_KEYS = ("steps", "margin", "floor", "cap")
@@ -356,6 +357,9 @@ def _parse_checks(data, require: tuple[str, ...]) -> dict:
     checks["lock"] = _parse_lock(data.get("lock"))
     checks["e2e"] = _parse_e2e(data.get("e2e"))
     checks["secret_scan"] = _parse_secret_scan(data.get("secret_scan"))
+    import sweep  # late, like drift: read by pk sweep and pk drift alone (0.6.2)
+
+    checks["processes"] = sweep.parse(data.get("processes"))
     for key in require:
         if not checks[key]:
             raise KitError(f"checks.yaml: {key} must list at least one command")
@@ -694,7 +698,7 @@ def _step_lines(step: str, commands: list[tuple[list[str], int]], cwd: Path, env
             lines.append(f"step {step}: {' '.join(argv)} reused from the test step ({exit_text(code)})")
         else:
             started = time.monotonic()
-            code, output = run_argv(argv, cwd, env=env, timeout=timeout)
+            code, output = run_argv(argv, cwd, env=env, timeout=timeout, track=f"gate step {step}")
             _note_time(step, time.monotonic() - started, code == 124)
         if sink is not None:
             sink.append({"argv": list(argv), "exit": code, "output": output})

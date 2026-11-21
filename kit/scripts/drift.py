@@ -19,6 +19,8 @@ detached worktree, so nothing in the checkout is written, and removes that workt
      Like D3 it reads the real checkout and the main branch, whatever REV is.
   D8 research citations (0.6.0): with the optional `research` section, no file of `research.guard` cites a research
      item that has not graduated (research.py, `pk research check`); without the section there is no D8 line.
+  D9 stale processes (0.6.2, KF-60): the processes `pk sweep` lists (sweep.py). A note printed after the checks,
+     never counted, unless `processes.drift: fail` makes it a check that drifts while any is listed.
 
 After the checks it prints, as information and never as drift, the tasks ready to start (`pk status ready`).
 Drift is information: the command exits 0 unless `--strict` is given and a check drifts (for a scheduled run).
@@ -39,6 +41,7 @@ import time
 from pathlib import Path, PurePosixPath
 
 import research
+import sweep
 from common import KitError, find_root, git, read_json, read_yaml, run_argv
 
 KEYS = ("regenerate", "docs_vs_migrations")
@@ -246,8 +249,10 @@ def _regeneration(root: Path, sha: str, commands: list[list[str]], stage: int) -
     return False, "; ".join(([hint] if changed else []) + failures)
 
 
-def report(root: Path, rev: str = "HEAD") -> tuple[str, list[tuple[str, bool, str]]]:
-    """(sha, [(check id, ok, detail)]) for commit `rev`; writes nothing in the checkout."""
+def report(root: Path, rev: str = "HEAD", notes: dict | None = None) -> tuple[str, list[tuple[str, bool, str]]]:
+    """(sha, [(check id, ok, detail)]) for commit `rev`; writes nothing in the checkout.
+
+    `notes`, when given, receives {"D9": detail} while D9 is a note rather than a check (0.6.2)."""
     root = Path(root)
     if not rev or rev.startswith("-"):
         raise KitError(f"drift: {_one_line(rev) or 'an empty revision'} is not a commit")
@@ -262,6 +267,7 @@ def report(root: Path, rev: str = "HEAD") -> tuple[str, list[tuple[str, bool, st
     # D3 first, on the real checkout: the temporary worktree below would otherwise be listed in the hand-off
     hand_off = _hand_off(root) if sha == head else (True, "skipped: not the checkout's HEAD")
     progress_docs = _progress(root)
+    processes = sweep.drift_check(root)  # D9 (0.6.2): live processes, so the checkout's config, like D7
     with tempfile.TemporaryDirectory(prefix="pk-drift-") as tmp:
         tree = Path(tmp) / "tree"
         git(root, "worktree", "add", "--detach", "--quiet", str(tree), sha)
@@ -280,7 +286,12 @@ def report(root: Path, rev: str = "HEAD") -> tuple[str, list[tuple[str, bool, st
             subprocess.run(["git", "-C", str(root), "worktree", "remove", "--force", str(tree)], capture_output=True)
             subprocess.run(["git", "-C", str(root), "worktree", "prune"], capture_output=True)
     found["D7"] = progress_docs
-    return sha, [(cid, *found[cid]) for cid in ("D1", "D2", "D3", "D4", "D5", "D6", "D7", "D8") if cid in found]
+    if processes[0] == "fail":  # otherwise a note that cmd_drift prints, so 0.6.1 reports keep their checks
+        found["D9"] = processes[1:]
+    elif notes is not None:
+        notes["D9"] = processes[2]
+    return sha, [(cid, *found[cid]) for cid in ("D1", "D2", "D3", "D4", "D5", "D6", "D7", "D8", "D9")
+                 if cid in found]
 
 
 def _progress(root: Path) -> tuple[bool, str]:
@@ -311,10 +322,13 @@ def cmd_drift(args: argparse.Namespace) -> int:
         return hook.stop_check(args.hook)
     started = time.monotonic()
     root = find_root()
-    sha, results = report(root, args.rev)
+    notes: dict = {}
+    sha, results = report(root, args.rev, notes)
     print(f"drift report at {sha[:12]} ({time.monotonic() - started:.0f} s)")
     for cid, ok, detail in results:
         print(f"  {cid} {'ok' if ok else 'DRIFT':5} {_one_line(detail)}")
+    if "D9" in notes:
+        print(f"  D9 note  {_one_line(notes['D9'])}")
     lines = _ready_lines(root)
     print(f"  ready to start (information, not a check): {len(lines) or 'none'}")
     for line in lines:
@@ -336,5 +350,6 @@ def _configure(parser: argparse.ArgumentParser) -> None:
 
 def register(add_command) -> None:
     add_command("drift", cmd_drift, help="report-only: do the documents still agree with their generators, "
-                "approvals and code, and are the progress docs behind state (D1 to D7; D8 with research)",
+                "approvals and code, and are the progress docs behind state (D1 to D7; D8 with research; D9 stale "
+                "processes, a note unless processes.drift is fail)",
                 configure=_configure)
