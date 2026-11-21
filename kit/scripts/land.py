@@ -362,8 +362,18 @@ def round_check(root: Path, name: str) -> int:
                 and gate._definition(root, worktree, task_id, meta) is not None
                 and gate._tier_unchanged(worktree, task_id, meta)):
             return 1
-    for step in SUITE:
-        if not gate._run_commands(step, gate._commands(checks[step]), worktree):
+    e2e = sorted({reason for member in data["members"]
+                  for reason in gate.e2e_reasons(root, member["branch"], checks, merge=True)})
+
+    def suite() -> int:
+        for step in SUITE:
+            if not gate._run_commands(step, gate._commands(checks[step]), worktree,
+                                      timeout=gate.step_limit(checks, step)):
+                return 1
+        return 0 if gate._e2e_step(checks, worktree, e2e, merge=True) else 1
+
+    with gate.heavy(root, checks, f"integrate-check-{name}"):  # 0.6.1: checks.yaml's lock, limits and e2e
+        if gate._limited(root, checks, suite):
             return 1
     if gate._changes(worktree):
         gate._out(f"FAILED: round the checks left {worktree} dirty")
@@ -447,10 +457,12 @@ def round_close(root: Path, name: str, recheck: bool = False, commit: bool = Tru
             raise KitError("; ".join([*lines, f"re-check them: pk integrate close {name} --recheck runs "
                                               f"{MAIN}'s checks once over the final tree"]))
         checks = gate.load_checks_at(root, MAIN, require=("build", "test", "scan"))
-        trial = Path(tempfile.mkdtemp(prefix="pk-trial-"))
-        git(root, "worktree", "add", "--detach", str(trial), MAIN)
-        code = gate._with_trial(root, trial, lambda: 0 if all(
-            gate._run_commands(step, gate._commands(checks[step]), trial) for step in SUITE) else 1)
+        with gate.heavy(root, checks, f"integrate-close-{name}"):
+            trial = Path(tempfile.mkdtemp(prefix="pk-trial-"))
+            git(root, "worktree", "add", "--detach", str(trial), MAIN)
+            code = gate._limited(root, checks, lambda: gate._with_trial(root, trial, lambda: 0 if all(
+                gate._run_commands(step, gate._commands(checks[step]), trial, timeout=gate.step_limit(checks, step))
+                for step in SUITE) else 1))
         if code:
             raise KitError(f"round {name}: the re-check failed on {MAIN}; fix it before anything else merges")
         lines.append(f"re-checked {len(differing)} changed path(s): {MAIN}'s checks pass on the final tree")
@@ -545,13 +557,20 @@ def merge_check(root: Path, task_id: str) -> int:
     the acceptance is found while it is still cheap. It merges as `git merge-tree` does, with the resolutions pk merge
     applies (the task's status file, `merge.union_files`); no checkout, no suite, no acceptance needed, nothing
     written. Prints the resolved lines and `OK: task/<ID> merges into main at <sha> without conflicts`, or a
-    `FAILED:` line naming the conflicting files (exit 1).
+    `FAILED:` line naming the conflicting files (exit 1). With an `e2e` section (0.6.1, F-0630) a line says when main's
+    e2e specs changed since the branch left it, so QA knows the merge check will run the e2e step; nothing runs here.
     """
     branch = f"task/{task_id}"
     gate._branch_head(Path(root).resolve(), branch)
     sha, resolved, remaining = conflicts.check(Path(root).resolve(), branch)
     for line in resolved:
         gate._out(line)
+    try:
+        checks = gate.load_checks_at(Path(root).resolve(), MAIN)
+    except KitError:
+        checks = {}
+    for reason in gate.e2e_reasons(Path(root).resolve(), branch, checks, merge=True) if checks.get("e2e") else []:
+        gate._out(f"e2e: {reason}; the merge check (pk merge, pk gate merge-check) runs the e2e step")
     if remaining:
         gate._out(f"FAILED: merge {branch} into {MAIN} at {sha} conflicts in: {', '.join(remaining)}")
         return 1
@@ -560,6 +579,16 @@ def merge_check(root: Path, task_id: str) -> int:
 
 
 def cmd_merge(args: argparse.Namespace) -> int:
+    import lock as lock_module  # a signal while the merge check waits for or holds the heavy lock (0.6.1)
+
+    try:
+        return _cmd_merge(args)
+    except lock_module.Signalled as exc:
+        raise KitError(f"stopped by signal {exc.signum} (the heavy lock is released and the trial merge removed)") \
+            from None
+
+
+def _cmd_merge(args: argparse.Namespace) -> int:
     if args.task_id == "check":
         if args.more is None:
             raise KitError("pk merge check <ID>: name the task whose branch task/<ID> to check against main")

@@ -160,7 +160,8 @@ def _checks_problems(data) -> list[str]:
         parts.append(({"drift": data.get("drift")}, ()))
         parts.append(({"evidence": data.get("evidence")}, ()))
         parts.append(({"progress": data.get("progress")}, ()))
-        for key in ("merge", "research", "remote"):  # 0.6.0
+        for key in ("merge", "research", "remote",  # 0.6.0
+                    "step_timeout", "lock", "e2e", "secret_scan"):  # 0.6.1
             parts.append(({key: data.get(key)}, ()))
         parts.append(({key: value for key, value in data.items() if key not in gate.ALL_KEYS}, ()))
     problems = []
