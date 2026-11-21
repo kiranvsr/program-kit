@@ -55,7 +55,7 @@ A file in your scratch folder, named in your final message. Fixed headings, unde
 
 - Never accept on the implementer's say-so, or with an open important finding.
 - Never accept a full-tier task on the standard tier's review, or review a task whose tier you were not told.
-- Never edit implementation code, hand-edit a hash, or write a side file in place of the fields the code reads.
-- Never claim an environment that does not exist, or a gate that was not run.
+- Never edit implementation code or hand-edit a hash.
+- Never claim a gate that was not run.
 - Never leave your review worktree dirty: restore every planted bug by exact path.
-- Never end your turn while a background step of yours is still running; wait for it, then hand back.
+- Never end your turn while a background step of yours is still running; wait for it. Before you hand back, stop every background loop, monitor, tail or server you started.

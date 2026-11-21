@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.6.2
+
+Two findings from running a program on the kit (KF-59 and KF-60 there): a process the kit's own test suite left running for good, and agents' background wait loops and watchers that outlived their hand-back, 146 loops (some ten days old) and 16 orphaned tails under one agent session. Everything is backward compatible: every record, pointer, status file and `checks.yaml` written before reads, validates and runs as it did, `pk drift` counts the same checks, and nothing is ever stopped unless `pk sweep --kill` is run.
+
+What changed:
+
+- The kit's tests leave nothing running (KF-59, bug fix). The ordered-waiters lock test started a `pk lock run holder` whose command polled every 20 ms for a `go` file, and nothing stopped it when the test failed before writing the file: the temp folder went with the test's cleanup and the orphaned command polled forever. Every `pk lock` child of `test_lock.py` now runs in a session of its own that a cleanup kills, pass or fail; the holder's wait gives up after 60 s; and `test_zz_leftovers.py`, which runs last, fails (after stopping them) on any process still descending from the test runner. It reads `ps` but looks only at the runner's descendants.
+- `pk sweep` (KF-60, new command, report only unless `--kill`). It lists this project's stale processes: the children of pk runs that ended, at any age, and non-interactive shell wait loops with their `sleep` and `tail` children and orphaned `tail` watchers, older than `processes.max_age_hours` (24), whose command line or working directory points into the checkout, a worktree, the git common dir or a `processes.paths` prefix. `--kill` stops exactly what it lists: SIGTERM, then SIGKILL after `processes.kill_grace_seconds` (5), checking each pid's start time again first. It never lists another user's process, itself or its ancestors, a pk lock holder or an active pk run with their families, interactive shells, editors or browsers.
+- pk's own long-running children are registered (KF-60). `pk lock run`'s command, every gate step and the lanes' ssh are written to `<git common dir>/pk-procs/<pid>.json` (pid, start time, owner, command, pk's pid) while they run and removed when they end, so a child left behind by a killed pk is found whatever its age. Writing the entry never fails the run.
+- `pk drift` D9 (KF-60). After the checks `pk drift` prints `D9 note` with the number of stale processes, from one `ps` call (`lsof` only for candidates whose command line does not match, and not on Linux). It is never counted unless `processes.drift: fail`, which makes D9 a check that drifts while any process is listed.
+- The briefs (KF-60). The implementer, QA and spec-QA briefs add "Before you hand back, stop every background loop, monitor, tail or server you started." to KF-54's line, and playbook 07 asks for it in the spec author's dispatch. The briefs lost wording that repeated hard rules 2, 4 and 18 and working rule W7, so the reading sets stay under their ceilings.
+- `pk doctor` and the gates validate the `processes` section; the `checks.yaml` template shows it.
+- Docs: DESIGN sections 3, 9.3, 10.2 and 13; playbooks 07 and 09; README.
+
+Design choices, each with its reason:
+
+- Report first, kill on request: a loop left for one more look costs little, and killing another agent's current wait costs a run. The threshold, not a task's state, decides, because a shell loop carries no task id.
+- Matching is narrow on purpose: a shell must be given `-c` and loop or wait, a `sleep` or `tail` counts only as such a shell's child or (a tail) as an orphan, and a path matches only at a path boundary. An interactive terminal, a dev server started with `bash -c`, an editor or a browser in the repository is never listed.
+- Pid reuse is checked by start time (now minus `ps`'s elapsed time, which has no time-zone or daylight-saving trap), within three seconds, at report and again before each signal.
+- The registry sits in the git common dir, beside the lock, so every worktree of a clone shares it and no tree a gate checks changes.
+- D9 is a note by default so a 0.6.1 drift report keeps its checks and its `N of 7` line.
+
+Upgrading from 0.6.1: `sh install.sh /path/to/your-repo --upgrade`. Nothing in `program/` has to change. Run `pk sweep` to see what it lists before anything else; add a `processes` section to `checks.yaml` (a guarded edit, with the user's word) to add a scratch path, change the age or make D9 drift. Put the new brief line in any dispatch template of your own.
+
 ## 0.6.1
 
 Eight findings from running a program on the kit (KF-21 and KF-49 to KF-55 there, with its follow-ups F-0630, F-0677 and F-0783): gate test steps that timed out on a loaded machine with no failing test, about 280,000 temp folders leaked once per planted-bug run, stand-ins re-cut from an old working copy that silently reverted later commits of main, merge checks run off the heavy lock and lock waiters starved by a holder that ran again at once, flagged test literals that reached main through a stand-in or a ruling, an e2e change that no gate ran, and an agent that ended its turn while its own suites still ran. Everything is backward compatible: every record, pointer, producer, status file and `checks.yaml` written before reads, validates and runs as it did. New gate behaviour is opt-in; the safety fixes (KF-21, KF-49, KF-51) are on by default.

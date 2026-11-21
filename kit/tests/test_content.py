@@ -222,6 +222,15 @@ class BriefTests(unittest.TestCase):
                                  f"{name}: report shape is not short")
             self.assertRegex(text, r"(?i)under 25 lines", f"{name}: report limit not stated")
 
+    def test_agents_are_told_to_stop_what_they_started_before_handing_back(self):
+        """KF-54 (0.6.1) and KF-60 (0.6.2): wait for your own background steps, stop your loops and watchers."""
+        line = "Before you hand back, stop every background loop, monitor, tail or server you started."
+        for name in ("implementer.md", "qa.md", "spec_qa.md"):
+            never = sections(read(BRIEF_DIR / name))["Never"]
+            self.assertIn("Never end your turn while a background step of yours is still running", never, name)
+            self.assertIn(line, never, name)
+        self.assertIn(line, read(PLAYBOOK_DIR / "07_task_specs.md"))
+
 
 class ZeroContextReviewTests(unittest.TestCase):
     """0.5.0: the lens and challenger reviews a full-tier spec gets, and how spec QA rules on them."""

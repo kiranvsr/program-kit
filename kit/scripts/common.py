@@ -6,6 +6,8 @@ import json
 import os
 import secrets
 import subprocess
+import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -245,12 +247,17 @@ def primary_branch_problem(root: Path, main: str = PRIMARY_BRANCH, need_commit: 
 
 
 def run_argv(argv: list[str], cwd: Path, env: dict | None = None,
-             timeout: int | None = None) -> tuple[int, str]:
+             timeout: int | None = None, track: str | None = None) -> tuple[int, str]:
     """Run argv directly (never a shell); return (exit code, stdout+stderr combined).
 
     Shell conventions for the two non-exit cases: 124 on timeout, 127 if the
-    executable cannot be started.
+    executable cannot be started. `track` (0.6.2, KF-60), else the owner a `tracking` block of this thread names,
+    keeps the child in the registry of pk's long-running children while it runs, so `pk sweep` finds it if this
+    process dies first.
     """
+    track = track if track is not None else getattr(_TRACKING, "owner", None)
+    if track is not None:
+        return _run_tracked(argv, cwd, env, timeout, track)
     try:
         proc = subprocess.run(argv, cwd=str(cwd), env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                               timeout=timeout, shell=False)
@@ -260,3 +267,39 @@ def run_argv(argv: list[str], cwd: Path, env: dict | None = None,
     except OSError as exc:
         return 127, f"cannot run {argv[0]}: {exc.strerror or exc}\n"
     return proc.returncode, proc.stdout.decode("utf-8", errors="replace")
+
+
+_TRACKING = threading.local()
+
+
+@contextmanager
+def tracking(owner: str):
+    """Within the block, `run_argv` in this thread registers its child under `owner` (0.6.2, KF-60)."""
+    before = getattr(_TRACKING, "owner", None)
+    _TRACKING.owner = owner
+    try:
+        yield
+    finally:
+        _TRACKING.owner = before
+
+
+def _run_tracked(argv: list[str], cwd: Path, env: dict | None, timeout: int | None, owner: str) -> tuple[int, str]:
+    import sweep  # lazy: only a tracked run needs the registry
+
+    try:
+        proc = subprocess.Popen(argv, cwd=str(cwd), env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                shell=False)
+    except OSError as exc:
+        return 127, f"cannot run {argv[0]}: {exc.strerror or exc}\n"
+    with proc, sweep.tracked(cwd, proc.pid, owner, argv):
+        try:
+            out, _ = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out, _ = proc.communicate()
+            return 124, f"{(out or b'').decode('utf-8', errors='replace')}timed out after {timeout}s: {argv[0]}\n"
+        except BaseException:
+            proc.kill()
+            proc.wait()
+            raise
+    return proc.returncode, out.decode("utf-8", errors="replace")

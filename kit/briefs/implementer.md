@@ -50,7 +50,6 @@ The file your dispatch names (step 8). Fixed headings, under 25 lines:
 
 - Never edit anything under `program/tasks/<ID>/` on the task branch, your status record's tier, or a guarded file without a `Guarded edit: <path>` line in the SPEC on main. A needed SPEC, PLAN or table change goes in your hand-back; the controller makes it on main and you merge main.
 - Never set `done`. Only QA does.
-- Never produce evidence from a dirty tree, hand-edit a hash, or substitute a command.
+- Never substitute a command or hand-edit a hash.
 - Never write under `program/evidence/<ID>/results/`, `acceptance/` or `plants/`, or edit `latest.json`: the kit does. Run outputs go outside the repository; run `pk evidence check-tree <ID>` before each commit.
-- Never work around a denied action. Stop and report it.
-- Never end your turn while a background step of yours is still running (the gate included); wait for it, then hand back.
+- Never end your turn while a background step of yours is still running (the gate included); wait for it. Before you hand back, stop every background loop, monitor, tail or server you started.

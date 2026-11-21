@@ -410,7 +410,10 @@ def run(owner: str, argv: list[str], name: str | None = None, cwd=None) -> int:
             except OSError as exc:
                 _say(f"cannot run {argv[0]}: {exc.strerror or exc}")
                 return 127 if isinstance(exc, FileNotFoundError) else 126
-            code = state["child"].wait()
+            import sweep  # late: the registry of pk's long-running children (0.6.2, KF-60)
+
+            with sweep.tracked(cwd if cwd is not None else Path.cwd(), state["child"].pid, f"lock run {owner}", argv):
+                code = state["child"].wait()
         except Signalled as exc:
             return 128 + exc.signum
         finally:

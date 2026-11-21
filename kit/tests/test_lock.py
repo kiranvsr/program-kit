@@ -1,5 +1,6 @@
 """`pk lock` (0.6.0, KF-16 of the program it came from): the machine lock for heavy runs, with real processes."""
 import _paths  # noqa: F401  (must come first: puts kit/scripts/ on sys.path)
+import io
 import os
 import signal
 import subprocess
@@ -18,6 +19,25 @@ PY = sys.executable
 
 def sh(cwd, *argv):
     return subprocess.run(list(argv), cwd=str(cwd), check=True, capture_output=True, text=True).stdout
+
+
+def wait_for_file(path, seconds=60.0) -> str:
+    """Python code that waits for `path` to exist, giving up after `seconds` (KF-59: never polls forever)."""
+    return (f"import os, sys, time\ndeadline = time.monotonic() + {float(seconds)!r}\n"
+            f"while not os.path.exists({str(path)!r}):\n"
+            "    if time.monotonic() > deadline: sys.exit(3)\n"
+            "    time.sleep(0.02)")
+
+
+def stop_group(child) -> None:
+    """Stop `child` and every process of its session (a `pk lock run` and its command), whatever state the test
+    left them in (KF-59: a failed test must not leave a holder behind)."""
+    if child.poll() is None:
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except OSError:
+            child.kill()
+    child.communicate()
 
 
 class LockBase(unittest.TestCase):
@@ -42,8 +62,11 @@ class LockBase(unittest.TestCase):
                               capture_output=True, text=True, timeout=60, **kwargs)
 
     def start(self, *argv, cwd=None):
-        return subprocess.Popen([PY, str(PK), "lock", *argv], cwd=str(cwd or self.root), env=self.env,
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        """A `pk lock` child in a session of its own, stopped with its command when the test ends, pass or fail."""
+        child = subprocess.Popen([PY, str(PK), "lock", *argv], cwd=str(cwd or self.root), env=self.env,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+        self.addCleanup(stop_group, child)
+        return child
 
     def wait_for(self, condition, seconds=20):
         deadline = time.monotonic() + seconds
@@ -232,8 +255,7 @@ class Queue(LockBase):
     def test_waiters_are_served_in_the_order_they_came(self):
         log = self.base / "log"
         gate = self.base / "go"
-        holder = self.start("run", "holder", "--", PY, "-c",
-                            f"import os, time\nwhile not os.path.exists({str(gate)!r}): time.sleep(0.02)")
+        holder = self.start("run", "holder", "--", PY, "-c", wait_for_file(gate))
         self.wait_for(lambda: (self.lock / "owner").is_file())
         queue = self.root / ".git" / "pk-heavy.queue"
         waiters = []
@@ -290,6 +312,41 @@ class Nested(LockBase):
             self.assertTrue(self.lock.is_dir())  # the inner block did not release the outer hold
         self.assertFalse(self.lock.exists())
         self.assertNotIn(f"pk-heavy:{os.getpid()}", os.environ.get("PK_LOCK_HELD", ""))
+
+
+class NoLeftHolder(unittest.TestCase):
+    """KF-59 (0.6.2): a lock test that fails part-way leaves no `pk lock run` holder polling for its `go` file."""
+
+    def test_a_failed_ordered_waiters_test_stops_its_holder_and_waiters(self):
+        started = []
+
+        class Failing(Queue):
+            def start(self, *argv, cwd=None):
+                child = super().start(*argv, cwd=cwd)
+                started.append(child)
+                return child
+
+            def wait_for(self, condition, seconds=20):
+                super().wait_for(condition, seconds)
+                if len(started) > 1:  # the holder holds the lock and a waiter queues: time out as a loaded machine can
+                    self.fail("timed out waiting")
+
+        case = Failing("test_waiters_are_served_in_the_order_they_came")
+        result = unittest.TextTestRunner(stream=io.StringIO(), verbosity=0).run(case)
+        self.addCleanup(lambda: [stop_group(child) for child in started])
+        self.assertEqual(len(result.failures), 1)
+        self.assertTrue(started)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and any(child.poll() is None for child in started):
+            time.sleep(0.05)
+        self.assertEqual([child.args[3:5] for child in started if child.poll() is None], [])
+
+    def test_the_holders_wait_for_its_go_file_gives_up_at_its_deadline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            began = time.monotonic()
+            done = subprocess.run([PY, "-c", wait_for_file(Path(tmp) / "never", seconds=0.5)], timeout=30)
+            self.assertEqual(done.returncode, 3)  # gave up
+            self.assertLess(time.monotonic() - began, 20)
 
 
 if __name__ == "__main__":
