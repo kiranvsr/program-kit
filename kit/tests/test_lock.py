@@ -192,5 +192,105 @@ class Refusals(LockBase):
             lock.lock_path(self.base)
 
 
+class Queue(LockBase):
+    """F-0677 (0.6.1): waiters are served first in, first out, by ticket; a dead or abandoned ticket never blocks."""
+
+    def ticket(self, pid, age=0, stamp=1):
+        queue = self.root / ".git" / "pk-heavy.queue"
+        queue.mkdir(exist_ok=True)
+        path = queue / f"{stamp:020d}-{pid}-feedface"
+        path.write_text(f"owner=earlier\npid={pid}\n")
+        if age:
+            past = time.time() - age
+            os.utime(path, (past, past))
+        return path
+
+    def test_a_free_lock_is_not_taken_while_an_earlier_waiter_holds_a_ticket(self):
+        earlier = subprocess.Popen([PY, "-c", "import time; time.sleep(60)"])
+        self.addCleanup(self.stop, earlier)
+        mine = self.ticket(earlier.pid)
+        log = self.base / "ran"
+        waiter = self.start("run", "later", "--", PY, "-c", f"open({str(log)!r}, 'w').write('x')")
+        time.sleep(1.0)
+        self.assertIsNone(waiter.poll())  # the lock is free, but an earlier ticket is first
+        self.assertFalse(log.exists())
+        mine.unlink()  # the earlier waiter took its turn and left
+        _, err = waiter.communicate(timeout=30)
+        self.assertEqual(waiter.returncode, 0, err)
+        self.assertTrue(log.exists())
+        self.assertEqual(sorted(p.name for p in (self.root / ".git").glob("pk-heavy.*")), [])
+
+    def test_a_ticket_whose_pid_is_gone_or_that_went_unrefreshed_is_cleared(self):
+        self.ticket(self.dead_pid(), stamp=1)
+        alive = subprocess.Popen([PY, "-c", "import time; time.sleep(60)"])
+        self.addCleanup(self.stop, alive)
+        self.ticket(alive.pid, age=3600, stamp=2)  # a live pid that stopped refreshing: a reused pid, or a hung waiter
+        result = self.pk("run", "o", "--", PY, "-c", "pass")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(list((self.root / ".git").glob("pk-heavy.queue/*")), [])
+
+    def test_waiters_are_served_in_the_order_they_came(self):
+        log = self.base / "log"
+        gate = self.base / "go"
+        holder = self.start("run", "holder", "--", PY, "-c",
+                            f"import os, time\nwhile not os.path.exists({str(gate)!r}): time.sleep(0.02)")
+        self.wait_for(lambda: (self.lock / "owner").is_file())
+        queue = self.root / ".git" / "pk-heavy.queue"
+        waiters = []
+        for name in ("a", "b", "c"):
+            waiters.append(self.start("run", name, "--", PY, "-c", f"open({str(log)!r}, 'a').write('{name}\\n')"))
+            self.wait_for(lambda n=len(waiters): queue.is_dir() and len(list(queue.iterdir())) == n)
+        gate.write_text("")
+        holder.communicate(timeout=30)
+        for waiter in waiters:
+            waiter.communicate(timeout=30)
+        self.assertEqual(log.read_text().splitlines(), ["a", "b", "c"])
+
+    def test_status_names_the_waiters(self):
+        earlier = subprocess.Popen([PY, "-c", "import time; time.sleep(60)"])
+        self.addCleanup(self.stop, earlier)
+        self.ticket(earlier.pid)
+        self.assertIn(f"queued: 1 (first: owner=earlier pid={earlier.pid})", self.pk("status").stdout)
+
+
+class Nested(LockBase):
+    """KF-52 (0.6.1): a call under the lock's own holder runs at once instead of waiting for itself."""
+
+    def test_a_nested_run_under_pk_lock_run_does_not_deadlock(self):
+        inner = [PY, str(PK), "lock", "run", "inner", "--", PY, "-c", "print('inner ran')"]
+        result = self.pk("run", "outer", "--", *inner)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("inner ran", result.stdout)
+        self.assertNotIn("waiting for", result.stderr)
+        self.assertFalse(self.lock.exists())  # the outer run released it; the inner run left it alone
+
+    def test_a_holder_that_is_an_ancestor_counts_as_the_same_owner(self):
+        self.plant(pid=os.getpid(), owner="their-shell-wrapper")  # as a program's own wrapper of this command
+        result = self.pk("run", "o", "--", PY, "-c", "pass")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("waiting for", result.stderr)
+        self.assertIn("owner=their-shell-wrapper", (self.lock / "owner").read_text())  # still theirs
+
+    def test_a_stray_marker_does_not_let_an_unrelated_holder_be_skipped(self):
+        holder = subprocess.Popen([PY, "-c", "import time; time.sleep(60)"])
+        self.addCleanup(self.stop, holder)
+        self.plant(pid=holder.pid, owner="live")
+        self.env["PK_LOCK_HELD"] = "pk-heavy:1"
+        waiter = self.start("run", "o", "--", PY, "-c", "pass")
+        time.sleep(1.0)
+        self.assertIsNone(waiter.poll())
+        waiter.send_signal(signal.SIGTERM)
+        waiter.communicate(timeout=30)
+
+    def test_held_in_process_is_reentrant_and_marks_the_environment(self):
+        with lock.held("outer", cwd=self.root):
+            self.assertIn(f"pk-heavy:{os.getpid()}", os.environ.get("PK_LOCK_HELD", ""))
+            with lock.held("inner", cwd=self.root):
+                self.assertTrue(self.lock.is_dir())
+            self.assertTrue(self.lock.is_dir())  # the inner block did not release the outer hold
+        self.assertFalse(self.lock.exists())
+        self.assertNotIn(f"pk-heavy:{os.getpid()}", os.environ.get("PK_LOCK_HELD", ""))
+
+
 if __name__ == "__main__":
     unittest.main()

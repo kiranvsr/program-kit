@@ -147,3 +147,36 @@ tiers:
 #     scan:
 #       - - tools/secret-scan
 #         - .
+# Optional (0.6.1), each a setting of its own; absent, the gates do what 0.6.0 did. step_timeout is the limit in
+# seconds of each build, compile_check, test, scan, extra_gate, PLAN and e2e command (not produce.py, which has
+# evidence.step_timeout): one number for all, or a default and single steps; scale takes the listed steps' limits
+# from their last run measured on this machine, margin times it, between floor (the step's own limit) and cap
+# (twice the floor). lock names the heavy lock (as pk lock run --name takes it) that the hand-back gate, the merge
+# check and integration rounds then hold around their steps; a gate under its own holder (pk lock run, or a
+# program's wrapper that runs it) does not wait. e2e runs its command at the hand-back gate when the branch changes
+# a path under paths, and at the merge check also when main changed a file under specs (default: paths) since the
+# branch's merge base. secret_scan, the shape of progress.scan, is the scanner pk spec precheck runs over the task
+# folder, pk scan staged over staged files and pk record over what it commits. For example:
+#
+#   step_timeout:
+#     default: 3600
+#     test: 4800
+#     scale:
+#       steps:
+#         - test
+#       margin: 1.5
+#       cap: 7200
+#   lock:
+#     name: pk-heavy
+#   e2e:
+#     command:
+#       - - make
+#         - e2e
+#     paths:
+#       - web/src/
+#     specs:
+#       - web/e2e/
+#     timeout: 5400
+#   secret_scan:
+#     - - tools/secret-scan
+#       - .

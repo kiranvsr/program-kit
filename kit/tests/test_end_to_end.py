@@ -530,6 +530,8 @@ class EndToEndTests(unittest.TestCase):
         self.assertIn("progress section", project.pk("progress", expect=1).stderr)
         self.assertEqual(project.pk("lock", "status").stdout.strip(), "free")  # 0.6.0: nothing holds the lock
         self.assertIn("remote", project.pk("remote", "status", expect=1).stderr)  # no remote section: refused
+        # 0.6.1: pk scan staged needs a scanner the example does not configure, and says so
+        self.assertIn("needs a scanner", project.pk("scan", "staged", expect=1).stderr)
         self.assertEqual(project.git("status", "--porcelain"), "")
         project.pk("init", expect=1)  # program/ exists: init refuses to overwrite it
 

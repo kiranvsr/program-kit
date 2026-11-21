@@ -54,7 +54,9 @@ Limits:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import functools
+import json
 import math
 import os
 import re
@@ -64,6 +66,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path, PurePosixPath
 
 import conflicts
@@ -75,13 +78,20 @@ import stale as stale_module
 import status as status_module
 import store
 import miniyaml
-from common import KitError, drop_bom, find_root, git, read_json, read_yaml, run_argv, write_json
+from common import (KitError, drop_bom, find_root, git, read_json, read_text, read_yaml, run_argv, utc_now,
+                    write_json)
 from register import GATE_ID, GATE_SHAPE
 
 MAIN = "main"  # the primary branch; fixed, so no caller can choose where the rules are read from
 CHECK_KEYS = ("build", "test", "scan", "compile_check", "extra_gate")
 ALL_KEYS = CHECK_KEYS + ("parallel_steps", "guarded_files", "tiers", "drift", "evidence", "progress", "merge",
-                         "research", "remote")  # drift, progress: `pk drift` only; research, remote: their commands (0.6.0)
+                         "research", "remote",  # drift, progress: `pk drift` only; research, remote: their commands (0.6.0)
+                         "step_timeout", "lock", "e2e", "secret_scan")  # 0.6.1: KF-50, KF-52, KF-53, KF-21 and KF-55
+TIMED_STEPS = ("build", "compile_check", "test", "scan", "extra_gate", "plan", "e2e")  # step_timeout's steps (0.6.1)
+STEP_TIMEOUT_KEYS = ("default", *TIMED_STEPS, "scale")
+SCALE_KEYS = ("steps", "margin", "floor", "cap")
+E2E_KEYS = ("command", "paths", "specs", "timeout")
+TIMES_FILE = "pk-step-seconds.json"  # in the git common dir: this machine's last measured step times (0.6.1)
 MERGE_KEYS = ("union_files",)  # the `merge` section (0.6.0)
 TIER_KEYS = ("full_paths", "light_paths", "light_ruling")
 BUILTIN_FULL = ("kit/", "program/checks.yaml", "program/gates.yaml")  # the kit's own gates: always full-tier
@@ -204,6 +214,108 @@ def _parse_merge(value) -> dict:
     return {"union_files": [_norm_guard(path) for path in union]}
 
 
+def _seconds(value, what: str, least: int = 1) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < least:
+        raise KitError(f"checks.yaml: {what} must be a whole number of seconds, at least {least}")
+    return value
+
+
+def _parse_step_timeout(value) -> dict:
+    """`step_timeout` (0.6.1, KF-50) as {limits: {step or default: seconds}, scale: {...} or None}.
+
+    A number sets every step's limit (TIMED_STEPS: build, compile_check, test, scan, extra_gate, the PLAN commands and
+    e2e; never the evidence step, which has `evidence.step_timeout`); a mapping sets `default` and single steps.
+    `scale: {steps, margin, floor, cap}` takes a listed step's limit (default: test) from the last time it was
+    measured on this machine: margin (1.5) times it, never below `floor` (the step's own limit) or above `cap`
+    (twice the floor). Absent, every step keeps the fixed STEP_TIMEOUT.
+    """
+    if value is None:
+        return {"limits": {}, "scale": None}
+    if not isinstance(value, dict):
+        return {"limits": {"default": _seconds(value, "step_timeout")}, "scale": None}
+    unknown = sorted(str(key) for key in value if key not in STEP_TIMEOUT_KEYS)
+    if unknown:
+        raise KitError(f"checks.yaml: step_timeout: unknown key {_show(', '.join(unknown))} "
+                       f"(expected {', '.join(STEP_TIMEOUT_KEYS)})")
+    limits = {key: _seconds(value[key], f"step_timeout.{key}") for key in value if key != "scale"}
+    scale = value.get("scale")
+    if scale is not None:
+        if not isinstance(scale, dict):
+            raise KitError("checks.yaml: step_timeout.scale must be a mapping of " + ", ".join(SCALE_KEYS))
+        unknown = sorted(str(key) for key in scale if key not in SCALE_KEYS)
+        if unknown:
+            raise KitError(f"checks.yaml: step_timeout.scale: unknown key {_show(', '.join(unknown))} "
+                           f"(expected {', '.join(SCALE_KEYS)})")
+        steps = scale.get("steps", ["test"])
+        if not isinstance(steps, list) or not steps or not all(step in TIMED_STEPS for step in steps):
+            raise KitError(f"checks.yaml: step_timeout.scale.steps must list steps of {', '.join(TIMED_STEPS)}")
+        margin = scale.get("margin", 1.5)
+        if isinstance(margin, bool) or not isinstance(margin, (int, float)) or not 1 <= margin <= 10:
+            raise KitError("checks.yaml: step_timeout.scale.margin must be a number from 1 to 10")
+        floor = _seconds(scale["floor"], "step_timeout.scale.floor") if "floor" in scale else None
+        cap = _seconds(scale["cap"], "step_timeout.scale.cap") if "cap" in scale else None
+        if floor is not None and cap is not None and cap < floor:
+            raise KitError("checks.yaml: step_timeout.scale.cap must not be below its floor")
+        scale = {"steps": list(steps), "margin": margin, "floor": floor, "cap": cap}
+    return {"limits": limits, "scale": scale}
+
+
+def _parse_lock(value) -> dict | None:
+    """`lock` (0.6.1, KF-52): the heavy lock the gates take, as {name}; a bare name is short for {name: NAME}."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = {"name": value}
+    if not isinstance(value, dict) or sorted(value) != ["name"] or not isinstance(value["name"], str):
+        raise KitError("checks.yaml: lock must be a mapping with name: the heavy lock's name, as pk lock run --name "
+                       "takes it")
+    import lock as lock_module  # late: only a project that names a lock needs it
+
+    return {"name": lock_module.lock_name(value["name"])}
+
+
+def _parse_e2e(value) -> dict | None:
+    """`e2e` (0.6.1, KF-53, F-0630) as {command, paths, specs, timeout}; absent means no e2e step (the default).
+
+    `command` lists argv lists; `paths` (paths, directories and globs, `_under` rules) are what a branch must change
+    for the hand-back gate to run it; `specs` (default: `paths`) are the spec files whose change on main since the
+    branch left it makes the merge check run it too; `timeout` its limit (default: step_timeout's e2e or default).
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise KitError("checks.yaml: e2e must be a mapping of " + ", ".join(E2E_KEYS))
+    unknown = sorted(str(key) for key in value if key not in E2E_KEYS)
+    if unknown:
+        raise KitError(f"checks.yaml: e2e: unknown key {_show(', '.join(unknown))} (expected {', '.join(E2E_KEYS)})")
+    if value.get("command") is None:
+        raise KitError("checks.yaml: e2e.command must list at least one argv list")
+    command = _argv_lists(value["command"], "e2e.command")
+    if not command:
+        raise KitError("checks.yaml: e2e.command must list at least one argv list")
+    found = {"command": command}
+    for key in ("paths", "specs"):
+        paths = value.get(key)
+        if paths is None and key == "specs":
+            found[key] = list(found["paths"])
+            continue
+        if not isinstance(paths, list) or not paths or not all(isinstance(path, str) and path for path in paths):
+            raise KitError(f"checks.yaml: e2e.{key} must be a non-empty list of paths")
+        found[key] = [_norm_guard(path) for path in paths]
+    found["timeout"] = _seconds(value["timeout"], "e2e.timeout") if value.get("timeout") is not None else None
+    return found
+
+
+def _parse_secret_scan(value) -> list[list[str]]:
+    """`secret_scan` (0.6.1, KF-21, KF-55): argv lists run over copies of files, as `progress.scan`; [] when absent."""
+    import progress  # late: the copy-and-scan rules are pk progress's
+
+    try:
+        return progress._scan(value)
+    except KitError as exc:
+        raise KitError(str(exc).replace("progress.scan", "secret_scan")) from None
+
+
 def _parse_checks(data, require: tuple[str, ...]) -> dict:
     if data is None:
         data = {}
@@ -240,6 +352,10 @@ def _parse_checks(data, require: tuple[str, ...]) -> dict:
     import remote  # late, like drift: read by `pk remote` alone (0.6.0)
 
     checks["remote"] = remote.parse(data.get("remote"))
+    checks["step_timeout"] = _parse_step_timeout(data.get("step_timeout"))
+    checks["lock"] = _parse_lock(data.get("lock"))
+    checks["e2e"] = _parse_e2e(data.get("e2e"))
+    checks["secret_scan"] = _parse_secret_scan(data.get("secret_scan"))
     for key in require:
         if not checks[key]:
             raise KitError(f"checks.yaml: {key} must list at least one command")
@@ -391,6 +507,169 @@ def trial_merge(root, branch: str, main: str = MAIN, resolved: list | None = Non
         raise
 
 
+# --- step limits (0.6.1, KF-50) ------------------------------------------------------
+
+_TIMES: dict = {}  # step: (longest command's seconds in this run, whether it timed out)
+_TIMES_LOCK = threading.Lock()
+
+
+def _note_time(step: str, seconds: float, timed_out: bool) -> None:
+    with _TIMES_LOCK:
+        if step not in _TIMES or seconds > _TIMES[step][0]:
+            _TIMES[step] = (seconds, timed_out)
+
+
+def step_limit(checks: dict, step: str) -> int:
+    """The limit in seconds of each command of `step`: what `prepare_limits` computed for this run, else checks.yaml's
+    `step_timeout` (e2e: `e2e.timeout` first), else STEP_TIMEOUT."""
+    computed = checks.get("step_limits") or {}
+    if step in computed:
+        return computed[step]
+    if step == "e2e" and (checks.get("e2e") or {}).get("timeout") is not None:
+        return checks["e2e"]["timeout"]
+    limits = (checks.get("step_timeout") or {}).get("limits", {})
+    return limits.get(step, limits.get("default", STEP_TIMEOUT))
+
+
+def _times_path(root: Path) -> Path:
+    return Path(git(root, "rev-parse", "--path-format=absolute", "--git-common-dir")) / TIMES_FILE
+
+
+def _read_times(root: Path) -> dict:
+    try:
+        data = json.loads(read_text(_times_path(root)))
+    except (OSError, ValueError, KitError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _measured(times: dict, step: str) -> float | None:
+    entry = times.get(step)
+    seconds = entry.get("seconds") if isinstance(entry, dict) else None
+    return float(seconds) if isinstance(seconds, (int, float)) and not isinstance(seconds, bool) and seconds > 0 \
+        else None
+
+
+def prepare_limits(root: Path, checks: dict) -> list[str]:
+    """Set `checks["step_limits"]` for this run and return one line per step whose limit is not STEP_TIMEOUT.
+
+    A step listed under `step_timeout.scale` takes margin x the time its longest command took in the last gate run on
+    this machine (`<git common dir>/pk-step-seconds.json`, written only when `scale` is set; a run that timed out
+    counts its limit), never below the floor or above the cap; with no measured run it has the floor.
+    """
+    with _TIMES_LOCK:
+        _TIMES.clear()
+    config = checks.get("step_timeout") or {"limits": {}, "scale": None}
+    scale = config["scale"]
+    times = _read_times(root) if scale else {}
+    computed, lines = {}, []
+    checks.pop("step_limits", None)
+    for step in TIMED_STEPS:
+        limit = step_limit(checks, step)
+        how = ("e2e.timeout" if step == "e2e" and (checks.get("e2e") or {}).get("timeout") is not None
+               else "step_timeout") + " in program/checks.yaml"
+        if scale and step in scale["steps"]:
+            floor = scale["floor"] or limit
+            cap = scale["cap"] or 2 * floor
+            last = _measured(times, step)
+            if last is None:
+                limit, how = floor, f"scaled, no run measured on this machine yet: the floor {floor}, cap {cap}"
+            else:
+                limit = min(cap, max(floor, math.ceil(scale["margin"] * last)))
+                how = (f"scaled: {scale['margin']:g} x {last:.0f} s measured on this machine by the last run, "
+                       f"floor {floor}, cap {cap}")
+        computed[step] = limit
+        runs = checks.get("e2e") is not None if step == "e2e" else step == "plan" or bool(checks.get(step))
+        if limit != STEP_TIMEOUT and runs:
+            lines.append(f"step limit: {step} {limit} s ({how})")
+    checks["step_limits"] = computed
+    return lines
+
+
+def save_times(root: Path, checks: dict) -> None:
+    """Record this run's measured times of the `step_timeout.scale` steps for the next run (nothing without scale)."""
+    scale = (checks.get("step_timeout") or {}).get("scale")
+    with _TIMES_LOCK:
+        taken = dict(_TIMES)
+    if not scale or not any(step in taken for step in scale["steps"]):
+        return
+    try:
+        path = _times_path(Path(root))
+        data = _read_times(Path(root))
+        for step in scale["steps"]:
+            if step in taken:
+                seconds, timed_out = taken[step]
+                data[step] = {"seconds": round(seconds, 1), "at": utc_now(), "timed_out": timed_out}
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    except (OSError, KitError) as exc:
+        _out(f"warning: the step times were not recorded: {exc}", sys.stderr)
+
+
+@contextlib.contextmanager
+def heavy(root: Path, checks: dict, owner: str):
+    """Hold checks.yaml's `lock` for the body (0.6.1, KF-52); no `lock` setting, no lock. Re-entrant: a gate run under
+    the lock's own holder (`pk lock run`, a program's wrapper of it) does not wait for itself."""
+    if not checks.get("lock"):
+        yield
+        return
+    import lock as lock_module  # late: only a project that names a lock needs it
+
+    main_thread = threading.current_thread() is threading.main_thread()
+    with lock_module.held(owner, name=checks["lock"]["name"], cwd=root, signals=main_thread):
+        yield
+
+
+def _limited(root: Path, checks: dict, body):
+    """`body()` with this run's step limits said first and the measured times recorded after, whatever happened."""
+    for line in prepare_limits(root, checks):
+        _out(line)
+    try:
+        return body()
+    finally:
+        save_times(root, checks)
+
+
+# --- e2e (0.6.1, KF-53, F-0630) ----------------------------------------------------------
+
+def _listed(paths: list[str], shown: int = 5) -> str:
+    return ", ".join(paths[:shown]) + (f" (and {len(paths) - shown} more)" if len(paths) > shown else "")
+
+
+def e2e_reasons(root: Path, branch: str, checks: dict, merge: bool) -> list[str]:
+    """Why the e2e step runs for `branch`: it changes a path under `e2e.paths`; for the merge check also main's
+    changes under `e2e.specs` since the branch's merge base. [] when neither (or no e2e section)."""
+    e2e = checks.get("e2e")
+    if e2e is None:
+        return []
+    base = git(root, "merge-base", MAIN, f"refs/heads/{branch}")
+    changed = _git_fields(root, "diff", "--name-only", "--no-renames", "-z", f"{base}..refs/heads/{branch}")
+    reasons = []
+    touched = sorted(path for path in changed if _under(path, e2e["paths"]))
+    if touched:
+        reasons.append(f"the branch changes {_listed(touched)}")
+    if merge:
+        moved = _git_fields(root, "diff", "--name-only", "--no-renames", "-z", f"{base}..{MAIN}")
+        specs = sorted(path for path in moved if _under(path, e2e["specs"]))
+        if specs:
+            reasons.append(f"main's e2e specs changed since the branch left it: {_listed(specs)}")
+    return reasons
+
+
+def _e2e_step(checks: dict, where: Path, reasons: list[str], merge: bool) -> bool:
+    """Run `e2e.command` in `where` when there is a reason; a line says why, or why not."""
+    if checks.get("e2e") is None:
+        return True
+    if not reasons:
+        _out("e2e: skipped (the branch changes nothing under e2e.paths" +
+             (", and main's e2e specs did not change since the branch left it)" if merge else ")"))
+        return True
+    for reason in reasons:
+        _out(f"e2e: {reason}")
+    return _run_commands("e2e", _commands(checks["e2e"]["command"]), where, timeout=step_limit(checks, "e2e"))
+
+
 # --- running steps -----------------------------------------------------------------
 
 def _step_lines(step: str, commands: list[tuple[list[str], int]], cwd: Path, env: dict | None = None,
@@ -414,7 +693,9 @@ def _step_lines(step: str, commands: list[tuple[list[str], int]], cwd: Path, env
             code, output = found["exit"], found["output"]
             lines.append(f"step {step}: {' '.join(argv)} reused from the test step ({exit_text(code)})")
         else:
+            started = time.monotonic()
             code, output = run_argv(argv, cwd, env=env, timeout=timeout)
+            _note_time(step, time.monotonic() - started, code == 124)
         if sink is not None:
             sink.append({"argv": list(argv), "exit": code, "output": output})
         if code == expect:
@@ -479,11 +760,12 @@ def _run_parallel(checks: dict, cwd: Path, steps: tuple[str, ...] = PARALLEL_STE
 
     def work(step: str) -> None:
         try:
-            results[step] = _step_lines(step, _commands(checks[step]), cwd, sink=sink if step == "test" else None)
+            results[step] = _step_lines(step, _commands(checks[step]), cwd, sink=sink if step == "test" else None,
+                                        timeout=step_limit(checks, step))
         except BaseException as exc:  # re-raised in the calling thread, in step order
             results[step] = exc
 
-    threads = [threading.Thread(target=work, args=(step,), name=f"pk-gate-{step}") for step in steps]
+    threads = [threading.Thread(target=work, args=(step,), name=f"pk-gate-{step}", daemon=True) for step in steps]
     for thread in threads:
         thread.start()
     for thread in threads:
@@ -509,8 +791,8 @@ def _run_late_steps(checks: dict, cwd: Path, skip: tuple[str, ...] = (), sink: l
     steps = tuple(step for step in PARALLEL_STEPS if step not in skip)
     if checks["parallel_steps"]:
         return _run_parallel(checks, cwd, steps, sink)
-    return all(_run_commands(step, _commands(checks[step]), cwd, sink=sink if step == "test" else None)
-               for step in steps)
+    return all(_run_commands(step, _commands(checks[step]), cwd, sink=sink if step == "test" else None,
+                             timeout=step_limit(checks, step)) for step in steps)
 
 
 def _commands(argvs: list[list[str]]) -> list[tuple[list[str], int]]:
@@ -1020,7 +1302,7 @@ def _frozen_plan(root: Path, tree: Path, task_id: str) -> bytes | None:
 def _run_light(checks: dict, where: Path) -> int:
     """The light tier's whole gate: build, compile check and scans. No tests, no PLAN commands, no evidence."""
     for step in LIGHT_STEPS:
-        if not _run_commands(step, _commands(checks[step]), where):
+        if not _run_commands(step, _commands(checks[step]), where, timeout=step_limit(checks, step)):
             return 1
     return 0
 
@@ -1119,7 +1401,7 @@ def plant_estimate(wt: Path, task_id: str, workers: int | None = None, limit: in
 
 
 def _run_steps(checks: dict, task_id: str, wt: Path, trial: Path, authoritative: bytes, meta: dict,
-               no_reuse: bool = False) -> int:
+               no_reuse: bool = False, e2e: list[str] | None = None) -> int:
     if not _tier_unchanged(wt, task_id, meta):
         return 1
     if meta["tier"] == "light":
@@ -1134,21 +1416,23 @@ def _run_steps(checks: dict, task_id: str, wt: Path, trial: Path, authoritative:
         if warning:
             _out(warning)
     for step in ("build", "compile_check"):
-        if not _run_commands(step, _commands(checks[step]), trial):
+        if not _run_commands(step, _commands(checks[step]), trial, timeout=step_limit(checks, step)):
             return 1
     results = Path(tempfile.mkdtemp(prefix="pk-gate-test-"))  # outside the worktree, removed below
     try:
-        return _late_and_evidence(checks, task_id, wt, authoritative, meta, reused, results, limit)
+        return _late_and_evidence(checks, task_id, wt, authoritative, meta, reused, results, limit, e2e or [])
     finally:
         shutil.rmtree(results, ignore_errors=True)
 
 
 def _late_and_evidence(checks: dict, task_id: str, wt: Path, authoritative: bytes, meta: dict, reused: dict | None,
-                       results: Path, limit: int = STEP_TIMEOUT) -> int:
+                       results: Path, limit: int = STEP_TIMEOUT, e2e: list[str] | None = None) -> int:
     sink: list = []
     if reused is not None:
         _out("step test: skipped (the reused record holds its results)")
     if not _run_late_steps(checks, wt, skip=("test",) if reused is not None else (), sink=sink):
+        return 1
+    if not _e2e_step(checks, wt, e2e or [], merge=False):
         return 1
     path = results / "test-step.json"
     write_json(path, {"root": str(wt), "head": git(wt, "rev-parse", "HEAD"), "commands": sink})
@@ -1163,7 +1447,7 @@ def _late_and_evidence(checks: dict, task_id: str, wt: Path, authoritative: byte
     # KF-33 (0.6.0): with evidence.plan_reuse_test, a PLAN command identical to a test command of this run's test step
     # (same argv, same worktree) takes its result; the test step's results file for produce.py stays as it was.
     recorded = sink if checks["evidence"]["plan_reuse_test"] and reused is None else None
-    if not _run_commands("plan", plan, wt, recorded=recorded):
+    if not _run_commands("plan", plan, wt, recorded=recorded, timeout=step_limit(checks, "plan")):
         return 1
     env = dict(os.environ, **{evidence_module.GATE_TEST_ENV: str(path)})
     if not _evidence_step(wt, task_id, env=env, reused=reused, limit=limit):
@@ -1194,8 +1478,11 @@ def handback(root, task_id: str, branch: str, worktree=None, no_reuse: bool = Fa
     if meta["tier"] != "light" and not _early_evidence(wt, task_id):
         return 1
     _accepted_late_work(wt, task_id)
-    trial = trial_merge(root, branch)
-    code = _with_trial(root, trial, lambda: _run_steps(checks, task_id, wt, trial, authoritative, meta, no_reuse))
+    e2e = e2e_reasons(root, branch, checks, merge=False) if meta["tier"] != "light" else []
+    with heavy(root, checks, f"gate-handback-{task_id}"):
+        trial = trial_merge(root, branch)
+        code = _limited(root, checks, lambda: _with_trial(
+            root, trial, lambda: _run_steps(checks, task_id, wt, trial, authoritative, meta, no_reuse, e2e)))
     if code:
         return code
     if git(wt, "rev-parse", "HEAD") != sha or _branch_head(root, branch) != sha:
@@ -1295,7 +1582,7 @@ def merge_check(root, branch: str, inspected: str | None = None, suite: bool = T
         _out(f"FAILED: inspection {task_id} is light-tier: read the diff of {branch} at {sha}, then pass "
              f"--inspected {sha}")
         return 1
-    trial = trial_merge(root, branch)
+    e2e = e2e_reasons(root, branch, checks, merge=True) if suite and meta["tier"] != "light" else []
 
     def steps() -> int:
         if _definition(root, trial, task_id, meta) is None or not _tier_unchanged(trial, task_id, meta):
@@ -1305,11 +1592,16 @@ def merge_check(root, branch: str, inspected: str | None = None, suite: bool = T
         if meta["tier"] == "light":
             return _run_light(checks, trial)
         for step in ("build", "compile_check"):
-            if not _run_commands(step, _commands(checks[step]), trial):
+            if not _run_commands(step, _commands(checks[step]), trial, timeout=step_limit(checks, step)):
                 return 1
-        return 0 if _run_late_steps(checks, trial) else 1
+        if not _run_late_steps(checks, trial):
+            return 1
+        return 0 if _e2e_step(checks, trial, e2e, merge=True) else 1
 
-    code = _with_trial(root, trial, steps)
+    with heavy(root, checks, f"gate-merge-check-{task_id}") if suite else contextlib.nullcontext():
+        trial = trial_merge(root, branch)
+        code = _limited(root, checks, lambda: _with_trial(root, trial, steps)) if suite else _with_trial(
+            root, trial, steps)
     if code:
         return code
     if _branch_head(root, branch) != sha:
@@ -1627,10 +1919,16 @@ def cmd_gate(args: argparse.Namespace) -> int:
 
         return plants.cmd_plants(args)
     root = find_root()
-    if action == "handback":
-        return handback(root, args.task_id, args.branch, worktree=args.worktree, no_reuse=args.no_reuse)
-    if action == "merge-check":
-        return merge_check(root, args.branch, inspected=args.inspected)
+    import lock as lock_module  # a signal while the gate waits for or holds the heavy lock (0.6.1)
+
+    try:
+        if action == "handback":
+            return handback(root, args.task_id, args.branch, worktree=args.worktree, no_reuse=args.no_reuse)
+        if action == "merge-check":
+            return merge_check(root, args.branch, inspected=args.inspected)
+    except lock_module.Signalled as exc:
+        _out(f"FAILED: stopped by signal {exc.signum} (the heavy lock is released and the trial merge removed)")
+        return 128 + exc.signum
     if action == "binding":
         problems = binding(root, args.task_id, args.branch)
         return _report(problems) if problems else 0

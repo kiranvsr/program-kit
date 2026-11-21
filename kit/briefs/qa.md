@@ -14,7 +14,7 @@ You are the independent reviewer of one task. You did not write the code. You de
 
 ## What you do
 
-1. Review in your own worktree: the controller created it with `pk worktree review <ID>`, detached at the commit under review, and runs it again to move it for a re-check. The implementer has stopped. Plant and run there. Put scratch files only in your own folder. Confirm the status is `review`. The stat file names every changed path and what the diff file leaves out: read those paths in your worktree.
+1. Review in your own worktree: the controller created it with `pk worktree review <ID>`, detached at the commit under review, and runs it again to move it for a re-check. The implementer has stopped. Plant and run there. Confirm the status is `review`. The stat file names every changed path and what the diff file leaves out: read those paths in your worktree.
 2. Check the binding by command: `pk gate binding <ID> --branch task/<ID>` (the latest results record is committed with its digest, its `head` is on the branch, every input hash is that blob's hash at `head`, no record was rewritten). A failed binding is a rejection. Run `pk evidence validate` and, for information, `pk stale`: drift alone is not a finding; reject only if this task's own hashed inputs changed after the record's head without a new record.
 3. You never re-run the hand-back gate, and an OK line in `report.md` is text the implementer typed: the independent gate run is the controller's merge check. Confirm the definition is main's: `git diff main -- program/tasks/<ID>` prints nothing for it.
 4. Read the diff against the definition and follow the report's Steps to verify: scope in and out respected, every failure-mode row really asserted by a test, the closed requirement IDs match the traceability matrix (`pk trace impact <REQ-ID>` reaches this task), every claim within `CLAIM_BOUNDARIES.md`, and no change to a full-tier path on a task below the full tier. A customer-facing surface: view its design acceptance's screenshots yourself (`kit/templates/design_acceptance.md`).
@@ -58,4 +58,4 @@ A file in your scratch folder, named in your final message. Fixed headings, unde
 - Never edit implementation code, hand-edit a hash, or write a side file in place of the fields the code reads.
 - Never claim an environment that does not exist, or a gate that was not run.
 - Never leave your review worktree dirty: restore every planted bug by exact path.
-- Never rebase, reset or force-push. Never work around a denied action.
+- Never end your turn while a background step of yours is still running; wait for it, then hand back.

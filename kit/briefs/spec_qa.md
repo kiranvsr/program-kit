@@ -47,3 +47,4 @@ A file in your scratch folder, named in your final message. Fixed headings, unde
 - Never accept with an open critical or important finding, an unconfirmed assumption at stage 5, or a claim about an environment that does not exist.
 - Never accept a SPEC whose tier is lower than its scope allows.
 - Never work around a denied action.
+- Never end your turn while a background step of yours is still running; wait for it, then hand back.

@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -40,8 +41,9 @@ import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Callable
+from typing import Callable, Iterator
 
 import store
 from common import KitError, find_root, git, read_json, run_argv, sha256_bytes, utc_now
@@ -264,6 +266,68 @@ def _then(body: Callable[[], object], cleanup: Callable[[], str | None], describ
     if problem:
         raise KitError(f"{describe(result)}; {problem}")
     return result
+
+
+RUN_TMP_PREFIX = "pk-plant-tmp-"  # each planted-bug run's own temp folder: pk-plant-tmp-<pid>-<random> (0.6.1)
+
+
+def _remove_tree(path: str) -> None:
+    """Remove `path` whatever a test left in it, read-only folders too; what cannot be removed stays, silently."""
+    def retry(function, name, *_):
+        try:
+            os.chmod(os.path.dirname(name) or name, 0o700)
+            os.chmod(name, 0o700)
+            function(name)
+        except OSError:
+            pass
+
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=retry)
+    else:  # pragma: no cover - the 3.11 spelling of the same handler
+        shutil.rmtree(path, onerror=retry)
+
+
+def sweep_run_tmp() -> list[str]:
+    """Remove the run folders a killed planted-bug run left in the temp folder: those whose pid is not running.
+
+    A run removes its own folder after a timeout or a killed command; only a runner that was itself killed leaves
+    one, and the next run of any runner clears it here. A running pid's folders are never touched."""
+    parent = tempfile.gettempdir()
+    removed = []
+    try:
+        entries = [entry.name for entry in os.scandir(parent) if entry.name.startswith(RUN_TMP_PREFIX)]
+    except OSError:
+        return removed
+    for name in entries:
+        pid = name[len(RUN_TMP_PREFIX):].split("-", 1)[0]
+        if not pid.isdigit() or int(pid) == os.getpid() or _pid_runs(int(pid)):
+            continue
+        _remove_tree(os.path.join(parent, name))
+        removed.append(name)
+    return removed
+
+
+def _pid_runs(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+@contextmanager
+def run_tmp(env: dict) -> Iterator[dict]:
+    """`env` with TMPDIR, TMP and TEMP set to a fresh folder for one planted-bug run, removed after it whatever
+    happened (0.6.1, KF-49): a test that leaks a temp folder leaks it into this one, not once per run into the
+    machine's temp folder."""
+    path = os.path.join(tempfile.gettempdir(), f"{RUN_TMP_PREFIX}{os.getpid()}-{secrets.token_hex(6)}")
+    os.mkdir(path, 0o700)  # not mkdtemp: callers count the mirrors the runner makes with it
+    try:
+        yield dict(env, TMPDIR=path, TMP=path, TEMP=path)
+    finally:
+        _remove_tree(path)
 
 
 def _clear_bytecode(mirror: Path) -> None:
@@ -588,6 +652,7 @@ class Evidence(_MirrorCleanup):
         build = _argv(build, "build") if build is not None else None
         count = plant_workers(self.root, workers)
         judged = [item for item in rows if not item["defer"]]
+        sweep_run_tmp()
         started = time.monotonic()
         if count > 1:
             found = _PlantPool(self, judged, build, test, timeout, count, first=rows[0]).run()
@@ -633,17 +698,17 @@ class Evidence(_MirrorCleanup):
 
         Returns (builds, test exit or None, test output hash, the output of the failing build or of the test).
         """
-        env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
         target = mirror / path
 
         def run() -> tuple[bool, int | None, str, str]:
             target.write_bytes(edit(target.read_bytes()))
             _clear_bytecode(mirror)
-            if build is not None:
-                code, output = run_argv(build, mirror, env=env, timeout=timeout)
-                if code != 0:
-                    return False, None, "", output
-            code, output = run_argv(argv, mirror, env=env, timeout=timeout)
+            with run_tmp(dict(os.environ, PYTHONDONTWRITEBYTECODE="1")) as env:
+                if build is not None:
+                    code, output = run_argv(build, mirror, env=env, timeout=timeout)
+                    if code != 0:
+                        return False, None, "", output
+                code, output = run_argv(argv, mirror, env=env, timeout=timeout)
             builds = code not in _NO_RUN  # a timeout or a missing program is never a kill
             return builds, code, sha256_bytes(output.encode("utf-8")), output
 
@@ -662,15 +727,14 @@ class Evidence(_MirrorCleanup):
     def _baseline_problem(self, mirror: Path, build: list[str] | None, argv: list[str], rid: str,
                           timeout: int | None, cleaner: "_MirrorCleanup | None" = None) -> str | None:
         """Why the unmutated mirror does not build or pass `argv`, or None; the mirror is restored either way."""
-        env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
-
         def run() -> str | None:
-            if build is not None:
-                code, _ = run_argv(build, mirror, env=env, timeout=timeout)
-                if code != 0:
-                    return (f"unmutated mirror does not build (exit {code}); fix the build before planting bugs "
-                            f"(row {rid})")
-            code, _ = run_argv(argv, mirror, env=env, timeout=timeout)
+            with run_tmp(dict(os.environ, PYTHONDONTWRITEBYTECODE="1")) as env:
+                if build is not None:
+                    code, _ = run_argv(build, mirror, env=env, timeout=timeout)
+                    if code != 0:
+                        return (f"unmutated mirror does not build (exit {code}); fix the build before planting bugs "
+                                f"(row {rid})")
+                code, _ = run_argv(argv, mirror, env=env, timeout=timeout)
             if code != 0:
                 return f"unmutated mirror fails its own test (exit {code}); a failing test kills nothing (row {rid})"
             return None
@@ -1002,6 +1066,7 @@ class _PlantPool:
         return results
 
     def run(self) -> list[dict]:
+        sweep_run_tmp()
         firsts: dict[tuple, str] = {}  # each distinct build and test argv, with the first row that uses it
         for item in self.rows:
             firsts.setdefault(self._key(item), item["id"])
@@ -1077,8 +1142,10 @@ class PlantJudge(_MirrorCleanup):
         self._prepare = prepare
         self._mirror: Path | None = None
         self._added = False
+        self._run_env: dict | None = None  # the run's own TMPDIR, TMP and TEMP while a baseline or attempt runs
 
     def __enter__(self) -> "PlantJudge":
+        sweep_run_tmp()
         mirror = Path(tempfile.mkdtemp(prefix="pk-mirror-")).resolve()
         self._mirror = mirror
         try:
@@ -1120,7 +1187,17 @@ class PlantJudge(_MirrorCleanup):
             raise KitError(problem)
 
     def _env(self) -> dict:
-        return dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+        return self._run_env if self._run_env is not None else dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+
+    @contextmanager
+    def _own_tmp(self) -> Iterator[None]:
+        """One TMPDIR for the commands of one baseline or attempt (`run_tmp`)."""
+        with run_tmp(dict(os.environ, PYTHONDONTWRITEBYTECODE="1")) as env:
+            self._run_env = env
+            try:
+                yield
+            finally:
+                self._run_env = None
 
     def _builds(self, builds: list[list[str]], mirror: Path) -> tuple[int, list[str] | None, str]:
         """(exit, the failing argv or None, its output) of the build commands, stopping at the first failure."""
@@ -1144,12 +1221,13 @@ class PlantJudge(_MirrorCleanup):
 
         def run() -> dict:
             _clear_bytecode(mirror)
-            code, argv, output = self._builds(builds, mirror)
-            if code != 0:
-                return {"ok": False, "step": "build", "argv": argv, "exit": code, "tail": _tail(output)}
-            if test is None:
-                return {"ok": True, "step": "build", "argv": None, "exit": 0, "tail": []}
-            code, output = run_argv(_argv(test, "test"), mirror, env=self._env(), timeout=self.timeout)
+            with self._own_tmp():
+                code, argv, output = self._builds(builds, mirror)
+                if code != 0:
+                    return {"ok": False, "step": "build", "argv": argv, "exit": code, "tail": _tail(output)}
+                if test is None:
+                    return {"ok": True, "step": "build", "argv": None, "exit": 0, "tail": []}
+                code, output = run_argv(_argv(test, "test"), mirror, env=self._env(), timeout=self.timeout)
             return {"ok": code == 0, "step": "test", "argv": list(test), "exit": code, "tail": _tail(output)}
 
         return _then(run, lambda: self._restore_problem(mirror), lambda found: f"the baseline gave {found['exit']}")
@@ -1184,14 +1262,15 @@ class PlantJudge(_MirrorCleanup):
                 return {**result, "problem": f"find occurs {count} times in {rel} (it must occur exactly once)"}
             target.write_bytes(text.replace(find, replace).encode("utf-8"))
             _clear_bytecode(mirror)
-            code, argv, output = self._builds(builds, mirror)
-            if code != 0:
-                return {**result, "builds": False, "killed": False, "kill_reason": "build failed", "build_argv": argv,
-                        "build_exit": code, "build_tail": _tail(output)}
-            done = {**result, "build_exit": 0}
-            if test is None:
-                return {**done, "builds": True, "kill_reason": "builds"}
-            code, output = run_argv(test, mirror, env=self._env(), timeout=self.timeout)
+            with self._own_tmp():
+                code, argv, output = self._builds(builds, mirror)
+                if code != 0:
+                    return {**result, "builds": False, "killed": False, "kill_reason": "build failed",
+                            "build_argv": argv, "build_exit": code, "build_tail": _tail(output)}
+                done = {**result, "build_exit": 0}
+                if test is None:
+                    return {**done, "builds": True, "kill_reason": "builds"}
+                code, output = run_argv(test, mirror, env=self._env(), timeout=self.timeout)
             done.update(test_exit=code, test_tail=_tail(output))
             if code in _NO_RUN:  # a timeout or a missing program is never a kill
                 return {**done, "builds": False, "killed": False, "kill_reason": "build failed"}

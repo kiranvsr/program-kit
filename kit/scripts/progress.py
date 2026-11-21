@@ -232,7 +232,6 @@ def ready_lines(found: dict) -> list[str]:
 HANDOFF = "program/HANDOFF.md"
 BOOKKEEPING = ("program/HANDOFF.md", "program/rulings.md", "program/costs.jsonl", "program/controller-state.json",
                "program/beta-feedback.md")  # committed with the docs when the pass leaves them changed
-SCAN_TIMEOUT = 600  # seconds per scan command
 NOT_SET_UP = ("pk progress needs the progress section of program/checks.yaml: docs (the hand-kept progress "
               "documents) and state (the paths whose commits change the program's state), and optionally history "
               "(doc and heading for --history) and scan (argv lists run over copies before a commit); "
@@ -458,30 +457,25 @@ def _behind_after(root: Path, cfg: dict, committing: set[str]) -> list[str]:
     return reasons
 
 
+def _scan_commands(root: Path, cfg: dict) -> list[list[str]]:
+    """progress.scan, else (0.6.1) the project's `secret_scan`: the commands run over copies before a commit."""
+    if cfg["scan"]:
+        return cfg["scan"]
+    import gate
+
+    path = Path(root) / "program" / "checks.yaml"
+    data = read_yaml(path) if path.is_file() else None
+    return gate._parse_secret_scan(data.get("secret_scan")) if isinstance(data, dict) else []
+
+
 def _scan_copies(root: Path, cfg: dict, paths: list[str]) -> None:
-    """Run each progress.scan command in a temporary directory holding copies of `paths`; refuse on any failure."""
-    import shutil
-    import tempfile
+    """Run each scan command in a temporary directory holding copies of `paths`; refuse on any failure (`scan`)."""
+    import scan
 
-    from common import run_argv
-
-    if not cfg["scan"] or not paths:
-        return
-    with tempfile.TemporaryDirectory(prefix="pk-progress-scan-") as tmp:
-        for rel in paths:
-            target = Path(tmp) / rel
-            target.parent.mkdir(parents=True, exist_ok=True)
-            if (Path(root) / rel).is_file():
-                shutil.copyfile(Path(root) / rel, target)
-        for argv in cfg["scan"]:
-            argv = [arg.replace("{root}", str(root)).replace("{dir}", tmp) for arg in argv]
-            if "/" in argv[0] and not Path(argv[0]).is_absolute():
-                argv[0] = str(Path(root) / argv[0])  # a program of the repository, named from its root
-            code, output = run_argv(argv, Path(tmp), timeout=SCAN_TIMEOUT)
-            if code != 0:
-                tail = " ".join(output.split())[-600:]
-                raise KitError(f"scan {' '.join(argv)} exit {code} over copies of {', '.join(paths)}: {tail}; the "
-                               "docs are written and nothing committed: fix the text and run the pass again")
+    problem = scan.scan_copies(Path(root), _scan_commands(root, cfg), scan.working_copies(Path(root), paths))
+    if problem:
+        raise KitError(f"scan {problem} over copies of {', '.join(paths)}; the docs are written and nothing "
+                       "committed: fix the text and run the pass again")
 
 
 def run_pass(root: Path, rows=(), bullets=(), items=(), lists=(), history=None, dashboard_out=None,
@@ -542,9 +536,10 @@ def run_pass(root: Path, rows=(), bullets=(), items=(), lists=(), history=None, 
         write_text(out, page)
         report.append(f"dashboard: wrote {out}")
     paths = _changed(root, list(dict.fromkeys([*cfg["docs"], *BOOKKEEPING])))
-    if cfg["scan"] and paths:
+    commands = _scan_commands(root, cfg)
+    if commands and paths:
         _scan_copies(root, cfg, paths)
-        report.append(f"scan: ok ({len(cfg['scan'])} command(s) over {len(paths)} file(s))")
+        report.append(f"scan: ok ({len(commands)} command(s) over {len(paths)} file(s))")
     if commit is not None:
         if not paths:
             report.append("commit: nothing changed, nothing to commit")
