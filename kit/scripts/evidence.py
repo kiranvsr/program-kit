@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -321,7 +322,8 @@ def run_tmp(env: dict) -> Iterator[dict]:
     """`env` with TMPDIR, TMP and TEMP set to a fresh folder for one planted-bug run, removed after it whatever
     happened (0.6.1, KF-49): a test that leaks a temp folder leaks it into this one, not once per run into the
     machine's temp folder."""
-    path = tempfile.mkdtemp(prefix=f"{RUN_TMP_PREFIX}{os.getpid()}-")
+    path = os.path.join(tempfile.gettempdir(), f"{RUN_TMP_PREFIX}{os.getpid()}-{secrets.token_hex(6)}")
+    os.mkdir(path, 0o700)  # not mkdtemp: callers count the mirrors the runner makes with it
     try:
         yield dict(env, TMPDIR=path, TMP=path, TEMP=path)
     finally:
