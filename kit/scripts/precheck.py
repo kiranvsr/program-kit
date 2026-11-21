@@ -26,6 +26,14 @@ there is none. `note:` lines say what was skipped and why; they are not findings
   PC-6  only with `--build`: each plant row's replacement, applied alone to a throwaway mirror of the code, still
         passes main's `build` and `compile_check` commands (`program/checks.yaml` on main). A row that does not
         build is judged `build failed` by the gate, never `killed`. The unmutated code must build first.
+  PC-7  (0.6.1, KF-51) no hunk of `standin.patch` undoes a commit of the base (main, or `--base REF`): a hunk that
+        removes lines a commit of the file's recent history added and restores lines that same commit removed is a
+        stale-base revert, named with the file, the hunk and the commit. When the patch records its base
+        (`base-commit: <sha>`, as `git format-patch --base` writes it), a hunk that only removes or only restores
+        lines of a commit after that base is one too. Skipped when the patch does not apply (PC-4 says why).
+  PC-8  (0.6.1, KF-21) the project's secret scanner finds nothing in copies of the task folder, `standin.patch`
+        included: the commands of `secret_scan`, else `progress.scan`, of `program/checks.yaml` on the base
+        (`scan.py`). Without a scanner there is a note; without a checks.yaml, nothing.
 
 The code is the stand-in (`standin.patch` applied to main) or, without one, the tip of the task branch
 (`task/<folder name>`, else `origin/task/<folder name>`); with neither, the checks that need the code are skipped
@@ -679,8 +687,8 @@ def why(res):
     return ", ".join(files) if files else (res.stderr.strip().splitlines() or ["git apply failed"])[0]
 
 
-def check_patch(patch, repo, findings, own):
-    base = "main" if repo.ref_ok("main") else "HEAD"
+def check_patch(patch, repo, findings, own, base=None):
+    base = base or ("main" if repo.ref_ok("main") else "HEAD")
     res, _ = repo.apply(base, patch, "main-check")
     if res.returncode != 0:
         findings.append(Finding("PC-4", patch.name, f"does not apply to {base}: {why(res)}"))
@@ -690,6 +698,141 @@ def check_patch(patch, repo, findings, own):
         res, _ = repo.apply(sha, patch, "branch-check", three_way=True)
         if res.returncode != 0 or "with conflicts" in res.stderr:
             findings.append(Finding("PC-4", patch.name, f"three-way apply onto {branch} conflicts: {why(res)}"))
+
+
+HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+BASE_COMMIT = re.compile(r"^base-commit: ([0-9a-f]{7,40})[ \t]*$", re.M)
+UNDO_WINDOW = 50  # commits of each file's history a hunk is compared with
+
+
+def parse_hunks(text):
+    """[(old path, `@@ ... @@` header, removed lines, added lines)] of a unified diff, one per hunk; a new file has
+    no old path and is left out (it can undo nothing)."""
+    found, path, lines, index = [], None, text.splitlines(), 0
+    while index < len(lines):
+        line = lines[index]
+        index += 1
+        if line.startswith("diff --git "):
+            path = None
+        elif line.startswith("--- "):
+            old = line[4:].split("\t")[0]
+            path = old[2:] if old.startswith("a/") else None
+        elif line.startswith("@@") and path is not None:
+            match = HUNK.match(line)
+            if not match:
+                continue
+            old_left = int(match.group(2)) if match.group(2) is not None else 1
+            new_left = int(match.group(4)) if match.group(4) is not None else 1
+            removed, added = [], []
+            while (old_left > 0 or new_left > 0) and index < len(lines):
+                body = lines[index]
+                index += 1
+                if body.startswith("\\"):
+                    continue
+                if body.startswith("-"):
+                    removed.append(body[1:])
+                    old_left -= 1
+                elif body.startswith("+"):
+                    added.append(body[1:])
+                    new_left -= 1
+                else:  # context (an editor may have dropped the space of an empty context line)
+                    old_left -= 1
+                    new_left -= 1
+            found.append((path, line[:line.index("@@", 2) + 2] if "@@" in line[2:] else line, removed, added))
+    return found
+
+
+def _meaningful(line):
+    text = line.strip()
+    return text if len(text) >= 4 and any(ch.isalnum() for ch in text) else None
+
+
+def _history(repo, ref, path):
+    """[(sha, subject, hunks)] of the last UNDO_WINDOW non-merge commits on `ref` that changed `path`, newest first."""
+    out = repo.run(["log", "-p", "-U0", "--no-merges", "--no-renames", "--no-color", "--format=%x00%H %s",
+                    "-n", str(UNDO_WINDOW), ref, "--", path])
+    found = []
+    for chunk in out.stdout.split("\0")[1:]:
+        head, _, body = chunk.partition("\n")
+        sha, _, subject = head.partition(" ")
+        found.append((sha, subject.strip(), [h for h in parse_hunks(body) if h[0] == path]))
+    return found
+
+
+def check_stale_base(patch, repo, findings, notes, base):
+    """PC-7: the hunks of `patch` that undo a commit of `base` (see the module text)."""
+    text = read_text(patch)
+    applied, _ = repo.apply(base, patch, "stale-check")
+    if applied.returncode != 0:
+        notes.append(f"PC-7 skipped: {patch.name} does not apply to {base} (see PC-4)")
+        return
+    recorded = None
+    match = BASE_COMMIT.search(text)
+    if match:
+        found = repo.run(["rev-parse", "--verify", "--quiet", match.group(1) + "^{commit}"])
+        if found.returncode == 0:
+            recorded = found.stdout.strip()
+        else:
+            notes.append(f"PC-7: the patch's base-commit {match.group(1)} is not in this repository; only whole "
+                         "undos are checked")
+    histories, after = {}, {}
+    for path, header, removed, added in parse_hunks(text):
+        gone_set = {t for t in map(_meaningful, removed) if t}
+        back_set = {t for t in map(_meaningful, added) if t}
+        if not gone_set:
+            continue
+        if path not in histories:
+            histories[path] = _history(repo, base, path)
+        for sha, subject, hunks in histories[path]:
+            if recorded is not None and sha not in after:
+                after[sha] = repo.run(["merge-base", "--is-ancestor", sha, recorded]).returncode != 0
+            late = recorded is not None and after[sha]
+            hit = None
+            for _, _, their_removed, their_added in hunks:
+                theirs_added = {t for t in map(_meaningful, their_added) if t}
+                theirs_removed = {t for t in map(_meaningful, their_removed) if t}
+                gone = [t for t in map(_meaningful, removed) if t and t in theirs_added]
+                back = [t for t in map(_meaningful, added) if t and t in theirs_removed]
+                if (gone and back) or (late and (gone or back)):
+                    hit = (gone, back)
+                    break
+            if hit is None:
+                continue
+            gone, back = hit
+            said = ", ".join(part for part in (f"removes {len(gone)} line(s) it added" if gone else "",
+                                               f"restores {len(back)} line(s) it removed" if back else "") if part)
+            when = f" (after the patch's base-commit {recorded[:12]})" if late else ""
+            findings.append(Finding("PC-7", path, f"hunk {header} undoes {sha[:12]} ({subject}){when}: {said}; a "
+                                    f"stand-in cut from an older base reverts it: re-cut it on {base}"))
+            break
+
+
+def check_secrets(folder, root, base, findings, notes):
+    """PC-8: the project's secret scanner over copies of the task folder (`scan.py`)."""
+    import gate  # late: the gate imports most of the kit
+    import scan
+
+    try:
+        checks = gate.load_checks_at(root, base)
+    except KitError as exc:
+        if "cannot be read" not in str(exc):
+            notes.append(f"PC-8 skipped: program/checks.yaml on {base} does not parse: {' '.join(str(exc).split())}")
+        return
+    commands, key = scan.scanner(checks)
+    if not commands:
+        notes.append("no secret scanner in program/checks.yaml (secret_scan, or progress.scan): the folder was not "
+                     "scanned (PC-8)")
+        return
+    try:
+        prefix = folder.relative_to(root).as_posix()
+    except ValueError:
+        prefix = f"program/tasks/{folder.name}"
+    files = {f"{prefix}/{path.relative_to(folder).as_posix()}": path.read_bytes() for path in sorted(folder.rglob("*"))
+             if path.is_file() and "__pycache__" not in path.parts}
+    problem = scan.scan_copies(root, commands, files)
+    if problem:
+        findings.append(Finding("PC-8", prefix, f"the secret scanner ({key}) flags the folder: {problem} (fix the "
+                                "text, or re-cut the stand-in without the flagged literal)"))
 
 
 def check_commands(folder, findings):
@@ -756,8 +899,10 @@ def check_builds(root, plants, base, patch, findings, timeout):
                                         "not killed)"))
 
 
-def precheck(folder, root, build=False, timeout=None, notes=None, require_plants=False):
-    """The findings of the task folder `folder` against the repository at `root`; `notes` collects what was skipped."""
+def precheck(folder, root, build=False, timeout=None, notes=None, require_plants=False, base=None):
+    """The findings of the task folder `folder` against the repository at `root`; `notes` collects what was skipped.
+
+    `base` (0.6.1) is the ref the stand-in is judged against: main by default, else HEAD."""
     folder = Path(folder).resolve()
     root = Path(root).resolve()
     notes = notes if notes is not None else []
@@ -769,7 +914,9 @@ def precheck(folder, root, build=False, timeout=None, notes=None, require_plants
         plants, source = load_plants(folder)
         patch = folder / "standin.patch"
         own = {f"task/{folder.name}", f"origin/task/{folder.name}"}
-        base = "main" if repo.ref_ok("main") else "HEAD"
+        if base is not None and not repo.ref_ok(base):
+            raise KitError(f"--base {base}: not a commit in this repository")
+        base = base or ("main" if repo.ref_ok("main") else "HEAD")
         env, files, unavailable, code_ref = None, [], None, None
         if patch.exists():
             res, env = repo.apply(base, patch, "content")
@@ -794,8 +941,10 @@ def precheck(folder, root, build=False, timeout=None, notes=None, require_plants
                          "(--require-plants makes that a finding)")
         check_failure_modes(folder, plants, findings, require_plants)
         if patch.exists():
-            check_patch(patch, repo, findings, own)
+            check_patch(patch, repo, findings, own, base)
+            check_stale_base(patch, repo, findings, notes, base)
         check_commands(folder, findings)
+        check_secrets(folder, root, base, findings, notes)
         if build:
             if code_ref is None:
                 notes.append("--build needs the code (a stand-in that applies, or the task branch): nothing built")
@@ -822,7 +971,7 @@ def cmd_spec(args: argparse.Namespace) -> int:
     root = find_root()
     notes: list[str] = []
     findings = precheck(_folder(root, args.folder), root, build=args.build, timeout=args.timeout, notes=notes,
-                        require_plants=args.require_plants)
+                        require_plants=args.require_plants, base=args.base)
     for note in notes:
         print(f"note: {note}")
     for finding in findings:
@@ -845,6 +994,8 @@ def _configure(parser: argparse.ArgumentParser) -> None:
                             "and every failure mode needs a plant")
     check.add_argument("--timeout", type=int, default=3600, metavar="SECONDS",
                        help="per build command with --build (default 3600)")
+    check.add_argument("--base", metavar="REF", help="judge the stand-in against this ref instead of main (PC-4, "
+                                                     "PC-7) and read its checks.yaml (PC-8)")
 
 
 def register(add_command) -> None:

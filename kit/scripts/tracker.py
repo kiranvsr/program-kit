@@ -32,7 +32,7 @@ import ctlstate
 import handoff as handoff_module
 import rulings as rulings_module
 import status as status_module
-from common import KitError, PRIMARY_BRANCH, Refusal, find_root, git, run_argv, utc_now
+from common import KitError, PRIMARY_BRANCH, Refusal, find_root, git, read_yaml, run_argv, utc_now
 
 RECORD_FILES = ("program/rulings.md", ctlstate.STATE_FILE, "program/HANDOFF.md", "program/costs.jsonl")
 NOW_CHARS = 200
@@ -209,6 +209,24 @@ def _table_entry(planned: dict, table: str, text: str, registered: set[str]) -> 
     return f"{table}: {task_id}"
 
 
+def _scan_record(root: Path) -> None:
+    """With `secret_scan` in program/checks.yaml (0.6.1, KF-55, opt-in), scan copies of the files this step commits;
+    a finding is a KitError, so the step is undone and nothing is committed."""
+    import gate
+    import scan
+
+    path = Path(root) / "program" / "checks.yaml"
+    data = read_yaml(path) if path.is_file() else None
+    commands = gate._parse_secret_scan(data.get("secret_scan")) if isinstance(data, dict) else []
+    if not commands:
+        return
+    changed = [name for name in RECORD_FILES if git(root, "status", "--porcelain", "--", name)]
+    problem = scan.scan_copies(Path(root), commands, scan.working_copies(Path(root), changed))
+    if problem:
+        raise KitError(f"secret_scan over copies of {', '.join(changed)} refused the commit: {problem}; nothing is "
+                       "recorded: take the flagged text out of the ruling or the state and run the step again")
+
+
 def record(root: Path, ruling: str, question: str = "", precedent: str = "", role: str = "controller",
            tasks=(), notes=(), adhoc=(), start: bool = False, followups=(), closes=(), now: str | None = None,
            commit: bool = True, trailers=(), queued=(), parked=(), budget: int | None = None) -> list[str]:
@@ -277,6 +295,7 @@ def record(root: Path, ruling: str, question: str = "", precedent: str = "", rol
         limit = planned.get("handoff_budget_bytes", handoff_module.BUDGET_BYTES)
         lines.append(f"hand-off: {'updated' if changed else 'unchanged'} ({size} of {limit} bytes)")
         if commit:
+            _scan_record(root)
             sha = commit_paths(root, RECORD_FILES, _subject(number, ruling), trailers)
             lines.append(f"committed {sha}: {_subject(number, ruling)}" if sha else "nothing to commit")
             left = left_out(root)
