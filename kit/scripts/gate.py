@@ -78,7 +78,8 @@ import stale as stale_module
 import status as status_module
 import store
 import miniyaml
-from common import KitError, drop_bom, find_root, git, read_json, read_yaml, run_argv, utc_now, write_json
+from common import (KitError, drop_bom, find_root, git, read_json, read_text, read_yaml, run_argv, utc_now,
+                    write_json)
 from register import GATE_ID, GATE_SHAPE
 
 MAIN = "main"  # the primary branch; fixed, so no caller can choose where the rules are read from
@@ -536,7 +537,7 @@ def _times_path(root: Path) -> Path:
 
 def _read_times(root: Path) -> dict:
     try:
-        data = json.loads(_times_path(root).read_text(encoding="utf-8"))
+        data = json.loads(read_text(_times_path(root)))
     except (OSError, ValueError, KitError):
         return {}
     return data if isinstance(data, dict) else {}

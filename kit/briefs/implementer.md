@@ -52,7 +52,5 @@ The file your dispatch names (step 8). Fixed headings, under 25 lines:
 - Never set `done`. Only QA does.
 - Never produce evidence from a dirty tree, hand-edit a hash, or substitute a command.
 - Never write under `program/evidence/<ID>/results/`, `acceptance/` or `plants/`, or edit `latest.json`: the kit does. Run outputs go outside the repository; run `pk evidence check-tree <ID>` before each commit.
-- Never rebase, reset, force-push or use a bare `git stash`.
-- Never run a destructive command except on a literal path you created.
 - Never work around a denied action. Stop and report it.
-- Never end a commit message with an attribution line that is not your own.
+- Never end your turn while a background step of yours is still running (the gate included); wait for it, then hand back.

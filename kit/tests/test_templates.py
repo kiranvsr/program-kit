@@ -157,7 +157,12 @@ class YamlTemplateTests(unittest.TestCase):
             {"progress": {"docs": ["program/DASHBOARD.md"],  # 0.6.0: the pass's history and scan keys
                           "state": ["program/status", "program/rulings.md", "program/controller-state.json"],
                           "history": {"doc": "program/DASHBOARD.md", "heading": "History"},
-                          "scan": [["tools/secret-scan", "."]]}}])
+                          "scan": [["tools/secret-scan", "."]]}},
+            {"step_timeout": {"default": 3600, "test": 4800,  # 0.6.1: step limits (KF-50), the gates' lock (KF-52),
+                              "scale": {"steps": ["test"], "margin": 1.5, "cap": 7200}},  # e2e (KF-53), the scanner
+             "lock": {"name": "pk-heavy"},  # before commits (KF-21, KF-55)
+             "e2e": {"command": [["make", "e2e"]], "paths": ["web/src/"], "specs": ["web/e2e/"], "timeout": 5400},
+             "secret_scan": [["tools/secret-scan", "."]]}])
         import gate  # the examples are ones the checks loader accepts
         for block in checks[1:]:
             gate._parse_checks(miniyaml.loads(block), ())
