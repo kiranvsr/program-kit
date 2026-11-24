@@ -32,7 +32,9 @@ PREFIX = re.compile(r"[A-Z]{1,4}\Z", re.ASCII)  # a legacy phase prefix; `P` alo
 _STAMP = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\Z", re.ASCII)
 _SHA40 = re.compile(r"[0-9a-f]{40}\Z")
 _SHA64 = re.compile(r"[0-9a-f]{64}\Z")
-_LEGACY_HEADER = re.compile(r"## R(\d+)\b", re.ASCII)  # the old log's headers: `## R<n> (<date or undated>)`
+# The old log's headers: `## R<n> (<date or undated>)`, and also a suffixed block (`## R84a`) or a sub-block
+# (`## R141(e)`, `## R43-R45`) of the number before it: any header whose number is not followed by another digit.
+_LEGACY_HEADER = re.compile(r"## R(\d+)(?!\d)", re.ASCII)
 
 
 def prefix_problem(prefix) -> str | None:
@@ -124,20 +126,20 @@ def ruling_start(root: Path) -> int:
 # --- the legacy rulings log ------------------------------------------------------------------
 
 def legacy_blocks(data: bytes) -> dict[int, str]:
-    """{number: block text} of an old rulings log: each block runs from its `## R<n>` header to the next `## ` line.
+    """{number: text} of an old rulings log: each block runs from its `## R<n>` header to the next `## ` line.
 
-    The old log is read as it is: any text after the number on the header line, no fixed fields. A number that
-    appears twice keeps its first block.
+    The old log is read as it is: any text after the number on the header line, no fixed fields. Every block of a
+    number is kept, in log order, blank-line separated: R84 with R84a, R141 with R141(e), a repeated header too.
     """
     lines = data.decode("utf-8", errors="replace").splitlines()
-    found: dict[int, str] = {}
+    found: dict[int, list[str]] = {}
     for index, line in enumerate(lines):
         match = _LEGACY_HEADER.match(line)
         if not match:
             continue
         end = next((n for n in range(index + 1, len(lines)) if lines[n].startswith("## ")), len(lines))
-        found.setdefault(int(match.group(1)), "\n".join(lines[index:end]).rstrip() + "\n")
-    return found
+        found.setdefault(int(match.group(1)), []).append("\n".join(lines[index:end]).rstrip() + "\n")
+    return {number: "\n".join(blocks) for number, blocks in found.items()}
 
 
 def legacy_ruling_numbers(root: Path) -> set[int]:

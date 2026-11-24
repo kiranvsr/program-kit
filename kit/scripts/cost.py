@@ -13,10 +13,11 @@ is required: every dispatch names the model it ran on. Earlier lines are never r
 or RESUME_THRESHOLD resumes): past it the controller stops resuming that agent and starts a fresh one with a
 tight fix brief, because an agent that has read that much re-reads it on every turn.
 
-An adopted programme's imported lines (0.7.0, `pk adopt`) carry every key above. A line whose task was neither a
-register task nor an ad-hoc task before adoption keeps its old name with `legacy_task: true`: the reader accepts it
-(the key, when present, must be true), the report totals it like any line, and it is never flagged, since no agent
-of a legacy task is resumed. `pk cost add` still refuses an unknown task for a new line.
+An adopted programme's imported lines (0.7.0, `pk adopt`) carry every key above and `imported: true`. A line whose
+task was neither a register task nor an ad-hoc task before adoption also keeps its old name with `legacy_task: true`.
+The reader accepts both keys (each, when present, must be true) and the report totals such lines like any other, but
+an imported line is never flagged: its agents ran before adoption and are never resumed, so a new line for the same
+task counts towards the threshold from zero. `pk cost add` still refuses an unknown task for a new line.
 """
 from __future__ import annotations
 
@@ -82,6 +83,8 @@ def record_problem(record) -> str | None:
         return "item and category go together, each a string (0.6.0)"
     if "legacy_task" in record and record["legacy_task"] is not True:
         return "legacy_task, when present, is true: the line names a task from before adoption (0.7.0)"
+    if "imported" in record and record["imported"] is not True:
+        return "imported, when present, is true: pk adopt brought the line in from before adoption (0.7.0)"
     return None
 
 
@@ -164,7 +167,7 @@ def flagged(records: list[dict], tokens: int = TOKEN_THRESHOLD, resumes: int = R
     """Each (task, agent) past the threshold: {task, agent, model, tokens, runs, resumes}, in first-seen order."""
     agents: dict[tuple[str, str], dict] = {}
     for record in records:
-        if record.get("legacy_task") is True:  # a task from before adoption: no agent of it is resumed
+        if record.get("imported") is True or record.get("legacy_task") is True:  # before adoption: never resumed
             continue
         row = agents.setdefault((record["task"], record["agent"]),
                                 {"task": record["task"], "agent": record["agent"], "model": record["model"],

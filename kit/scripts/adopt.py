@@ -334,8 +334,9 @@ def _costs(source: dict, task_ids: set[str], adhoc_ids: dict[str, str], problems
             problems.add(f"{who}: must be an object")
             continue
         record = dict(row)
-        if "legacy_task" in record:
-            problems.add(f"{who}: legacy_task is the kit's own key; the importer sets it")
+        reserved = [key for key in ("legacy_task", "imported") if key in record]
+        if reserved:
+            problems.add(f"{who}: {', '.join(reserved)} is the kit's own key; the importer sets it")
             continue
         bad = [key for key in COST_TEXT if not (isinstance(record.get(key), str) and record[key].strip())]
         if bad:
@@ -347,6 +348,7 @@ def _costs(source: dict, task_ids: set[str], adhoc_ids: dict[str, str], problems
         record.update(zip(COST_NUMBERS, numbers))
         record.setdefault("agent", "unknown")
         record.setdefault("resume", False)
+        record["imported"] = True  # its agents ran before adoption: counted in the report, never flagged
         if "category" not in record and record["task"] not in task_ids:
             if record["task"] in adhoc_ids:
                 record["task"] = adhoc_ids[record["task"]]

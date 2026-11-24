@@ -65,10 +65,10 @@
     },
     "costs": {
       "type": "array",
-      "description": "the source rows as they are. at, task, role and model are required text, tokens, tool_calls and seconds whole numbers; agent defaults to \"unknown\" and resume to false; other keys are kept. A task that is a register ID is kept, a legacy ad-hoc name becomes its AH- ID, anything else is kept with legacy_task: true (a key the source must not carry)",
+      "description": "the source rows as they are. at, task, role and model are required text, tokens, tool_calls and seconds whole numbers; agent defaults to \"unknown\" and resume to false; other keys are kept. A task that is a register ID is kept, a legacy ad-hoc name becomes its AH- ID, anything else is kept with legacy_task: true; every row is stored with imported: true, so it is totalled in the report but never flagged past the fresh-agent threshold (keys the source must not carry)",
       "items": {
         "type": "object", "required": ["at", "task", "role", "model", "tokens", "tool_calls", "seconds"],
-        "not": {"required": ["legacy_task"]},
+        "not": {"anyOf": [{"required": ["legacy_task"]}, {"required": ["imported"]}]},
         "properties": {
           "at": {"type": "string", "minLength": 1},
           "task": {"type": "string", "minLength": 1},

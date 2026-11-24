@@ -45,17 +45,17 @@ def register_doc():
             {"id": "CX-M01-S02", "title": "s", "tasks": [task("CX-M01-S02-T01", depends_on=[CX])]}]}]}]}
 
 
-def adopted_by_hand(root: Path, start: int = 6, prefixes=("CX",)) -> None:
+def adopted_by_hand(root: Path, start: int = 6, prefixes=("CX",), log: str = LEGACY_LOG) -> None:
     """program/adoption.yaml and the legacy copies, written directly (the identity rules alone, without pk adopt)."""
     legacy = root / "program" / "legacy"
     legacy.mkdir(parents=True, exist_ok=True)
-    (legacy / "rulings.md").write_text(LEGACY_LOG)
+    (legacy / "rulings.md").write_text(log)
     (legacy / "HANDOFF.md").write_text("old\n")
     (legacy / "adoption-source.json").write_text("{}\n")
     write_yaml(root / adoption.ADOPTION_FILE, {
         "adopted_at": "2026-11-24T00:00:00Z", "adopted_commit": "a" * 40, "source": adoption.SOURCE_COPY,
         "source_sha256": sha256_bytes(b"{}\n"), "legacy_phase_prefixes": list(prefixes), "ruling_start": start,
-        "legacy_rulings": adoption.LEGACY_RULINGS, "legacy_rulings_sha256": sha256_bytes(LEGACY_LOG.encode()),
+        "legacy_rulings": adoption.LEGACY_RULINGS, "legacy_rulings_sha256": sha256_bytes(log.encode()),
         "legacy_handoff": adoption.LEGACY_HANDOFF, "legacy_evidence_roots": ["old/evidence/"]})
 
 
@@ -145,6 +145,7 @@ class IdentityTests(Base):
                                 (lambda d: d.update(extra=1), "unknown key"),
                                 (lambda d: d.update(legacy_phase_prefixes=["P"]), "is the kit's own"),
                                 (lambda d: d.update(legacy_phase_prefixes=["cx"]), "one to four capital"),
+                                (lambda d: d.update(legacy_phase_prefixes=["CX", "CX"]), "lists a prefix twice"),
                                 (lambda d: d.update(source_sha256="x"), "source_sha256 must be"),
                                 (lambda d: d.update(ruling_start=0), "ruling_start must be"),
                                 (lambda d: d.update(legacy_rulings="old/RULINGS.md"), "under program/legacy/")):
@@ -160,10 +161,12 @@ class IdentityTests(Base):
         self.assertEqual(adoption.problems(self.root), [])
         (self.root / adoption.LEGACY_RULINGS).write_text(LEGACY_LOG + "\n## R6 (late)\n")
         (self.root / adoption.LEGACY_HANDOFF).unlink()
+        (self.root / adoption.SOURCE_COPY).write_text('{"edited": true}\n')
         found = adoption.problems(self.root)
-        self.assertEqual(len(found), 2, found)
-        self.assertIn("no longer matches legacy_rulings_sha256", found[0])
-        self.assertIn("legacy_handoff program/legacy/HANDOFF.md is missing", found[1])
+        self.assertEqual(len(found), 3, found)
+        self.assertIn("program/legacy/adoption-source.json no longer matches source_sha256", found[0])
+        self.assertIn("program/legacy/rulings.md no longer matches legacy_rulings_sha256", found[1])
+        self.assertIn("legacy_handoff program/legacy/HANDOFF.md is missing", found[2])
 
     def test_the_adoption_files_are_always_guarded(self):
         sh(self.root, "git", "add", "-A")
@@ -220,6 +223,24 @@ class RulingsTests(Base):
         self.assertEqual(run_cli("rulings", self.root, "rulings", "show", "R9")[0], 1)
         self.assertIn("takes a ruling as R<n>", run_cli("rulings", self.root, "rulings", "show", "6")[2])
 
+    def test_show_returns_every_block_of_a_number_suffixed_and_sub_blocks_too(self):
+        log = ("# Old rulings\n\n## R84 (2026-01-01)\n\nBase.\n\n## R84a (2026-01-02)\n\nSuffixed.\n\n"
+               "## R840 (2026-02-01)\n\nAnother number.\n\n## R141(a) (2026-03-01)\n\nFirst part.\n\n"
+               "## R141(e) (2026-03-05)\n\nAmendment.\n\n## R12-R13 (undated)\n\nA range.\n")
+        adopted_by_hand(self.root, start=841, log=log)
+        self.assertEqual(rulings.block(self.root, 84),
+                         "## R84 (2026-01-01)\n\nBase.\n\n## R84a (2026-01-02)\n\nSuffixed.\n")
+        self.assertEqual(rulings.block(self.root, 141),
+                         "## R141(a) (2026-03-01)\n\nFirst part.\n\n## R141(e) (2026-03-05)\n\nAmendment.\n")
+        self.assertEqual(rulings.block(self.root, 840), "## R840 (2026-02-01)\n\nAnother number.\n")
+        self.assertEqual(adoption.legacy_ruling_numbers(self.root), {12, 84, 141, 840})
+        code, out, _ = run_cli("rulings", self.root, "rulings", "show", "R84")
+        self.assertEqual((code, out.count("## R84")), (0, 2))
+        self.assertEqual(rulings.add(self.root, "controller", "q", "supersedes R141 and supersedes R12"), 841)
+        self.assertEqual(rulings.validate(self.root), [])
+        with self.assertRaisesRegex(KitError, "supersedes R13, which is not an earlier ruling"):
+            rulings.add(self.root, "controller", "q", "supersedes R13")
+
     def test_record_and_the_hand_off_number_from_the_start(self):
         (self.root / "program" / "HANDOFF.md").write_bytes((KIT / "templates" / "HANDOFF.md").read_bytes())
         write_json(self.root / ctlstate.STATE_FILE, read_json(KIT / "templates" / "controller-state.json"))
@@ -247,6 +268,12 @@ class CostAndStateTests(Base):
         self.assertEqual(len(cost.flagged_lines(self.root)), 1)  # the same line without the key is flagged
         log.write_text(json.dumps(self.row(legacy_task=False)) + "\n")
         with self.assertRaisesRegex(KitError, "line 1: legacy_task, when present, is true"):
+            cost.read(self.root)
+        log.write_text(json.dumps(self.row(task="AH-0001", imported=True)) + "\n")
+        self.assertEqual(cost.flagged_lines(self.root), [])  # an imported line of a kit task is never flagged
+        self.assertEqual(cost.totals(cost.read(self.root))["AH-0001"]["tokens"], 500_000)
+        log.write_text(json.dumps(self.row(imported=False)) + "\n")
+        with self.assertRaisesRegex(KitError, "line 1: imported, when present, is true"):
             cost.read(self.root)
 
     def test_the_state_keeps_legacy_id_and_adhoc_list_shows_it(self):

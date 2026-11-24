@@ -70,6 +70,9 @@ class SourceValidationTests(unittest.TestCase):
         cls._case = unittest.TestCase()
         cls.root = make_repo(cls._case)
         install(cls.root)
+        (cls.root / "old" / "ignored.md").write_text(LEGACY_LOG)  # on disk, git-ignored: never committed
+        with open(cls.root / ".git" / "info" / "exclude", "a") as handle:
+            handle.write("old/ignored.md\n")
 
     @classmethod
     def tearDownClass(cls):
@@ -128,6 +131,8 @@ class SourceValidationTests(unittest.TestCase):
             (dict(schema="other"), "this kit reads 'program-kit.adoption.v1'"),
             (dict(primary_branch="master"), "the kit's primary branch is main"),
             (dict(legacy_phase_prefixes=["P"]), "'P' is the kit's own"),
+            (dict(legacy_phase_prefixes=["CX", "CX"]), "legacy_phase_prefixes lists a prefix twice"),
+            (dict(rulings={"path": "old/ignored.md", "next": 6}), "old/ignored.md is not a file committed at HEAD"),
             (dict(legacy_phase_prefixes=[]), "CX: id is not a valid phase id"),
             (dict(rulings={"path": "old/RULINGS.md", "next": 9}), "the legacy log's last ruling is R5"),
             (dict(rulings={"path": "old/missing.md", "next": 6}), "is not a file committed at HEAD"),
@@ -142,6 +147,8 @@ class SourceValidationTests(unittest.TestCase):
                           "seconds": 0}]), "costs[1]: tokens must be a whole number"),
             (dict(costs=[{"at": "t", "task": "x", "role": "r", "model": "m", "tokens": 1, "tool_calls": 0,
                           "seconds": 0, "legacy_task": True}]), "legacy_task is the kit's own key"),
+            (dict(costs=[{"at": "t", "task": "x", "role": "r", "model": "m", "tokens": 1, "tool_calls": 0,
+                          "seconds": 0, "imported": True}]), "imported is the kit's own key"),
             (dict(costs=[{"at": "t", "task": "x", "role": "r", "model": "m", "tokens": 1, "tool_calls": 0,
                           "seconds": 0, "agent": 3}]), "costs[1]: not a cost record"),
             (dict(legacy_evidence_roots=["old/none/"]), "old/none/ is not a directory committed at HEAD"),
@@ -205,6 +212,7 @@ class AdoptCommandTests(unittest.TestCase):
         self.assertEqual(tracker.add_followup(state, "a", "b"), "F-0004")
         rows = cost.read(self.root)
         self.assertEqual([row["task"] for row in rows], [P1, "AH-0001", "G-P1"])
+        self.assertEqual([row["imported"] for row in rows], [True, True, True])
         handoff = (self.root / "program" / "HANDOFF.md").read_text()
         self.assertIn("#### Rulings (0; next R6)", handoff)  # pk handoff update ran, numbering from ruling_start
         self.assertIn("rulings before R6: program/legacy/rulings.md", handoff)
@@ -219,6 +227,41 @@ class AdoptCommandTests(unittest.TestCase):
         code, said = adopt._run_pk(self.root, "doctor")
         self.assertEqual(code, 1)
         self.assertIn("program/legacy/rulings.md no longer matches legacy_rulings_sha256", said)
+
+    def test_imported_cost_lines_are_never_flagged_and_new_lines_count_from_zero(self):
+        heavy = [{"at": "2026-01-01T00:00:00Z", "task": task, "role": "qa", "model": "m-1", "tokens": 300_000,
+                  "tool_calls": 0, "seconds": 0, "agent": "qa", "resume": True} for task in (P1, "kit-fp") * 3]
+        self.write(source(costs=heavy))
+        self.assertEqual(self.adopt()[0], 0)
+        self.assertEqual(cost.totals(cost.read(self.root))["AH-0001"]["tokens"], 900_000)  # still in the report
+        self.assertEqual(cost.flagged_lines(self.root), [])  # 900k tokens and 3 resumes each, but before adoption
+        self.assertIn("#### Agents past the fresh-agent threshold\n- none",
+                      (self.root / "program" / "HANDOFF.md").read_text())
+        for task in ("AH-0001", P1):
+            code, out, err = run_cli("cost", self.root, "cost", "add", "--task", task, "--role", "qa", "--model",
+                                     "m-1", "--tokens", "1000")
+            self.assertEqual((code, err), (0, ""))
+            self.assertNotIn("past the threshold", out)
+        run_cli("cost", self.root, "cost", "add", "--task", P1, "--role", "qa", "--model", "m-1", "--tokens",
+                "400000")
+        self.assertEqual(cost.flagged_lines(self.root),
+                         [f"{P1} qa (m-1): 401000 tokens over 2 run(s), 0 resume(s): start a fresh agent with a "
+                          "tight fix brief"])  # the new lines alone, from zero
+
+    def test_pk_doctor_is_one_of_the_checks_after_the_import(self):
+        before = self.tree()
+        real = adopt._run_pk
+
+        def failing(root, *argv):
+            if argv == ("doctor",) and (Path(root) / adoption.ADOPTION_FILE).exists():
+                return 1, "error: planted doctor failure"
+            return real(root, *argv)
+
+        with mock.patch.object(adopt, "_run_pk", side_effect=failing):
+            code, out, err = self.adopt()
+        self.assertEqual(code, 1)
+        self.assertIn("pk doctor failed after the import: error: planted doctor failure", err)
+        self.assertEqual(self.tree(), before)
 
     def test_dry_run_prints_the_plan_and_writes_nothing(self):
         before = self.tree()
