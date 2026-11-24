@@ -2,6 +2,8 @@
 
 ## 0.7.0
 
+The kit stays generic and is open to extension, and it can take over a programme that was run another way. Both are opt-in: without `program/extensions.yaml` and `program/adoption.yaml` a programme runs exactly as on 0.6.2.
+
 ### Extension interface
 
 The kit stays generic and a programme extends it in code it owns: `program/extensions.yaml` declares the modules under `program/extensions/` and the extension api they speak (1), and `kit/scripts/ext.py` is the one interface. Without the declaration nothing changes: every command, record, gate and report behaves as in 0.6.2.
