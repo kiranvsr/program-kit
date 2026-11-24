@@ -149,7 +149,8 @@ def render(root: Path, main: str = "main") -> str:
     root = Path(root)
     state = _state(root)
     records = status_module.list_all(root)
-    counts = {name: 0 for name in status_module.STATUSES}
+    # adopted (0.7.0) is its own line, never counted as done; a programme that has not adopted lists it only if found
+    counts = {name: 0 for name in status_module.STATUSES if name != status_module.ADOPTED or adoption.adopted(root)}
     for record in records:
         counts[record["status"]] = counts.get(record["status"], 0) + 1
     unregistered: list[str] = []

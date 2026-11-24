@@ -56,7 +56,8 @@ def adopted_by_hand(root: Path, start: int = 6, prefixes=("CX",), log: str = LEG
         "adopted_at": "2026-11-24T00:00:00Z", "adopted_commit": "a" * 40, "source": adoption.SOURCE_COPY,
         "source_sha256": sha256_bytes(b"{}\n"), "legacy_phase_prefixes": list(prefixes), "ruling_start": start,
         "legacy_rulings": adoption.LEGACY_RULINGS, "legacy_rulings_sha256": sha256_bytes(log.encode()),
-        "legacy_handoff": adoption.LEGACY_HANDOFF, "legacy_evidence_roots": ["old/evidence/"]})
+        "legacy_handoff": adoption.LEGACY_HANDOFF, "legacy_evidence_roots": ["old/evidence/"], "followup_gaps": [],
+        "legacy_register": {"tasks": [], "gates": [], "roles": []}})
 
 
 class Base(unittest.TestCase):

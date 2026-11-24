@@ -18,7 +18,9 @@ changes the state. An ad-hoc task's state is the controller's tracking word, nev
 `closed`, and `done` stays the word only QA can write, in the status record.
 
 A follow-up is closed, never deleted, and its number is never given out twice: `load` refuses a file in which
-any id from F-0001 to the last one issued is in neither list.
+any id from F-0001 to the last one issued is in neither list. An adopted programme (0.7.0) may have imported a history
+with gaps below its import point: `load` then accepts exactly the gaps `program/adoption.yaml` lists as
+`followup_gaps`, and no other.
 """
 from __future__ import annotations
 
@@ -98,12 +100,17 @@ def _adhoc(data: dict) -> list[dict]:
 
 def load(root: Path) -> dict:
     """The controller state, validated and in the current shape; a missing file is an empty state."""
+    import adoption  # late: adoption imports nothing of the kit but common
+
     path = Path(root) / STATE_FILE
-    return parse(read_json(path) if path.exists() else {})
+    return parse(read_json(path) if path.exists() else {}, adoption.followup_gaps(root))
 
 
-def parse(data) -> dict:
-    """`data`, the parsed controller state, validated and in the current shape (what `load` returns)."""
+def parse(data, gaps=frozenset()) -> dict:
+    """`data`, the parsed controller state, validated and in the current shape (what `load` returns).
+
+    `gaps` are the follow-up numbers an adopted programme's source never had (`followup_gaps` of adoption.yaml):
+    exactly those may be missing, and each of them must be."""
     if not isinstance(data, dict):
         raise KitError(f"{STATE_FILE}: expected a mapping with stage, queued, parked and followups")
     taken: set[int] = set()
@@ -117,7 +124,12 @@ def parse(data) -> dict:
     issued = data.get("followups_issued", max(taken, default=0))
     if not isinstance(issued, int) or isinstance(issued, bool) or issued < max(taken, default=0):
         raise KitError(f"{STATE_FILE}: 'followups_issued' must be the number of the last follow-up id given out")
-    gone = [f"F-{number:04d}" for number in range(1, issued + 1) if number not in taken]
+    gaps = frozenset(gaps)
+    filled = sorted(f"F-{number:04d}" for number in gaps & taken)
+    if filled or any(number > issued for number in gaps):
+        raise KitError(f"{STATE_FILE}: program/adoption.yaml lists follow-up gaps that are not gaps "
+                       f"({', '.join(filled) or 'past the last one issued'}): the gaps are fixed at adoption")
+    gone = [f"F-{number:04d}" for number in range(1, issued + 1) if number not in taken and number not in gaps]
     if gone:
         raise KitError(f"{STATE_FILE}: follow-up(s) {', '.join(gone[:5])}{' and more' if len(gone) > 5 else ''} "
                        f"are in neither the open nor the closed list ({issued} were issued): a follow-up is "

@@ -165,6 +165,8 @@ def impact(root: Path, cr_id: str, ids: list[str]) -> dict:
         f"- Gates: {_listing(reached['gates'])}",
         f"- Done tasks: {_listing(tasks['done'])}",
         f"- Merged tasks (light tier, landed without QA): {_listing(tasks['merged'])}",
+        *([f"- Adopted tasks (finished before adoption; see their references): {_listing(tasks['adopted'])}"]
+          if "adopted" in tasks else []),
         f"- In-flight tasks: {_listing(tasks['in_flight'])}",
         f"- Not-started tasks: {_listing(tasks['not_started'])}",
     ])

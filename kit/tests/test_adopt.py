@@ -1,6 +1,6 @@
 """`pk adopt` (0.7.0): the whole source is validated before anything is written, a refusal writes nothing, and a
 check that fails after the import puts every file back. The importer moves the register, rulings, follow-ups, ad-hoc
-tasks, cost lines and hand-off; statuses wait for KA-2 and a source that lists any is refused.
+tasks, cost lines and hand-off; the statuses and the generic import rules are tried in test_adopted.py.
 """
 import _paths  # noqa: F401  (must come first: puts kit/scripts on sys.path)
 import json
@@ -104,22 +104,22 @@ class SourceValidationTests(unittest.TestCase):
     def test_the_schema_requires_the_keys_the_importer_reads(self):
         self.assertEqual(adopt.schema_required(), list(adopt.SOURCE_KEYS))
 
-    def test_a_follow_up_gap_is_refused_naming_the_missing_ids(self):
+    def test_a_follow_up_gap_below_next_is_recorded_not_refused(self):
         followups = source()["followups"]
-        followups["closed"] = followups["closed"][1:]
-        self.assertProblem(source(followups=followups), "F-0001 to F-0003 must all be listed, open or closed; "
-                                                        "missing 1: F-0001")
+        followups["closed"] = followups["closed"][:1]  # F-0002 is not in the source
+        plan, found = adopt.validate_source(self.root, json.dumps(source(followups=followups)).encode())
+        self.assertEqual((found, plan["followup_gaps"]), ([], ["F-0002"]))
+        self.assertEqual(plan["state"]["followups_issued"], 3)
 
-    def test_non_empty_statuses_wait_for_ka2(self):
-        self.assertProblem(source(statuses=[{"task_id": P1, "status": "done", "references": [{"path": "x"}]}]),
-                           "statuses import arrives in KA-2")
+    def test_the_status_shapes_the_source_may_use(self):
         self.assertProblem(source(statuses=[{"task_id": P1, "status": "adopted"}]), "must be one of done")
         widened = [{"task_id": P1, "status": state, "actor": "", "updated_at": ""}
                    for state in ("in_progress", "review", "blocked", "not_started")]
         widened[1]["task_id"], widened[2]["task_id"], widened[3]["task_id"] = CX, "CX-M01-S02-T01", "P9-M01-S01-T01"
-        self.assertEqual(self.problems(source(statuses=widened)),
-                         ["statuses: 4 listed; statuses import arrives in KA-2 (export an empty statuses list until "
-                          "then)"])  # the widened enum and empty actor and updated_at are shapes KA-2 imports
+        found = self.problems(source(statuses=widened))
+        self.assertIn("statuses[1]: actor must be non-empty text", found)  # only not_started may leave them empty
+        self.assertIn("statuses[4]: P9-M01-S01-T01 is not a task of the source register", found)
+        self.assertFalse([problem for problem in found if problem.startswith("statuses[4]: actor")])
 
     def test_notes_are_optional_text_and_stay_in_the_stored_source(self):
         self.assertEqual(self.problems(source(notes=["dropped two empty rows", "nulled a bad date"])), [])
@@ -274,13 +274,13 @@ class AdoptCommandTests(unittest.TestCase):
 
     def test_a_bad_source_prints_every_problem_and_writes_nothing(self):
         followups = source()["followups"]
-        followups["open"] = []
-        self.write(source(followups=followups, statuses=[{"task_id": P1, "status": "done"}]))
+        followups["open"] = [dict(followups["open"][0], id="F-0005")]
+        self.write(source(followups=followups, statuses=[{"task_id": P1, "status": "finished"}]))
         before = self.tree()
         code, out, err = self.adopt()
         self.assertEqual(code, 1)
-        self.assertIn("missing 1: F-0003", err)
-        self.assertIn("statuses import arrives in KA-2", err)
+        self.assertIn("F-0005 at or past followups.next F-0004", err)
+        self.assertIn("status 'finished' must be one of", err)
         self.assertIn("error: adopt: 2 problem(s); nothing written", err)
         self.assertEqual(self.tree(), before)
 

@@ -595,6 +595,138 @@ class EndToEndTests(unittest.TestCase):
     @skip_unless_slow()
     @NEEDS_SH
     @NEEDS_PIP
+    def test_an_adopted_programme_runs_a_new_task_through_the_loop_citing_legacy_evidence(self):
+        """0.7.0 (KA-2): a fixture programme adopted through a fixture `adopt_importer` extension, with a legacy phase
+        prefix, a ruling gap below ruling_start, a follow-up gap, legacy ad-hoc names, cost rows missing keys, two done
+        tasks with references, one task in flight, one parked task and a grandfathered size-L task with seven
+        dependencies and a hyphenated gate; then one new task through the whole loop, citing a legacy reference, and
+        `pk merge`."""
+        from test_adopted import BIG, FIRST, SECOND, SECOND_BYTES, T as LEGACY, ka2_source
+
+        new = "P2-M01-S01-T01"
+        branch, evidence_dir = f"task/{new}", f"program/evidence/{new}"
+        project = Project(self.base, with_gitleaks=True)
+        repo = project.repo
+        repo.mkdir()
+        project.git("init", "-q", "-b", "main")
+        (repo / "README.md").write_text("A programme that ran before the kit.\n", encoding="utf-8")
+        project.commit("initial commit")
+        project.run(["sh", ROOT / "install.sh", repo, "--preset", "python"])
+        project.put(EXAMPLE / "checks.yaml", repo / "program" / "checks.yaml")
+        project.put(EXAMPLE / ".gitignore", repo / ".gitignore")
+        (repo / "old" / "evidence" / "second").mkdir(parents=True)
+        (repo / "old" / "RULINGS.md").write_text(LEGACY_LOG, encoding="utf-8")  # R3 and R5: R4 is a gap below R6
+        (repo / "old" / "HANDOFF.md").write_bytes(b"# Old hand-off\r\n")
+        (repo / FIRST).write_text('{"task": "first", "decision": "accepted"}\n', encoding="utf-8")
+        (repo / SECOND).write_bytes(SECOND_BYTES)
+        (repo / "program" / "extensions").mkdir()
+        (repo / "program" / "extensions.yaml").write_text("api: 1\nmodules:\n  - name: legacy\n", encoding="utf-8")
+        (repo / "program" / "extensions" / "legacy.py").write_text(
+            "import json\nfrom pathlib import Path\n\n\ndef resolve(path, data):\n"
+            "    said = json.loads(data)\n"
+            "    return {'kind': 'acceptance', 'task_id': said['task'], 'summary': 'legacy ' + said['decision']}\n\n\n"
+            "def register(api):\n"
+            "    api.adopt_importer('fixture', lambda root, argv: json.loads(Path(argv[0]).read_text()))\n"
+            "    api.reference_resolver(resolve)\n", encoding="utf-8")
+        project.commit("the kit, the legacy files and the programme's extension")
+        export = self.base / "export.json"
+        export.write_text(json.dumps(ka2_source()), encoding="utf-8")
+
+        dry = project.pk("adopt", "--from", "fixture", export, "--dry-run").stdout
+        self.assertIn("statuses: 5: 2 adopted (3 references), 1 in flight", dry)
+        self.assertIn("held to shape (legacy_register): 1 tasks; 1 gates (G-DEP-LAND); 1 roles (platform-agent)", dry)
+        self.assertEqual(project.git("status", "--porcelain"), "")
+        project.pk("adopt", "--from", "fixture", export)
+        project.commit("adopt the programme", "program")
+        recorded = read_yaml(repo / "program" / "adoption.yaml")
+        self.assertEqual((recorded["followup_gaps"], recorded["legacy_register"]["tasks"], recorded["ruling_start"]),
+                         (["F-0002"], [BIG], 6))
+        listed = project.pk("status", "list").stdout
+        self.assertIn(f"{LEGACY[0]}\tadopted", listed)
+        self.assertNotIn("\tdone\t", listed)
+        self.assertIn("R5 (undated)", project.pk("rulings", "show", "R5").stdout)
+        self.assertIn("AH-0001", project.pk("adhoc", "list").stdout)
+        project.pk("status", "validate")
+        project.pk("register", "validate")
+        project.pk("doctor")
+
+        # A new task after adoption, held to the kit's rules, depending on an adopted task.
+        register_file = repo / "program" / "register.yaml"
+        data = read_yaml(register_file)
+        data["phases"].append({"id": "P2", "title": "New work", "milestones": [{"id": "P2-M01", "title": "m", "steps": [
+            {"id": "P2-M01-S01", "title": "s", "tasks": [{"id": new, "title": "Health and echo endpoints",
+                                                          "role": "backend", "size": "M",
+                                                          "depends_on": [LEGACY[0]]}]}]}]})
+        write_yaml(register_file, data)
+        project.pk("register", "validate")
+        project.pk("register", "change", "--note", f"{new}: the first task after adoption")
+        self.assertIn(f"{new} ready", project.pk("status", "ready").stdout)
+        for name in ("SPEC.md", "PLAN.md", "review.md"):
+            text = (EXAMPLE / "tasks" / TASK / name).read_text(encoding="utf-8").replace(TASK, new)
+            (repo / "program" / "tasks" / new).mkdir(parents=True, exist_ok=True)
+            (repo / "program" / "tasks" / new / name).write_text(text, encoding="utf-8")
+        project.pk("status", "set", new, "in_progress", "--role", "controller")
+        project.commit(f"dispatch {new}")
+        wt = Path(project.pk("worktree", "new", new).stdout.strip())
+        produce = (EXAMPLE / "evidence" / TASK / "produce.py").read_text(encoding="utf-8").replace(TASK, new)
+        produce = produce.replace("    run.write()", f"    run.reference({FIRST!r})  # builds on the legacy acceptance\n"
+                                                  "    run.write()")
+        (wt / evidence_dir).mkdir(parents=True)
+        (wt / evidence_dir / "produce.py").write_text(produce, encoding="utf-8")
+        shutil.copytree(EXAMPLE / "src", wt / "src", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        project.commit(f"{new}: endpoints, tests and evidence producer", cwd=wt)
+
+        lines = project.pk("gate", "handback", new, "--branch", branch, env=project.gate_env).stdout.splitlines()
+        self.assertTrue(lines[-1].startswith(f"OK: {branch} passes the hand-back gate at "), lines[-5:])
+        entry, results = store.load_latest(wt, new, "results")
+        first_sha = sha256_bytes((repo / FIRST).read_bytes())
+        self.assertEqual(results["references"], [{"path": FIRST, "sha256": first_sha}])
+        self.assertNotIn(FIRST, store.input_digests(results["inputs"]))
+        pointer = store.pointer_path(new)
+        status_file = f"program/status/{new}.json"
+        project.pk("status", "set", new, "review", "--role", "implementer", "--evidence", entry["path"], cwd=wt)
+        project.commit(f"{new}: evidence", entry["path"], pointer, status_file, cwd=wt)
+
+        commands = []
+        plan = (wt / "program" / "tasks" / new / "PLAN.md").read_text(encoding="utf-8")
+        for argv, expect in gate_module.parse_plan(plan):
+            code, output = run_argv(argv, wt, env=project.env)
+            commands.append({"label": " ".join(argv), "argv": argv, "exit": code, "expected_exit": expect,
+                             "as_expected": code == expect, "derived": {}, "output_sha256": sha256_bytes(
+                                 output.encode()), "output_tail": output[-2000:]})
+        with mock.patch.object(tempfile, "tempdir", str(project.scratch)):
+            qa_bugs = evidence_module.Evidence(wt, new).planted_bugs(
+                QA_BUGS, [sys.executable, "-m", "compileall", "-q", "."], [sys.executable, "-m", "unittest"])
+        acceptance = {"task_id": new, "decision": "accepted_development",
+                      "evidence_sha256": sha256_file(wt / entry["path"]), "source_commit": results["head"],
+                      "accepted_at": utc_now(), "role": "qa", "commands": commands, "planted_bugs": qa_bugs,
+                      "findings": [], "blocked_by": []}
+        written = project.scratch / "acceptance.json"
+        written.write_text(json.dumps(acceptance, indent=2) + "\n", encoding="utf-8")
+        project.pk("evidence", "accept", new, written, "--done", cwd=wt)
+        accepted = store.load_latest(wt, new, "acceptance")[0]["path"]
+        project.commit(f"{new}: QA acceptance, done", accepted, pointer, status_file, cwd=wt)
+        history = project.pk("evidence", "history", new, cwd=wt).stdout.splitlines()
+        self.assertIn(f"  reference {FIRST} sha256 {first_sha} (acceptance first: legacy accepted)", history)
+
+        landed = project.pk("merge", new, "--trailer", "Co-Authored-By: Example Agent",
+                            env=project.gate_env).stdout.splitlines()
+        self.assertTrue(landed[0].startswith(f"OK: {branch} merges into main at "), landed)
+        self.assertEqual(project.git("status", "--porcelain"), "")
+        self.assertIn(f"{new}\tdone", project.pk("status", "list").stdout)
+        handoff = (repo / "program" / "HANDOFF.md").read_text(encoding="utf-8")
+        self.assertIn("- done: 1 (full 1)", handoff)
+        self.assertIn("- adopted: 2", handoff)
+        project.pk("status", "validate")
+        page = self.base / "dashboard.html"
+        project.pk("dashboard", page)
+        self.assertIn(f"<code>{new}</code> <span class=meta>results {entry['path']}</span> {FIRST} sha256 "
+                      f"{first_sha} (acceptance first: legacy accepted)", page.read_text(encoding="utf-8"))
+        project.pk("doctor")
+
+    @skip_unless_slow()
+    @NEEDS_SH
+    @NEEDS_PIP
     def test_gate_fails_with_missing_tool_without_gitleaks(self):
         project = Project(self.base, with_gitleaks=False)
         project.prepare()

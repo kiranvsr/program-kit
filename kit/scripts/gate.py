@@ -1487,6 +1487,36 @@ def _ext_ready(root: Path, what: str) -> bool:
     return True
 
 
+EXT_CHECK = "ext-check"
+
+
+def ext_check_step(root: Path, checks: dict, branch: str, tree: Path) -> bool:
+    """`pk ext check` on the tree the merge would make, when the branch changes the extensions (0.7.0).
+
+    The gates judge a branch by main's extensions, so a branch that changes `program/extensions.yaml` or anything
+    under `program/extensions/` would otherwise reach main untried. When it does, this kit step runs `pk ext check`
+    in `tree` (the trial merge) with PK_EXT_FROM=worktree, in a child process, so the declaration and every module
+    must load and register cleanly from the merged tree; nothing of theirs runs in the gate itself. Prints
+    `step ext-check: ok` or `FAILED: ext-check ...` with the child's output tail; True when it passed or did not apply.
+    """
+    base = git(root, "merge-base", MAIN_REF, f"refs/heads/{branch}")
+    changed = [path for path in _git_fields(root, "diff", "--name-only", "--no-renames", "-z",
+                                            f"{base}..refs/heads/{branch}") if _under(path, ext.PATHS)]
+    if not changed:
+        return True
+    pk_script = Path(__file__).resolve().parent / "pk.py"
+    code, output = run_argv([sys.executable, str(pk_script), "ext", "check"], tree,
+                            env=dict(os.environ, **{ext.ENV: ext.WORKTREE}), timeout=step_limit(checks, "ext"))
+    if code == 0:
+        _out(f"step {EXT_CHECK}: ok ({_listed(changed)} changed: the merged tree's extensions load)")
+        return True
+    _out(f"FAILED: {EXT_CHECK} the branch changes {_listed(changed)}, and the merged tree's extensions do not load "
+         f"(pk ext check with {ext.ENV}={ext.WORKTREE} in the trial merge: {exit_text(code)})")
+    for line in output.splitlines()[-TAIL_LINES:]:
+        _out(TAIL_PREFIX + line)
+    return False
+
+
 def ext_steps(gate: str, root: Path, checks: dict, task_id: str, branch: str, head: str, path: Path,
               worktree: Path | None = None, trial: Path | None = None) -> int:
     """The extensions' gate steps for `gate` (0.7.0), after the kit's own and before the `OK:` line: 0 when all pass.
@@ -1548,7 +1578,8 @@ def handback(root, task_id: str, branch: str, worktree=None, no_reuse: bool = Fa
     with heavy(root, checks, f"gate-handback-{task_id}"):
         trial = trial_merge(root, branch)
         code = _limited(root, checks, lambda: _with_trial(
-            root, trial, lambda: _run_steps(checks, task_id, wt, trial, authoritative, meta, no_reuse, e2e)
+            root, trial, lambda: (0 if ext_check_step(root, checks, branch, trial) else 1)
+            or _run_steps(checks, task_id, wt, trial, authoritative, meta, no_reuse, e2e)
             or ext_steps("handback", root, checks, task_id, branch, sha, wt, worktree=wt, trial=trial)))
     if code:
         return code
@@ -1655,6 +1686,8 @@ def merge_check(root, branch: str, inspected: str | None = None, suite: bool = T
 
     def steps() -> int:
         if _definition(root, trial, task_id, meta) is None or not _tier_unchanged(trial, task_id, meta):
+            return 1
+        if not ext_check_step(root, checks, branch, trial):  # 0.7.0: a round member's merged tree too
             return 1
         if not suite:
             return 0
@@ -1809,7 +1842,24 @@ def _expected_claims(root: Path, gate_id: str) -> dict[str, dict]:
         states, acceptance_sha = _states(task_id, own, environments, index, source)
         docs[name] = {"gate": gate_id, "record": record, "environment": states,
                       "acceptance_sha256": acceptance_sha, "generated_from_commit": commit}
+        adopted = _adopted_record(root, task_id)
+        if adopted is not None:  # 0.7.0: finished before adoption; it evidences nothing here, and says where to look
+            docs[name].update(adopted=ADOPTED_CLAIM, references=adopted["references"])
     return docs
+
+
+ADOPTED_CLAIM = "adopted; see references"
+
+
+def _adopted_record(root: Path, task_id: str | None) -> dict | None:
+    """The task's status record when it is `adopted` (0.7.0), else None; a record that does not read is not one."""
+    if not task_id or not (root / "program" / "status" / f"{task_id}.json").is_file():
+        return None
+    try:
+        record = status_module.read(root, task_id)
+    except KitError:
+        return None
+    return record if record["status"] == status_module.ADOPTED else None
 
 
 def _claims_dir(root: Path, gate_id: str) -> Path:

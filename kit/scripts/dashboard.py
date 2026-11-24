@@ -8,7 +8,10 @@ counts, the gates of `program/gates.yaml` with the status of the tasks whose rec
 `program/beta-feedback.md` exists (0.6.0), a Feedback panel: the open items by urgency then number and the five most
 recently done, declined ones hidden; a row that does not read fails the page, naming the row and the field. With a
 programme's extensions (0.7.0) an Extensions panel shows each module's `dashboard_data` dict as JSON, and the summary
-carries them under `extensions.<module>`; a hook that fails is a note on standard error and is left out. It adds no
+carries them under `extensions.<module>`; a hook that fails is a note on standard error and is left out. An adopted
+programme (0.7.0) sees its adopted tasks as their own state (never counted as done) and a References panel: each
+adopted task's and each latest results record's citations of legacy evidence, described by a `reference_resolver`
+extension when one is registered. The open follow-ups are listed newest first under their count. It adds no
 state of its own and decides nothing: the hand-off stays the document a successor reads, and every check stays a
 command. The page carries no script, no external asset and no wall-clock time, so the same commit and state give
 the same bytes; it names the commit it was made at.
@@ -23,6 +26,7 @@ import html
 import json
 from pathlib import Path
 
+import adoption
 import cost as cost_module
 import ctlstate
 import ext
@@ -30,9 +34,11 @@ import feedback as feedback_module
 import handoff as handoff_module
 import register as register_module
 import status as status_module
+import store
 from common import KitError, find_root, git, read_yaml, write_text
 
-ORDER = ("done", "merged", "review", "in_progress", "blocked", "parked", "not_started")
+ORDER = ("done", "merged", "adopted", "review", "in_progress", "blocked", "parked", "not_started")
+REFERENCES_SHOWN = 200  # reference lines on the page; the rest are counted
 
 
 def _e(value) -> str:
@@ -84,7 +90,8 @@ def _register_rows(root: Path) -> list[dict]:
                     rows.append({"phase": f"{phase.get('id', '')} {phase.get('title', '')}".strip(),
                                  "id": task["id"], "title": task.get("title", ""),
                                  "status": record["status"] if record else "not_started",
-                                 "tier": status_module.tier_of(record) if record else ""})
+                                 "tier": status_module.tier_of(record) if record and record["status"] != "adopted"
+                                 else ""})  # an adopted task went through no kit gate: no tier
     return rows
 
 
@@ -103,8 +110,57 @@ def _gate_rows(root: Path, statuses: dict[str, str]) -> list[dict]:
     return rows
 
 
+def _reference_rows(root: Path, records: list[dict]) -> list[tuple[str, str, list[str]]]:
+    """(task, where, [line]) for every adopted status record and every latest results record that cites legacy
+    evidence (0.7.0); a resolver extension's description follows a line when it answers."""
+    import evidence as evidence_module  # late: only an adopted programme has references to show
+
+    record = adoption.load(root)
+    if record is None:
+        return []
+    rows = []
+    for status in records:
+        if status["status"] == status_module.ADOPTED and status.get("references"):
+            rows.append((status["task_id"], "adopted",
+                         evidence_module.reference_lines(root, status["references"], record["adopted_commit"])))
+    index = store.read_index(root)
+    for task_id in sorted(index.get("tasks", {})):
+        entry = store.latest(index, task_id, "results")
+        if entry is None:
+            continue
+        try:
+            data = store.load(root, entry["path"], entry["digest"])
+        except KitError:
+            continue
+        if isinstance(data.get("references"), list) and data["references"]:
+            rows.append((task_id, f"results {entry['path']}",
+                         evidence_module.reference_lines(root, data["references"], str(data.get("head", "")))))
+    return rows
+
+
+def _references_html(rows: list[tuple[str, str, list[str]]]) -> str:
+    if not rows:
+        return ""
+    items, shown = [], 0
+    for task, where, lines in rows:
+        for line in lines:
+            if shown < REFERENCES_SHOWN:
+                items.append(f"<li><code>{_e(task)}</code> <span class=meta>{_e(where)}</span> "
+                             f"{_e(line.strip().removeprefix('reference '))}</li>")
+            shown += 1
+    more = f'<p class="meta">and {shown - REFERENCES_SHOWN} more</p>' if shown > REFERENCES_SHOWN else ""
+    return (f'\n<h2>References ({shown})</h2>\n<div class="panel"><p class="meta">Legacy evidence: what adopted tasks '
+            f"rest on and what new work cites; never an input, checked at the record's commit</p><ul>"
+            f"{''.join(items)}</ul>{more}</div>")
+
+
 def _chip(state: str) -> str:
     return f'<span class="chip s-{_e(state)}">{_e(state.replace("_", " "))}</span>' if state else ""
+
+
+def _shown_states(counts: dict[str, int], adopted: bool) -> tuple[str, ...]:
+    """ORDER, with `adopted` only for a programme that adopted or holds an adopted record."""
+    return tuple(state for state in ORDER if state != "adopted" or adopted or counts.get("adopted"))
 
 
 def _bar(counts: dict[str, int]) -> str:
@@ -137,16 +193,21 @@ def render(root: Path) -> tuple[str, dict]:
     for record in records:
         per_model[record["model"]] = per_model.get(record["model"], 0) + record["tokens"]
     tokens = sum(per_model.values())
-    followups = sorted(ctlstate.load(root)["followups"], key=lambda item: item["id"], reverse=True)
+    # newest first: follow-up IDs are given out in order, F-0001 onward, and never twice
+    followups = sorted(ctlstate.load(root)["followups"], key=lambda item: int(item["id"][2:]), reverse=True)
     commit = git(root, "rev-parse", "--short=12", "HEAD")
     done = counts["done"] + counts["merged"]
+    is_adopted = adoption.adopted(root)
+    states = _shown_states(counts, is_adopted)
+    references_html = _references_html(_reference_rows(root, status_module.list_all(root)))
 
     phases: dict[str, list[dict]] = {}
     for row in rows:
         phases.setdefault(row["phase"], []).append(row)
     register_html = "".join(
         f"<details open><summary><span>{_e(phase)}</span><span class=meta>"
-        f"{sum(r['status'] in ('done', 'merged') for r in tasks)} of {len(tasks)} done</span>"
+        f"{sum(r['status'] in ('done', 'merged') for r in tasks)} of {len(tasks)} done"
+        + (f", {sum(r['status'] == 'adopted' for r in tasks)} adopted" if "adopted" in states else "") + "</span>"
         f'<span class="bar">{_bar({s: sum(r["status"] == s for r in tasks) for s in ORDER})}</span></summary>'
         + _table(["Task", "Title", "Status", "Tier"],
                  [[f"<code>{_e(r['id'])}</code>", _e(r["title"]), _chip(r["status"]), _e(r["tier"])] for r in tasks],
@@ -154,10 +215,12 @@ def render(root: Path) -> tuple[str, dict]:
         + "</details>" for phase, tasks in phases.items()) or '<p class="empty">No register yet (stage 6).</p>'
     tiles = "".join(f'<div class="tile"><div class="n">{_e(n)}</div><div class="l">{_e(label)}</div></div>'
                     for n, label in ((len(rows), "tasks in the register"), (done, "done or merged"),
+                                     *([(counts["adopted"], "adopted (before the kit)")] if "adopted" in states
+                                       else []),
                                      (counts["in_progress"] + counts["review"], "in flight"),
                                      (counts["blocked"], "blocked"), (len(followups), "open follow-ups"),
                                      (f"{tokens:,}", "tokens logged")))
-    legend = " ".join(f'{_chip(state)} {counts[state]}' for state in ORDER)
+    legend = " ".join(f'{_chip(state)} {counts[state]}' for state in states)
     gates_html = _table(["Gate", "Environment", "Claims", "Records (status)"], [
         [f"<code>{_e(g['id'])}</code><br><span class=meta>{_e(g['title'])}</span>", _e(g["environment"]),
          _e(g["claims"]), "<br>".join(f"<code>{_e(task)}</code> {_chip(state)}" for task, state in g["records"])]
@@ -178,7 +241,8 @@ def render(root: Path) -> tuple[str, dict]:
     if extensions_html:
         extensions_html = f'\n<h2>Extensions</h2>\n<div class="panel">{extensions_html}</div>'
     page = TEMPLATE
-    for key, value in (("COMMIT", _e(commit)), ("FEEDBACK", feedback_html), ("EXTENSIONS", extensions_html),
+    for key, value in (("COMMIT", _e(commit)), ("FEEDBACK", references_html + feedback_html),
+                       ("EXTENSIONS", extensions_html), ("OPEN", _e(len(followups))),
                        ("TILES", tiles), ("BAR", _bar(counts)),
                        ("LEGEND", legend),
                        ("HANDOFF", _block_html(block)), ("REGISTER", register_html), ("GATES", gates_html),
@@ -187,6 +251,8 @@ def render(root: Path) -> tuple[str, dict]:
                         else '<p class="empty">None open.</p>')):
         page = page.replace(f"@@{key}@@", value)
     summary = {"tasks": len(rows), "gates": len(gates), "tokens": tokens}
+    if is_adopted:
+        summary["adopted"] = counts["adopted"]
     if extensions:
         summary["extensions"] = extensions
     return page, summary
@@ -200,9 +266,9 @@ TEMPLATE = """<!doctype html>
 <title>Program dashboard</title>
 <style>
 :root{--bg:#f6f5f1;--surface:#fff;--fg:#1d2126;--muted:#5d6670;--line:#dcdad2;--ok:#2f7d4a;--info:#2f5f9e;
---warn:#b2691b;--crit:#b2362e;--idle:#8a9199;--mono:ui-monospace,Menlo,Consolas,monospace}
+--warn:#b2691b;--crit:#b2362e;--idle:#8a9199;--adopted:#2e7d7a;--mono:ui-monospace,Menlo,Consolas,monospace}
 @media (prefers-color-scheme:dark){:root{--bg:#15181c;--surface:#1d2127;--fg:#e8e6df;--muted:#9aa3ad;--line:#2d333b;
---ok:#6cc08a;--info:#7fa6dc;--warn:#e0a35a;--crit:#e3736a;--idle:#7a838c;color-scheme:dark}}
+--ok:#6cc08a;--info:#7fa6dc;--warn:#e0a35a;--crit:#e3736a;--idle:#7a838c;--adopted:#5fb8b3;color-scheme:dark}}
 body{margin:0;padding:0 16px 48px;background:var(--bg);color:var(--fg);font:15px/1.45 system-ui,sans-serif}
 .wrap{max-width:1200px;margin:0 auto}
 header{display:flex;flex-wrap:wrap;gap:8px 20px;align-items:baseline;padding:24px 0 10px;
@@ -217,9 +283,9 @@ h1{margin:0;font-size:1.6rem}h2{font-size:1.1rem;margin:28px 0 10px}h3{font-size
 .bar span{display:block;height:100%}
 .chip{display:inline-block;font-size:.72rem;font-weight:600;padding:0 8px;border-radius:999px;white-space:nowrap;
 border:1px solid currentColor}
-.s-done,.s-merged{color:var(--ok)}.s-review{color:var(--info)}.s-in_progress{color:var(--warn)}
+.s-done,.s-merged{color:var(--ok)}.s-adopted{color:var(--adopted)}.s-review{color:var(--info)}.s-in_progress{color:var(--warn)}
 .s-blocked{color:var(--crit)}.s-parked,.s-not_started{color:var(--idle)}
-.bar .s-done,.bar .s-merged{background:var(--ok)}.bar .s-review{background:var(--info)}
+.bar .s-done,.bar .s-merged{background:var(--ok)}.bar .s-adopted{background:var(--adopted)}.bar .s-review{background:var(--info)}
 .bar .s-in_progress{background:var(--warn)}.bar .s-blocked{background:var(--crit)}.bar .s-parked{background:var(--idle)}
 .grid{display:grid;grid-template-columns:3fr 2fr;gap:20px;align-items:start}
 @media (max-width:860px){.grid{grid-template-columns:1fr}}
@@ -256,7 +322,7 @@ kit's files; the hand-off and the commands are the record</span></header>
 <div class="panel">@@GATES@@</div>@@FEEDBACK@@@@EXTENSIONS@@
 <div class="grid">
 <div><h2>Costs</h2><div class="panel">@@COSTS@@@@FLAGGED@@</div></div>
-<div><h2>Open follow-ups</h2><div class="panel">@@FOLLOWUPS@@</div></div>
+<div><h2>Open follow-ups (@@OPEN@@, newest first)</h2><div class="panel">@@FOLLOWUPS@@</div></div>
 </div>
 </div>
 </body>

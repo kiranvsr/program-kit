@@ -10,6 +10,13 @@ An adopted programme (`program/adoption.yaml`, 0.7.0) may also name a phase by o
 so `CX`, `CX-M01`, `CX-M01-S02` and `CX-M01-S02-T01` are IDs there. `valid_id` is the one function that decides
 whether an ID has the shape of its kind, and `is_task_id` whether a string can name a task at all (a register task
 ID or an ad-hoc `AH-<nnnn>`); every place that checks a task ID calls one of them.
+
+An adopted programme's register entries from before adoption are held to shape, not granularity (0.7.0, KA-2):
+`program/adoption.yaml` lists under `legacy_register` the tasks whose size, number of dependencies or role, the gate
+IDs and the role names the kit's rules would refuse. Such a task keeps them, and such a gate ID stays valid on its
+node, for as long as the entry is exactly what the frozen source (`program/legacy/adoption-source.json`) holds; once
+it is changed (through a change request, or any edit) the kit's rules apply to it as to everything added after
+adoption. Well-formed IDs, nesting, `depends_on` naming real tasks and no cycles are checked for every entry.
 """
 from __future__ import annotations
 
@@ -21,7 +28,7 @@ import sys
 from pathlib import Path
 
 import adoption
-from common import KitError, find_root, read_yaml, utc_now, write_yaml
+from common import KitError, find_root, read_json, read_yaml, utc_now, write_yaml
 
 KIT_DIR = Path(__file__).resolve().parent.parent
 MAX_FAN_IN = 6
@@ -255,30 +262,96 @@ def _find_cycles(graph: dict[str, list[str]]) -> list[str]:
     return cycles
 
 
+# --- an adopted programme's grandfathered entries (0.7.0, KA-2) ----------------------------------------------------
+
+def own_fields(level: int, node: dict) -> dict:
+    """A register node without its list of children: what an edit of the entry itself changes."""
+    return {key: value for key, value in node.items() if level == 3 or key != _CHILD[level]}
+
+
+def adopted_entries(document) -> dict[str, dict]:
+    """{id: own fields} of every node of a register document (the frozen source's); empty for anything else."""
+    if not (isinstance(document, dict) and isinstance(document.get("phases"), list)):
+        return {}
+    return {node["id"]: own_fields(level, node) for level, node, _ in _nodes(document)
+            if isinstance(node.get("id"), str)}
+
+
+def _role_ids(roles) -> set[str] | None:
+    if roles is None:
+        return None
+    if not isinstance(roles, dict) or not isinstance(roles.get("roles"), list):
+        raise KitError("roles: expected a mapping with a 'roles' list")
+    return {role["id"] for role in roles["roles"] if isinstance(role, dict) and isinstance(role.get("id"), str)}
+
+
+def deviations(register: dict, roles: dict | None) -> dict[str, list[str]]:
+    """What the kit's granularity rules, role catalog and gate-ID pattern would refuse in `register`, by name:
+    {tasks: IDs of tasks with another size, more than MAX_FAN_IN dependencies or a role outside the catalog, gates:
+    gate IDs that do not match the pattern, roles: those roles}. `pk adopt` records it as `legacy_register`."""
+    _check_shape(register)
+    role_ids = _role_ids(roles)
+    tasks, gates, names = [], [], []
+    for level, node, _ in _nodes(register):
+        gate = node.get("gate")
+        if isinstance(gate, str) and gate and not _GATE.match(gate) and gate not in gates:
+            gates.append(gate)
+        ident = node.get("id")
+        if level < 3 or not isinstance(ident, str):
+            continue
+        role = node.get("role")
+        foreign = role_ids is not None and isinstance(role, str) and role and role not in role_ids
+        depends = node.get("depends_on")
+        if (node.get("size") not in SIZES or foreign
+                or (isinstance(depends, list) and len(depends) > MAX_FAN_IN)) and ident not in tasks:
+            tasks.append(ident)
+        if foreign and role not in names:
+            names.append(role)
+    return {"tasks": tasks, "gates": gates, "roles": names}
+
+
+def legacy_rules(root: Path) -> dict | None:
+    """The grandfathered entries of an adopted programme: {tasks, gates, roles: sets from adoption.yaml's
+    legacy_register, entries: {id: own fields} of the frozen source's register}; None without adoption."""
+    record = adoption.load(root)
+    if record is None:
+        return None
+    try:
+        source = read_json(Path(root) / record["source"])
+    except KitError:
+        source = None  # pk doctor names a missing or changed source; nothing is grandfathered without it
+    held = record["legacy_register"]
+    return {"tasks": set(held["tasks"]), "gates": set(held["gates"]), "roles": set(held["roles"]),
+            "entries": adopted_entries(source.get("register") if isinstance(source, dict) else None)}
+
+
 def problems_in(root: Path) -> list[str]:
     """The problems `pk register validate` reports for `program/register.yaml`; a missing register is one."""
     if not _path(root).exists():
         return ["program/register.yaml is missing"]
     environments = Path(root) / "program" / "environments.yaml"
     return validate(load(root), read_yaml(environments) if environments.exists() else None,
-                    read_yaml(KIT_DIR / "interview" / "roles.yaml"), phase_prefixes(root))
+                    read_yaml(KIT_DIR / "interview" / "roles.yaml"), phase_prefixes(root), legacy_rules(root))
 
 
-def validate(register: dict, environments: dict | None, roles: dict | None, prefixes=()) -> list[str]:
+CHANGED = (" (it was adopted as it is; it changed since adoption, so the kit's rules apply to it now, as to everything "
+           "added after adoption)")
+
+
+def validate(register: dict, environments: dict | None, roles: dict | None, prefixes=(), legacy=None) -> list[str]:
     """Problems with the register, one string each (the offending ID first); empty when valid.
 
-    `prefixes` are the legacy phase prefixes of an adopted programme (`phase_prefixes(root)`)."""
+    `prefixes` are the legacy phase prefixes of an adopted programme (`phase_prefixes(root)`), and `legacy` its
+    grandfathered entries (`legacy_rules(root)`): a listed task or gate ID whose entry is unchanged since adoption is
+    held to shape only."""
     _check_shape(register)
     known_envs = None
     if environments is not None:
         if not isinstance(environments, dict) or not isinstance(environments.get("environments"), dict):
             raise KitError("environments: expected a mapping with an 'environments' mapping")
         known_envs = environments["environments"]
-    role_ids = None
-    if roles is not None:
-        if not isinstance(roles, dict) or not isinstance(roles.get("roles"), list):
-            raise KitError("roles: expected a mapping with a 'roles' list")
-        role_ids = {role["id"] for role in roles["roles"] if isinstance(role, dict) and isinstance(role.get("id"), str)}
+    role_ids = _role_ids(roles)
+    entries = legacy["entries"] if legacy is not None else {}
 
     problems: list[str] = []
     nodes = list(_nodes(register, problems))
@@ -302,23 +375,32 @@ def validate(register: dict, environments: dict | None, roles: dict | None, pref
         title = node.get("title")
         if not isinstance(title, str) or not title.strip():
             problems.append(f"{who}: title is missing")
+        # held to shape only: an entry present at adoption, exactly as it was then (0.7.0, KA-2)
+        unchanged = isinstance(ident, str) and ident in entries and entries[ident] == own_fields(level, node)
+        changed = CHANGED if isinstance(ident, str) and ident in entries and not unchanged else ""
         gate = node.get("gate")
-        if gate is not None and not (isinstance(gate, str) and _GATE.match(gate)):
-            problems.append(f"{who}: gate {gate!r} must be {GATE_SHAPE}, or null")
+        if gate is not None and not (isinstance(gate, str) and _GATE.match(gate)) \
+                and not (unchanged and gate in legacy["gates"]):
+            problems.append(f"{who}: gate {gate!r} must be {GATE_SHAPE}, or null"
+                            + (changed if legacy is not None and gate in legacy["gates"] else ""))
         if level < 3:
             continue
 
+        held = unchanged and ident in legacy["tasks"]
+        changed = changed if legacy is not None and ident in legacy["tasks"] else ""
         size = node.get("size")
-        if size == "L":
-            problems.append(f"{who}: size L is not allowed on a task; split into steps")
+        if held:
+            pass  # any size label the programme used before adoption
+        elif size == "L":
+            problems.append(f"{who}: size L is not allowed on a task; split into steps{changed}")
         elif size not in SIZES:
-            problems.append(f"{who}: size {size!r} must be S or M")
+            problems.append(f"{who}: size {size!r} must be S or M{changed}")
         role = node.get("role")
-        if role_ids is not None and role not in role_ids:
-            problems.append(f"{who}: unknown role {role!r}")
+        if role_ids is not None and role not in role_ids and not (held and role in legacy["roles"]):
+            problems.append(f"{who}: unknown role {role!r}{changed}")
         depends = _id_list(node, "depends_on", who, problems)
-        if len(depends) > MAX_FAN_IN:
-            problems.append(f"{who}: depends_on has {len(depends)} entries; at most {MAX_FAN_IN} are allowed")
+        if len(depends) > MAX_FAN_IN and not held:
+            problems.append(f"{who}: depends_on has {len(depends)} entries; at most {MAX_FAN_IN} are allowed{changed}")
         for target in depends:
             if target not in known:
                 problems.append(f"{who}: depends_on {target} does not exist")
@@ -419,7 +501,7 @@ def cmd_register(args: argparse.Namespace) -> int:
     env_path = Path(root) / "program" / "environments.yaml"
     environments = read_yaml(env_path) if env_path.exists() else None
     roles = read_yaml(KIT_DIR / "interview" / "roles.yaml")
-    problems = validate(register, environments, roles, phase_prefixes(root))
+    problems = validate(register, environments, roles, phase_prefixes(root), legacy_rules(root))
     if problems:
         print(f"error: register invalid: {len(problems)} problem(s)", file=sys.stderr)
         print("\n".join(f"error: {problem}" for problem in problems), file=sys.stderr)

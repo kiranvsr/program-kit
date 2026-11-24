@@ -1227,6 +1227,27 @@ class GateEndToEndTests(HandbackBase):
         self.assertEqual(rc, 1, out)
         self.assertIn("FAILED: ext:fixture.check (not ok)\n    | fixture step from mainx", out)
 
+    def test_a_branch_whose_extension_does_not_import_fails_both_gates_at_the_kit_s_ext_check(self):
+        """KA-2 (the KX-1 review's L4): the branch's own extension is tried on the merged tree before it reaches main."""
+        gate_put(self.root, f"program/tasks/{TASK}/SPEC.md", "# Spec\n\nGuarded edit: program/extensions/\n")
+        gate_commit(self.root, "the SPEC allows the branch to edit the extension")
+        sh(self.wt, "git", "merge", "-q", "main")
+        gate_put(self.wt, "program/extensions/fixture.py", FIXTURE + "\nimport nonexistent_dependency\n")
+        gate_commit(self.wt, "the branch breaks its extension")
+        for run in (self.handback, self.merge_check):
+            rc, out = run()
+            self.assertEqual(rc, 1, out)
+            self.assertIn("FAILED: ext-check the branch changes program/extensions/fixture.py, and the merged tree's "
+                          "extensions do not load", out)
+            self.assertIn("nonexistent_dependency", out)
+            self.assertNotIn("step build", out)  # it runs first, before the kit's long steps
+        gate_put(self.wt, "program/extensions/fixture.py", FIXTURE + "\nEXTRA = 1\n")
+        gate_commit(self.wt, "the branch mends it")
+        rc, out = self.handback()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("step ext-check: ok (program/extensions/fixture.py changed: the merged tree's extensions load)",
+                      out)
+
     def test_a_module_that_stops_loading_while_the_gate_runs_fails_it(self):
         """The reviewer's MainMovesMidGate (M2): main gains a module that does not import after the kit's steps."""
         original = gate._run_steps
