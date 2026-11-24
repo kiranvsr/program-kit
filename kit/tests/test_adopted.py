@@ -197,8 +197,12 @@ class SourceStatusTests(unittest.TestCase):
         cls.root = make_repo(cls._case)
         install_legacy(cls.root)
         (cls.root / "old" / "outside.json").write_text("{}\n")
-        sh(cls.root, "git", "add", "old/outside.json")
-        sh(cls.root, "git", "commit", "-q", "-m", "a file outside the evidence roots")
+        (cls.root / "old" / "outside").mkdir()
+        (cls.root / "old" / "outside" / "a.json").write_text("{}\n")
+        (cls.root / "old" / "evidence" / "link.json").symlink_to("../outside.json")  # a linked file
+        (cls.root / "old" / "evidence" / "linked").symlink_to("../outside")  # a linked directory
+        sh(cls.root, "git", "add", "old")
+        sh(cls.root, "git", "commit", "-q", "-m", "a file outside the evidence roots, and links to it")
 
     @classmethod
     def tearDownClass(cls):
@@ -223,6 +227,15 @@ class SourceStatusTests(unittest.TestCase):
                       self.problems(self.one(references=[{"path": "old/evidence/none.json"}])))
         self.assertIn("statuses[1].references[2]: old/evidence/acceptance.json is listed twice for " + T[0],
                       self.problems(self.one(references=[{"path": FIRST}, {"path": FIRST}])))
+
+    def test_a_symbolic_link_or_a_path_below_one_is_refused(self):
+        found = self.problems(self.one(references=[{"path": "old/evidence/link.json"},
+                                                   {"path": "old/evidence/linked/a.json"}]))
+        self.assertIn("statuses[1].references[1]: old/evidence/link.json is a symbolic link at HEAD: a reference "
+                      "must be a regular file (a link's digest covers its target's name, not the file it points to)",
+                      found)
+        self.assertIn("statuses[1].references[2]: old/evidence/linked/a.json lies below old/evidence/linked, a "
+                      "symbolic link at HEAD: a reference must be a regular file reached through directories", found)
 
     def test_references_belong_to_a_done_task(self):
         found = self.problems(self.one(status="in_progress", references=[{"path": FIRST}]))
@@ -312,6 +325,37 @@ class AdoptedStatusTests(AdoptedBase):
         self.assertIn(f"{T[1]}: reference 1: {SECOND} is not under the legacy evidence roots "
                       "(old/other/)", found)
 
+    def test_pk_stale_reports_an_adopted_task_s_drifted_reference_as_information(self):
+        report = stale.drift_report(self.root)["adopted"]
+        self.assertEqual((report["since"], report["checked"], report["drifted"], report["unreadable"]),
+                         (self.record["adopted_commit"], 2, 0, []))
+        self.assertEqual(run_cli("stale", self.root, "stale", "--strict")[0], 0)
+        (self.root / SECOND).write_bytes(b"changed after adoption\n")
+        commit_all(self.root, "the legacy file moves on")
+        self.assertEqual(status.validate(self.root), [])  # still true at adopted_commit
+        report = stale.drift_report(self.root)["adopted"]
+        self.assertEqual(report["tasks"], [
+            {"task_id": T[0], "status": "adopted", "path": f"program/status/{T[0]}.json", "state": "fresh",
+             "changed_references": []},
+            {"task_id": T[1], "status": "adopted", "path": f"program/status/{T[1]}.json", "state": "drifted",
+             "changed_references": [SECOND]}])
+        self.assertEqual(report["drifted"], 1)
+        code, out, err = run_cli("stale", self.root, "stale")
+        self.assertEqual(code, 0)  # information
+        self.assertEqual(json.loads(out)["adopted"]["tasks"][1]["changed_references"], [SECOND])
+        self.assertEqual(run_cli("stale", self.root, "stale", "--strict")[0], 1)
+        self.assertNotIn("adopted", stale.drift_report(self.root, references=False))  # the gate's own drift step
+        (self.root / SECOND).unlink()
+        (self.root / SECOND).symlink_to("../acceptance.json")  # a link now: never fresh, whatever its text
+        commit_all(self.root, "the legacy file becomes a link")
+        self.assertEqual(stale.drift_report(self.root)["adopted"]["tasks"][1]["changed_references"], [SECOND])
+        status.reopen(self.root, T[0], "new work")  # a reopened record keeps its references, so it is reported too
+        (self.root / FIRST).write_text('{"moved": "on"}\n')
+        commit_all(self.root, "the first legacy file moves on")
+        rows = stale.drift_report(self.root)["adopted"]["tasks"]
+        self.assertEqual([(row["task_id"], row["status"], row["changed_references"]) for row in rows],
+                         [(T[0], "in_progress", [FIRST]), (T[1], "adopted", [FIRST, SECOND])])
+
     def test_an_adopted_record_written_by_hand_is_refused(self):
         forged = dict(self.rec(T[0]), task_id=T[4], references=[])
         self.write_record(T[4], forged)
@@ -375,6 +419,7 @@ class WithoutAdoptionTests(unittest.TestCase):
                          1)
         with self.assertRaisesRegex(KitError, "only an adopted programme cites legacy evidence"):
             evidence.Evidence(root, T[0]).reference("README.md")
+        self.assertNotIn("adopted", stale.drift_report(root))
 
 
 # --- the register: shape for what was adopted, granularity for everything after ----------------------------------
@@ -448,6 +493,32 @@ class FollowupGapTests(AdoptedBase):
         with self.assertRaisesRegex(KitError, "followup_gaps must be a list of follow-up IDs"):
             adoption.load(self.root)
 
+    def test_doctor_and_validate_derive_the_gaps_from_the_frozen_source(self):
+        self.assertEqual((adoption.problems(self.root), status.validate(self.root)), ([], []))
+        state = read_json(self.root / ctlstate.STATE_FILE)
+        state["followups"] = [item for item in state["followups"] if item["id"] != "F-0003"]  # deleted, not closed
+        write_json(self.root / ctlstate.STATE_FILE, state)
+        data = read_yaml(self.root / adoption.ADOPTION_FILE)
+        write_yaml(self.root / adoption.ADOPTION_FILE, dict(data, followup_gaps=["F-0002", "F-0003"]))  # hidden
+        ctlstate.load(self.root)  # the state alone cannot tell: it trusts the listed gaps
+        said = (f"{adoption.ADOPTION_FILE}: followup_gaps [F-0002, F-0003] are not the gaps of the frozen source "
+                f"{adoption.SOURCE_COPY} [F-0002]: the gaps are fixed at adoption; restore {adoption.ADOPTION_FILE} "
+                "from git")
+        self.assertEqual(adoption.problems(self.root), [said])
+        self.assertEqual(status.validate(self.root), [said])
+        code, out, err = run_cli("pk", self.root, "doctor")
+        self.assertEqual(code, 1)
+        self.assertIn("error: " + said, err)
+        write_yaml(self.root / adoption.ADOPTION_FILE, dict(data, followup_gaps=[]))  # a gap dropped is refused too
+        self.assertIn("followup_gaps [] are not the gaps", adoption.problems(self.root)[0])
+        write_yaml(self.root / adoption.ADOPTION_FILE, data)
+        (self.root / adoption.SOURCE_COPY).write_text("{}")  # the source itself changed: reported once, as changed
+        found = adoption.problems(self.root)
+        self.assertEqual(len(found), 1)
+        self.assertIn("no longer matches source_sha256", found[0])
+        self.assertEqual(status.validate(self.root)[-1], f"{adoption.ADOPTION_FILE}: followup_gaps cannot be checked: "
+                         f"{adoption.SOURCE_COPY} no longer matches source_sha256; restore it from git")
+
     def test_the_next_follow_up_is_numbered_after_the_import(self):
         state = ctlstate.load(self.root)
         self.assertEqual(ctlstate.next_followup_id(state), "F-0006")
@@ -492,6 +563,30 @@ class ReferenceTests(AdoptedBase):
             run.reference("old/evidence/none.json")
         with self.assertRaisesRegex(KitError, "must not contain"):
             run.reference("old/evidence/../RULINGS.md")
+
+    def test_a_symbolic_link_or_a_path_below_one_is_refused(self):
+        (self.root / "secret.txt").write_text("outside the roots\n")
+        (self.root / "elsewhere").mkdir()
+        (self.root / "elsewhere" / "a.json").write_text("{}\n")
+        (self.root / "old" / "evidence" / "link.json").symlink_to("../../secret.txt")
+        (self.root / "old" / "evidence" / "linked").symlink_to("../../elsewhere")
+        commit_all(self.root, "links under the evidence roots")
+        run = evidence.Evidence(self.root, T[5])
+        with self.assertRaisesRegex(KitError, "reference old/evidence/link.json is a symbolic link at HEAD: a "
+                                              "reference must be a regular file"):
+            run.reference("old/evidence/link.json")
+        with self.assertRaisesRegex(KitError, "reference old/evidence/linked/a.json lies below old/evidence/linked, a "
+                                              "symbolic link at HEAD"):
+            run.reference("old/evidence/linked/a.json")
+        self.assertEqual(run.references, [])
+        data = read_json(self.root / self.run_record(FIRST).write()["path"])
+        commit_all(self.root, "a record")
+        link = sha256_bytes(b"../../secret.txt")  # the link's text: what a blob digest of it would cover
+        crafted = dict(data, references=[{"path": "old/evidence/link.json", "sha256": link}])
+        self.assertEqual(evidence.gate_problems(crafted, T[5], root=self.root),
+                         [f"references[1]: old/evidence/link.json is a symbolic link at {data['head'][:12]}: a "
+                          "reference must be a regular file (a link's digest covers its target's name, not the file "
+                          "it points to)"])
 
     def test_the_gate_checks_each_reference_at_the_record_s_head(self):
         run = self.run_record(FIRST)
@@ -581,10 +676,33 @@ class ExtCheckStepTests(unittest.TestCase):
             gate._remove_trial(self.root, trial)
         return ok, out
 
-    def test_a_branch_that_does_not_touch_the_extensions_runs_nothing(self):
+    def test_a_branch_that_does_not_touch_the_extensions_is_still_checked(self):
+        (self.wt / "other.txt").write_text("x\n")
+        commit_all(self.wt, "other work")
+        self.assertEqual(self.step(), (True, ["step ext-check: ok (the merged tree's extensions load)"]))
+
+    def test_a_tree_without_extensions_runs_nothing(self):
+        sh(self.root, "git", "rm", "-q", "-r", "program/extensions.yaml", "program/extensions")
+        sh(self.root, "git", "commit", "-q", "-m", "no extensions")
+        sh(self.wt, "git", "merge", "-q", "main")
         (self.wt / "other.txt").write_text("x\n")
         commit_all(self.wt, "other work")
         self.assertEqual(self.step(), (True, []))
+
+    def test_a_branch_that_breaks_a_helper_an_extension_imports_fails_the_step(self):
+        (self.root / "repo_helper.py").write_text("NAME = 'helper'\n")
+        (self.root / "program" / "extensions" / "mine.py").write_text(
+            "import os\nimport sys\n\nsys.path.insert(0, os.getcwd())\nimport repo_helper  # noqa: E402\n\n\n"
+            "def register(api):\n    assert repo_helper.NAME\n")
+        commit_all(self.root, "an extension that imports repository code")
+        sh(self.wt, "git", "merge", "-q", "main")
+        (self.wt / "repo_helper.py").write_text("OTHER = 'renamed'\n")  # no extension file changes
+        commit_all(self.wt, "the helper changes")
+        ok, out = self.step()
+        self.assertFalse(ok)
+        self.assertTrue(out[0].startswith("FAILED: ext-check the branch changes no extension file (code they import "
+                                          "may have changed), and the merged tree's extensions do not load"), out)
+        self.assertTrue(any("NAME" in line for line in out[1:]), out)
 
     def test_an_extension_that_does_not_import_fails_the_step(self):
         (self.wt / "program" / "extensions" / "mine.py").write_text("import nonexistent_dependency\n")

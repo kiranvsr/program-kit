@@ -1179,7 +1179,7 @@ def _evidence_step(wt: Path, task_id: str, env: dict | None = None, reused: dict
 
 def _stale_step(wt: Path) -> bool:
     """The drift report against the worktree's HEAD: information, never a failure; an unreadable record fails."""
-    report = stale_module.drift_report(wt, "HEAD")
+    report = stale_module.drift_report(wt, "HEAD", references=False)  # the task's own record; pk stale has the rest
     _out(f"drift: {report['drifted']} of {report['checked']} record(s) drifted from HEAD")
     for row in report["tasks"]:
         if row["state"] == "drifted":
@@ -1491,26 +1491,31 @@ EXT_CHECK = "ext-check"
 
 
 def ext_check_step(root: Path, checks: dict, branch: str, tree: Path) -> bool:
-    """`pk ext check` on the tree the merge would make, when the branch changes the extensions (0.7.0).
+    """`pk ext check` on the tree the merge would make, whenever that tree declares extensions (0.7.0).
 
     The gates judge a branch by main's extensions, so a branch that changes `program/extensions.yaml` or anything
-    under `program/extensions/` would otherwise reach main untried. When it does, this kit step runs `pk ext check`
-    in `tree` (the trial merge) with PK_EXT_FROM=worktree, in a child process, so the declaration and every module
-    must load and register cleanly from the merged tree; nothing of theirs runs in the gate itself. Prints
-    `step ext-check: ok` or `FAILED: ext-check ...` with the child's output tail; True when it passed or did not apply.
+    under `program/extensions/` would otherwise reach main untried; so would a branch that changes code an extension
+    imports from elsewhere in the repository. So whenever `tree` (the trial merge: the branch's tree merged with main)
+    holds `program/extensions.yaml`, this kit step runs `pk ext check` in it with PK_EXT_FROM=worktree, in one child
+    process, so the declaration and every module must load and register cleanly from the merged tree; nothing of
+    theirs runs in the gate itself. Prints `step ext-check: ok` or `FAILED: ext-check ...` with the child's output
+    tail; True when it passed or did not apply (no declaration in the merged tree).
     """
+    if not (Path(tree) / ext.DECLARATION).is_file():
+        return True
     base = git(root, "merge-base", MAIN_REF, f"refs/heads/{branch}")
     changed = [path for path in _git_fields(root, "diff", "--name-only", "--no-renames", "-z",
                                             f"{base}..refs/heads/{branch}") if _under(path, ext.PATHS)]
-    if not changed:
-        return True
+    said = (f"the branch changes {_listed(changed)}" if changed
+            else "the branch changes no extension file (code they import may have changed)")
     pk_script = Path(__file__).resolve().parent / "pk.py"
     code, output = run_argv([sys.executable, str(pk_script), "ext", "check"], tree,
                             env=dict(os.environ, **{ext.ENV: ext.WORKTREE}), timeout=step_limit(checks, "ext"))
     if code == 0:
-        _out(f"step {EXT_CHECK}: ok ({_listed(changed)} changed: the merged tree's extensions load)")
+        _out(f"step {EXT_CHECK}: ok ({_listed(changed) + ' changed: ' if changed else ''}the merged tree's "
+             "extensions load)")
         return True
-    _out(f"FAILED: {EXT_CHECK} the branch changes {_listed(changed)}, and the merged tree's extensions do not load "
+    _out(f"FAILED: {EXT_CHECK} {said}, and the merged tree's extensions do not load "
          f"(pk ext check with {ext.ENV}={ext.WORKTREE} in the trial merge: {exit_text(code)})")
     for line in output.splitlines()[-TAIL_LINES:]:
         _out(TAIL_PREFIX + line)

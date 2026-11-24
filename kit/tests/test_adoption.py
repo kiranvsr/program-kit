@@ -51,10 +51,11 @@ def adopted_by_hand(root: Path, start: int = 6, prefixes=("CX",), log: str = LEG
     legacy.mkdir(parents=True, exist_ok=True)
     (legacy / "rulings.md").write_text(log)
     (legacy / "HANDOFF.md").write_text("old\n")
-    (legacy / "adoption-source.json").write_text("{}\n")
+    source = b'{"followups": {"next": 1, "open": [], "closed": []}}\n'  # what doctor derives followup_gaps from
+    (legacy / "adoption-source.json").write_bytes(source)
     write_yaml(root / adoption.ADOPTION_FILE, {
         "adopted_at": "2026-11-24T00:00:00Z", "adopted_commit": "a" * 40, "source": adoption.SOURCE_COPY,
-        "source_sha256": sha256_bytes(b"{}\n"), "legacy_phase_prefixes": list(prefixes), "ruling_start": start,
+        "source_sha256": sha256_bytes(source), "legacy_phase_prefixes": list(prefixes), "ruling_start": start,
         "legacy_rulings": adoption.LEGACY_RULINGS, "legacy_rulings_sha256": sha256_bytes(log.encode()),
         "legacy_handoff": adoption.LEGACY_HANDOFF, "legacy_evidence_roots": ["old/evidence/"], "followup_gaps": [],
         "legacy_register": {"tasks": [], "gates": [], "roles": []}})

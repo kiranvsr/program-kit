@@ -873,6 +873,7 @@ def validate(root: Path) -> list[str]:
                 problem = f"{name}: {exc}"
             if problem:
                 problems.append(problem)
+    problems.extend(imported.gap_problems())
     return problems
 
 
@@ -904,6 +905,19 @@ class _Imported:
             self.statuses = {item["task_id"]: item for item in items if isinstance(item, dict)}
         except (KitError, KeyError, TypeError) as exc:
             self.problem = f"the frozen source {self.record['source']} does not read ({exc}); restore it from git"
+
+    def gap_problems(self) -> list[str]:
+        """Why `followup_gaps` of adoption.yaml is not what the frozen source gives (adoption.followup_gap_problems);
+        empty without adoption, and when adoption.yaml does not read (each imported record reports that)."""
+        import adoption  # late, as above
+
+        if not adoption.adopted(self.root):
+            return []
+        try:
+            record = adoption.load(self.root)
+        except KitError:
+            return []
+        return adoption.followup_gap_problems(self.root, record)
 
     def problems(self, name: str, record: dict) -> list[str]:
         """Why an imported record is not what pk adopt wrote from the frozen source, or its references do not hold."""

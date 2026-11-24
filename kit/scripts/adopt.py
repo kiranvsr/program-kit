@@ -29,7 +29,8 @@ Statuses and the generic import rules (0.7.0, KA-2; spec 2.3 and 2.6a):
 
 - a source `done` becomes `adopted` (status.py), with the source's actor and time as `legacy_actor` and
   `legacy_updated_at` and each reference as {path, sha256}: the path must lie under `legacy_evidence_roots` and be a
-  file committed at HEAD, whose blob's sha256 is recorded (`adopted_commit` is HEAD);
+  regular file committed at HEAD (never a symbolic link, nor a path below one), whose blob's sha256 is recorded
+  (`adopted_commit` is HEAD);
 - a source `in_progress`, `review` or `blocked` task is imported `not_started` with `legacy_status`, and a follow-up
   "re-dispatch <ID> (was <state> at adoption)" is opened for it, so it re-enters the kit's loop by a dispatch;
 - a source `not_started` task (a parked one has no status file) writes no record, and its note, when it has one,
@@ -249,11 +250,11 @@ def _statuses(root: Path, source: dict, task_ids: set[str], roots: list[str], pr
             if not adoption.under_roots(path, roots):
                 problems.add(f"{where}: {path} is not under legacy_evidence_roots ({', '.join(roots) or 'none'})")
                 continue
-            blob = subprocess.run(["git", "-C", str(root), "cat-file", "blob", f"HEAD:{path}"], capture_output=True)
-            if blob.returncode != 0:
-                problems.add(f"{where}: {path} is not a file committed at HEAD")
+            data, why = adoption.committed_file(root, "HEAD", path, "HEAD")
+            if data is None:
+                problems.add(f"{where}: {path} {why}")
                 continue
-            bound.append({"path": path, "sha256": sha256_bytes(blob.stdout)})
+            bound.append({"path": path, "sha256": sha256_bytes(data)})
         found.append({"task_id": task_id, "status": state, **texts, "references": bound})
     return found
 
@@ -326,7 +327,7 @@ def _followups(source: dict, problems: _Problems) -> dict | None:
     if beyond:
         problems.add(f"followups: {', '.join(beyond[:SHOWN])} at or past followups.next F-{issued:04d}")
     # a gap below the import point is recorded (adoption.yaml followup_gaps) and accepted exactly, never filled
-    gaps = [f"F-{n:04d}" for n in range(1, issued) if n not in found]
+    gaps = adoption.missing_followups(issued, found)
     for item in lists["closed"]:
         if item["duplicate_of"] and not (_FOLLOWUP.match(item["duplicate_of"])
                                          and int(item["duplicate_of"][2:]) in found):

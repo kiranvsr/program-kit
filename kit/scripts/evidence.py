@@ -496,7 +496,8 @@ class Evidence(_MirrorCleanup):
 
         A reference says "this builds on that old record" without re-binding it: it never makes the record drift and
         never counts toward its commands or planted bugs. The path must lie under `legacy_evidence_roots` of
-        `program/adoption.yaml` and be a file committed at HEAD; the gate checks it again at the record's head.
+        `program/adoption.yaml` and be a regular file committed at HEAD (never a symbolic link, nor a path below
+        one); the gate checks it again at the record's head.
         """
         import adoption  # late: only an adopted programme cites legacy evidence
 
@@ -508,9 +509,10 @@ class Evidence(_MirrorCleanup):
         if not adoption.under_roots(path, roots):
             raise KitError(f"reference {path} is not under the legacy evidence roots ({', '.join(roots)}); a file "
                            "of this programme's own work is an input (hash_inputs)")
-        if self._object_type(path) != "blob":
-            raise KitError(f"reference {path} is not a file committed at HEAD")
-        found = {"path": path, "sha256": sha256_bytes(self._blob(path))}
+        data, why = adoption.committed_file(self.root, "HEAD", path, "HEAD")
+        if data is None:
+            raise KitError(f"reference {path} {why}")
+        found = {"path": path, "sha256": sha256_bytes(data)}
         self.references = [item for item in self.references if item["path"] != path] + [found]
         return dict(found)
 
