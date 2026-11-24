@@ -98,6 +98,7 @@ program-kit/
       hook.py               `pk hook`: the agent tool's stop hook running `pk drift --hook`, in git-ignored local settings (section 9.3)
       precheck.py           `pk spec precheck`: the spec author's check of a task folder before spec QA (section 4.2)
       scan.py               `pk scan staged`: the project's secret scanner over copies of files (0.6.1, section 10.3)
+      ext.py                the extension interface, API_VERSION, and `pk ext list|check` (0.7.0, section 9.6)
       rejudge.py            `pk gate rejudge`: re-runs named planted-bug rows of a task branch; never evidence (section 5)
       plants.py             `pk gate plants`: judges deferred planted-bug rows at the record's head; writes plants records (section 5)
       latework.py           the late-work rule: what a branch may add after the reviewed commit (section 5)
@@ -159,6 +160,8 @@ program/
   rounds/<NAME>.json        integration rounds: members, tested tree, what merged
   HANDOFF.md, controller-state.json, progress.md
   beta-feedback.md          optional: the feedback register (`pk feedback`)
+  extensions.yaml           optional: the programme's extension modules and the api they speak (section 9.6)
+  extensions/<module>       optional: the programme's own code behind the extension interface (section 9.6)
 ```
 ## 4. Stage flow: from a few lines to a frozen spec and a task register
 
@@ -416,6 +419,87 @@ The optional `evidence` section (0.5.2) speeds up the evidence step; absent, eve
 
 **What it is not.** It does not replace the gates or QA's re-run, it is not signed, and it is not a statement about any commit but its own `head`.
 
+### 9.6 Extending the kit
+
+The kit stays generic. A programme adds its own behaviour in code it owns, under `program/`, through a fixed and versioned interface (`kit/scripts/ext.py`), and never edits `kit/` (the manifest would refuse the next upgrade). Without `program/extensions.yaml` nothing here applies and the kit behaves exactly as before.
+
+**Declaration.** `program/extensions.yaml`:
+
+```yaml
+api: 1
+modules:
+  - name: house_rules
+```
+
+Each module is `program/extensions/<name>.py` or the package `program/extensions/<name>/__init__.py` (both at once is an error), with a name matching `[a-z_][a-z0-9_]*`; a package imports its own files relatively (`from .rows import ROWS`). `ext.py` defines `API_VERSION = 1`. When the declared api differs, every pk command refuses and names both versions; a declaration that does not read (an unknown key, a bad or repeated name, an api that is not a whole number) refuses every command the same way. The fix is a commit on main.
+
+**Loading from main.** Extension code is always read from main's committed tree, the way the gate reads `checks.yaml`: the kit lists `program/extensions.yaml` and `program/extensions/` at `refs/heads/main` with git (the branch: a tag named `main` never stands in for it, here or where the gates read `checks.yaml` and a SPEC's `Guarded edit:` lines), writes the files into a private temporary directory outside the repository and imports them from there under a package name of its own, so an extension module never shadows a kit module and no bytecode is written into the repository. The directory is removed when the pk process ends. A task branch, a dirty main checkout and a task worktree all get main's code, so a branch cannot change the rules it is judged by. For developing an extension, `PK_EXT_FROM=worktree` loads the working copy instead (through the same private directory); while it is set, whatever its value, the hand-back gate, the merge check (and so `pk merge` and `pk integrate check`), the binding check and every status move (`pk status set`, `pk status reopen`, `pk evidence accept --done`; a tier change, `pk status tier`, is not a move and runs neither) refuse to run. Any other value of it refuses every command.
+
+**Registration.** A module defines `register(api)` and calls the points below while it runs; a call after `register` returns is refused. A module that raises (or calls `sys.exit`) while importing or registering, or breaks a rule below, contributes nothing and is listed as not loaded. A module's top-level code and its `register` run at the start of every pk command, since pk reads the extensions before its arguments to know their commands.
+
+| Point | Called by | Contract |
+|---|---|---|
+| `api.command(name, handler, help="", configure=None)` | pk | a new subcommand (`[a-z][a-z0-9-]*`); `configure(parser)` adds its arguments and `handler(args)` returns the exit code. A name that collides with a kit command (or another extension's) is refused, so the kit's command always runs. |
+| `api.on_status_transition(fn)` | `pk status set`, `pk status reopen` (and every other status move) | `fn(task_id, old, new, record, root)` returns None or a refusal string. Called after the kit's own checks pass and before anything is written, with a copy of the record about to be written. A refusal stops the write and is printed. |
+| `api.after_worktree_new(fn)` | `pk worktree new` | `fn(task_id, path, root)` after the worktree exists; when it raises, the worktree and branch just made are removed and the command fails naming the exception. |
+| `api.gate_step(name, fn, gates=("handback", "merge"))` | the hand-back gate, the merge check, `pk integrate check` (as merge, once per member) | `fn(ctx)` returns `(ok, lines)`. `ctx` carries `gate`, `root`, `task_id`, `branch`, `head` (the branch tip judged), `path` (the task worktree at the hand-back gate, the trial merge at the merge check, the round's worktree in a round), `worktree` and `trial`. It runs after the kit's own steps and before the `OK:` line, printed as `step ext:<module>.<name>: ok` or `FAILED: ext:<module>.<name> (not ok)`, under the step timeout (`step_timeout.default`, else 3,600 s). Its lines, anything it prints and anything a child process it starts writes to the standard descriptors while the step runs follow with the gate's tail prefix, so none can read as an `OK:` line. On a timeout the step fails and its thread is abandoned, but it keeps running (Python cannot stop a thread): what it prints afterwards reaches the gate's output unprefixed, after the gate's `FAILED:` line, and the processes it started run on. A step that may run long bounds its own work (a `timeout=` on each `subprocess.run`). |
+| `api.drift_check(code, fn)` | `pk drift` | `code` is `X<n>` (D1 to D9 are the kit's). `fn(root)`, run on the commit checked, returns `[{severity: "note" or "fail", text}]`. A `fail` finding makes `X<n>` drift and counts; a `note` is printed as `X<n> note`. |
+| `api.handoff_lines(fn)` | the hand-off (and so the dashboard) | `fn(root)` returns a list of strings, added to the Now list after the kit's lines. |
+| `api.dashboard_data(fn)` | `pk dashboard` | `fn(root)` returns a JSON-serialisable dict, shown in an Extensions panel and returned under `extensions.<module>`; one per module. |
+| `api.adopt_importer(name, fn)` | `pk adopt --from <name> [args...]` | `fn(root, argv)` (without `--dry-run`, which is the kit's before or after `--from`) returns a source dict of the adoption schema (`kit/templates/adoption.schema.json`). It is written as JSON, validated exactly as a file would be, and stored as `program/legacy/adoption-source.json`. |
+| `api.reference_resolver(fn)` | the display of a legacy reference (`pk evidence history`, the dashboard) | `fn(path, data_bytes)` returns `{kind, summary}` with optional `task_id` and `decision`, all text, or None. The first resolver that answers is shown; it never affects validity. |
+
+An example module that uses every point:
+
+```python
+import subprocess
+from pathlib import Path
+
+PINNED = {"P0-M01-S00-T02": "evidence/pins/sandbox.json"}
+
+
+def register(api):
+    api.command("house-check", lambda args: 0, help="the programme's own read-only check")
+    api.on_status_transition(pinned_evidence)
+    api.after_worktree_new(lambda task_id, path, root: (path / "env.local").write_text("MODE=dev\n"))
+    api.gate_step("frozen_register", frozen_register)
+    api.drift_check("X1", lambda root: [{"severity": "note", "text": "legacy register is read-only"}])
+    api.handoff_lines(lambda root: ["house rules: 3 checks registered"])
+    api.dashboard_data(lambda root: {"checks": 3})
+    api.adopt_importer("old-tracker", lambda root, argv: export(root, argv))
+    api.reference_resolver(lambda path, data: {"kind": "acceptance", "summary": f"{path}: {len(data)} bytes"})
+
+
+def pinned_evidence(task_id, old, new, record, root):
+    if new == "done" and task_id in PINNED and not (Path(root) / PINNED[task_id]).is_file():
+        return f"done needs the pinned evidence {PINNED[task_id]}"
+    return None
+
+
+def frozen_register(ctx):
+    on_main = subprocess.run(["git", "-C", str(ctx.root), "show", "refs/heads/main:docs/register.csv"],
+                             capture_output=True, timeout=60).stdout  # captured: a child's output stays in the step
+    changed = (ctx.path / "docs" / "register.csv").read_bytes() != on_main
+    return (not changed, ["docs/register.csv is frozen"] if changed else [])
+
+
+def export(root, argv):
+    raise NotImplementedError("the programme's own exporter goes here")
+```
+
+**Extensions add and refuse, never loosen.** A hook can add a refusal, a gate step, a drift finding or display data. Nothing it returns makes the kit accept what its own checks refuse: the status hook runs after those checks and gets a copy, so `done` still needs QA's acceptance; the kit's gate steps all run before an extension's; and only the exact accepting value passes (None from a status hook; `(True, [text, ...])` from a gate step), so a truthy answer of the wrong shape is a refusal. An exception in a refusing point (status transition, gate step, after-worktree, importer) is a refusal naming the exception, and so is a `sys.exit` (whatever its code: argparse in a hook raises `SystemExit(2)`), so a hook never ends the command or skips what follows it, such as `pk merge`'s bookkeeping after the merge commit. A module that did not load makes every refusing point refuse before it runs (it may have held a refusal); each point judges the one registry it read, and a gate reads main again before its extension steps, so a module that stops loading while a gate runs fails that gate. An exception or a `sys.exit` in an informational point (drift, hand-off, dashboard, resolver), or an answer of the wrong shape, is a note on standard error and, in `pk drift`, a `note` line (`pk drift` calls the hand-off and dashboard hooks once to find them), and the command still runs.
+
+The guarantee is about the interface. Extension code runs inside the pk process with the kit's rights, so code that patches kit modules is not stopped by `ext.py`; that is why the extension files get the full review below.
+
+A module that does not load on main refuses every gate, status move and `pk merge`, the fixing branch's too, because the merge check loads main's code. Check a change before it merges with `PK_EXT_FROM=worktree pk ext check` in the task worktree. If a broken module lands anyway, the way out is one commit on main that fixes or reverts it, made by hand; the kit cannot merge that fix itself.
+
+**Integrity.**
+
+- `program/extensions.yaml` and `program/extensions/**` are always guarded (a branch changes them only with a `Guarded edit:` line in its SPEC on main, like any guarded file) and always full-tier, whatever `checks.yaml` says.
+- The release fingerprint's toolchain block carries `extensions_sha256`: the sha256 over one `<sha256>  <path>` line per extension file at `head`, sorted by path, or null when there is none. A record written before 0.7.0 has no such key and still validates.
+- `pk doctor` loads every module and reports each one that does not load (an api mismatch has already refused the command).
+- `pk ext list` prints each module and the points it registered; `pk ext check` loads and validates them all and exits 1 when one does not load, without running any hook.
+
 ## 10. Working rules and the controller's rules (kit/rules/RULES.md, parts 2 and 4)
 
 Rework and token cost, not coding, are what slow a program down. Part 2 of the rules file holds the working rules every agent follows (W1 to W12: decide don't ask, the OK line, fix rounds, your own folder and worktree, no polling, the return contract, read only what you are pointed at, interruptions, decided means decided, work to your tier, report the cost, fast default with the slow set in the release set). Part 4 holds the controller's rules (C1 to C20). This section explains the three mechanisms behind them; the rules themselves are not repeated here.
@@ -494,7 +578,7 @@ The controller state (`program/controller-state.json`) is written by commands, n
   - default: `TMPDIR=$(mktemp -d) python3 -W error -m unittest discover -s kit/tests` runs 1545 tests, 395 of them skipped as slow, in about 245 s (measured: 244.0 s);
   - everything: `KIT_TESTS_SLOW=1 TMPDIR=$(mktemp -d) python3 -W error -m unittest discover -s kit/tests` runs all 1545 in about 1,095 s (measured: 18 min 13 s).
   - No process outlives the run (0.6.2, KF-59): `test_zz_leftovers.py` runs last, reads `ps` once, keeps only the processes descending from the test runner, stops any it finds and fails naming them. Tests that start a long-lived child run it in a session of its own and kill that session in a cleanup, pass or fail, and a child that waits for a file gives up after a deadline.
-  - The slow cases are the ones that build whole repositories, run the gate end to end, install the kit or spawn many processes. They are marked with `skip_unless_slow()` from `kit/tests/_slow.py`, and only these modules use it: `test_gate.py`, `test_gate_reuse.py`, `test_gate_steps.py`, `test_land.py`, `test_end_to_end.py`, `test_evidence.py`, `test_parallel_plants.py`, `test_plant_chunks.py`, `test_tiers.py`, `test_rejudge.py` and `test_install.py`. Each keeps fast cases that import and drive its entry point, so a broken import still fails the default run. A test in `test_content.py` fails when the set of modules importing `_slow` differs from this list.
+  - The slow cases are the ones that build whole repositories, run the gate end to end, install the kit or spawn many processes. They are marked with `skip_unless_slow()` from `kit/tests/_slow.py`, and only these modules use it: `test_gate.py`, `test_gate_reuse.py`, `test_gate_steps.py`, `test_land.py`, `test_end_to_end.py`, `test_evidence.py`, `test_ext.py`, `test_parallel_plants.py`, `test_plant_chunks.py`, `test_tiers.py`, `test_rejudge.py` and `test_install.py`. Each keeps fast cases that import and drive its entry point, so a broken import still fails the default run. A test in `test_content.py` fails when the set of modules importing `_slow` differs from this list.
 
 ## 14. Out of scope for the first version
 

@@ -29,6 +29,7 @@ import threading
 import time
 from pathlib import Path, PurePosixPath
 
+import ext
 import miniyaml
 from common import KitError, find_root, read_json, run_argv, sha256_bytes, utc_now
 from gate import STEP_TIMEOUT
@@ -567,6 +568,7 @@ def run(root, only: str | None = None, scratch: Path | None = None) -> tuple[dic
         "release_set_sha256": _hash_at(root, head, RELEASE_SET),
         "toolchain": {"kit_manifest_sha256": _hash_at(root, head, "kit/MANIFEST.sha256"),
                       "checks_sha256": _hash_at(root, head, "program/checks.yaml"),
+                      "extensions_sha256": ext.digest_at(root, head),  # 0.7.0: the programme's extensions
                       "versions": versions},
         "tracks": {name: {"seconds": seconds[name], "commands": [e["id"] for e in selected[name]]}
                    for name in selected},
@@ -633,11 +635,13 @@ def record_problems(data, text: str, dirname: str) -> list[str]:
     if not isinstance(data["release_set_sha256"], str) or not _HEX64.match(data["release_set_sha256"]):
         bad("release_set_sha256", "must be a 64-character lowercase hex sha256")
     chain = data["toolchain"]
-    if not isinstance(chain, dict) or set(chain) != {"kit_manifest_sha256", "checks_sha256", "versions"}:
-        bad("toolchain", "must hold exactly kit_manifest_sha256, checks_sha256 and versions")
+    keys = {"kit_manifest_sha256", "checks_sha256", "versions"}
+    if not isinstance(chain, dict) or set(chain) not in (keys, keys | {"extensions_sha256"}):
+        bad("toolchain", "must hold exactly kit_manifest_sha256, checks_sha256, versions and (from 0.7.0) "
+                         "extensions_sha256")
     else:
-        for key in ("kit_manifest_sha256", "checks_sha256"):
-            if chain[key] is not None and not (isinstance(chain[key], str) and _HEX64.match(chain[key])):
+        for key in ("kit_manifest_sha256", "checks_sha256", "extensions_sha256"):
+            if key in chain and chain[key] is not None and not (isinstance(chain[key], str) and _HEX64.match(chain[key])):
                 bad(f"toolchain.{key}", "must be a 64-character lowercase hex sha256 or null")
         versions = chain["versions"]
         if not isinstance(versions, list) or not all(

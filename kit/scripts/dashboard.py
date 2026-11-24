@@ -6,7 +6,9 @@ now, exactly as `pk handoff update` would write it), the register with each task
 counts, the gates of `program/gates.yaml` with the status of the tasks whose records prove them, the cost log
 (totals per task and per model, the agents past the fresh-agent threshold), the open follow-ups and, when
 `program/beta-feedback.md` exists (0.6.0), a Feedback panel: the open items by urgency then number and the five most
-recently done, declined ones hidden; a row that does not read fails the page, naming the row and the field. It adds no
+recently done, declined ones hidden; a row that does not read fails the page, naming the row and the field. With a
+programme's extensions (0.7.0) an Extensions panel shows each module's `dashboard_data` dict as JSON, and the summary
+carries them under `extensions.<module>`; a hook that fails is a note on standard error and is left out. It adds no
 state of its own and decides nothing: the hand-off stays the document a successor reads, and every check stays a
 command. The page carries no script, no external asset and no wall-clock time, so the same commit and state give
 the same bytes; it names the commit it was made at.
@@ -18,10 +20,12 @@ from __future__ import annotations
 
 import argparse
 import html
+import json
 from pathlib import Path
 
 import cost as cost_module
 import ctlstate
+import ext
 import feedback as feedback_module
 import handoff as handoff_module
 import register as register_module
@@ -167,15 +171,25 @@ def render(root: Path) -> tuple[str, dict]:
                              + (f" <span class=meta>[{_e(', '.join(item['tags']))}]</span>" if item["tags"] else "")
                              + "</li>" for item in followups)
     feedback_html = feedback_module.panel_html(root)  # 0.6.0: '' without the register; a bad row raises
+    extensions = ext.dashboard_data(root)  # 0.7.0: {} without program/extensions.yaml, and then no panel
+    extensions_html = "".join(
+        f"<h3><code>extensions.{_e(module)}</code></h3><pre>{_e(json.dumps(data, indent=2, sort_keys=True))}</pre>"
+        for module, data in extensions.items())
+    if extensions_html:
+        extensions_html = f'\n<h2>Extensions</h2>\n<div class="panel">{extensions_html}</div>'
     page = TEMPLATE
-    for key, value in (("COMMIT", _e(commit)), ("FEEDBACK", feedback_html), ("TILES", tiles), ("BAR", _bar(counts)),
+    for key, value in (("COMMIT", _e(commit)), ("FEEDBACK", feedback_html), ("EXTENSIONS", extensions_html),
+                       ("TILES", tiles), ("BAR", _bar(counts)),
                        ("LEGEND", legend),
                        ("HANDOFF", _block_html(block)), ("REGISTER", register_html), ("GATES", gates_html),
                        ("COSTS", costs_html), ("FLAGGED", f"<ul>{flagged}</ul>" if flagged else ""),
                        ("FOLLOWUPS", f"<ul>{followups_html}</ul>" if followups_html
                         else '<p class="empty">None open.</p>')):
         page = page.replace(f"@@{key}@@", value)
-    return page, {"tasks": len(rows), "gates": len(gates), "tokens": tokens}
+    summary = {"tasks": len(rows), "gates": len(gates), "tokens": tokens}
+    if extensions:
+        summary["extensions"] = extensions
+    return page, summary
 
 
 TEMPLATE = """<!doctype html>
@@ -217,6 +231,7 @@ th{text-align:left;font-size:.72rem;text-transform:uppercase;letter-spacing:.05e
 padding:5px 8px;border-bottom:1px solid var(--line)}
 td{padding:5px 8px;border-bottom:1px solid var(--line);vertical-align:top}
 .u-urgent{color:var(--crit)}.u-high{color:var(--warn)}.u-polish{color:var(--idle)}
+pre{white-space:pre-wrap;font-family:var(--mono);font-size:.8rem;margin:4px 0}
 .panel{overflow-x:auto}ul{padding-left:1.2em;margin:4px 0}li{margin:3px 0}.empty{color:var(--muted);font-style:italic}
 </style>
 </head>
@@ -238,7 +253,7 @@ kit's files; the hand-off and the commands are the record</span></header>
 </div>
 </div>
 <h2>Gates</h2>
-<div class="panel">@@GATES@@</div>@@FEEDBACK@@
+<div class="panel">@@GATES@@</div>@@FEEDBACK@@@@EXTENSIONS@@
 <div class="grid">
 <div><h2>Costs</h2><div class="panel">@@COSTS@@@@FLAGGED@@</div></div>
 <div><h2>Open follow-ups</h2><div class="panel">@@FOLLOWUPS@@</div></div>

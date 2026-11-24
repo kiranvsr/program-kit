@@ -17,6 +17,7 @@
       "properties": {
         "kit_manifest_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$", "description": "of kit/MANIFEST.sha256 at head; null when the file is absent"},
         "checks_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$", "description": "of program/checks.yaml at head; null when the file is absent"},
+        "extensions_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$", "description": "0.7.0, absent before: sha256 over one '<sha256>  <path>' line per file of program/extensions.yaml and program/extensions/ at head, sorted by path; null when there is none"},
         "versions": {
           "type": "array",
           "items": {

@@ -18,9 +18,14 @@ record in the stored copy of the source. The command:
 5. runs `pk register validate`, `pk status validate`, `pk handoff update` and `pk doctor`, and when any of them fails
    puts every file it wrote back as it was.
 
-`--dry-run` stops after step 2 and prints the plan and the counts. The command never commits: the controller commits
-`program/` as one commit. Status records are written by batch KA-2's importer (`_write_statuses`); until then a
-source whose `statuses` list is not empty is refused, so nothing is half adopted.
+`pk adopt --from <name> [args...]` (0.7.0) takes the source from a programme's extension instead of a file: the importer
+an extension registered under that name (`api.adopt_importer`, ext.py) is called with the root and the args, and the
+dict it returns is written as JSON and then validated and stored exactly as a file's bytes would be.
+
+`--dry-run` stops after step 2 and prints the plan and the counts; it is the kit's before or after `--from`, and an
+importer never receives it. The command never commits: the controller commits `program/` as one commit. Status
+records are written by batch KA-2's importer (`_write_statuses`); until then a source whose `statuses` list is not
+empty is refused, so nothing is half adopted.
 """
 from __future__ import annotations
 
@@ -82,7 +87,7 @@ def _run_pk(root: Path, *argv: str) -> tuple[int, str]:
     return proc.returncode, (proc.stderr.strip() or proc.stdout.strip())
 
 
-def _repository_problems(root: Path, source_path: Path, problems: _Problems) -> None:
+def _repository_problems(root: Path, source_path: Path | None, problems: _Problems) -> None:
     try:
         head = git(root, "symbolic-ref", "--quiet", "HEAD")
     except KitError:
@@ -96,7 +101,7 @@ def _repository_problems(root: Path, source_path: Path, problems: _Problems) -> 
     listing = subprocess.run(["git", "-C", str(root), "status", "--porcelain", "-z", "--untracked-files=all"],
                              capture_output=True, text=True, encoding="utf-8", errors="replace").stdout
     try:
-        own = source_path.resolve().relative_to(root.resolve()).as_posix()
+        own = source_path.resolve().relative_to(root.resolve()).as_posix() if source_path is not None else None
     except ValueError:
         own = None
     dirty = [entry[3:] for entry in listing.split("\0")
@@ -563,15 +568,32 @@ def _summary(plan: dict) -> list[str]:
     ]
 
 
-def adopt(root: Path, source_path: Path, dry_run: bool = False) -> list[str]:
-    """Run `pk adopt`; the lines to print. KitError (after printing every problem) when it refuses or fails."""
-    root = Path(root).resolve()
+def importer_source(root: Path, argv: list[str]) -> bytes:
+    """The bytes of the source an extension's importer builds (`pk adopt --from <name> [args...]`): its dict as JSON."""
+    if not argv:
+        raise KitError("pk adopt --from needs the importer's name (pk ext list shows the registered importers)")
+    import ext  # late: only an adoption through an extension needs it
+
+    source = ext.run_importer(root, argv[0], argv[1:])
     try:
-        data = Path(source_path).read_bytes()
-    except OSError as exc:
-        raise KitError(f"cannot read {source_path}: {exc.strerror or exc}") from exc
+        return (json.dumps(source, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise KitError(f"pk adopt --from {argv[0]}: the importer's source is not JSON-serialisable: {exc}; nothing "
+                       "written") from exc
+
+
+def adopt(root: Path, source_path: Path | None, dry_run: bool = False, data: bytes | None = None) -> list[str]:
+    """Run `pk adopt`; the lines to print. KitError (after printing every problem) when it refuses or fails.
+
+    `data`, when given, is the source itself (built by an extension's importer) and `source_path` is None."""
+    root = Path(root).resolve()
+    if data is None:
+        try:
+            data = Path(source_path).read_bytes()
+        except OSError as exc:
+            raise KitError(f"cannot read {source_path}: {exc.strerror or exc}") from exc
     problems = _Problems()
-    _repository_problems(root, Path(source_path), problems)
+    _repository_problems(root, Path(source_path) if source_path is not None else None, problems)
     plan, found = validate_source(root, data)
     problems.extend(found)
     if problems:
@@ -601,15 +623,32 @@ def adopt(root: Path, source_path: Path, dry_run: bool = False) -> list[str]:
             "not committed: commit program/ as one commit"]
 
 
+DRY_RUN = "--dry-run"
+
+
 def cmd_adopt(args: argparse.Namespace) -> int:
-    print("\n".join(adopt(find_root(), Path(args.source), dry_run=args.dry_run)))
+    if (args.source is None) == (args.importer is None):
+        raise KitError("pk adopt needs either a source file or --from <importer> [args...], not both")
+    root = find_root()
+    if args.importer is not None:
+        # --from takes the rest of the line, so `--from NAME args --dry-run` would hand --dry-run to the importer and
+        # then write: --dry-run anywhere is the kit's, and the importer never sees it
+        importer = [arg for arg in args.importer if arg != DRY_RUN]
+        dry_run = args.dry_run or len(importer) != len(args.importer)
+        data = importer_source(root, importer)
+        print("\n".join(adopt(root, None, dry_run=dry_run, data=data)))
+    else:
+        print("\n".join(adopt(root, Path(args.source), dry_run=args.dry_run)))
     return 0
 
 
 def _configure(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("source", help="the adoption source, JSON (kit/templates/adoption.schema.json)")
-    parser.add_argument("--dry-run", action="store_true", dest="dry_run",
-                        help="validate and print the plan and the counts; write nothing")
+    parser.add_argument("source", nargs="?", help="the adoption source, JSON (kit/templates/adoption.schema.json)")
+    parser.add_argument(DRY_RUN, action="store_true", dest="dry_run",
+                        help="validate and print the plan and the counts; write nothing (before or after --from)")
+    parser.add_argument("--from", dest="importer", nargs=argparse.REMAINDER, metavar="NAME",
+                        help="build the source with the importer an extension registered under NAME; every "
+                             f"argument after NAME goes to the importer, except {DRY_RUN}, which is the kit's (0.7.0)")
 
 
 def register(add_command) -> None:

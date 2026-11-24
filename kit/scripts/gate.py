@@ -71,6 +71,7 @@ from pathlib import Path, PurePosixPath
 
 import conflicts
 import evidence as evidence_module
+import ext
 import latework
 import reuse as reuse_module
 import rulings as rulings_module
@@ -83,6 +84,12 @@ from common import (KitError, drop_bom, find_root, git, read_json, read_text, re
 from register import GATE_ID, GATE_SHAPE
 
 MAIN = "main"  # the primary branch; fixed, so no caller can choose where the rules are read from
+MAIN_REF = f"refs/heads/{MAIN}"  # where the rules are read: the branch, never a tag that is also named main
+
+
+def _branch_ref(ref: str) -> str:
+    """`ref`, with the bare primary branch name spelled as the branch (git resolves a tag named main first)."""
+    return MAIN_REF if ref == MAIN else ref
 CHECK_KEYS = ("build", "test", "scan", "compile_check", "extra_gate")
 ALL_KEYS = CHECK_KEYS + ("parallel_steps", "guarded_files", "tiers", "drift", "evidence", "progress", "merge",
                          "research", "remote",  # drift, progress: `pk drift` only; research, remote: their commands (0.6.0)
@@ -95,7 +102,10 @@ E2E_KEYS = ("command", "paths", "specs", "timeout")
 TIMES_FILE = "pk-step-seconds.json"  # in the git common dir: this machine's last measured step times (0.6.1)
 MERGE_KEYS = ("union_files",)  # the `merge` section (0.6.0)
 TIER_KEYS = ("full_paths", "light_paths", "light_ruling")
-BUILTIN_FULL = ("kit/", "program/checks.yaml", "program/gates.yaml")  # the kit's own gates: always full-tier
+# The kit's own gates and the programme's extensions (0.7.0): always full-tier.
+BUILTIN_FULL = ("kit/", "program/checks.yaml", "program/gates.yaml", *ext.PATHS)
+# Guarded whatever checks.yaml says (0.7.0): the extension declaration and code. A `Guarded edit:` line allows them.
+EXT_GUARDED = ext.PATHS
 # Guarded whatever checks.yaml says (0.7.0): an adopted programme's record of adoption and its frozen history.
 ALWAYS_GUARDED = ("program/adoption.yaml", "program/legacy/")
 LIGHT_STEPS = ("build", "compile_check", "scan")
@@ -380,7 +390,7 @@ def load_checks(root, require: tuple[str, ...] = ()) -> dict:
 def load_checks_at(root, ref: str, require: tuple[str, ...] = ()) -> dict:
     """`program/checks.yaml` as committed at `ref`; the gates use this so the working tree cannot change the rules."""
     try:
-        text = drop_bom(_git_bytes(Path(root), "show", f"{ref}:program/checks.yaml").decode("utf-8"))
+        text = drop_bom(_git_bytes(Path(root), "show", f"{_branch_ref(ref)}:program/checks.yaml").decode("utf-8"))
     except (KitError, UnicodeDecodeError) as exc:
         raise KitError(f"program/checks.yaml cannot be read on {_show(ref)}: {_show(exc)}") from exc
     try:
@@ -887,9 +897,11 @@ def _guarded_changes(root: Path, task_id: str, branch: str, main: str, guarded: 
     An entry is an exact path, or a directory when it ends in `/` (everything under it is guarded).
     The SPEC allows a changed path with `Guarded edit: <path>`; a directory entry may be allowed whole
     with `Guarded edit: <directory>/`. ALWAYS_GUARDED is added to `guarded`, and no SPEC line allows it: only
-    `pk adopt` writes those files, on main.
+    `pk adopt` writes those files, on main. EXT_GUARDED (the extension declaration and code, 0.7.0) is added too, and
+    a SPEC line allows it like any guarded entry.
     """
-    entries = [_norm_guard(entry) for entry in guarded] + list(ALWAYS_GUARDED)
+    entries = [_norm_guard(entry) for entry in guarded] + list(EXT_GUARDED) + list(ALWAYS_GUARDED)
+    main = _branch_ref(main)
     base = git(root, "merge-base", main, f"refs/heads/{branch}")
     changed = sorted(_git_fields(root, "diff", "--name-only", "--no-renames", "-z",
                                  f"{base}..refs/heads/{branch}"))
@@ -1465,12 +1477,56 @@ def _late_and_evidence(checks: dict, task_id: str, wt: Path, authoritative: byte
     return 0 if _stale_step(wt) else 1
 
 
+def _ext_ready(root: Path, what: str) -> bool:
+    """Whether the gate may run as far as the extensions go (0.7.0): PK_EXT_FROM is unset and every declared module
+    loaded from main. Prints `FAILED: ext ...` and returns False otherwise."""
+    problem = ext.development_refusal(what) or ext.load_problem(root, what)
+    if problem:
+        _out(f"FAILED: ext {problem}")
+        return False
+    return True
+
+
+def ext_steps(gate: str, root: Path, checks: dict, task_id: str, branch: str, head: str, path: Path,
+              worktree: Path | None = None, trial: Path | None = None) -> int:
+    """The extensions' gate steps for `gate` (0.7.0), after the kit's own and before the `OK:` line: 0 when all pass.
+
+    Each prints `step ext:<module>.<name>: ok`, or `FAILED: ext:<module>.<name> ...`; its lines (and anything it
+    or a child process it started printed while it ran) follow with the tail prefix, so none can read as an `OK:`
+    line. Each runs under the step timeout. Main is read again here: a module that no longer loads fails the gate.
+    """
+    try:
+        steps = ext.steps_for(root, gate)  # refuses when a module stopped loading since the gate began (M2)
+    except KitError as exc:
+        _out(f"FAILED: ext {exc}")
+        return 1
+    if not steps:
+        return 0
+    limit = step_limit(checks, "ext")
+    ctx = ext.GateContext(gate=gate, root=root, task_id=task_id, branch=branch, path=Path(path), head=head,
+                          worktree=worktree, trial=trial)
+    for module, name, fn in steps:
+        label = f"ext:{module}.{name}"
+        ok, lines = ext.run_step(fn, ctx, limit)
+        if ok:
+            _out(f"step {label}: ok")
+        else:
+            _out(f"FAILED: {label} (not ok)")
+        for line in lines[-TAIL_LINES:]:
+            _out(TAIL_PREFIX + line)
+        if not ok:
+            return 1
+    return 0
+
+
 def handback(root, task_id: str, branch: str, worktree=None, no_reuse: bool = False) -> int:
     """The hand-back gate; 0 and a final `OK:` line only when every step passed.
 
     `no_reuse` runs the test step and produce.py even when `evidence.reuse_unchanged_code` would reuse a record.
     """
     root = Path(root).resolve()
+    if not _ext_ready(root, "the hand-back gate"):
+        return 1
     _task_branch(task_id, branch)
     sha = _branch_head(root, branch)
     wt = _task_worktree(root, task_id, branch, worktree)
@@ -1492,7 +1548,8 @@ def handback(root, task_id: str, branch: str, worktree=None, no_reuse: bool = Fa
     with heavy(root, checks, f"gate-handback-{task_id}"):
         trial = trial_merge(root, branch)
         code = _limited(root, checks, lambda: _with_trial(
-            root, trial, lambda: _run_steps(checks, task_id, wt, trial, authoritative, meta, no_reuse, e2e)))
+            root, trial, lambda: _run_steps(checks, task_id, wt, trial, authoritative, meta, no_reuse, e2e)
+            or ext_steps("handback", root, checks, task_id, branch, sha, wt, worktree=wt, trial=trial)))
     if code:
         return code
     if git(wt, "rev-parse", "HEAD") != sha or _branch_head(root, branch) != sha:
@@ -1578,6 +1635,8 @@ def merge_check(root, branch: str, inspected: str | None = None, suite: bool = T
     merge still run, the commands do not, and no `OK:` line is printed, because this is not a merge check.
     """
     root = Path(root).resolve()
+    if not _ext_ready(root, "the merge check"):
+        return 1
     task_id = _branch_task(branch)
     sha = _branch_head(root, branch)
     checks = load_checks_at(root, MAIN, require=("build", "test", "scan"))
@@ -1600,13 +1659,16 @@ def merge_check(root, branch: str, inspected: str | None = None, suite: bool = T
         if not suite:
             return 0
         if meta["tier"] == "light":
-            return _run_light(checks, trial)
+            return _run_light(checks, trial) or ext_steps("merge", root, checks, task_id, branch, sha, trial,
+                                                          trial=trial)
         for step in ("build", "compile_check"):
             if not _run_commands(step, _commands(checks[step]), trial, timeout=step_limit(checks, step)):
                 return 1
         if not _run_late_steps(checks, trial):
             return 1
-        return 0 if _e2e_step(checks, trial, e2e, merge=True) else 1
+        if not _e2e_step(checks, trial, e2e, merge=True):
+            return 1
+        return ext_steps("merge", root, checks, task_id, branch, sha, trial, trial=trial)
 
     with heavy(root, checks, f"gate-merge-check-{task_id}") if suite else contextlib.nullcontext():
         trial = trial_merge(root, branch)
@@ -1864,6 +1926,9 @@ def binding(root, task_id: str, branch: str) -> list[str]:
     (inputs changed between `head` and the tip, the branch's HEAD) is reported on the printed line, never a problem.
     """
     root = Path(root).resolve()
+    refusal = ext.development_refusal("the binding check")
+    if refusal:
+        return [refusal]
     _task_branch(task_id, branch)
     tip = _branch_head(root, branch)
     pointer = store.pointer_path(task_id)

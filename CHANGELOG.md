@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.7.0
+
+### Extension interface
+
+The kit stays generic and a programme extends it in code it owns: `program/extensions.yaml` declares the modules under `program/extensions/` and the extension api they speak (1), and `kit/scripts/ext.py` is the one interface. Without the declaration nothing changes: every command, record, gate and report behaves as in 0.6.2.
+
+What changed:
+
+- Declaration and api (new). `program/extensions.yaml` holds `api: 1` and `modules: [{name}]`; each module is a Python module or package under `program/extensions/`. A declared api other than `ext.API_VERSION`, or a declaration that does not read, refuses every pk command and names both versions or the problem.
+- Loading from main (new). Extension code is read from main's committed tree into a private temporary directory outside the repository, imported under a package name of its own and removed when the process ends; no bytecode is written into the repository. `PK_EXT_FROM=worktree` loads the working copy for development; the hand-back gate, the merge check, `pk integrate check`, the binding check and every status move refuse while it is set.
+- Nine registration calls behind eight points: `api.command`, `api.on_status_transition`, `api.after_worktree_new`, `api.gate_step` (printed as `step ext:<module>.<name>`, after the kit's steps and before the `OK:` line, under the step timeout), `api.drift_check` (codes `X<n>` after D9 in `pk drift`), `api.handoff_lines` and `api.dashboard_data`, `api.adopt_importer` (`pk adopt --from <name> [args...]`) and `api.reference_resolver`.
+- Cannot loosen. Hooks run after the kit's own checks; only the exact accepting value passes; an exception or a `sys.exit` in a refusing point (status transition, gate step, after-worktree, importer), or a module that did not load, is a refusal naming it, so a hook never ends a command half-way (such as `pk merge` between its merge commit and its bookkeeping); an exception or a `sys.exit` in an informational point (drift, hand-off, dashboard, resolver) is a note and the command runs on. A gate reads main again before its extension steps, and fails when a module stopped loading meanwhile. A gate step's child processes write into the step's lines, never bare into the gate's output.
+- Main is the branch. The extensions, the gates' `checks.yaml` and the guard's SPEC are read from `refs/heads/main`, so a tag named `main` never stands in for the branch. `pk adopt --from <name> [args...] --dry-run` is a dry run: `--dry-run` is the kit's before or after `--from`.
+- Integrity. `program/extensions.yaml` and `program/extensions/**` are always guarded (allowed by `Guarded edit:` like any guarded file) and always full-tier. The fingerprint's toolchain block gains `extensions_sha256` (null without extensions; a record without the key still validates). `pk doctor` loads every module; `pk ext list` and `pk ext check` show and validate them without running a hook.
+- Docs: DESIGN sections 3, 9.6 and 13; README.
+
+Design choices, each with its reason:
+
+- Main's tree, never the branch's: the rule the gate already follows for `checks.yaml`, so the code that judges a branch is code that was reviewed onto main.
+- Collisions and broken modules refuse rather than degrade: a module that did not load may have held a refusal, so the refusing points fail closed while the informational ones only note it.
+- A private package name per load: an extension called like a kit module must not replace the kit's module in the running process.
+- A `Guarded edit:` line can allow an extension change, unlike the adoption files: extensions are the programme's own code and change through ordinary full-tier tasks.
+
+Upgrading from 0.6.2: `sh install.sh /path/to/your-repo --upgrade`. Nothing in `program/` has to change.
+
 ## 0.6.2
 
 Two findings from running a program on the kit (KF-59 and KF-60 there): a process the kit's own test suite left running for good, and agents' background wait loops and watchers that outlived their hand-back, 146 loops (some ten days old) and 16 orphaned tails under one agent session. Everything is backward compatible: every record, pointer, status file and `checks.yaml` written before reads, validates and runs as it did, `pk drift` counts the same checks, and nothing is ever stopped unless `pk sweep --kill` is run.
