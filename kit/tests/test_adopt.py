@@ -193,7 +193,9 @@ class AdoptCommandTests(unittest.TestCase):
         self.assertEqual(tracker.add_followup(state, "a", "b"), "F-0004")
         rows = cost.read(self.root)
         self.assertEqual([row["task"] for row in rows], [P1, "AH-0001", "G-P1"])
-        self.assertIn("Generated state", (self.root / "program" / "HANDOFF.md").read_text())
+        handoff = (self.root / "program" / "HANDOFF.md").read_text()
+        self.assertIn("#### Rulings (0; next R6)", handoff)  # pk handoff update ran, numbering from ruling_start
+        self.assertIn("rulings before R6: program/legacy/rulings.md", handoff)
         self.assertIn(f"{adoption.ADOPTION_FILE}", sh(self.root, "git", "status", "--porcelain", "-uall"))  # no commit
         self.assertEqual(run_cli("rulings", self.root, "rulings", "show", "R5")[1].splitlines()[0], "## R5 (undated)")
         self.assertEqual(rulings.add(self.root, "controller", "q", "supersedes R5"), 6)
@@ -201,6 +203,10 @@ class AdoptCommandTests(unittest.TestCase):
         code, out, err = self.adopt()  # once only
         self.assertEqual(code, 1)
         self.assertIn("program/adoption.yaml exists: this programme has already adopted", err)
+        (self.root / adoption.LEGACY_RULINGS).write_bytes(LEGACY_LOG.encode() + b"edited\n")
+        code, said = adopt._run_pk(self.root, "doctor")
+        self.assertEqual(code, 1)
+        self.assertIn("program/legacy/rulings.md no longer matches legacy_rulings_sha256", said)
 
     def test_dry_run_prints_the_plan_and_writes_nothing(self):
         before = self.tree()
