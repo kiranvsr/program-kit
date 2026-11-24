@@ -7,12 +7,13 @@ Declaration. `program/extensions.yaml` holds `api: 1` and `modules: [{name: <mod
 API_VERSION, or the file does not read, every pk command refuses, naming the problem.
 
 Loading from main. Extension code is always read from main's committed tree (`git ls-tree` and `git cat-file` of
-`main`), written into a private temporary directory outside the repository and imported from there under a package
-name of its own, so no kit module is shadowed and no bytecode lands in the repository; the directory is removed when
-the registry is closed (at the latest when the pk process exits). A task branch therefore cannot change the rules it
+`refs/heads/main`, so a tag named main cannot stand in for the branch), written into a private temporary directory
+outside the repository and imported from there under a package name of its own, so no kit module is shadowed and no
+bytecode lands in the repository; the directory is removed when the registry is closed (at the latest when the pk
+process exits). A task branch therefore cannot change the rules it
 is judged by. `PK_EXT_FROM=worktree` loads the working copy instead, for developing an extension; the hand-back gate,
-the merge check (so `pk merge` and `pk integrate check`), the binding check and every status write (`pk status set`,
-`pk status reopen`, `pk evidence accept --done`) refuse to run while it is set.
+the merge check (so `pk merge` and `pk integrate check`), the binding check and every status move (`pk status set`,
+`pk status reopen`, `pk evidence accept --done`; a tier change is not a move) refuse to run while it is set.
 
 Registration. Each module defines `register(api)` and calls these, and only these, while it runs:
 
@@ -32,9 +33,10 @@ Registration. Each module defines `register(api)` and calls these, and only thes
 
 Extensions add and refuse, never loosen. Nothing a hook returns can make the kit accept what its own checks refuse:
 the hooks run after those checks, a status hook sees a copy, and anything but the exact accepting value (None from a
-status hook, `(True, [str])` from a gate step) is a refusal. An exception in a refusing point (status transition,
-gate step, after-worktree) is a refusal naming the exception, and so is a module that did not load. An exception in an
-informational point (drift, hand-off, dashboard, resolver) is a note, and the command still runs.
+status hook, `(True, [str])` from a gate step) is a refusal. An exception or a sys.exit (HOOK_FAILURES) in a refusing
+point (status transition, gate step, after-worktree, importer) is a refusal naming it, and so is a module that did not
+load in the registry the point reads. An exception or a sys.exit in an informational point (drift, hand-off,
+dashboard, resolver) is a note, and the command still runs.
 
 The guarantee is about the interface. Extension code runs in the pk process with the kit's own rights, so code that
 patches kit modules is not stopped by this file: that is why the declaration and every extension file are always
@@ -68,6 +70,7 @@ API_VERSION = 1
 DECLARATION = "program/extensions.yaml"
 EXT_DIR = "program/extensions"
 PATHS = (DECLARATION, EXT_DIR + "/")  # always guarded and always full-tier
+MAIN_REF = f"refs/heads/{PRIMARY_BRANCH}"  # the branch: a tag named main must not stand in for it
 ENV = "PK_EXT_FROM"
 WORKTREE = "worktree"
 DECLARATION_KEYS = ("api", "modules")
@@ -78,6 +81,10 @@ POINTS = ("command", "on_status_transition", "after_worktree_new", "gate_step", 
 SEVERITIES = ("note", "fail")
 RESOLVED_KEYS = ("kind", "task_id", "decision", "summary")
 DESCRIBE_CHARS = 300
+# What a hook's failure is, at every point: an exception, and a sys.exit too (argparse in a hook raises SystemExit(2)),
+# so a hook can never end the pk command, skip what follows it (pk merge's bookkeeping) or pass by exiting 0.
+# KeyboardInterrupt is the person at the keyboard, not the hook: it still stops the command.
+HOOK_FAILURES = (Exception, SystemExit)
 
 _NAME = re.compile(r"[a-z_][a-z0-9_]*\Z")
 _COMMAND = re.compile(r"[a-z][a-z0-9-]*\Z")
@@ -475,7 +482,7 @@ def _build(root: Path, source: str, files: dict[str, bytes], key: tuple) -> Regi
     for name in registry.modules:
         try:
             _load_module(registry, name)
-        except (Exception, SystemExit) as exc:  # a module that does not load contributes nothing, and is named
+        except HOOK_FAILURES as exc:  # a module that does not load contributes nothing, and is named
             registry.errors.append(f"{name}: {describe(exc)}")
             registry.points.setdefault(name, [])
     return registry
@@ -507,7 +514,7 @@ def load(root) -> Registry | None:
     """
     root = Path(root).resolve()
     source = mode()
-    files = _tree_files(root, PRIMARY_BRANCH) if source == "main" else _worktree_files(root)
+    files = _tree_files(root, MAIN_REF) if source == "main" else _worktree_files(root)
     if not files or DECLARATION not in files:
         return None
     key = (source, tuple(sorted((path, sha256_bytes(data)) for path, data in files.items())))
@@ -533,13 +540,16 @@ def for_pk() -> Registry | None:
     return load(root)
 
 
-def load_problem(root, what: str) -> str | None:
-    """Why a refusing point refuses before running anything: a module did not load (it may hold a refusal)."""
-    registry = load(root)
+def _not_loaded(registry: Registry | None, what: str) -> str | None:
     if registry is None or not registry.errors:
         return None
     return (f"{what} refuses: extension module(s) did not load from {registry.where()} ({'; '.join(registry.errors)});"
             " a module that does not load may hold a refusal, so nothing it guards runs (see: pk ext check)")
+
+
+def load_problem(root, what: str) -> str | None:
+    """Why a refusing point refuses before running anything: a module did not load (it may hold a refusal)."""
+    return _not_loaded(load(root), what)
 
 
 def problems(root) -> list[str]:
@@ -566,16 +576,14 @@ def run_command(registry: Registry, args: argparse.Namespace) -> int:
 def status_refusal(root, task_id: str, old: str, new: str, record: dict) -> str | None:
     """None when every status hook accepts; otherwise the refusal (also for a hook that raised, returned anything but
     None or a string, or a module that did not load)."""
-    registry = load(root)
-    if registry is None:
-        return None
-    problem = load_problem(root, f"{task_id}: the move {old} -> {new}")
-    if problem:
+    registry = load(root)  # once: the registry judged is the registry checked
+    problem = _not_loaded(registry, f"{task_id}: the move {old} -> {new}")
+    if registry is None or problem:
         return problem
     for module, fn in registry.status_hooks:
         try:
             said = fn(task_id, old, new, copy.deepcopy(record), Path(root))
-        except Exception as exc:
+        except HOOK_FAILURES as exc:
             return f"{task_id}: {old} -> {new} refused by extension {module}: on_status_transition raised {describe(exc)}"
         if said is None:
             continue
@@ -587,30 +595,69 @@ def status_refusal(root, task_id: str, old: str, new: str, record: dict) -> str 
 
 
 def after_worktree_new(root, task_id: str, path: Path) -> str | None:
-    """None when every after-worktree hook ran; otherwise why the new worktree must go."""
+    """None when every after-worktree hook ran; otherwise why the new worktree must go (also when a module no longer
+    loads: main moved since the check before the worktree was made)."""
     registry = load(root)
-    if registry is None:
-        return None
+    problem = _not_loaded(registry, f"pk worktree new {task_id}")
+    if registry is None or problem:
+        return problem
     for module, fn in registry.worktree_hooks:
         try:
             fn(task_id, Path(path), Path(root))
-        except Exception as exc:
+        except HOOK_FAILURES as exc:
             return f"extension {module}: after_worktree_new raised {describe(exc)}"
     return None
 
 
 def steps_for(root, gate: str) -> list[tuple]:
-    """(module, name, fn) of every gate step registered for `gate`, in declaration order."""
+    """(module, name, fn) of every gate step registered for `gate`, in declaration order.
+
+    KitError when a module does not load now: main may have moved since the gate's first check, and a gate that ran
+    no extension step because its module stopped loading must not pass (KX-1 fix round 1, M2)."""
     registry = load(root)
+    problem = _not_loaded(registry, f"the {gate} gate's extension steps")
+    if problem:
+        raise KitError(problem)
     if registry is None:
         return []
     return [(module, name, fn) for module, name, fn, gates in registry.gate_steps if gate in gates]
 
 
-def run_step(fn, ctx: GateContext, timeout: float) -> tuple[bool, list[str]]:
-    """Run one gate step under `timeout` seconds: (ok, lines). Its own printing is captured into the lines.
+def _flush_standard_streams() -> None:
+    for stream in (sys.stdout, sys.stderr, sys.__stdout__, sys.__stderr__):
+        with contextlib.suppress(Exception):
+            if stream is not None:
+                stream.flush()
 
-    Only `(True, [str, ...])` passes: an exception, a timeout or any other return fails the step, naming why.
+
+@contextlib.contextmanager
+def _descriptors_into(sink):
+    """File descriptors 1 and 2 point at `sink` while the block runs, so a child process a gate step starts (which
+    writes to the descriptors, past sys.stdout) lands in the step's lines, never bare in the gate's output. A
+    descriptor that cannot be duplicated (closed) is left as it is."""
+    _flush_standard_streams()
+    saved = []
+    try:
+        for fd in (1, 2):
+            with contextlib.suppress(OSError):
+                saved.append((fd, os.dup(fd)))
+        for fd, _ in saved:
+            os.dup2(sink.fileno(), fd)
+        yield
+    finally:
+        _flush_standard_streams()
+        for fd, kept in saved:
+            os.dup2(kept, fd)
+            os.close(kept)
+
+
+def run_step(fn, ctx: GateContext, timeout: float) -> tuple[bool, list[str]]:
+    """Run one gate step under `timeout` seconds: (ok, lines). Its own printing, and what a child process it starts
+    writes to the standard descriptors while it runs, are captured into the lines.
+
+    Only `(True, [str, ...])` passes: an exception, a sys.exit, a timeout or any other return fails the step, naming
+    why. After a timeout the step's thread is abandoned but keeps running (Python cannot stop it): what it prints
+    afterwards reaches the gate's streams unprefixed, after the gate's FAILED line, and its child processes run on.
     """
     box: dict = {}
     captured = io.StringIO()
@@ -618,14 +665,17 @@ def run_step(fn, ctx: GateContext, timeout: float) -> tuple[bool, list[str]]:
     def target():
         try:
             box["value"] = fn(ctx)
-        except BaseException as exc:  # noqa: BLE001 (a step's SystemExit is a failure too, never the gate's exit)
+        except HOOK_FAILURES as exc:  # a step's SystemExit is a failure too, never the gate's exit
             box["error"] = exc
 
     worker = threading.Thread(target=target, name="pk-ext-gate-step", daemon=True)
-    with contextlib.redirect_stdout(captured), contextlib.redirect_stderr(captured):
-        worker.start()
-        worker.join(timeout)
-    printed = captured.getvalue().splitlines()
+    with tempfile.TemporaryFile() as sink:
+        with _descriptors_into(sink), contextlib.redirect_stdout(captured), contextlib.redirect_stderr(captured):
+            worker.start()
+            worker.join(timeout)
+        sink.seek(0)
+        children = sink.read().decode("utf-8", "replace")
+    printed = captured.getvalue().splitlines() + children.splitlines()
     if worker.is_alive():
         return False, [*printed, f"timed out after {timeout:g}s (the step's thread is abandoned)"]
     if "error" in box:
@@ -652,7 +702,7 @@ def drift_results(root) -> tuple[list[tuple[str, bool, str]], list[tuple[str, st
             bad = not isinstance(findings, list) or not all(
                 isinstance(f, dict) and set(f) == {"severity", "text"} and f["severity"] in SEVERITIES
                 and isinstance(f["text"], str) for f in findings)
-        except Exception as exc:
+        except HOOK_FAILURES as exc:
             notes.append((code, f"extension {module} raised {describe(exc)}"))
             continue
         if bad:
@@ -684,7 +734,7 @@ def _probe(root, registry: Registry) -> list[str]:
 def _handoff_problem(module: str, fn, root) -> tuple[list[str], str | None]:
     try:
         lines = fn(Path(root))
-    except Exception as exc:
+    except HOOK_FAILURES as exc:
         return [], f"extension {module}: handoff_lines raised {describe(exc)}"
     if not isinstance(lines, list) or not all(isinstance(line, str) for line in lines):
         return [], f"extension {module}: handoff_lines returned {type(lines).__name__}, not a list of text"
@@ -713,7 +763,7 @@ def _dashboard_problem(module: str, fn, root) -> tuple[dict | None, str | None]:
         if not isinstance(data, dict):
             return None, f"extension {module}: dashboard_data returned {type(data).__name__}, not a dict"
         json.dumps(data, sort_keys=True)
-    except Exception as exc:
+    except HOOK_FAILURES as exc:
         return None, f"extension {module}: dashboard_data failed: {describe(exc)}"
     return data, None
 
@@ -744,7 +794,7 @@ def resolve_reference(root, path: str, data: bytes) -> dict | None:
     for module, fn in registry.resolvers:
         try:
             said = fn(path, data)
-        except Exception as exc:
+        except HOOK_FAILURES as exc:
             note(f"extension {module}: reference_resolver raised {describe(exc)} for {path}")
             continue
         if said is None:
@@ -764,7 +814,7 @@ def run_importer(root, name: str, argv: list[str]) -> dict:
     registry = load(root)
     if registry is None:
         raise KitError(f"pk adopt --from {name}: no {DECLARATION} on {PRIMARY_BRANCH}, so there is no importer")
-    problem = load_problem(root, f"pk adopt --from {name}")
+    problem = _not_loaded(registry, f"pk adopt --from {name}")
     if problem:
         raise KitError(problem)
     if name not in registry.importers:
@@ -773,7 +823,7 @@ def run_importer(root, name: str, argv: list[str]) -> dict:
     module, fn = registry.importers[name]
     try:
         source = fn(Path(root), list(argv))
-    except Exception as exc:
+    except HOOK_FAILURES as exc:
         raise KitError(f"pk adopt --from {name}: the importer of extension {module} raised {describe(exc)}; "
                        "nothing written") from exc
     if not isinstance(source, dict):

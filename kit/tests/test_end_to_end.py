@@ -20,6 +20,7 @@ import hook
 import pk
 import store
 from common import read_json, read_yaml, run_argv, sha256_bytes, sha256_file, utc_now, write_yaml
+from test_adopt import LEGACY_LOG, source as adoption_source  # the adoption fixture (0.7.0)
 from test_neutrality import TOKEN as FORBIDDEN, URL  # the same compiled rules the repository-wide scan uses
 from test_templates import FLOW  # a flow collection with something inside
 
@@ -547,6 +548,49 @@ class EndToEndTests(unittest.TestCase):
         pk.build_parser()  # fills pk.COMMANDS: only init and doctor register at import, the rest when it is built
         self.assertEqual(sorted(project.invoked), sorted(pk.COMMANDS))
         self.assertTrue(time.monotonic() - started < 120, "the end-to-end test took two minutes or more")
+
+    @skip_unless_slow()
+    @NEEDS_SH
+    def test_an_extension_lists_its_points_and_adopts_through_its_importer(self):
+        """0.7.0, installed by install.sh: `pk ext list` names what the programme's extension registered, and
+        `pk adopt --from` adopts the source its importer builds (a dry run first, `--dry-run` after the importer's
+        arguments), stored byte for byte as the JSON it wrote; the extension's hand-off line follows."""
+        project = Project(self.base, with_gitleaks=True)
+        repo = project.repo
+        repo.mkdir()
+        project.git("init", "-q", "-b", "main")
+        (repo / "README.md").write_text("A programme that ran before the kit.\n", encoding="utf-8")
+        project.commit("initial commit")
+        project.run(["sh", ROOT / "install.sh", repo, "--preset", "python"])
+        (repo / "old" / "evidence").mkdir(parents=True)
+        (repo / "old" / "RULINGS.md").write_text(LEGACY_LOG, encoding="utf-8")
+        (repo / "old" / "HANDOFF.md").write_bytes(b"# Old hand-off\r\n\r\nbytes kept as they are\r\n")
+        (repo / "old" / "evidence" / "acceptance.json").write_text("{}\n", encoding="utf-8")
+        (repo / "program" / "extensions").mkdir()
+        (repo / "program" / "extensions.yaml").write_text("api: 1\nmodules:\n  - name: legacy\n", encoding="utf-8")
+        (repo / "program" / "extensions" / "legacy.py").write_text(
+            "import json\nfrom pathlib import Path\n\n\ndef register(api):\n"
+            "    api.adopt_importer('legacy-json', lambda root, argv: json.loads(Path(argv[0]).read_text()))\n"
+            "    api.handoff_lines(lambda root: ['legacy importer installed'])\n", encoding="utf-8")
+        project.commit("the kit, the legacy files and the programme's extension")
+        export = self.base / "export.json"  # outside the repository, where an exporter would leave it
+        export.write_text(json.dumps(adoption_source()), encoding="utf-8")
+
+        self.assertEqual(project.pk("ext", "list").stdout.splitlines(), [
+            "extensions: api 1, 1 module(s) from main's committed tree",
+            "  legacy: handoff_lines; adopt_importer legacy-json"])
+        self.assertIn("ext check: ok, api 1, 1 module(s)", project.pk("ext", "check").stdout)
+        dry = project.pk("adopt", "--from", "legacy-json", export, "--dry-run").stdout
+        self.assertIn("dry run: nothing written", dry)
+        self.assertEqual(project.git("status", "--porcelain"), "")
+        adopted = project.pk("adopt", "--from", "legacy-json", export).stdout
+        self.assertIn("adopted:", adopted)
+        stored = (repo / "program" / "legacy" / "adoption-source.json").read_bytes()
+        self.assertEqual(stored, (json.dumps(adoption_source(), indent=2, ensure_ascii=False) + "\n").encode())
+        recorded = read_yaml(repo / "program" / "adoption.yaml")
+        self.assertEqual((recorded["source_sha256"], recorded["legacy_phase_prefixes"]), (sha256_bytes(stored), ["CX"]))
+        self.assertIn("- legacy importer installed", (repo / "program" / "HANDOFF.md").read_text(encoding="utf-8"))
+        project.pk("doctor")
 
     @skip_unless_slow()
     @NEEDS_SH

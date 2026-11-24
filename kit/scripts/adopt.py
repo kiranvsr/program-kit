@@ -22,9 +22,10 @@ record in the stored copy of the source. The command:
 an extension registered under that name (`api.adopt_importer`, ext.py) is called with the root and the args, and the
 dict it returns is written as JSON and then validated and stored exactly as a file's bytes would be.
 
-`--dry-run` stops after step 2 and prints the plan and the counts. The command never commits: the controller commits
-`program/` as one commit. Status records are written by batch KA-2's importer (`_write_statuses`); until then a
-source whose `statuses` list is not empty is refused, so nothing is half adopted.
+`--dry-run` stops after step 2 and prints the plan and the counts; it is the kit's before or after `--from`, and an
+importer never receives it. The command never commits: the controller commits `program/` as one commit. Status
+records are written by batch KA-2's importer (`_write_statuses`); until then a source whose `statuses` list is not
+empty is refused, so nothing is half adopted.
 """
 from __future__ import annotations
 
@@ -622,13 +623,20 @@ def adopt(root: Path, source_path: Path | None, dry_run: bool = False, data: byt
             "not committed: commit program/ as one commit"]
 
 
+DRY_RUN = "--dry-run"
+
+
 def cmd_adopt(args: argparse.Namespace) -> int:
     if (args.source is None) == (args.importer is None):
         raise KitError("pk adopt needs either a source file or --from <importer> [args...], not both")
     root = find_root()
     if args.importer is not None:
-        data = importer_source(root, args.importer)
-        print("\n".join(adopt(root, None, dry_run=args.dry_run, data=data)))
+        # --from takes the rest of the line, so `--from NAME args --dry-run` would hand --dry-run to the importer and
+        # then write: --dry-run anywhere is the kit's, and the importer never sees it
+        importer = [arg for arg in args.importer if arg != DRY_RUN]
+        dry_run = args.dry_run or len(importer) != len(args.importer)
+        data = importer_source(root, importer)
+        print("\n".join(adopt(root, None, dry_run=dry_run, data=data)))
     else:
         print("\n".join(adopt(root, Path(args.source), dry_run=args.dry_run)))
     return 0
@@ -636,11 +644,11 @@ def cmd_adopt(args: argparse.Namespace) -> int:
 
 def _configure(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("source", nargs="?", help="the adoption source, JSON (kit/templates/adoption.schema.json)")
-    parser.add_argument("--dry-run", action="store_true", dest="dry_run",
-                        help="validate and print the plan and the counts; write nothing (before --from)")
+    parser.add_argument(DRY_RUN, action="store_true", dest="dry_run",
+                        help="validate and print the plan and the counts; write nothing (before or after --from)")
     parser.add_argument("--from", dest="importer", nargs=argparse.REMAINDER, metavar="NAME",
                         help="build the source with the importer an extension registered under NAME; every "
-                             "argument after NAME goes to the importer (0.7.0)")
+                             f"argument after NAME goes to the importer, except {DRY_RUN}, which is the kit's (0.7.0)")
 
 
 def register(add_command) -> None:

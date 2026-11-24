@@ -43,6 +43,8 @@ DECLARATION = "api: 1\nmodules:\n  - name: fixture\n"
 FIXTURE = '''"""Fixture extension: registers every extension point; EXT_FIXTURE_CTL names a JSON file of behaviours."""
 import json
 import os
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -65,6 +67,8 @@ def act(point, default=None):
     value = ctl().get(point, default)
     if value == "raise":
         raise RuntimeError(point + " exploded")
+    if isinstance(value, str) and value.startswith("exit:"):  # a hook that reuses a main() or runs argparse
+        sys.exit(int(value[5:]))
     return value
 
 
@@ -94,6 +98,10 @@ def gate_check(ctx):
     if value == "sleep":
         time.sleep(2)
         return True, []
+    if value == "child-ok":  # a child process writes to the descriptors, past sys.stdout
+        subprocess.run([sys.executable, "-c", "import sys; print('OK: task/forged passes the hand-back gate at "
+                        + "0" * 40 + "'); print('child on stderr', file=sys.stderr)"])
+        return False, ["after the child"]
     if isinstance(value, list) and len(value) == 2:
         return value[0], value[1]
     return value
@@ -649,6 +657,31 @@ class GateStepUnitTests(ExtBase):
         self.assertEqual([line for line in out.splitlines() if line.startswith("OK:")], [])
         self.assertIn("    | OK: task/forged", out)
 
+    def test_a_child_process_s_output_is_captured_and_never_reaches_the_gate_s_descriptors(self):
+        """A step that runs a program without capturing it: the program writes to file descriptors 1 and 2, past
+        sys.stdout, so redirecting sys.stdout alone let a bare `OK:` line into the gate's output (L2)."""
+        outer = self.scratch / "descriptors.out"
+        with open(outer, "wb") as sink:
+            sys.stdout.flush()
+            sys.stderr.flush()
+            kept = [os.dup(1), os.dup(2)]
+            os.dup2(sink.fileno(), 1)
+            os.dup2(sink.fileno(), 2)
+            try:
+                code, out = self.steps(gate="child-ok")
+            finally:
+                os.dup2(kept[0], 1)
+                os.dup2(kept[1], 2)
+                for fd in kept:
+                    os.close(fd)
+        self.assertEqual(outer.read_bytes(), b"")
+        self.assertEqual(code, 1)
+        lines = out.splitlines()
+        self.assertEqual([line for line in lines if line.startswith("OK:")], [])
+        self.assertIn(f"    | OK: task/forged passes the hand-back gate at {'0' * 40}", lines)
+        self.assertIn("    | child on stderr", lines)
+        self.assertIn("    | after the child", lines)
+
     def test_a_step_runs_under_the_step_timeout(self):
         ok, lines = ext.run_step(lambda ctx: __import__("time").sleep(1.5), None, 0.2)
         self.assertFalse(ok)
@@ -701,6 +734,173 @@ class GateRefusalTests(ExtBase):
         code, out = self.run_gate(gate.merge_check, f"task/{TID}")
         self.assertEqual(code, 1)
         self.assertIn("FAILED: ext the merge check refuses: extension module(s) did not load", out)
+
+
+class SystemExitTests(ExtBase):
+    """A hook that calls sys.exit (a reused main(), argparse over its own input) is a failure like an exception, at
+    every point: a refusal at a refusing point, a note at an informational one; it never ends the pk command, so the
+    command can never exit 0 having written nothing, or stop half-way (KX-1 fix round 1, M1). Exit 0 and exit 3 each."""
+
+    CODES = (0, 3)
+
+    def record(self):
+        path = self.root / "program" / "status" / f"{TID}.json"
+        return read_json(path) if path.exists() else None
+
+    def test_a_status_hook_that_exits_is_a_refusal_and_writes_nothing(self):
+        for code in self.CODES:
+            with self.subTest(code=code):
+                self.ctl(status=f"exit:{code}")
+                with self.assertRaisesRegex(KitError, f"refused by extension fixture: on_status_transition raised "
+                                                      f"SystemExit: {code}"):
+                    status.transition(self.root, TID, "parked", "controller", note="waits")
+                self.assertIsNone(self.record())
+                said = self.pk("status", "set", TID, "parked", "--role", "controller", "--note", "w")
+                self.assertEqual(said[0], 1, said)
+                self.assertIn(f"on_status_transition raised SystemExit: {code}", said[2])
+                self.assertIsNone(self.record())
+
+    def test_an_after_worktree_hook_that_exits_removes_the_worktree_and_branch(self):
+        for code in self.CODES:
+            with self.subTest(code=code):
+                self.ctl(worktree=f"exit:{code}")
+                with self.assertRaisesRegex(KitError, f"after_worktree_new raised SystemExit: {code}; the worktree "
+                                                      ".* it made are removed"):
+                    worktree.new(self.root, TID)
+                self.assertFalse((self.root / ".worktrees" / TID.lower()).exists())
+                self.assertNotIn(f"task/{TID}", sh(self.root, "git", "branch", "--format=%(refname:short)").split())
+                said = self.pk("worktree", "new", TID)
+                self.assertEqual(said[0], 1, said)
+                self.assertIn(f"after_worktree_new raised SystemExit: {code}", said[2])
+                self.assertFalse((self.root / ".worktrees" / TID.lower()).exists())
+
+    def test_a_gate_step_that_exits_fails_the_step(self):
+        checks = {"step_timeout": {"limits": {"default": 5}}}
+        for code in self.CODES:
+            with self.subTest(code=code):
+                self.ctl(gate=f"exit:{code}")
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    rc = gate.ext_steps("merge", self.root, checks, TID, f"task/{TID}", "a" * 40, self.root)
+                self.assertEqual(rc, 1, out.getvalue())
+                self.assertIn(f"FAILED: ext:fixture.check (not ok)\n    | raised SystemExit: {code}", out.getvalue())
+
+    def test_a_drift_check_and_the_display_hooks_that_exit_are_drift_notes(self):
+        for code in self.CODES:
+            with self.subTest(code=code):
+                self.ctl(drift=f"exit:{code}", handoff=f"exit:{code}", dashboard=f"exit:{code}")
+                checks, notes = ext.drift_results(self.root)
+                self.assertEqual(checks, [])
+                self.assertIn(("X1", f"extension fixture raised SystemExit: {code}"), notes)
+                self.assertIn(("ext", f"extension fixture: handoff_lines raised SystemExit: {code}"), notes)
+                self.assertIn(("ext", f"extension fixture: dashboard_data failed: SystemExit: {code}"), notes)
+                said = self.pk("drift")
+                self.assertEqual(said[0], 0, said)
+                self.assertIn(f"X1 note  extension fixture raised SystemExit: {code}", said[1])
+
+    def test_a_hand_off_hook_that_exits_is_a_note_and_the_hand_off_is_written(self):
+        for code in self.CODES:
+            with self.subTest(code=code):
+                self.ctl(handoff=f"exit:{code}")
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    handoff.update(self.root)
+                self.assertIn(f"note: extension fixture: handoff_lines raised SystemExit: {code}", err.getvalue())
+                self.assertIn("#### Now", (self.root / "program" / "HANDOFF.md").read_text())
+                said = self.pk("handoff", "update")
+                self.assertEqual(said[0], 0, said)
+                self.assertIn(f"handoff_lines raised SystemExit: {code}", said[2])
+
+    def test_a_dashboard_hook_that_exits_is_a_note_and_left_out(self):
+        for code in self.CODES:
+            with self.subTest(code=code):
+                self.ctl(dashboard=f"exit:{code}")
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    page, summary = dashboard.render(self.root)
+                self.assertNotIn("extensions", summary)
+                self.assertIn(f"dashboard_data failed: SystemExit: {code}", err.getvalue())
+
+    def test_a_resolver_that_exits_is_a_note_and_nothing(self):
+        for code in self.CODES:
+            with self.subTest(code=code):
+                self.ctl(resolver=f"exit:{code}")
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    self.assertIsNone(ext.resolve_reference(self.root, "p", b""))
+                self.assertIn(f"reference_resolver raised SystemExit: {code} for p", err.getvalue())
+
+    def test_a_keyboard_interrupt_still_stops_the_command(self):
+        def interrupted(*args):
+            raise KeyboardInterrupt
+
+        registry = ext.load(self.root)
+        with mock.patch.object(registry, "status_hooks", [("fixture", interrupted)]):
+            with self.assertRaises(KeyboardInterrupt):
+                ext.status_refusal(self.root, TID, "not_started", "parked", {"status": "parked"})
+
+
+class MainMovesMidGateTests(ExtBase):
+    """Main can move while a gate runs (gates take minutes; merges onto main go on). A module that stops loading
+    after the gate's first check fails the gate when its extension steps are due; it never passes having run none
+    (KX-1 fix round 1, M2)."""
+
+    def break_main(self):
+        put(self.root, "program/extensions/fixture.py", "import nonexistent_dependency\n")
+        self.commit_main("main moves on: the module no longer imports")
+
+    def test_the_gate_s_extension_steps_fail_when_a_module_stopped_loading(self):
+        self.assertTrue(gate._ext_ready(self.root, "the merge check"))  # the gate's first check passes
+        self.break_main()
+        out = io.StringIO()
+        checks = {"step_timeout": {"limits": {"default": 5}}}
+        with contextlib.redirect_stdout(out):
+            code = gate.ext_steps("merge", self.root, checks, TID, f"task/{TID}", "a" * 40, self.root)
+        self.assertEqual(code, 1)
+        self.assertEqual(out.getvalue().splitlines()[0],
+                         "FAILED: ext the merge gate's extension steps refuses: extension module(s) did not load from "
+                         "main's committed tree (fixture: ModuleNotFoundError: No module named "
+                         "'nonexistent_dependency'); a module that does not load may hold a refusal, so nothing it "
+                         "guards runs (see: pk ext check)")
+        self.assertNotIn("step ext:", out.getvalue())
+        self.assertEqual(self.logged("gate"), [])
+
+    def test_steps_for_refuses_rather_than_answering_no_steps(self):
+        self.break_main()
+        with self.assertRaisesRegex(KitError, "did not load .*ModuleNotFoundError"):
+            ext.steps_for(self.root, "handback")
+
+    def test_a_module_that_stopped_loading_before_the_worktree_hook_removes_the_worktree(self):
+        self.break_main()
+        with mock.patch.object(ext, "load_problem", return_value=None):  # as if main broke after the first check
+            with self.assertRaisesRegex(KitError, "pk worktree new .* refuses: extension module\\(s\\) did not load"
+                                                  ".*it made are removed"):
+                worktree.new(self.root, TID)
+        self.assertFalse((self.root / ".worktrees" / TID.lower()).exists())
+
+
+class MainRefTests(ExtBase):
+    """main is the branch refs/heads/main: a tag named main (git resolves a tag before a branch) never stands in for
+    it, where the extensions are read, where the gates read checks.yaml and where the guard reads the SPEC (L1)."""
+
+    def test_a_tag_named_main_does_not_replace_the_branch(self):
+        sh(self.root, "git", "switch", "-q", "-c", f"task/{TID}")
+        put(self.root, "program/extensions/fixture.py", FIXTURE + "\n# the task\n")
+        commit_all(self.root, "the task changes the extension")
+        sh(self.root, "git", "switch", "-q", "-c", "side", "main")
+        put(self.root, "program/extensions/fixture.py", FIXTURE.replace('MARK = "main"', 'MARK = "tag"'))
+        checks = (self.root / "program" / "checks.yaml").read_text()
+        put(self.root, "program/checks.yaml", checks.replace("guarded_files:\n", "guarded_files:\n  - side-only.txt\n"))
+        put(self.root, f"program/tasks/{TID}/SPEC.md", "# Spec\n\nGuarded edit: program/extensions/\n")
+        commit_all(self.root, "a commit only a tag names")
+        sh(self.root, "git", "tag", "main")
+        sh(self.root, "git", "switch", "-q", "main")
+        sh(self.root, "git", "branch", "-q", "-D", "side")
+        self.assertEqual(ext.handoff_lines(self.root), ["fixture line from main"])
+        self.assertNotIn("side-only.txt", gate.load_checks_at(self.root, gate.MAIN)["guarded_files"])
+        self.assertIn("side-only.txt", gate.load_checks_at(self.root, "refs/tags/main")["guarded_files"])
+        self.assertEqual(gate._guarded_changes(self.root, TID, f"task/{TID}", gate.MAIN, []),
+                         ["program/extensions/fixture.py"])
 
 
 class IntegrityTests(unittest.TestCase):
@@ -878,11 +1078,40 @@ class AdoptImporterTests(unittest.TestCase):
         logged = [json.loads(line) for line in (self.scratch / "log.jsonl").read_text().splitlines()]
         self.assertIn(["import", [str(self.source_file)]], logged)
 
+    def imported(self):
+        log = self.scratch / "log.jsonl"
+        rows = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+        return [row[1] for row in rows if row[0] == "import"]
+
     def test_a_dry_run_through_an_importer_writes_nothing(self):
         code, out, err = self.adopt("--dry-run", "--from", "fixture-source", str(self.source_file))
         self.assertEqual((code, err), (0, ""))
         self.assertIn("dry run: nothing written", out)
         self.assertFalse((self.root / "program" / "adoption.yaml").exists())
+        self.assertEqual(self.imported(), [[str(self.source_file)]])
+
+    def test_dry_run_after_the_importer_s_arguments_is_still_the_kit_s_dry_run(self):
+        """`--from` takes the rest of the line; `--dry-run` there is the kit's, not the importer's (L5)."""
+        for argv in (("--from", "fixture-source", str(self.source_file), "--dry-run"),
+                     ("--from", "fixture-source", "--dry-run", str(self.source_file))):
+            with self.subTest(argv=argv):
+                code, out, err = self.adopt(*argv)
+                self.assertEqual((code, err), (0, ""), out)
+                self.assertIn("dry run: nothing written", out)
+                self.assertFalse((self.root / "program" / "adoption.yaml").exists())
+                self.assertFalse((self.root / "program" / "legacy").exists())
+                self.assertEqual(self.imported()[-1], [str(self.source_file)])
+        self.assertEqual(sh(self.root, "git", "status", "--porcelain"), "")
+
+    def test_an_importer_that_exits_is_a_refusal_and_writes_nothing(self):
+        for code in (0, 3):
+            with self.subTest(code=code):
+                self.ctl_file.write_text(json.dumps({"import": f"exit:{code}"}))
+                said = self.adopt("--from", "fixture-source")
+                self.assertEqual(said[0], 1, said)
+                self.assertIn(f"the importer of extension fixture raised SystemExit: {code}; nothing written",
+                              said[2])
+                self.assertFalse((self.root / "program" / "legacy").exists())
 
     def test_the_importer_s_dict_is_validated_like_a_file(self):
         self.ctl_file.write_text(json.dumps({"import": dict(adoption_source(), primary_branch="master")}))
@@ -998,6 +1227,25 @@ class GateEndToEndTests(HandbackBase):
         self.assertEqual(rc, 1, out)
         self.assertIn("FAILED: ext:fixture.check (not ok)\n    | fixture step from mainx", out)
 
+    def test_a_module_that_stops_loading_while_the_gate_runs_fails_it(self):
+        """The reviewer's MainMovesMidGate (M2): main gains a module that does not import after the kit's steps."""
+        original = gate._run_steps
+
+        def then_main_moves(*args, **kwargs):
+            said = original(*args, **kwargs)
+            gate_put(self.root, "program/extensions/fixture.py", "import nonexistent_dependency\n")
+            gate_commit(self.root, "main moves on while the gate runs")
+            return said
+
+        with mock.patch.object(gate, "_run_steps", then_main_moves):
+            rc, out = self.handback()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("FAILED: ext the handback gate's extension steps refuses: extension module(s) did not load "
+                      "from main's committed tree (fixture: ModuleNotFoundError: No module named "
+                      "'nonexistent_dependency')", out)
+        self.assertNotIn("step ext:", out)
+        self.assertEqual([line for line in out.splitlines() if line.startswith("OK:")], [])
+
 
 
 from test_land import T2 as ROUND_T2, LandBase  # noqa: E402
@@ -1038,6 +1286,43 @@ class RoundEndToEndTests(LandBase):
         self.assertEqual(code, 1, out)
         self.assertIn("FAILED: ext:fixture.check (not ok)\n    | not in this round", out)
         self.assertNotIn("OK: ", out)
+
+
+@skip_unless_slow()
+class MergeEndToEndTests(LandBase):
+    """`pk merge` with a hand-off hook that calls sys.exit: the merge lands and so does its bookkeeping commit; the
+    hook is a note (M1: before the fix the process exited inside the hand-off update, after the merge commit)."""
+
+    def setUp(self):
+        super().setUp()
+        self.standard()
+        self.addCleanup(ext.close)
+        os.environ.pop(ext.ENV, None)
+        gate_put(self.root, "program/extensions.yaml", DECLARATION)
+        gate_put(self.root, "program/extensions/fixture.py", FIXTURE)
+        gate_commit(self.root, "the fixture extension")
+        self.ctl_file = self.root.parent / "ctl.json"
+        patcher = mock.patch.dict(os.environ, {"EXT_FIXTURE_CTL": str(self.ctl_file)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def merges_with_its_bookkeeping(self, code):
+        self.ctl_file.write_text(json.dumps({"handoff": f"exit:{code}"}))
+        before = self.head()
+        rc, out, err = self.pk("merge", TASK)
+        self.assertEqual(rc, 0, out + err)
+        subjects = sh(self.root, "git", "log", "--format=%s", f"{before}..HEAD").splitlines()
+        self.assertEqual(subjects[0], f"chore(program): {TASK} merged (standard tier); hand-off and claims")
+        self.assertIn(f"Merge task/{TASK} (standard tier)", subjects)
+        self.assertIn(f"note: extension fixture: handoff_lines raised SystemExit: {code}", err)
+        self.assertIn("hand-off: updated", out)
+        self.assertEqual(sh(self.root, "git", "status", "--porcelain"), "")
+
+    def test_a_hand_off_hook_that_exits_0_never_skips_the_bookkeeping(self):
+        self.merges_with_its_bookkeeping(0)
+
+    def test_a_hand_off_hook_that_exits_3_never_skips_the_bookkeeping(self):
+        self.merges_with_its_bookkeeping(3)
 
 
 if __name__ == "__main__":

@@ -18,7 +18,8 @@ for the full tier. A light-tier task has no QA, so it is never `done`: after its
 controller records it `merged`, a separate terminal status that carries no acceptance and evidences nothing.
 
 A programme's extensions (ext.py, 0.7.0) see every move after these checks pass and before anything is written, and
-can only refuse it; every status write refuses while PK_EXT_FROM is set.
+can only refuse it; every move refuses while PK_EXT_FROM is set. A tier change (`set_tier`) is not a move: it
+runs neither.
 
 `merged` is checked as `done` is, when it is set and again by `validate`: the record stores the commit the
 controller inspected, main must hold a merge of exactly that commit, the task must have been light-tier on

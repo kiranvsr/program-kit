@@ -84,6 +84,12 @@ from common import (KitError, drop_bom, find_root, git, read_json, read_text, re
 from register import GATE_ID, GATE_SHAPE
 
 MAIN = "main"  # the primary branch; fixed, so no caller can choose where the rules are read from
+MAIN_REF = f"refs/heads/{MAIN}"  # where the rules are read: the branch, never a tag that is also named main
+
+
+def _branch_ref(ref: str) -> str:
+    """`ref`, with the bare primary branch name spelled as the branch (git resolves a tag named main first)."""
+    return MAIN_REF if ref == MAIN else ref
 CHECK_KEYS = ("build", "test", "scan", "compile_check", "extra_gate")
 ALL_KEYS = CHECK_KEYS + ("parallel_steps", "guarded_files", "tiers", "drift", "evidence", "progress", "merge",
                          "research", "remote",  # drift, progress: `pk drift` only; research, remote: their commands (0.6.0)
@@ -384,7 +390,7 @@ def load_checks(root, require: tuple[str, ...] = ()) -> dict:
 def load_checks_at(root, ref: str, require: tuple[str, ...] = ()) -> dict:
     """`program/checks.yaml` as committed at `ref`; the gates use this so the working tree cannot change the rules."""
     try:
-        text = drop_bom(_git_bytes(Path(root), "show", f"{ref}:program/checks.yaml").decode("utf-8"))
+        text = drop_bom(_git_bytes(Path(root), "show", f"{_branch_ref(ref)}:program/checks.yaml").decode("utf-8"))
     except (KitError, UnicodeDecodeError) as exc:
         raise KitError(f"program/checks.yaml cannot be read on {_show(ref)}: {_show(exc)}") from exc
     try:
@@ -895,6 +901,7 @@ def _guarded_changes(root: Path, task_id: str, branch: str, main: str, guarded: 
     a SPEC line allows it like any guarded entry.
     """
     entries = [_norm_guard(entry) for entry in guarded] + list(EXT_GUARDED) + list(ALWAYS_GUARDED)
+    main = _branch_ref(main)
     base = git(root, "merge-base", main, f"refs/heads/{branch}")
     changed = sorted(_git_fields(root, "diff", "--name-only", "--no-renames", "-z",
                                  f"{base}..refs/heads/{branch}"))
@@ -1485,9 +1492,14 @@ def ext_steps(gate: str, root: Path, checks: dict, task_id: str, branch: str, he
     """The extensions' gate steps for `gate` (0.7.0), after the kit's own and before the `OK:` line: 0 when all pass.
 
     Each prints `step ext:<module>.<name>: ok`, or `FAILED: ext:<module>.<name> ...`; its lines (and anything it
-    printed) follow with the tail prefix, so none can read as an `OK:` line. Each runs under the step timeout.
+    or a child process it started printed while it ran) follow with the tail prefix, so none can read as an `OK:`
+    line. Each runs under the step timeout. Main is read again here: a module that no longer loads fails the gate.
     """
-    steps = ext.steps_for(root, gate)
+    try:
+        steps = ext.steps_for(root, gate)  # refuses when a module stopped loading since the gate began (M2)
+    except KitError as exc:
+        _out(f"FAILED: ext {exc}")
+        return 1
     if not steps:
         return 0
     limit = step_limit(checks, "ext")
