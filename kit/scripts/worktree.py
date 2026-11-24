@@ -41,13 +41,12 @@ import conflicts
 import register as register_module
 from common import KitError, PRIMARY_BRANCH, find_root, git, primary_branch_problem, run_argv
 
-ADHOC_ID = re.compile(r"AH-\d{4}\Z")  # an ad-hoc task of the controller state
 _PROJECT = re.compile(r"[a-z0-9][a-z0-9_-]{2,}\Z")
 DIFF_EXCLUDES = ("program/evidence", "program/status")
 
 
-def _is_task(task_id) -> bool:
-    return isinstance(task_id, str) and bool(register_module.TASK_ID.match(task_id) or ADHOC_ID.match(task_id))
+def _is_task(root: Path, task_id) -> bool:
+    return register_module.is_task_id(root, task_id)
 
 
 def _resolves(root: Path, ref: str) -> bool:
@@ -66,8 +65,9 @@ def new(root: Path, task_id: str, main: str = "main") -> Path:
     name a commit.
     """
     root = Path(root)
-    if not _is_task(task_id):
-        raise KitError(f"{task_id!r} is not a task id (expected P<n>-M<nn>-S<nn>-T<nn>, or AH-<nnnn> for an "
+    if not _is_task(root, task_id):
+        legacy = "".join(f", {prefix}-M<nn>-S<nn>-T<nn>" for prefix in register_module.phase_prefixes(root))
+        raise KitError(f"{task_id!r} is not a task id (expected P<n>-M<nn>-S<nn>-T<nn>{legacy}, or AH-<nnnn> for an "
                        "ad-hoc task)")
     if (not isinstance(main, str) or not main or main.startswith("-")
             or any(ch.isspace() or not ch.isprintable() for ch in main)):
@@ -141,7 +141,7 @@ def review(root: Path, task_id: str, commit: str | None = None, excludes=()) -> 
     Nothing is created or moved on a refusal.
     """
     root = Path(root).resolve()
-    if not _is_task(task_id):
+    if not _is_task(root, task_id):
         raise KitError(f"{task_id!r} is not a task id")
     branch = f"refs/heads/task/{task_id}"
     if not _resolves(root, branch):
@@ -240,7 +240,7 @@ def finish(root: Path, task_id: str, symlinks=(), compose_project: str | None = 
     """Clean up after a task; returns one line per thing removed. Never forces; every check and every listing
     comes before the first removal."""
     root = Path(root).resolve()
-    if not _is_task(task_id):
+    if not _is_task(root, task_id):
         raise KitError(f"{task_id!r} is not a task id")
     _main_checkout(root, "pk worktree finish")
     for name in symlinks:

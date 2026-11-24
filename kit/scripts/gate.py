@@ -96,6 +96,8 @@ TIMES_FILE = "pk-step-seconds.json"  # in the git common dir: this machine's las
 MERGE_KEYS = ("union_files",)  # the `merge` section (0.6.0)
 TIER_KEYS = ("full_paths", "light_paths", "light_ruling")
 BUILTIN_FULL = ("kit/", "program/checks.yaml", "program/gates.yaml")  # the kit's own gates: always full-tier
+# Guarded whatever checks.yaml says (0.7.0): an adopted programme's record of adoption and its frozen history.
+ALWAYS_GUARDED = ("program/adoption.yaml", "program/legacy/")
 LIGHT_STEPS = ("build", "compile_check", "scan")
 FAST_BRIEF_HEADINGS = ("## Scope", "## Assumptions checked", "## Decided (do not reopen)", "## Stop and report when")
 STEP_TIMEOUT = evidence_module.STEP_TIMEOUT_FLOOR  # seconds per command; the evidence step's may be longer (0.5.5)
@@ -884,17 +886,19 @@ def _guarded_changes(root: Path, task_id: str, branch: str, main: str, guarded: 
 
     An entry is an exact path, or a directory when it ends in `/` (everything under it is guarded).
     The SPEC allows a changed path with `Guarded edit: <path>`; a directory entry may be allowed whole
-    with `Guarded edit: <directory>/`.
+    with `Guarded edit: <directory>/`. ALWAYS_GUARDED is added to `guarded`, and no SPEC line allows it: only
+    `pk adopt` writes those files, on main.
     """
-    entries = [_norm_guard(entry) for entry in guarded]
-    if not entries:
-        return []
+    entries = [_norm_guard(entry) for entry in guarded] + list(ALWAYS_GUARDED)
     base = git(root, "merge-base", main, f"refs/heads/{branch}")
     changed = sorted(_git_fields(root, "diff", "--name-only", "--no-renames", "-z",
                                  f"{base}..refs/heads/{branch}"))
 
     def guard(path: str) -> str | None:
         return next((e for e in entries if path == e or (e.endswith("/") and path.startswith(e))), None)
+
+    def always(path: str) -> bool:
+        return any(path == e or (e.endswith("/") and path.startswith(e)) for e in ALWAYS_GUARDED)
 
     touched = [(path, guard(path)) for path in changed if guard(path)]
     if not touched:
@@ -904,7 +908,8 @@ def _guarded_changes(root: Path, task_id: str, branch: str, main: str, guarded: 
     except KitError:
         spec = ""
     allowed = {_norm_guard(m.group(1)) for m in map(_GUARDED.match, spec.splitlines()) if m}
-    return [path for path, entry in touched if path not in allowed and entry not in allowed]
+    return [path for path, entry in touched
+            if always(path) or (path not in allowed and entry not in allowed)]
 
 
 def is_glob(entry: str) -> bool:

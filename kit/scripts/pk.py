@@ -33,7 +33,7 @@ COMMAND_MODULES: tuple[str, ...] = ("status", "rulings", "register", "briefs", "
                                     "stale", "fetch", "gate", "worktree", "handoff", "change", "manifest",
                                     "cost", "tracker", "land", "fingerprint", "dashboard", "drift", "precheck",
                                     "hook", "research", "remote", "lock", "feedback", "progress", "scan",
-                                    "sweep")
+                                    "sweep", "adopt")
 
 COMMANDS: dict[str, Callable[[argparse.Namespace], int]] = {}
 CONFIGURERS: dict[str, tuple[str, Callable[[argparse.ArgumentParser], None] | None]] = {}
@@ -246,6 +246,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     found, pending = store.check(root)
     problems.extend(" ".join(problem.split()) for problem in found)
+    import adoption  # 0.7.0: an adopted programme's frozen copies still match their digests
+
+    problems.extend(adoption.problems(root))
     for path, _ in pending:  # present with its digest, not committed yet: the evidence commit is still to come
         print(f"warning: record pending commit: {path}", file=sys.stderr)
     for problem in problems:

@@ -12,6 +12,12 @@ is required: every dispatch names the model it ran on. Earlier lines are never r
 `flagged` names each agent of a task that has passed the fresh-agent threshold (TOKEN_THRESHOLD tokens in all,
 or RESUME_THRESHOLD resumes): past it the controller stops resuming that agent and starts a fresh one with a
 tight fix brief, because an agent that has read that much re-reads it on every turn.
+
+An adopted programme's imported lines (0.7.0, `pk adopt`) carry every key above and `imported: true`. A line whose
+task was neither a register task nor an ad-hoc task before adoption also keeps its old name with `legacy_task: true`.
+The reader accepts both keys (each, when present, must be true) and the report totals such lines like any other, but
+an imported line is never flagged: its agents ran before adoption and are never resumed, so a new line for the same
+task counts towards the threshold from zero. `pk cost add` still refuses an unknown task for a new line.
 """
 from __future__ import annotations
 
@@ -58,16 +64,28 @@ def read(root: Path) -> list[dict]:
             record = json.loads(line)
         except ValueError as exc:
             raise KitError(f"{COST_FILE} line {number}: not JSON: {exc}") from exc
-        if not (isinstance(record, dict) and all(key in record for key in _KEYS)
-                and all(isinstance(record[key], str) for key in _TEXT)
-                and all(isinstance(record[key], int) and not isinstance(record[key], bool) for key in _NUMBERS)
-                and isinstance(record["resume"], bool)):
-            raise KitError(f"{COST_FILE} line {number}: not a cost record ({', '.join(_KEYS)})")
-        if ("item" in record) != ("category" in record) or not all(
-                isinstance(record.get(key, ""), str) for key in ("item", "category")):
-            raise KitError(f"{COST_FILE} line {number}: item and category go together, each a string (0.6.0)")
+        problem = record_problem(record)
+        if problem:
+            raise KitError(f"{COST_FILE} line {number}: {problem}")
         found.append(record)
     return found
+
+
+def record_problem(record) -> str | None:
+    """Why `record` is not a line the cost log may hold, or None."""
+    if not (isinstance(record, dict) and all(key in record for key in _KEYS)
+            and all(isinstance(record[key], str) for key in _TEXT)
+            and all(isinstance(record[key], int) and not isinstance(record[key], bool) for key in _NUMBERS)
+            and isinstance(record["resume"], bool)):
+        return f"not a cost record ({', '.join(_KEYS)})"
+    if ("item" in record) != ("category" in record) or not all(
+            isinstance(record.get(key, ""), str) for key in ("item", "category")):
+        return "item and category go together, each a string (0.6.0)"
+    if "legacy_task" in record and record["legacy_task"] is not True:
+        return "legacy_task, when present, is true: the line names a task from before adoption (0.7.0)"
+    if "imported" in record and record["imported"] is not True:
+        return "imported, when present, is true: pk adopt brought the line in from before adoption (0.7.0)"
+    return None
 
 
 def add(root: Path, task: str, role: str, model: str, tokens: int, tool_calls: int = 0, seconds: int = 0,
@@ -149,6 +167,8 @@ def flagged(records: list[dict], tokens: int = TOKEN_THRESHOLD, resumes: int = R
     """Each (task, agent) past the threshold: {task, agent, model, tokens, runs, resumes}, in first-seen order."""
     agents: dict[tuple[str, str], dict] = {}
     for record in records:
+        if record.get("imported") is True or record.get("legacy_task") is True:  # before adoption: never resumed
+            continue
         row = agents.setdefault((record["task"], record["agent"]),
                                 {"task": record["task"], "agent": record["agent"], "model": record["model"],
                                  "tokens": 0, "runs": 0, "resumes": 0})
