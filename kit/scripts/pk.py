@@ -5,6 +5,10 @@ Subcommands live in a registry. A command module exposes `register(add_command)`
 and calls `add_command(name, handler, help=..., configure=...)` once per command;
 its module name is then listed in COMMAND_MODULES. Nothing else in this file
 changes when a command is added.
+
+A programme's extensions (`program/extensions.yaml`, ext.py, 0.7.0) are read before the arguments: a declaration
+that does not read or names another extension api refuses every command, and an extension's commands are added
+after the kit's (a name that collides with a kit command is refused when the extension loads).
 """
 from __future__ import annotations
 
@@ -33,7 +37,7 @@ COMMAND_MODULES: tuple[str, ...] = ("status", "rulings", "register", "briefs", "
                                     "stale", "fetch", "gate", "worktree", "handoff", "change", "manifest",
                                     "cost", "tracker", "land", "fingerprint", "dashboard", "drift", "precheck",
                                     "hook", "research", "remote", "lock", "feedback", "progress", "scan",
-                                    "sweep", "adopt")
+                                    "sweep", "adopt", "ext")
 
 COMMANDS: dict[str, Callable[[argparse.Namespace], int]] = {}
 CONFIGURERS: dict[str, tuple[str, Callable[[argparse.ArgumentParser], None] | None]] = {}
@@ -53,7 +57,8 @@ class _Parser(argparse.ArgumentParser):
         raise KitError(message)
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser(extensions=None) -> argparse.ArgumentParser:
+    """The parser of every kit command, then of every command `extensions` (an ext.Registry) registered."""
     def add_once(name, handler, **kwargs):  # build_parser runs on every main(): re-adding the same command is a no-op
         if COMMANDS.get(name) is not handler:
             register(name, handler, **kwargs)
@@ -67,14 +72,23 @@ def build_parser() -> argparse.ArgumentParser:
         subparser = sub.add_parser(name, help=help_text, description=help_text)
         if configure is not None:
             configure(subparser)
+    for name, (_, _, help_text, configure) in (extensions.commands.items() if extensions is not None else ()):
+        subparser = sub.add_parser(name, help=help_text, description=help_text)
+        if configure is not None:
+            configure(subparser)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     try:
-        args = build_parser().parse_args(argv)
+        import ext  # 0.7.0: the programme's extensions, from main's committed tree
+
+        extensions = ext.for_pk()  # a declaration problem (such as another api) refuses every command here
+        args = build_parser(extensions).parse_args(argv)
         if args.command is None:
             raise KitError("no command given (try: pk init)")
+        if extensions is not None and args.command in extensions.commands:
+            return ext.run_command(extensions, args)
         return COMMANDS[args.command](args)
     except KitError as exc:
         line = "error: " + " ".join(str(exc).split())
@@ -249,6 +263,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     import adoption  # 0.7.0: an adopted programme's frozen copies still match their digests
 
     problems.extend(adoption.problems(root))
+    import ext  # 0.7.0: every extension module loads (an api mismatch already refused the command)
+
+    problems.extend(ext.problems(root))
     for path, _ in pending:  # present with its digest, not committed yet: the evidence commit is still to come
         print(f"warning: record pending commit: {path}", file=sys.stderr)
     for problem in problems:

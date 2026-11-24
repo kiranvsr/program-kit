@@ -212,6 +212,19 @@ class Producer(Repo):
         self.assertEqual(record["toolchain"]["checks_sha256"], fp.sha256_bytes(b"build: []\n"))
         self.assertEqual(record["toolchain"]["kit_manifest_sha256"], fp.sha256_bytes(b"abc  x\n"))
 
+    def test_the_extensions_digest_is_taken_at_head(self):
+        self.release(entry("one", "pass"))
+        self.assertIsNone(self.run_ok()[3]["toolchain"]["extensions_sha256"])  # 0.7.0: none declared
+        declaration, code = b"api: 1\nmodules: []\n", b"def register(api):\n    pass\n"
+        (self.root / "program" / "extensions").mkdir()
+        (self.root / "program" / "extensions.yaml").write_bytes(declaration)
+        (self.root / "program" / "extensions" / "rules.py").write_bytes(code)
+        self.commit("extensions")
+        lines = (f"{fp.sha256_bytes(declaration)}  program/extensions.yaml\n"
+                 f"{fp.sha256_bytes(code)}  program/extensions/rules.py\n")
+        record = self.run_ok()[3]
+        self.assertEqual(record["toolchain"]["extensions_sha256"], fp.sha256_bytes(lines.encode()))
+
     def test_the_full_output_goes_to_the_scratch_directory_and_not_the_record(self):
         self.release(entry("loud", "[print('line', i) for i in range(30)]"))
         record = self.run_ok()[3]

@@ -38,6 +38,7 @@ import re
 import subprocess
 
 import conflicts
+import ext
 import register as register_module
 from common import KitError, PRIMARY_BRANCH, find_root, git, primary_branch_problem, run_argv
 
@@ -61,8 +62,10 @@ def new(root: Path, task_id: str, main: str = "main") -> Path:
     """Create the worktree and branch for `task_id` and return the worktree path.
 
     Refuses (KitError, nothing created) for a task ID that is not P<n>-M<nn>-S<nn>-T<nn>,
-    when the directory exists, when branch `task/<ID>` exists, or when `main` does not
-    name a commit.
+    when the directory exists, when branch `task/<ID>` exists, when `main` does not
+    name a commit, or when an extension module did not load (0.7.0). The extensions'
+    after-worktree hooks run last; when one raises, the worktree and branch just made are
+    removed and the refusal names the exception.
     """
     root = Path(root)
     if not _is_task(root, task_id):
@@ -83,7 +86,17 @@ def new(root: Path, task_id: str, main: str = "main") -> Path:
             raise KitError(primary_branch_problem(root, main, need_commit=True)
                            or f"{main} does not resolve to a commit")
         raise KitError(f"{main} does not resolve to a commit")
+    problem = ext.load_problem(root, f"pk worktree new {task_id}")
+    if problem:
+        raise KitError(problem)
     git(root, "worktree", "add", "-b", branch, "--", str(path), main)
+    problem = ext.after_worktree_new(root, task_id, path)
+    if problem:
+        removed = run_argv(["git", "-C", str(root), "worktree", "remove", "--force", "--", str(path)], root)[0] == 0
+        removed = run_argv(["git", "-C", str(root), "branch", "-D", "--", branch], root)[0] == 0 and removed
+        raise KitError(f"pk worktree new {task_id}: {problem}; "
+                       + (f"the worktree {path} and branch {branch} it made are removed" if removed else
+                          f"removing the worktree {path} and branch {branch} it made failed: remove them by hand"))
     return path
 
 

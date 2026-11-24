@@ -17,6 +17,9 @@ change only through `set_tier`, which needs a ruling. The gates read them from m
 for the full tier. A light-tier task has no QA, so it is never `done`: after its branch is merged the
 controller records it `merged`, a separate terminal status that carries no acceptance and evidences nothing.
 
+A programme's extensions (ext.py, 0.7.0) see every move after these checks pass and before anything is written, and
+can only refuse it; every status write refuses while PK_EXT_FROM is set.
+
 `merged` is checked as `done` is, when it is set and again by `validate`: the record stores the commit the
 controller inspected, main must hold a merge of exactly that commit, the task must have been light-tier on
 main when it landed, and the light path's guard (no full-tier path, only light paths) is run again on what
@@ -32,6 +35,7 @@ import sys
 from pathlib import Path
 
 import evidence as evidence_module
+import ext
 import register as register_module
 import rulings as rulings_module
 import store
@@ -547,6 +551,9 @@ def transition(root: Path, task_id: str, to: str, role: str, note: str = "",
                tier: str | None = None, fast: bool = False, ruling: str = "", inspected: str = "") -> dict:
     root = Path(root)
     _check_id(task_id)
+    refusal = ext.development_refusal(f"{task_id}: a status write")  # 0.7.0: judged by main's extensions only
+    if refusal:
+        raise KitError(refusal)
     if to not in STATUSES:
         raise KitError(f"unknown status {to!r}; statuses are {', '.join(STATUSES)}")
     if role not in ROLES:
@@ -628,6 +635,9 @@ def transition(root: Path, task_id: str, to: str, role: str, note: str = "",
                "tier": tier, "fast": bool(fast), "ruling": ruling}
     if to == "merged":
         updated["inspected"] = inspected
+    refusal = ext.status_refusal(root, task_id, current, to, updated)  # 0.7.0: after every kit check; can only refuse
+    if refusal:
+        raise KitError(refusal)
     write_json(_record_path(root, task_id), updated)
     return updated
 
@@ -685,6 +695,9 @@ def reopen(root: Path, task_id: str, reason: str, role: str = "controller", reje
     """
     root = Path(root)
     _check_id(task_id)
+    refusal = ext.development_refusal(f"{task_id}: a status write")
+    if refusal:
+        raise KitError(refusal)
     if role not in ("controller", "qa"):
         raise KitError(f"{task_id}: reopen is for the controller or qa, not {role}")
     if reject and role != "qa":
@@ -708,6 +721,9 @@ def reopen(root: Path, task_id: str, reason: str, role: str = "controller", reje
     entry = {"status": to, "role": role, "at": now, "reason": reason}
     updated = dict(record, status=to, role=role, updated_at=now, note=reason,
                    history=[*record["history"], entry])
+    refusal = ext.status_refusal(root, task_id, "done", to, updated)
+    if refusal:
+        raise KitError(refusal)
     write_json(_record_path(root, task_id), updated)
     return updated
 

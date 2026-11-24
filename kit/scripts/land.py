@@ -339,6 +339,8 @@ def round_start(root: Path, name: str, task_ids: list[str]) -> Path:
 def round_check(root: Path, name: str) -> int:
     """Every check of main's checks.yaml, once, on the combined tree; records the tested tree and prints the OK line."""
     root = Path(root).resolve()
+    if not gate._ext_ready(root, f"pk integrate check {name}"):  # 0.7.0: PK_EXT_FROM unset, every extension loaded
+        return 1
     data = _round(root, name)
     worktree = root / ".worktrees" / f"round-{name}"
     if not worktree.is_dir() or git(worktree, "rev-parse", "HEAD") != data["head"] or gate._changes(worktree):
@@ -370,7 +372,12 @@ def round_check(root: Path, name: str) -> int:
             if not gate._run_commands(step, gate._commands(checks[step]), worktree,
                                       timeout=gate.step_limit(checks, step)):
                 return 1
-        return 0 if gate._e2e_step(checks, worktree, e2e, merge=True) else 1
+        if not gate._e2e_step(checks, worktree, e2e, merge=True):
+            return 1
+        for member in data["members"]:  # 0.7.0: the extensions' merge steps, once per member, on the combined tree
+            if gate.ext_steps("merge", root, checks, member["id"], member["branch"], member["sha"], worktree):
+                return 1
+        return 0
 
     with gate.heavy(root, checks, f"integrate-check-{name}"):  # 0.6.1: checks.yaml's lock, limits and e2e
         if gate._limited(root, checks, suite):

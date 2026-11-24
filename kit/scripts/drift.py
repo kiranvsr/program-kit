@@ -22,6 +22,11 @@ detached worktree, so nothing in the checkout is written, and removes that workt
   D9 stale processes (0.6.2, KF-60): the processes `pk sweep` lists (sweep.py). A note printed after the checks,
      never counted, unless `processes.drift: fail` makes it a check that drifts while any is listed.
 
+  X<n> extension checks (0.7.0): each `drift_check` a programme's extension registers (ext.py), run on the commit
+     checked. A `fail` finding drifts; a `note` finding, a check that raises or answers in the wrong shape, a hand-off
+     or dashboard hook that fails and a module that does not load are printed as notes and never counted. Without
+     program/extensions.yaml there is no X line.
+
 After the checks it prints, as information and never as drift, the tasks ready to start (`pk status ready`).
 Drift is information: the command exits 0 unless `--strict` is given and a check drifts (for a scheduled run).
 Different from `pk stale`, which compares one task's evidence with the tree.
@@ -40,6 +45,7 @@ import tempfile
 import time
 from pathlib import Path, PurePosixPath
 
+import ext
 import research
 import sweep
 from common import KitError, find_root, git, read_json, read_yaml, run_argv
@@ -252,7 +258,8 @@ def _regeneration(root: Path, sha: str, commands: list[list[str]], stage: int) -
 def report(root: Path, rev: str = "HEAD", notes: dict | None = None) -> tuple[str, list[tuple[str, bool, str]]]:
     """(sha, [(check id, ok, detail)]) for commit `rev`; writes nothing in the checkout.
 
-    `notes`, when given, receives {"D9": detail} while D9 is a note rather than a check (0.6.2)."""
+    `notes`, when given, receives {"D9": detail} while D9 is a note rather than a check (0.6.2), and {"ext": [(code,
+    text)]} for the extensions' notes (0.7.0). The extensions' checks follow D9."""
     root = Path(root)
     if not rev or rev.startswith("-"):
         raise KitError(f"drift: {_one_line(rev) or 'an empty revision'} is not a commit")
@@ -281,6 +288,7 @@ def report(root: Path, rev: str = "HEAD", notes: dict | None = None) -> tuple[st
             guard = research.drift_check(tree)  # D8 (0.6.0): only with the research section, so 0.5 reports stay
             if guard is not None:
                 found["D8"] = guard
+            extension_checks, extension_notes = ext.drift_results(tree)  # 0.7.0: before D1, which writes
             found["D1"] = _regeneration(tree, sha, config["regenerate"], stage)  # last: it writes into the tree
         finally:
             subprocess.run(["git", "-C", str(root), "worktree", "remove", "--force", str(tree)], capture_output=True)
@@ -290,8 +298,10 @@ def report(root: Path, rev: str = "HEAD", notes: dict | None = None) -> tuple[st
         found["D9"] = processes[1:]
     elif notes is not None:
         notes["D9"] = processes[2]
+    if extension_notes and notes is not None:
+        notes["ext"] = extension_notes
     return sha, [(cid, *found[cid]) for cid in ("D1", "D2", "D3", "D4", "D5", "D6", "D7", "D8", "D9")
-                 if cid in found]
+                 if cid in found] + extension_checks
 
 
 def _progress(root: Path) -> tuple[bool, str]:
@@ -329,6 +339,8 @@ def cmd_drift(args: argparse.Namespace) -> int:
         print(f"  {cid} {'ok' if ok else 'DRIFT':5} {_one_line(detail)}")
     if "D9" in notes:
         print(f"  D9 note  {_one_line(notes['D9'])}")
+    for code, text in notes.get("ext", []):
+        print(f"  {code} note  {_one_line(text)}")
     lines = _ready_lines(root)
     print(f"  ready to start (information, not a check): {len(lines) or 'none'}")
     for line in lines:

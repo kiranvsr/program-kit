@@ -536,6 +536,12 @@ class EndToEndTests(unittest.TestCase):
         self.assertRegex(project.pk("sweep").stdout, r"^sweep: \d+ stale process\(es\) at ")
         self.assertIn("  D9 note  ", project.pk("drift").stdout)
         self.assertEqual(project.git("status", "--porcelain"), "")
+        # 0.7.0: no program/extensions.yaml, so no extension; adoption is refused once the program holds kit work
+        self.assertEqual(project.pk("ext", "list").stdout, "extensions: none (no program/extensions.yaml on main)\n")
+        self.assertIn("so there is no importer", project.pk("adopt", "--from", "none", expect=1).stderr)
+        self.assertIn("already holds kit work",
+                      project.pk("adopt", project.repo / "program" / "register.yaml", "--dry-run", expect=1).stderr)
+        self.assertEqual(project.git("status", "--porcelain"), "")
         project.pk("init", expect=1)  # program/ exists: init refuses to overwrite it
 
         pk.build_parser()  # fills pk.COMMANDS: only init and doctor register at import, the rest when it is built
