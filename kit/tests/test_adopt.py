@@ -17,7 +17,7 @@ import pk
 import rulings
 import tracker
 from common import KitError, read_yaml, sha256_bytes
-from test_adoption import KIT, LEGACY_LOG, P1, register_doc
+from test_adoption import CX, KIT, LEGACY_LOG, P1, register_doc
 from test_worktree import commit_all, make_repo, run_cli, sh
 
 
@@ -111,6 +111,17 @@ class SourceValidationTests(unittest.TestCase):
         self.assertProblem(source(statuses=[{"task_id": P1, "status": "done", "references": [{"path": "x"}]}]),
                            "statuses import arrives in KA-2")
         self.assertProblem(source(statuses=[{"task_id": P1, "status": "adopted"}]), "must be one of done")
+        widened = [{"task_id": P1, "status": state, "actor": "", "updated_at": ""}
+                   for state in ("in_progress", "review", "blocked", "not_started")]
+        widened[1]["task_id"], widened[2]["task_id"], widened[3]["task_id"] = CX, "CX-M01-S02-T01", "P9-M01-S01-T01"
+        self.assertEqual(self.problems(source(statuses=widened)),
+                         ["statuses: 4 listed; statuses import arrives in KA-2 (export an empty statuses list until "
+                          "then)"])  # the widened enum and empty actor and updated_at are shapes KA-2 imports
+
+    def test_notes_are_optional_text_and_stay_in_the_stored_source(self):
+        self.assertEqual(self.problems(source(notes=["dropped two empty rows", "nulled a bad date"])), [])
+        self.assertProblem(source(notes="one note"), "notes: must be a list of text")
+        self.assertProblem(source(notes=[1]), "notes: must be a list of text")
 
     def test_each_refusal(self):
         cases = [
@@ -161,7 +172,7 @@ class AdoptCommandTests(unittest.TestCase):
         self.root = make_repo(self)
         install(self.root)
         self.source = self.root / "adoption-source.json"  # untracked in the tree: the one file a clean tree may add
-        self.write(source())
+        self.write(source(notes=["the exporter kept every row"]))
 
     def write(self, data):
         self.source.write_text(json.dumps(data, indent=1))
@@ -186,6 +197,7 @@ class AdoptCommandTests(unittest.TestCase):
         self.assertEqual((legacy / "rulings.md").read_bytes(), (self.root / "old" / "RULINGS.md").read_bytes())
         self.assertEqual((legacy / "HANDOFF.md").read_bytes(), (self.root / "old" / "HANDOFF.md").read_bytes())
         self.assertEqual((legacy / "adoption-source.json").read_bytes(), self.source.read_bytes())
+        self.assertEqual(json.loads(self.source.read_bytes())["notes"], ["the exporter kept every row"])
         self.assertEqual(record["source_sha256"], sha256_bytes(self.source.read_bytes()))
         self.assertEqual(read_yaml(self.root / "program" / "register.yaml"), register_doc())
         state = ctlstate.load(self.root)

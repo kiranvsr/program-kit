@@ -3,7 +3,8 @@
 
 The source is one neutral JSON file (`kit/templates/adoption.schema.json`, `"schema": "program-kit.adoption.v1"`)
 that the programme's own exporter writes: its register, statuses, rulings log, follow-ups, ad-hoc tasks, cost rows,
-hand-off and the roots of its old evidence. The command:
+hand-off and the roots of its old evidence, and optionally `notes`, the exporter's judgement calls, which stay on
+record in the stored copy of the source. The command:
 
 1. refuses unless the tree is clean, HEAD is `main`, `program/` exists without `program/adoption.yaml`, holds no kit
    work yet (an empty register, no ruling, follow-up, ad-hoc task, cost line or status record) and `pk doctor`
@@ -44,8 +45,9 @@ KIT_DIR = Path(__file__).resolve().parent.parent
 SCHEMA_FILE = KIT_DIR / "templates" / "adoption.schema.json"
 SOURCE_KEYS = ("schema", "programme", "primary_branch", "legacy_phase_prefixes", "register", "statuses", "rulings",
                "followups", "adhoc", "costs", "handoff", "legacy_evidence_roots")
+OPTIONAL_SOURCE_KEYS = ("notes",)  # the exporter's judgement calls, kept with the stored source
 STATUS_KEYS = ("task_id", "status", "actor", "updated_at", "references", "note")
-STATUS_VALUES = ("done", "not_started")
+STATUS_VALUES = ("done", "in_progress", "review", "blocked", "not_started")  # read for shape: KA-2 imports them
 OPEN_KEYS = ("id", "area", "item", "added", "tags")
 CLOSED_KEYS = ("id", "area", "item", "reason", "added", "tags", "dup_of")
 ADHOC_KEYS = ("legacy_id", "title", "state", "note")
@@ -410,7 +412,7 @@ def validate_source(root: Path, data: bytes) -> tuple[dict | None, list[str]]:
     if not isinstance(source, dict):
         return None, ["the source must be a JSON object"]
     missing = [key for key in SOURCE_KEYS if key not in source]
-    unknown = sorted(str(key) for key in source if key not in SOURCE_KEYS)
+    unknown = sorted(str(key) for key in source if key not in SOURCE_KEYS + OPTIONAL_SOURCE_KEYS)
     if unknown:
         problems.add(f"unknown key(s) {', '.join(unknown)}")
     if missing:
@@ -418,6 +420,9 @@ def validate_source(root: Path, data: bytes) -> tuple[dict | None, list[str]]:
         return None, problems
     if source["schema"] != SCHEMA:
         problems.add(f"schema is {source['schema']!r}; this kit reads {SCHEMA!r}")
+    notes = source.get("notes", [])
+    if not (isinstance(notes, list) and all(isinstance(note, str) for note in notes)):
+        problems.add("notes: must be a list of text (the exporter's judgement calls)")
     if not (isinstance(source["programme"], str) and source["programme"].strip()):
         problems.add("programme must be the programme's name")
     if source["primary_branch"] != PRIMARY_BRANCH:

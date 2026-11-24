@@ -1,6 +1,6 @@
 {
   "title": "pk adopt source (program-kit.adoption.v1)",
-  "description": "The one file a programme that ran before the kit exports so that `pk adopt <file>` moves it onto the kit, once. Every top-level key is required and no other is allowed. Paths are repository-relative, posix, and name files or directories committed at HEAD.",
+  "description": "The one file a programme that ran before the kit exports so that `pk adopt <file>` moves it onto the kit, once. Every top-level key but notes is required and no other is allowed. Paths are repository-relative, posix, and name files or directories committed at HEAD.",
   "type": "object",
   "additionalProperties": false,
   "required": ["schema", "programme", "primary_branch", "legacy_phase_prefixes", "register", "statuses", "rulings",
@@ -25,9 +25,9 @@
         "type": "object", "additionalProperties": false, "required": ["task_id", "status"],
         "properties": {
           "task_id": {"type": "string", "minLength": 1},
-          "status": {"enum": ["done", "not_started"]},
-          "actor": {"type": "string"},
-          "updated_at": {"type": "string"},
+          "status": {"enum": ["done", "in_progress", "review", "blocked", "not_started"]},
+          "actor": {"type": "string", "description": "may be empty on a not_started entry"},
+          "updated_at": {"type": "string", "description": "may be empty on a not_started entry"},
           "references": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["path"],
                                                     "properties": {"path": {"type": "string", "minLength": 1}}}},
           "note": {"type": "string"}
@@ -88,6 +88,10 @@
         "path": {"type": "string", "minLength": 1, "description": "the legacy hand-off, copied byte for byte to program/legacy/HANDOFF.md"},
         "now": {"type": "string", "description": "the controller's one line: what it is doing"}
       }
+    },
+    "notes": {
+      "type": "array", "items": {"type": "string"},
+      "description": "optional: the exporter's judgement calls (values dropped, nulled or chosen), kept with the stored source"
     },
     "legacy_evidence_roots": {
       "type": "array", "uniqueItems": true,
