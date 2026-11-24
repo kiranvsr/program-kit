@@ -26,6 +26,15 @@ controller inspected, main must hold a merge of exactly that commit, the task mu
 main when it landed, and the light path's guard (no full-tier path, only light paths) is run again on what
 that merge brought in. A merge made by hand around a failed merge check is therefore never recorded `merged`,
 and a `merged` record written by hand does not validate.
+
+`adopted` (0.7.0, KA-2) is the status `pk adopt` gives a task the programme finished before it moved onto the kit.
+Only `pk adopt` writes it: `pk status set` refuses it as a target and as a source. It is terminal and satisfies a
+dependency exactly as `done` does (TERMINAL), but it is never `done`: it carries no kit acceptance and evidences
+nothing in a gate claim. The record keeps the source's `legacy_status`, `legacy_actor` and `legacy_updated_at` and the
+task's `references` into the legacy evidence, each {path, sha256}; `validate` checks that the frozen source lists the
+task as done with those paths, and that each path holds a blob at `adopted_commit` with that sha256. `pk status reopen`
+moves an adopted task to `in_progress` (full tier) with the reason as its audit line, so new work on it goes through
+the kit's whole loop. A source task that was in flight is imported `not_started` with its `legacy_status`.
 """
 from __future__ import annotations
 
@@ -42,10 +51,13 @@ import rulings as rulings_module
 import store
 from common import KitError, PRIMARY_BRANCH, find_root, git, read_json, read_text, run_argv, utc_now, write_json
 
-STATUSES = ("not_started", "in_progress", "review", "done", "blocked", "parked", "merged")
+STATUSES = ("not_started", "in_progress", "review", "done", "blocked", "parked", "merged", "adopted")
 ROLES = ("controller", "implementer", "qa")
 TIERS = ("full", "standard", "light")  # verification tiers; a record without the field is `full`
-TERMINAL = ("done", "merged")
+TERMINAL = ("done", "merged", "adopted")  # what satisfies a dependency; only `done` is a kit acceptance
+ADOPTED = "adopted"  # written by pk adopt alone (0.7.0)
+LEGACY_FIELDS = ("legacy_status", "legacy_actor", "legacy_updated_at", "references")  # from pk adopt; kept on every move
+LEGACY_STATUSES = ("done", "in_progress", "review", "blocked")  # the source states an imported record names
 ADHOC_ID = re.compile(r"AH-\d{4}\Z")  # work outside the register, listed in controller-state.json
 
 # (from, to) -> roles allowed to make that move.
@@ -68,7 +80,8 @@ FULL_PLANTED = 3  # the planted bugs of its own a full-tier acceptance must list
 
 _TASK_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 _FIELDS = ("task_id", "status", "role", "updated_at", "note", "evidence", "blocked_by", "history")
-_OPTIONAL_FIELDS = ("tier", "fast", "ruling", "inspected")  # the first three are absent before 0.3.0: full, not fast
+_OPTIONAL_FIELDS = ("tier", "fast", "ruling", "inspected",  # the first three are absent before 0.3.0: full, not fast
+                    *LEGACY_FIELDS)  # 0.7.0: an imported record's
 _SHA = re.compile(r"[0-9a-f]{40}\Z")  # `inspected`: on a merged record, the commit the controller read
 _TEXT_FIELDS = ("task_id", "role", "updated_at", "note")
 _ENTRY_FIELDS = ("status", "role", "at")
@@ -182,6 +195,7 @@ def _shape_problems(record) -> list[str]:
         problems.append("inspected is the full commit a merged record was inspected at, and nothing else")
     if "status" in record and (not isinstance(record["status"], str) or record["status"] not in STATUSES):
         problems.append(f"unknown status {record['status']!r}")
+    problems.extend(_legacy_shape_problems(record))
     for field in _TEXT_FIELDS:
         if field in record and not isinstance(record[field], str):
             problems.append(f"{field} must be text, not {record[field]!r}")
@@ -199,6 +213,34 @@ def _shape_problems(record) -> list[str]:
         else:
             problems.extend(f"{field} item {number} must be text, not {item!r}"
                             for number, item in enumerate(record[field], 1) if not isinstance(item, str))
+    return problems
+
+
+def _legacy_shape_problems(record: dict) -> list[str]:
+    """The shape of what `pk adopt` writes (0.7.0): an adopted record names the source's done and its references,
+    and only a record whose history starts at adoption carries references."""
+    problems = []
+    for field in ("legacy_actor", "legacy_updated_at"):
+        if field in record and not isinstance(record[field], str):
+            problems.append(f"{field} must be text, not {record[field]!r}")
+    if "legacy_status" in record and record["legacy_status"] not in LEGACY_STATUSES:
+        problems.append(f"legacy_status must be one of {', '.join(LEGACY_STATUSES)}, not {record['legacy_status']!r}")
+    references = record.get("references")
+    if "references" in record and not (isinstance(references, list) and all(
+            isinstance(item, dict) and set(item) == {"path", "sha256"} and isinstance(item["path"], str)
+            and isinstance(item["sha256"], str) for item in references)):
+        problems.append("references must be a list of {path, sha256}")
+    history = record.get("history")
+    first = history[0].get("status") if isinstance(history, list) and history and isinstance(history[0], dict) \
+        else None
+    if record.get("status") == ADOPTED:
+        if record.get("legacy_status") != "done" or "references" not in record:
+            problems.append("adopted is what pk adopt writes for a task the source lists as done: it carries "
+                            "legacy_status done and its references")
+        if first != ADOPTED or len(history) != 1:
+            problems.append("an adopted record's history is the one entry pk adopt wrote")
+    elif "references" in record and first != ADOPTED:
+        problems.append("references belong to a record pk adopt wrote (its history starts adopted)")
     return problems
 
 
@@ -567,6 +609,12 @@ def transition(root: Path, task_id: str, to: str, role: str, note: str = "",
         raise KitError(f"{task_id} is done and done is terminal; a change request creates a new task")
     if current == "merged":
         raise KitError(f"{task_id} is merged and merged is terminal; new work is a new task")
+    if current == ADOPTED:
+        raise KitError(f"{task_id} is adopted and adopted is terminal; new work on it starts with: pk status reopen "
+                       f"{task_id} --reason TEXT (back to in_progress, through the kit's whole loop)")
+    if to == ADOPTED:
+        raise KitError(f"{task_id}: adopted is written only by pk adopt, for a task the programme finished before it "
+                       "adopted the kit; new work ends at done, set by QA")
     allowed = TRANSITIONS.get((current, to))
     if allowed is None:
         raise KitError(f"{task_id}: {current} -> {to} is not allowed")
@@ -636,6 +684,7 @@ def transition(root: Path, task_id: str, to: str, role: str, note: str = "",
                "tier": tier, "fast": bool(fast), "ruling": ruling}
     if to == "merged":
         updated["inspected"] = inspected
+    updated.update({field: record[field] for field in LEGACY_FIELDS if field in record})  # where it came from
     refusal = ext.status_refusal(root, task_id, current, to, updated)  # 0.7.0: after every kit check; can only refuse
     if refusal:
         raise KitError(refusal)
@@ -709,6 +758,8 @@ def reopen(root: Path, task_id: str, reason: str, role: str = "controller", reje
     if task_id not in _registered(root):
         raise KitError(f"{task_id}: not a task in program/register.yaml")
     record = read(root, task_id)
+    if record["status"] == ADOPTED:
+        return _reopen_adopted(root, task_id, record, reason, role, reject)
     if record["status"] != "done":
         raise KitError(f"{task_id} is {record['status']}, not done; reopen is only for a done task "
                        f"({'a merged task is terminal and new work is a new task' if record['status'] == 'merged' else 'use pk status set'})")
@@ -723,6 +774,23 @@ def reopen(root: Path, task_id: str, reason: str, role: str = "controller", reje
     updated = dict(record, status=to, role=role, updated_at=now, note=reason,
                    history=[*record["history"], entry])
     refusal = ext.status_refusal(root, task_id, "done", to, updated)
+    if refusal:
+        raise KitError(refusal)
+    write_json(_record_path(root, task_id), updated)
+    return updated
+
+
+def _reopen_adopted(root: Path, task_id: str, record: dict, reason: str, role: str, reject: bool) -> dict:
+    """An adopted task back to `in_progress` for new work (0.7.0): the controller's dispatch, at the full tier, with the
+    reason as the audit line. The record keeps where it came from (legacy fields, references, the adopted entry)."""
+    if role != "controller" or reject:
+        raise KitError(f"{task_id}: an adopted task is reopened by the controller (new work is a dispatch), without "
+                       "--reject")
+    now = utc_now()
+    entry = {"status": "in_progress", "role": role, "at": now, "tier": "full", "reason": reason}
+    updated = dict(record, status="in_progress", role=role, updated_at=now, note=reason, tier="full", fast=False,
+                   ruling="", history=[*record["history"], entry])
+    refusal = ext.status_refusal(root, task_id, ADOPTED, "in_progress", updated)
     if refusal:
         raise KitError(refusal)
     write_json(_record_path(root, task_id), updated)
@@ -767,6 +835,7 @@ def validate(root: Path) -> list[str]:
     root = Path(root)
     folder = root / "program" / "status"
     problems: list[str] = []
+    imported = _Imported(root)
     for path in sorted(folder.glob("*.json")) if folder.is_dir() else []:
         name = path.stem
         try:
@@ -794,7 +863,9 @@ def validate(root: Path) -> list[str]:
         if state == "blocked" and not record["blocked_by"]:
             problems.append(f"{name}: blocked without blocked_by")
         problems.extend(_tier_history_problems(root, name, record))
-        if state in TERMINAL:
+        if "references" in record or state == ADOPTED:
+            problems.extend(imported.problems(name, record))
+        if state in ("done", "merged"):
             try:
                 problem = (_acceptance_problem(root, name) if state == "done"
                            else _merged_problem(root, name, record.get("inspected", "")))
@@ -802,7 +873,70 @@ def validate(root: Path) -> list[str]:
                 problem = f"{name}: {exc}"
             if problem:
                 problems.append(problem)
+    problems.extend(imported.gap_problems())
     return problems
+
+
+class _Imported:
+    """What `pk adopt` recorded, read once per validate: the adoption record and the frozen source's statuses."""
+
+    def __init__(self, root: Path):
+        self.root = root
+        self._loaded = False
+        self.record, self.statuses, self.problem = None, {}, None
+
+    def _load(self) -> None:
+        if self._loaded:
+            return
+        self._loaded = True
+        import adoption  # late: only a programme that adopted has imported records
+
+        try:
+            self.record = adoption.load(self.root)
+        except KitError as exc:
+            self.problem = str(exc)
+            return
+        if self.record is None:
+            self.problem = f"no {adoption.ADOPTION_FILE}: only pk adopt writes adopted records and references"
+            return
+        try:
+            source = read_json(self.root / self.record["source"])
+            items = source["statuses"]
+            self.statuses = {item["task_id"]: item for item in items if isinstance(item, dict)}
+        except (KitError, KeyError, TypeError) as exc:
+            self.problem = f"the frozen source {self.record['source']} does not read ({exc}); restore it from git"
+
+    def gap_problems(self) -> list[str]:
+        """Why `followup_gaps` of adoption.yaml is not what the frozen source gives (adoption.followup_gap_problems);
+        empty without adoption, and when adoption.yaml does not read (each imported record reports that)."""
+        import adoption  # late, as above
+
+        if not adoption.adopted(self.root):
+            return []
+        try:
+            record = adoption.load(self.root)
+        except KitError:
+            return []
+        return adoption.followup_gap_problems(self.root, record)
+
+    def problems(self, name: str, record: dict) -> list[str]:
+        """Why an imported record is not what pk adopt wrote from the frozen source, or its references do not hold."""
+        import adoption  # late, as above
+
+        self._load()
+        if self.problem:
+            return [f"{name}: {self.problem}"]
+        source = self.statuses.get(name)
+        if not (isinstance(source, dict) and source.get("status") == "done"):
+            return [f"{name}: {record['status']} with references, but the frozen source does not list {name} as "
+                    "done: only pk adopt writes adopted, from the source"]
+        listed = [item.get("path") for item in source.get("references") or [] if isinstance(item, dict)]
+        found = [item["path"] for item in record.get("references", [])]
+        if found != listed:
+            return [f"{name}: references {found} are not the paths the frozen source lists ({listed})"]
+        commit, roots = self.record["adopted_commit"], self.record["legacy_evidence_roots"]
+        return [problem for number, item in enumerate(record["references"], 1)
+                if (problem := adoption.reference_problem(self.root, item, commit, roots, f"{name}: reference {number}"))]
 
 
 def _tier_history_problems(root: Path, name: str, record: dict) -> list[str]:
@@ -867,9 +1001,10 @@ def cmd_status(args: argparse.Namespace) -> int:
     elif action == "show":
         print(json.dumps(read(_root(), args.task_id), indent=2))
     elif action == "list":
-        for record in list_all(_root()):
+        for record in list_all(_root()):  # an adopted task has no kit tier: it went through no kit gate
             print("\t".join([record["task_id"], record["status"], record["role"], record["updated_at"],
-                             tier_of(record) + ("+fast" if is_fast(record) else "")]))
+                             "-" if record["status"] == ADOPTED else tier_of(record) + ("+fast" if is_fast(record)
+                                                                                         else "")]))
     elif action == "ready":
         import progress
 
@@ -908,8 +1043,8 @@ def _configure(parser: argparse.ArgumentParser) -> None:
                                                                    "fast path or the lower tier")
     setter.add_argument("--inspected", default="", metavar="SHA",
                         help="with merged: the full commit whose diff the controller read, now merged into main")
-    reopener = actions.add_parser("reopen", help="move a done task back to review (or, for QA, to in_progress), "
-                                                 "with a reason kept in its history")
+    reopener = actions.add_parser("reopen", help="move a done task back to review (or, for QA, to in_progress), or "
+                                                 "an adopted task to in_progress, with a reason kept in its history")
     reopener.add_argument("task_id")
     reopener.add_argument("--reason", required=True, help="why: late work after acceptance, or QA's rejection")
     reopener.add_argument("--role", default="controller", help="controller or qa (default controller)")

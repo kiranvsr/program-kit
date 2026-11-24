@@ -414,6 +414,7 @@ class Evidence(_MirrorCleanup):
         self.reused_from: dict | None = None  # {path, digest, head} of the record a reused run copied (0.5.2)
         self.planted_bugs_timing: dict | None = None  # {seconds, rows, workers} of the judged rows (0.5.3)
         self.plants_reused_from: list[dict] | None = None  # plants records of the reused record (0.5.3)
+        self.references: list[dict] = []  # {path, sha256} of legacy evidence the work builds on (0.7.0)
 
     @classmethod
     def judging_at(cls, root, head: str) -> "Evidence":
@@ -486,6 +487,34 @@ class Evidence(_MirrorCleanup):
         found = dict(sorted(found.items()))
         self.inputs = dict(sorted({**self.inputs, **found}.items()))
         return found
+
+    # --- references (0.7.0) -----------------------------------------------------
+
+    def reference(self, path: str) -> dict:
+        """Cite a file of an adopted programme's legacy evidence: {path, sha256} of its blob at HEAD, kept in the
+        record's `references`, never in its inputs.
+
+        A reference says "this builds on that old record" without re-binding it: it never makes the record drift and
+        never counts toward its commands or planted bugs. The path must lie under `legacy_evidence_roots` of
+        `program/adoption.yaml` and be a regular file committed at HEAD (never a symbolic link, nor a path below
+        one); the gate checks it again at the record's head.
+        """
+        import adoption  # late: only an adopted programme cites legacy evidence
+
+        path = self._norm(path)
+        roots = adoption.evidence_roots(self.root)
+        if not roots:
+            raise KitError(f"reference {path}: only an adopted programme cites legacy evidence "
+                           f"(no legacy_evidence_roots: {adoption.ADOPTION_FILE} does not exist)")
+        if not adoption.under_roots(path, roots):
+            raise KitError(f"reference {path} is not under the legacy evidence roots ({', '.join(roots)}); a file "
+                           "of this programme's own work is an input (hash_inputs)")
+        data, why = adoption.committed_file(self.root, "HEAD", path, "HEAD")
+        if data is None:
+            raise KitError(f"reference {path} {why}")
+        found = {"path": path, "sha256": sha256_bytes(data)}
+        self.references = [item for item in self.references if item["path"] != path] + [found]
+        return dict(found)
 
     # --- commands --------------------------------------------------------------
 
@@ -912,6 +941,8 @@ class Evidence(_MirrorCleanup):
             data["planted_bugs_timing"] = dict(self.planted_bugs_timing)
         if self.plants_reused_from is not None:
             data["plants_reused_from"] = [dict(item) for item in self.plants_reused_from]
+        if self.references:
+            data["references"] = [dict(item) for item in self.references]
         # last line of defence: never append what validate or the lint would refuse
         problems = validate_results(data) + lint_record(data, self.root)
         if problems:
@@ -1448,6 +1479,13 @@ def validate_results(data) -> list[str]:
         bad("plants_reused_from", "must be a list of {path, digest: sha256} of the plants records of the reused record")
     if "plants_reused_from" in data and "reused_from" not in data:
         bad("plants_reused_from", "belongs to a record that reused another (reused_from)")
+    references = data.get("references")
+    if "references" in data and not (isinstance(references, list) and references and all(
+            isinstance(item, dict) and set(item) == {"path", "sha256"} and isinstance(item["path"], str)
+            and item["path"] and isinstance(item["sha256"], str) and _HEX64.match(item["sha256"])
+            for item in references) and len({item["path"] for item in references}) == len(references)):
+        bad("references", "must be a non-empty list of {path, sha256} with distinct paths (legacy evidence the work "
+                          "cites; Evidence.reference writes it)")
     children = data.get("children", [])
     if not isinstance(children, list) or not all(
             isinstance(child, dict) and set(child) == {"task_id", "kind", "digest", "drift"}
@@ -1747,7 +1785,24 @@ def gate_problems(data, task_id: str, head: str | None = None, root=None) -> lis
         if missing:
             problems.append(f"planted_bugs[{index}]: does not record {', '.join(missing)} (what was planted and "
                             "the commands that ran)")
+    if data.get("references") and root is not None:
+        problems.extend(reference_problems(data, root))
     return problems
+
+
+def reference_problems(data: dict, root) -> list[str]:
+    """Why a results record's `references` (0.7.0) do not hold: each must lie under the adopted programme's
+    `legacy_evidence_roots` and name a blob at the record's `head` with the recorded sha256. Never an input: a later
+    change to the file does not touch the record."""
+    import adoption  # late: only an adopted programme cites legacy evidence
+
+    try:
+        roots = adoption.evidence_roots(Path(root))
+    except KitError as exc:
+        return [f"references: {exc}"]
+    return [problem for number, item in enumerate(data["references"], 1)
+            if (problem := adoption.reference_problem(Path(root), item, data["head"], roots,
+                                                      f"references[{number}]"))]
 
 
 # --- command -----------------------------------------------------------------------
@@ -1875,7 +1930,8 @@ def _check_tree(args) -> int:
 
 
 def _history(args) -> int:
-    rows = store.history(find_root(), args.task_id)
+    root = find_root()
+    rows = store.history(root, args.task_id)
     if not rows:
         print(f"{args.task_id}: no records under program/evidence/{args.task_id}/")
         return 0
@@ -1891,7 +1947,37 @@ def _history(args) -> int:
         if row["altered"]:
             fields.append(row["altered"])
         print("\t".join(fields))
+        for line in reference_lines(root, row["references"], row["head"]):
+            print(line)
     return 0
+
+
+def describe_reference(root, path: str, commit: str) -> str:
+    """How a `reference_resolver` extension describes the legacy file at `commit` (0.7.0), for display only: ` (kind
+    task: summary)`, or '' when none is registered, none answers or the file does not read there."""
+    import ext  # late: display only
+
+    try:
+        registry = ext.load(Path(root))
+    except KitError:
+        return ""
+    if registry is None or not registry.resolvers:
+        return ""
+    shown = subprocess.run(["git", "-C", str(root), "cat-file", "blob", f"{commit}:{path}"], capture_output=True)
+    if shown.returncode != 0:
+        return ""
+    said = ext.resolve_reference(root, path, shown.stdout)
+    if not said:
+        return ""
+    who = " ".join(part for part in (said.get("task_id", ""), said.get("decision", "")) if part)
+    return f" ({said['kind']}{' ' + who if who else ''}: {' '.join(said['summary'].split())})"
+
+
+def reference_lines(root, references, commit: str) -> list[str]:
+    """`  reference <path> sha256 <digest>` per cited legacy file, with the resolver's description when there is one."""
+    return [f"  reference {item.get('path')} sha256 {item.get('sha256')}"
+            + (describe_reference(root, str(item.get("path")), commit) if commit else "")
+            for item in references if isinstance(item, dict)]
 
 
 def accept(root, task_id: str, data) -> dict:

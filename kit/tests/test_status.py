@@ -123,7 +123,8 @@ class StatusTests(unittest.TestCase):
 
     # table
     def test_table_is_exactly_the_spec(self):
-        self.assertEqual(status.STATUSES, ("not_started", "in_progress", "review", "done", "blocked", "parked", "merged"))
+        self.assertEqual(status.STATUSES, ("not_started", "in_progress", "review", "done", "blocked", "parked", "merged",
+                                           "adopted"))  # adopted (0.7.0): written by pk adopt alone
         self.assertEqual(status.TRANSITIONS, {
             ("not_started", "in_progress"): {"controller"},
             ("in_progress", "review"): {"implementer"},
@@ -598,7 +599,8 @@ class StatusTests(unittest.TestCase):
         rec = self.to_review()
         self.assertEqual(set(schema["required"]) | {"tier", "fast", "ruling"}, set(rec))  # a 0.2 record has no tier
         self.assertEqual(schema["properties"]["status"]["enum"], list(status.STATUSES))
-        self.assertEqual(set(schema["properties"]), set(rec) | {"inspected"})  # on a merged record only
+        self.assertEqual(set(schema["properties"]), set(rec) | {"inspected"}  # on a merged record only
+                         | set(status.LEGACY_FIELDS))  # 0.7.0: on what pk adopt writes
         self.assertEqual(schema["properties"]["inspected"]["pattern"], "^" + status._SHA.pattern.replace("\\Z", "$"))
 
 

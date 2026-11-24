@@ -12,9 +12,9 @@ record in the stored copy of the source. The command:
 2. validates the whole source before writing anything, and prints every problem when it fails;
 3. copies the legacy rulings log and hand-off into `program/legacy/` byte for byte, and the source to
    `program/legacy/adoption-source.json`;
-4. writes `program/register.yaml`, the controller state (follow-ups with their own IDs and `followups_issued`,
-   ad-hoc tasks as AH-<nnnn> keeping `legacy_id`, the now line), `program/costs.jsonl` with every kit key filled,
-   and last `program/adoption.yaml`;
+4. writes `program/register.yaml`, the status records (below), the controller state (follow-ups with their own IDs
+   and `followups_issued`, ad-hoc tasks as AH-<nnnn> keeping `legacy_id`, the now line), `program/costs.jsonl` with
+   every kit key filled, and last `program/adoption.yaml`;
 5. runs `pk register validate`, `pk status validate`, `pk handoff update` and `pk doctor`, and when any of them fails
    puts every file it wrote back as it was.
 
@@ -23,9 +23,23 @@ an extension registered under that name (`api.adopt_importer`, ext.py) is called
 dict it returns is written as JSON and then validated and stored exactly as a file's bytes would be.
 
 `--dry-run` stops after step 2 and prints the plan and the counts; it is the kit's before or after `--from`, and an
-importer never receives it. The command never commits: the controller commits `program/` as one commit. Status
-records are written by batch KA-2's importer (`_write_statuses`); until then a source whose `statuses` list is not
-empty is refused, so nothing is half adopted.
+importer never receives it. The command never commits: the controller commits `program/` as one commit.
+
+Statuses and the generic import rules (0.7.0, KA-2; spec 2.3 and 2.6a):
+
+- a source `done` becomes `adopted` (status.py), with the source's actor and time as `legacy_actor` and
+  `legacy_updated_at` and each reference as {path, sha256}: the path must lie under `legacy_evidence_roots` and be a
+  regular file committed at HEAD (never a symbolic link, nor a path below one), whose blob's sha256 is recorded
+  (`adopted_commit` is HEAD);
+- a source `in_progress`, `review` or `blocked` task is imported `not_started` with `legacy_status`, and a follow-up
+  "re-dispatch <ID> (was <state> at adoption)" is opened for it, so it re-enters the kit's loop by a dispatch;
+- a source `not_started` task (a parked one has no status file) writes no record, and its note, when it has one,
+  becomes a follow-up "<ID> was parked at adoption: <note>"; a `not_started` entry may carry an empty actor and time;
+- the register is held to shape, not granularity: what the kit's size, fan-in, role and gate-ID rules would refuse is
+  recorded in `adoption.yaml` as `legacy_register: {tasks, gates, roles}` (register.deviations) and kept as it is
+  until the entry changes;
+- follow-up IDs the source lacks below `followups.next` are recorded as `followup_gaps` and accepted exactly; every
+  follow-up opened by the import is numbered from `followups.next` on.
 """
 from __future__ import annotations
 
@@ -43,7 +57,7 @@ import miniyaml
 import register as register_module
 import rulings as rulings_module
 from common import (KitError, PRIMARY_BRANCH, find_root, git, read_json, read_yaml, sha256_bytes, utc_now,
-                    write_yaml)
+                    write_json, write_yaml)
 
 SCHEMA = "program-kit.adoption.v1"
 KIT_DIR = Path(__file__).resolve().parent.parent
@@ -52,7 +66,9 @@ SOURCE_KEYS = ("schema", "programme", "primary_branch", "legacy_phase_prefixes",
                "followups", "adhoc", "costs", "handoff", "legacy_evidence_roots")
 OPTIONAL_SOURCE_KEYS = ("notes",)  # the exporter's judgement calls, kept with the stored source
 STATUS_KEYS = ("task_id", "status", "actor", "updated_at", "references", "note")
-STATUS_VALUES = ("done", "in_progress", "review", "blocked", "not_started")  # read for shape: KA-2 imports them
+STATUS_VALUES = ("done", "in_progress", "review", "blocked", "not_started")
+IN_FLIGHT = ("in_progress", "review", "blocked")  # imported not_started, with a re-dispatch follow-up
+FOLLOWUP_AREA = "adoption"  # the area of every follow-up the import opens
 OPEN_KEYS = ("id", "area", "item", "added", "tags")
 CLOSED_KEYS = ("id", "area", "item", "reason", "added", "tags", "dup_of")
 ADHOC_KEYS = ("legacy_id", "title", "state", "note")
@@ -61,7 +77,6 @@ ADHOC_STATE = {**{state: state for state in ctlstate.ADHOC_STATES}, "done": "clo
 COST_TEXT = ("at", "task", "role", "model")
 COST_NUMBERS = ("tokens", "tool_calls", "seconds")
 POST_CHECKS = (("register", "validate"), ("status", "validate"), ("handoff", "update"), ("doctor",))
-KA2_STATUSES = "statuses import arrives in KA-2"
 _FOLLOWUP = re.compile(r"F-(\d{4})\Z", re.ASCII)
 SHOWN = 20  # missing follow-up IDs named in one problem line
 
@@ -188,12 +203,13 @@ def _tracked_file(root: Path, path, what: str, problems: _Problems) -> Path | No
     return root / path
 
 
-def _statuses(source: dict, problems: _Problems) -> list[dict]:
+def _statuses(root: Path, source: dict, task_ids: set[str], roots: list[str], problems: _Problems) -> list[dict]:
+    """The status entries as `_write_statuses` writes them: each done task with its references' digests at HEAD."""
     items = source["statuses"]
     if not isinstance(items, list):
         problems.add("statuses: must be a list")
         return []
-    seen = set()
+    seen, found = set(), []
     for number, entry in enumerate(items, 1):
         who = f"statuses[{number}]"
         if not _keys(entry, STATUS_KEYS, ("task_id", "status"), who, problems):
@@ -202,22 +218,45 @@ def _statuses(source: dict, problems: _Problems) -> list[dict]:
         if task_id in seen:
             problems.add(f"{who}: {task_id} is listed twice")
         seen.add(task_id)
-        if entry["status"] not in STATUS_VALUES:
-            problems.add(f"{who}: status {entry['status']!r} must be one of {', '.join(STATUS_VALUES)}")
-        for key in ("actor", "updated_at", "note"):
-            _text(entry, key, who, problems)
+        if task_id and task_id not in task_ids:
+            problems.add(f"{who}: {task_id} is not a task of the source register")
+        state = entry["status"]
+        if state not in STATUS_VALUES:
+            problems.add(f"{who}: status {state!r} must be one of {', '.join(STATUS_VALUES)}")
+            continue
+        texts = {key: _text(entry, key, who, problems, required=key != "note" and state != "not_started")
+                 for key in ("actor", "updated_at", "note")}
         references = entry.get("references", [])
         if not isinstance(references, list):
             problems.add(f"{who}: references must be a list")
             continue
+        if references and state != "done":
+            problems.add(f"{who}: references belong to a done task (adopted); {task_id} is {state}")
+            continue
+        bound, paths = [], set()
         for index, reference in enumerate(references, 1):
-            if _keys(reference, ("path",), ("path",), f"{who}.references[{index}]", problems):
-                problem = adoption.relative_path_problem(reference["path"], f"{who}.references[{index}].path")
-                if problem:
-                    problems.add(problem)
-    if items:
-        problems.add(f"statuses: {len(items)} listed; {KA2_STATUSES} (export an empty statuses list until then)")
-    return items
+            where = f"{who}.references[{index}]"
+            if not _keys(reference, ("path",), ("path",), where, problems):
+                continue
+            path = reference["path"]
+            problem = adoption.relative_path_problem(path, f"{where}.path")
+            if problem:
+                problems.add(problem)
+                continue
+            if path in paths:
+                problems.add(f"{where}: {path} is listed twice for {task_id}")
+                continue
+            paths.add(path)
+            if not adoption.under_roots(path, roots):
+                problems.add(f"{where}: {path} is not under legacy_evidence_roots ({', '.join(roots) or 'none'})")
+                continue
+            data, why = adoption.committed_file(root, "HEAD", path, "HEAD")
+            if data is None:
+                problems.add(f"{where}: {path} {why}")
+                continue
+            bound.append({"path": path, "sha256": sha256_bytes(data)})
+        found.append({"task_id": task_id, "status": state, **texts, "references": bound})
+    return found
 
 
 def _rulings(root: Path, source: dict, problems: _Problems) -> tuple[Path | None, int, list[int]]:
@@ -287,16 +326,15 @@ def _followups(source: dict, problems: _Problems) -> dict | None:
     beyond = sorted(f"F-{n:04d}" for n in found if n >= issued)
     if beyond:
         problems.add(f"followups: {', '.join(beyond[:SHOWN])} at or past followups.next F-{issued:04d}")
-    missing = [f"F-{n:04d}" for n in range(1, issued) if n not in found]
-    if missing:
-        problems.add(f"followups: F-0001 to F-{issued - 1:04d} must all be listed, open or closed; missing "
-                     f"{len(missing)}: {', '.join(missing[:SHOWN])}{' and more' if len(missing) > SHOWN else ''}")
+    # a gap below the import point is recorded (adoption.yaml followup_gaps) and accepted exactly, never filled
+    gaps = adoption.missing_followups(issued, found)
     for item in lists["closed"]:
         if item["duplicate_of"] and not (_FOLLOWUP.match(item["duplicate_of"])
                                          and int(item["duplicate_of"][2:]) in found):
             problems.add(f"followups.closed {item['id']}: dup_of {item['duplicate_of']} is not a follow-up of the "
                          "source")
-    return {"followups": lists["open"], "closed_followups": lists["closed"], "followups_issued": issued - 1}
+    return {"followups": lists["open"], "closed_followups": lists["closed"], "followups_issued": issued - 1,
+            "gaps": gaps}
 
 
 def _adhoc(source: dict, task_ids: set[str], problems: _Problems) -> list[dict]:
@@ -386,7 +424,10 @@ def _evidence_roots(root: Path, source: dict, problems: _Problems) -> list[str]:
     return list(roots)
 
 
-def _register(root: Path, source: dict, prefixes: tuple[str, ...], problems: _Problems) -> set[str]:
+def _register(root: Path, source: dict, prefixes: tuple[str, ...], problems: _Problems,
+              held: dict | None = None) -> set[str]:
+    """The source register's task IDs; checked for shape only, and `held` gets what is grandfathered
+    (register.deviations: the tasks, gate IDs and roles the kit's granularity rules would refuse)."""
     document = source["register"]
     if not (isinstance(document, dict) and set(document) == {"phases"} and isinstance(document["phases"], list)):
         problems.add("register: must be an object with one key, phases, a list (the shape of program/register.yaml)")
@@ -394,8 +435,13 @@ def _register(root: Path, source: dict, prefixes: tuple[str, ...], problems: _Pr
     env_path = root / "program" / "environments.yaml"
     try:
         environments = read_yaml(env_path) if env_path.exists() else None
-        found = register_module.validate(document, environments, read_yaml(KIT_DIR / "interview" / "roles.yaml"),
-                                         prefixes)
+        roles = read_yaml(KIT_DIR / "interview" / "roles.yaml")
+        legacy = register_module.deviations(document, roles)
+        if held is not None:
+            held.update(legacy)
+        found = register_module.validate(document, environments, roles, prefixes,
+                                         {**{key: set(value) for key, value in legacy.items()},
+                                          "entries": register_module.adopted_entries(document)})
     except KitError as exc:
         found = [str(exc)]
     problems.extend(f"register: {problem}" for problem in found)
@@ -443,8 +489,10 @@ def validate_source(root: Path, data: bytes) -> tuple[dict | None, list[str]]:
     prefixes = tuple(prefix for prefix in prefixes if not adoption.prefix_problem(prefix))
     if len(set(prefixes)) != len(prefixes):
         problems.add("legacy_phase_prefixes lists a prefix twice")
-    task_ids = _register(root, source, prefixes, problems)
-    statuses = _statuses(source, problems)
+    held: dict = {}
+    task_ids = _register(root, source, prefixes, problems, held)
+    roots = _evidence_roots(root, source, problems)
+    statuses = _statuses(root, source, task_ids, roots, problems)
     rulings_path, start, legacy_numbers = _rulings(root, source, problems)
     followups = _followups(source, problems)
     adhoc = _adhoc(source, task_ids, problems)
@@ -454,22 +502,60 @@ def validate_source(root: Path, data: bytes) -> tuple[dict | None, list[str]]:
     if _keys(handoff, ("path", "now"), ("path", "now"), "handoff", problems):
         handoff_path = _tracked_file(root, handoff["path"], "handoff.path", problems)
         now = " ".join(_text(handoff, "now", "handoff", problems).split())
-    roots = _evidence_roots(root, source, problems)
     if problems:
         return None, problems
-    state = ctlstate.parse({"stage": {}, "queued": {}, "parked": {}, "adhoc": adhoc, **followups, "now": now})
+    gaps = followups.pop("gaps")
+    opened = _import_followups(statuses, followups["followups_issued"])
+    if followups["followups_issued"] + len(opened) > 9999:
+        return None, [f"followups: the import opens {len(opened)} follow-up(s) past F-{followups['followups_issued']:04d}"
+                      "; follow-up IDs run to F-9999"]
+    followups["followups"] = [*followups["followups"], *opened]
+    followups["followups_issued"] += len(opened)
+    state = ctlstate.parse({"stage": {}, "queued": {}, "parked": {}, "adhoc": adhoc, **followups, "now": now},
+                           frozenset(int(gap[2:]) for gap in gaps))
     return {"source": source, "prefixes": list(prefixes), "statuses": statuses, "rulings_path": rulings_path,
             "ruling_start": start, "legacy_rulings": legacy_numbers, "state": state, "costs": costs,
-            "handoff_path": handoff_path, "evidence_roots": roots, "tasks": task_ids}, []
+            "handoff_path": handoff_path, "evidence_roots": roots, "tasks": task_ids, "followup_gaps": gaps,
+            "legacy_register": held, "opened": opened}, []
+
+
+def _import_followups(statuses: list[dict], issued: int) -> list[dict]:
+    """The follow-ups the import opens, numbered after the source's: one "re-dispatch" per task in flight, one per
+    parked task whose note gives the reason."""
+    added, opened = utc_now()[:10], []
+    for entry in statuses:
+        if entry["status"] in IN_FLIGHT:
+            item = f"re-dispatch {entry['task_id']} (was {entry['status']} at adoption)"
+        elif entry["status"] == "not_started" and entry["note"].strip():
+            item = f"{entry['task_id']} was parked at adoption: {' '.join(entry['note'].split())}"
+        else:
+            continue
+        opened.append({"id": f"F-{issued + len(opened) + 1:04d}", "area": FOLLOWUP_AREA, "item": item,
+                       "added": added, "tags": []})
+    return opened
 
 
 # --- steps 3 to 5: writing, checking, undoing ----------------------------------------------
 
-def _write_statuses(root: Path, plan: dict) -> list[str]:
-    """KA-2 writes the imported status records here (`adopted` and `not_started`) and returns their paths. Until
-    then the source's statuses list is empty (validate_source refuses any other) and nothing is written."""
-    assert not plan["statuses"], KA2_STATUSES
-    return []
+def _write_statuses(root: Path, plan: dict, stamp: str) -> list[str]:
+    """The imported status records (`adopted`, and `not_started` with `legacy_status` for a task that was in flight);
+    their paths. A source `not_started` task writes none: no record is not started."""
+    written = []
+    for entry in plan["statuses"]:
+        state = entry["status"]
+        if state == "not_started":
+            continue
+        record = {"task_id": entry["task_id"], "status": "not_started", "role": "", "updated_at": "",
+                  "note": entry["note"], "evidence": [], "blocked_by": [], "history": [], "legacy_status": state,
+                  "legacy_actor": entry["actor"], "legacy_updated_at": entry["updated_at"]}
+        if state == "done":
+            record.update(status="adopted", role="controller", updated_at=stamp,
+                          history=[{"status": "adopted", "role": "controller", "at": stamp}],
+                          references=entry["references"])
+        rel = f"program/status/{entry['task_id']}.json"
+        write_json(root / rel, record)
+        written.append(rel)
+    return written
 
 
 def _snapshot(root: Path) -> tuple[dict[str, bytes], set[str]]:
@@ -505,6 +591,7 @@ def _restore(root: Path, saved: tuple[dict[str, bytes], set[str]]) -> None:
 
 def _write(root: Path, plan: dict, data: bytes) -> list[str]:
     """Steps 3 and 4; returns the paths written (adoption.yaml last)."""
+    stamp = utc_now()
     legacy = root / adoption.LEGACY_DIR
     legacy.mkdir(parents=True)
     (root / adoption.SOURCE_COPY).write_bytes(data)
@@ -514,7 +601,8 @@ def _write(root: Path, plan: dict, data: bytes) -> list[str]:
     written = [adoption.SOURCE_COPY, adoption.LEGACY_RULINGS, adoption.LEGACY_HANDOFF]
     write_yaml(root / "program" / "register.yaml", plan["source"]["register"])
     written.append("program/register.yaml")
-    written += _write_statuses(root, plan)
+    statuses = _write_statuses(root, plan, stamp)
+    written += [f"program/status/ ({len(statuses)} records)"] if statuses else []
     ctlstate.save(root, plan["state"])
     written.append(ctlstate.STATE_FILE)
     if plan["costs"]:
@@ -522,11 +610,12 @@ def _write(root: Path, plan: dict, data: bytes) -> list[str]:
             handle.writelines(json.dumps(row, sort_keys=True) + "\n" for row in plan["costs"])
         written.append(cost_module.COST_FILE)
     write_yaml(root / adoption.ADOPTION_FILE, {
-        "adopted_at": utc_now(), "adopted_commit": git(root, "rev-parse", "HEAD"),
+        "adopted_at": stamp, "adopted_commit": git(root, "rev-parse", "HEAD"),
         "source": adoption.SOURCE_COPY, "source_sha256": sha256_bytes(data),
         "legacy_phase_prefixes": plan["prefixes"], "ruling_start": plan["ruling_start"],
         "legacy_rulings": adoption.LEGACY_RULINGS, "legacy_rulings_sha256": sha256_bytes(rulings_bytes),
-        "legacy_handoff": adoption.LEGACY_HANDOFF, "legacy_evidence_roots": plan["evidence_roots"]})
+        "legacy_handoff": adoption.LEGACY_HANDOFF, "legacy_evidence_roots": plan["evidence_roots"],
+        "followup_gaps": plan["followup_gaps"], "legacy_register": plan["legacy_register"]})
     written.append(adoption.ADOPTION_FILE)
     return written
 
@@ -554,11 +643,18 @@ def _summary(plan: dict) -> list[str]:
         f"programme: {plan['source']['programme']}",
         f"register: {len(plan['tasks'])} tasks (" + ", ".join(f"{k} {v}" for k, v in sorted(by_prefix.items()))
         + f"); legacy phase prefixes: {', '.join(plan['prefixes']) or 'none'}",
-        f"statuses: {len(plan['statuses'])}",
+        _statuses_line(plan["statuses"]),
+        "held to shape (legacy_register): " + "; ".join(
+            f"{len(names)} {key}" + (f" ({', '.join(names[:SHOWN])}{', ...' if len(names) > SHOWN else ''})"
+                                     if names and key != "tasks" else "")
+            for key, names in plan["legacy_register"].items()),
         f"rulings: {len(legacy)} legacy (R{legacy[0]} to R{legacy[-1]}) frozen in {adoption.LEGACY_RULINGS}; "
         f"the kit issues R{plan['ruling_start']} next",
         f"follow-ups: {len(state['followups'])} open, {len(state['closed_followups'])} closed; next "
-        f"F-{state['followups_issued'] + 1:04d}",
+        f"F-{state['followups_issued'] + 1:04d} ({len(plan['opened'])} opened by the import; "
+        f"{len(plan['followup_gaps'])} gap(s) below the import point, kept as followup_gaps"
+        + (f": {', '.join(plan['followup_gaps'][:SHOWN])}{', ...' if len(plan['followup_gaps']) > SHOWN else ''}"
+           if plan["followup_gaps"] else "") + ")",
         f"ad-hoc tasks: {len(state['adhoc'])} (AH-0001 to AH-{len(state['adhoc']):04d}, keeping legacy_id)"
         if state["adhoc"] else "ad-hoc tasks: 0",
         f"cost lines: {len(costs)} ({sum(1 for row in costs if row.get('legacy_task'))} legacy_task, {mapped} mapped "
@@ -566,6 +662,16 @@ def _summary(plan: dict) -> list[str]:
         f"legacy hand-off: {adoption.LEGACY_HANDOFF}; legacy evidence roots: "
         f"{', '.join(plan['evidence_roots']) or 'none'}",
     ]
+
+
+def _statuses_line(statuses: list[dict]) -> str:
+    count = {state: sum(entry["status"] == state for entry in statuses) for state in STATUS_VALUES}
+    flight = sum(count[state] for state in IN_FLIGHT)
+    noted = sum(1 for entry in statuses if entry["status"] == "not_started" and entry["note"].strip())
+    references = sum(len(entry["references"]) for entry in statuses)
+    return (f"statuses: {len(statuses)}: {count['done']} adopted ({references} references), {flight} in flight "
+            f"imported as not_started with a re-dispatch follow-up, {count['not_started']} not_started ({noted} with a "
+            "park note, kept as a follow-up)")
 
 
 def importer_source(root: Path, argv: list[str]) -> bytes:
@@ -604,7 +710,9 @@ def adopt(root: Path, source_path: Path | None, dry_run: bool = False, data: byt
     if dry_run:
         return ["dry run: nothing written", *lines,
                 "would write: program/legacy/ (rulings.md, HANDOFF.md, adoption-source.json), program/register.yaml, "
-                "program/controller-state.json" + (", program/costs.jsonl" if plan["costs"] else "")
+                + (f"program/status/ ({sum(e['status'] != 'not_started' for e in plan['statuses'])} records), "
+                   if any(e["status"] != "not_started" for e in plan["statuses"]) else "")
+                + "program/controller-state.json" + (", program/costs.jsonl" if plan["costs"] else "")
                 + ", program/adoption.yaml"]
     saved = _snapshot(root)  # program/ is a fresh install here (step 1): a handful of files
     try:

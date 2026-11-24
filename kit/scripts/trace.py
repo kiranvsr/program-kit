@@ -35,9 +35,10 @@ _KINDS = {  # kind -> (pattern, how it is written)
     "task": (register_module.TASK_ID, "P<n>-M<nn>-S<nn>-T<nn>"),
     "closes": (register_module.CLOSES_ID, "REQ-<nnn>, NFR-<nnn> or J<n>"),
 }
-_NOT_STARTED, _IN_FLIGHT, _DONE, _MERGED = "not_started", "in_flight", "done", "merged"
+_NOT_STARTED, _IN_FLIGHT, _DONE, _MERGED, _ADOPTED = "not_started", "in_flight", "done", "merged", "adopted"
 _BUCKET = {"done": _DONE, "in_progress": _IN_FLIGHT, "review": _IN_FLIGHT, "blocked": _IN_FLIGHT,
-           "merged": _MERGED}  # merged: a light-tier task that landed; terminal like done, and it evidences nothing
+           "merged": _MERGED,  # merged: a light-tier task that landed; terminal like done, and it evidences nothing
+           "adopted": _ADOPTED}  # 0.7.0: finished before the programme adopted the kit; never done
 
 
 def _path(root: Path, name: str) -> Path:
@@ -355,6 +356,8 @@ def impact(root: Path, ids: list[str]) -> dict:
     states = {record["task_id"]: record["status"] for record in status_module.list_all(root)}
     hit = reached_reqs | named_journeys
     buckets: dict[str, list[str]] = {_DONE: [], _MERGED: [], _IN_FLIGHT: [], _NOT_STARTED: []}
+    if "adopted" in states.values():  # 0.7.0: its own bucket, only where there are adopted tasks
+        buckets[_ADOPTED] = []
     for task_id in sorted(closes):
         if closes[task_id] & hit:
             buckets[_BUCKET.get(states.get(task_id, "not_started"), _NOT_STARTED)].append(task_id)

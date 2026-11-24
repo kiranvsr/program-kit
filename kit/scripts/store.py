@@ -423,7 +423,7 @@ def _record_files(root) -> list[str]:
 
 
 def history(root, task_id: str) -> list[dict]:
-    """Every record of `task_id`, newest first: {kind, digest, path, head, at, decision, current, altered}.
+    """Every record of `task_id`, newest first: {kind, digest, path, head, at, decision, current, altered, references}.
 
     `current` is true for the record the task's pointer names; `altered` names a record whose bytes no longer match
     its name."""
@@ -451,6 +451,8 @@ def history(root, task_id: str) -> list[dict]:
                          "head": str(data.get("source_commit" if kind == "acceptance" else "head", "")),
                          "at": str(data.get("accepted_at" if kind == "acceptance" else "produced_at", "")),
                          "decision": str(data.get("decision", "")) if kind == "acceptance" else "",
+                         "references": data["references"] if kind == "results" and isinstance(
+                             data.get("references"), list) else [],  # 0.7.0: legacy evidence the record cites
                          "current": (rel in listed) if kind == PLANTS else (
                              current is not None and current["path"] == rel and current["digest"] == digest),
                          "altered": altered(rel, raw)})

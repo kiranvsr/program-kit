@@ -9,17 +9,21 @@ from R1, no legacy log. With it:
   follow (register.valid_id decides, at every site that checks a task ID);
 - the kit issues rulings from `ruling_start` upward in `program/rulings.md`; the rulings below it are read from the
   frozen byte copy of the old log, `legacy_rulings` (`pk rulings show R<n>`), and a new ruling may supersede one;
-- `pk doctor` checks that the copied source and the legacy log still match the digests recorded at adoption.
+- `pk doctor` checks that the copied source and the legacy log still match the digests recorded at adoption, and
+  `pk doctor` and `pk status validate` re-derive `followup_gaps` from that digest-checked source and refuse a list
+  that differs from it.
 
 Every key is required and no other key is allowed. The file and everything under `program/legacy/` are always
 guarded: no task branch may change them (gate.ALWAYS_GUARDED).
 """
 from __future__ import annotations
 
+import json
 import re
+import subprocess
 from pathlib import Path
 
-from common import KitError, read_yaml, sha256_file
+from common import KitError, read_yaml, sha256_bytes, sha256_file
 
 ADOPTION_FILE = "program/adoption.yaml"
 LEGACY_DIR = "program/legacy/"
@@ -27,7 +31,10 @@ SOURCE_COPY = "program/legacy/adoption-source.json"
 LEGACY_RULINGS = "program/legacy/rulings.md"
 LEGACY_HANDOFF = "program/legacy/HANDOFF.md"
 KEYS = ("adopted_at", "adopted_commit", "source", "source_sha256", "legacy_phase_prefixes", "ruling_start",
-        "legacy_rulings", "legacy_rulings_sha256", "legacy_handoff", "legacy_evidence_roots")
+        "legacy_rulings", "legacy_rulings_sha256", "legacy_handoff", "legacy_evidence_roots", "followup_gaps",
+        "legacy_register")
+LEGACY_REGISTER_KEYS = ("tasks", "gates", "roles")  # the register entries held to shape only (KA-2, spec 2.6a)
+_FOLLOWUP = re.compile(r"F-(\d{4})\Z", re.ASCII)
 PREFIX = re.compile(r"[A-Z]{1,4}\Z", re.ASCII)  # a legacy phase prefix; `P` alone is the kit's own
 _STAMP = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\Z", re.ASCII)
 _SHA40 = re.compile(r"[0-9a-f]{40}\Z")
@@ -94,6 +101,16 @@ def _check(data) -> dict:
         else:
             problems += [problem for problem in (relative_path_problem(entry, "legacy evidence root")
                                                  for entry in roots) if problem]
+        gaps = data["followup_gaps"]
+        numbers = [int(match.group(1)) for match in (_FOLLOWUP.match(gap) if isinstance(gap, str) else None
+                                                     for gap in gaps) if match] if isinstance(gaps, list) else []
+        if not isinstance(gaps, list) or len(numbers) != len(gaps) or numbers != sorted(set(numbers)):
+            problems.append("followup_gaps must be a list of follow-up IDs (F-<nnnn>), ascending, each once")
+        held = data["legacy_register"]
+        if not (isinstance(held, dict) and set(held) == set(LEGACY_REGISTER_KEYS) and all(
+                isinstance(held[key], list) and all(isinstance(item, str) and item for item in held[key])
+                and len(set(held[key])) == len(held[key]) for key in LEGACY_REGISTER_KEYS)):
+            problems.append("legacy_register must map tasks, gates and roles each to a list of names, each once")
     if problems:
         raise KitError(f"{ADOPTION_FILE}: " + "; ".join(problems))
     return data
@@ -115,6 +132,99 @@ def phase_prefixes(root: Path) -> tuple[str, ...]:
     """The legacy phase prefixes a register phase ID may be, besides P<n>; empty without adoption."""
     record = load(root)
     return tuple(record["legacy_phase_prefixes"]) if record else ()
+
+
+def followup_gaps(root: Path) -> frozenset[int]:
+    """The follow-up numbers below the import point that the source never had (`followup_gaps`); empty without
+    adoption. The controller state accepts exactly these as missing (ctlstate.parse)."""
+    record = load(root)
+    return frozenset(int(gap[2:]) for gap in record["followup_gaps"]) if record else frozenset()
+
+
+def evidence_roots(root: Path) -> tuple[str, ...]:
+    """The legacy evidence roots a reference may point under; empty without adoption."""
+    record = load(root)
+    return tuple(record["legacy_evidence_roots"]) if record else ()
+
+
+def under_roots(path: str, roots) -> bool:
+    """Whether the repository-relative `path` lies under one of `roots` (a root names a directory)."""
+    return any(path.startswith(entry.rstrip("/") + "/") for entry in roots)
+
+
+REGULAR_MODES = ("100644", "100755")  # a regular file in a git tree; 120000 is a symbolic link
+
+
+def _ls_entry(root: Path, commit: str, path: str) -> tuple[str, str, str] | None:
+    """(mode, type, object id) of the tree entry `path` on `commit`, read from the trees alone; None when there is
+    none. Git never resolves a symbolic link here, so a path through a linked directory has no entry."""
+    proc = subprocess.run(["git", "--literal-pathspecs", "-C", str(root), "ls-tree", "-z", "--full-tree", commit,
+                           "--", path], capture_output=True)
+    if proc.returncode != 0:
+        return None
+    for entry in proc.stdout.split(b"\0"):
+        info, _, name = entry.partition(b"\t")
+        fields = info.decode("ascii", "replace").split()
+        if name.decode("utf-8", "surrogateescape") == path and len(fields) == 3:
+            return fields[0], fields[1], fields[2]
+    return None
+
+
+def committed_file(root: Path, commit: str, path: str, label: str) -> tuple[bytes | None, str]:
+    """(bytes, "") of the regular file `path` committed at `commit`, else (None, why), the why reading after the path.
+
+    A reference must be a regular file (mode 100644 or 100755). A symbolic link is refused, and so is a path below a
+    linked directory: git stores a link as its target's text, so a digest of it would cover the text and never the
+    file it points to, which may lie outside the legacy evidence roots and change freely. `label` names the commit in
+    the message (HEAD, or a short sha).
+    """
+    entry = _ls_entry(root, commit, path)
+    if entry is not None and entry[0] == "120000":
+        return None, (f"is a symbolic link at {label}: a reference must be a regular file (a link's digest covers its "
+                      "target's name, not the file it points to)")
+    if entry is None:
+        parts = path.split("/")
+        for depth in range(1, len(parts)):
+            parent = _ls_entry(root, commit, "/".join(parts[:depth]))
+            if parent is not None and parent[0] == "120000":
+                return None, (f"lies below {'/'.join(parts[:depth])}, a symbolic link at {label}: a reference must "
+                              "be a regular file reached through directories")
+    if entry is None or entry[0] not in REGULAR_MODES:
+        return None, f"is not a file committed at {label}"
+    shown = subprocess.run(["git", "-C", str(root), "cat-file", "blob", entry[2]], capture_output=True)
+    if shown.returncode != 0:
+        return None, f"is not a file committed at {label}"
+    return shown.stdout, ""
+
+
+def reference_problem(root: Path, reference, commit: str, roots, who: str) -> str | None:
+    """Why `reference` ({path, sha256}) is not a legacy reference the blob at `commit` bears out, or None.
+
+    The path must be a plain repository-relative path under one of `roots` (the legacy evidence roots), name a file
+    committed at `commit`, and that blob's sha256 must equal the recorded one. A reference is never an input: it is
+    checked at the commit its record names (an adopted status: `adopted_commit`; a results record: its `head`), so
+    a later change to the file never makes the record wrong; `pk stale` reports it as information. A symbolic link,
+    or a path below one, is refused (committed_file).
+    """
+    if not (isinstance(reference, dict) and set(reference) == {"path", "sha256"}
+            and isinstance(reference["sha256"], str) and _SHA64.match(reference["sha256"])):
+        return f"{who}: a reference is {{path, sha256}} with a 64-hex sha256"
+    path = reference["path"]
+    problem = relative_path_problem(path, f"{who}: reference path")
+    if problem:
+        return problem
+    if not roots:
+        return (f"{who}: {path}: references point into legacy evidence, and this programme has no "
+                f"legacy_evidence_roots (no {ADOPTION_FILE})")
+    if not under_roots(path, roots):
+        return f"{who}: {path} is not under the legacy evidence roots ({', '.join(roots)})"
+    data, why = committed_file(root, commit, path, commit[:12])
+    if data is None:
+        return f"{who}: {path} {why}"
+    if sha256_bytes(data) != reference["sha256"]:
+        return (f"{who}: {path} at {commit[:12]} has sha256 {sha256_bytes(data)}, not the recorded "
+                f"{reference['sha256']}")
+    return None
 
 
 def ruling_start(root: Path) -> int:
@@ -166,26 +276,77 @@ def legacy_ruling(root: Path, number: int) -> str | None:
         raise KitError(f"cannot read {path}: {exc.strerror or exc}") from exc
 
 
+# --- follow-up gaps ---------------------------------------------------------------------------
+
+def missing_followups(issued_next: int, numbers) -> list[str]:
+    """The follow-up IDs below `issued_next` that are not among `numbers`: the gaps of a source (pk adopt writes
+    them as `followup_gaps`, and doctor and status validate derive them again from the frozen source)."""
+    present = set(numbers)
+    return [f"F-{n:04d}" for n in range(1, issued_next) if n not in present]
+
+
+def source_gaps(data: bytes) -> list[str]:
+    """`followup_gaps` as the frozen source's bytes give them; KitError when its follow-ups do not read."""
+    try:
+        followups = json.loads(data.decode("utf-8"))["followups"]
+        issued_next = followups["next"]
+        ids = [item["id"] for name in ("open", "closed") for item in followups[name]]
+    except (UnicodeDecodeError, ValueError, KeyError, TypeError) as exc:
+        raise KitError(f"its followups do not read ({type(exc).__name__}: {exc})") from exc
+    if isinstance(issued_next, bool) or not isinstance(issued_next, int):
+        raise KitError("its followups.next is not a whole number")
+    return missing_followups(issued_next, [int(match.group(1)) for match in
+                                           (_FOLLOWUP.match(i) if isinstance(i, str) else None for i in ids) if match])
+
+
+def followup_gap_problems(root: Path, record: dict) -> list[str]:
+    """Why `followup_gaps` is not what the frozen source gives: the gaps are derived again from
+    `program/legacy/adoption-source.json`, which must still match `source_sha256`, so a hand edit of adoption.yaml
+    cannot hide a deleted follow-up as a gap. Empty when they agree."""
+    path = Path(root) / record["source"]
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return [f"{ADOPTION_FILE}: followup_gaps cannot be checked: {record['source']} is missing; restore it from git"]
+    if sha256_bytes(data) != record["source_sha256"]:
+        return [f"{ADOPTION_FILE}: followup_gaps cannot be checked: {record['source']} no longer matches "
+                "source_sha256; restore it from git"]
+    try:
+        derived = source_gaps(data)
+    except KitError as exc:
+        return [f"{ADOPTION_FILE}: followup_gaps cannot be checked: {record['source']}: {exc}"]
+    if derived != list(record["followup_gaps"]):
+        return [f"{ADOPTION_FILE}: followup_gaps [{', '.join(record['followup_gaps'])}] are not the gaps of the frozen "
+                f"source {record['source']} [{', '.join(derived)}]: the gaps are fixed at adoption; restore "
+                f"{ADOPTION_FILE} from git"]
+    return []
+
+
 # --- doctor --------------------------------------------------------------------------------
 
 def problems(root: Path) -> list[str]:
     """What `pk doctor` reports about the adoption: a record that does not read, a copied file that is missing or
-    whose digest no longer matches. Empty without adoption."""
+    whose digest no longer matches, `followup_gaps` that differ from the frozen source's. Empty without adoption."""
     try:
         record = load(root)
     except KitError as exc:
         return [str(exc)]
     if record is None:
         return []
-    found = []
+    found, frozen = [], {}
     for key, digest_key in (("source", "source_sha256"), ("legacy_rulings", "legacy_rulings_sha256")):
         path = Path(root) / record[key]
+        frozen[key] = False
         if not path.is_file():
             found.append(f"{ADOPTION_FILE}: {key} {record[key]} is missing; it is frozen at adoption: restore it "
                          "from git")
         elif sha256_file(path) != record[digest_key]:
             found.append(f"{ADOPTION_FILE}: {record[key]} no longer matches {digest_key}; it is frozen at adoption: "
                          f"restore it from git (git log -- {record[key]} shows the change)")
+        else:
+            frozen[key] = True
     if not (Path(root) / record["legacy_handoff"]).is_file():
         found.append(f"{ADOPTION_FILE}: legacy_handoff {record['legacy_handoff']} is missing; restore it from git")
+    if frozen["source"]:  # a missing or changed source is reported above; the gaps are derived from it only intact
+        found.extend(followup_gap_problems(root, record))
     return found
