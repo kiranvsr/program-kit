@@ -237,7 +237,7 @@ def record(root: Path, ruling: str, question: str = "", precedent: str = "", rol
     if problem:
         raise KitError(problem)
     state = ctlstate.load(root)
-    number = max((entry["number"] for entry in rulings_module.read(root)), default=0) + 1
+    number = rulings_module.next_number(root)
     name = f"R{number}"
     planned = copy.deepcopy(state)
     lines = [f"{name} recorded"]
@@ -363,6 +363,7 @@ def cmd_adhoc(args: argparse.Namespace) -> int:
     elif action == "list":
         for item in state["adhoc"]:
             print(f"{item['id']}\t{item['state']}\t{item['updated']}\t{item['ruling'] or '-'}\t{item['title']}"
+                  + (f" [legacy {item['legacy_id']}]" if item.get("legacy_id") else "")
                   + (f": {item['note']}" if item["note"] else ""))
         return 0
     else:

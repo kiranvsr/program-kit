@@ -19,7 +19,7 @@ from pathlib import Path
 from string import Template
 
 from common import KitError, find_root, read_text, sha256_bytes, write_text
-from register import ID_PATTERNS, KINDS, load
+from register import KINDS, load, phase_prefixes, valid_id
 
 KIT_DIR = Path(__file__).resolve().parent.parent
 TEMPLATES = KIT_DIR / "templates"
@@ -66,8 +66,10 @@ def _line(node: dict, field: str, who: str) -> str:
     return _cell(_string(node, field, who)) or "-"
 
 
-def _walk(register: dict):
-    """Yield (level, node, parents) in register order, where parents holds the ancestors' IDs."""
+def _walk(register: dict, prefixes=()):
+    """Yield (level, node, parents) in register order, where parents holds the ancestors' IDs.
+
+    `prefixes`: the legacy phase prefixes of an adopted programme (register.phase_prefixes)."""
     seen: set[str] = set()
 
     def visit(items, label: str, level: int, parents: tuple[str, ...]):
@@ -78,7 +80,7 @@ def _walk(register: dict):
             if not isinstance(node, dict):
                 raise KitError(f"{where} must be a mapping")
             ident = node.get("id")
-            if not isinstance(ident, str) or not ID_PATTERNS[KINDS[level]].match(ident):
+            if not valid_id(KINDS[level], ident, prefixes):
                 raise KitError(f"{where}: id {ident!r} is not a valid {KINDS[level]} id; "
                                f"run `pk register assign-ids`")
             if ident in seen:
@@ -118,7 +120,7 @@ def render(root: Path) -> dict[str, bytes]:
     templates = {kind: _template(name) for kind, name in TEMPLATE_NAMES.items()}
     files: dict[str, str] = {}
     catalog = ["# Catalog", "", "| ID | Title | Role | Gate | Depends on |", "|---|---|---|---|---|"]
-    for level, node, parents in _walk(document):
+    for level, node, parents in _walk(document, phase_prefixes(root)):
         kind = KINDS[level]
         ident = node["id"]
         ids = dict(zip(("phase", "milestone", "step"), parents + (ident,)))

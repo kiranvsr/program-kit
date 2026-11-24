@@ -15,6 +15,10 @@ Each ruling is one block:
 an earlier one by writing `supersedes R<n>` anywhere in its decision. `rewritten` says when the
 file no longer begins with the bytes committed at HEAD; `validate`, `pk record` and `pk merge`
 refuse such a log, so a rewritten ruling is never committed by a command of the kit.
+
+An adopted programme (`program/adoption.yaml`, 0.7.0) keeps its old log, frozen, in `program/legacy/rulings.md`. The
+kit's log then holds only the rulings the kit issued, numbered from `ruling_start` upward with no gaps; a ruling may
+supersede a legacy one, and `pk rulings show R<n>` reads the legacy log for a number below `ruling_start`.
 """
 from __future__ import annotations
 
@@ -24,6 +28,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import adoption
 from common import KitError, find_root, utc_now
 
 _HEADER = re.compile(r"## R(\d+) \((\d{4}-\d{2}-\d{2}), ([^()\n]+)\)\Z", re.ASCII)
@@ -92,6 +97,28 @@ def read(root: Path) -> list[dict]:
     return [ruling for ruling, _ in _parse(_load(root))]
 
 
+def next_number(root: Path, found: list[dict] | None = None) -> int:
+    """The number the next ruling gets: one past the last in the log, or the first the kit issues (R1, or
+    `ruling_start` on an adopted programme) when the log holds none."""
+    found = read(root) if found is None else found
+    return max((ruling["number"] for ruling in found), default=adoption.ruling_start(root) - 1) + 1
+
+
+def block(root: Path, number: int) -> str | None:
+    """The text of ruling R<number>: from the kit's log, or below `ruling_start` from the frozen legacy log of an
+    adopted programme; None when neither holds it."""
+    if number < adoption.ruling_start(root):
+        return adoption.legacy_ruling(root, number)
+    data = _load(root)
+    found = _parse(data)  # names a malformed log before anything is read from it
+    lines = data.decode("utf-8").splitlines()
+    for ruling, line in found:
+        if ruling["number"] == number:
+            end = next((n for n in range(line, len(lines)) if lines[n].startswith("## ")), len(lines))
+            return "\n".join(lines[line - 1:end]).rstrip() + "\n"
+    return None
+
+
 def _check_text(label: str, value: str, required: bool) -> str:
     value = value.strip()
     if required and not value:
@@ -113,8 +140,8 @@ def add(root: Path, role: str, question: str, decision: str, precedent: str = ""
     precedent = _check_text("precedent", precedent, False)
     data = _load(root)
     existing = _parse(data)
-    number = max((ruling["number"] for ruling, _ in existing), default=0) + 1
-    earlier = {ruling["number"] for ruling, _ in existing}
+    number = next_number(root, [ruling for ruling, _ in existing])
+    earlier = {ruling["number"] for ruling, _ in existing} | adoption.legacy_ruling_numbers(root)
     for target in _SUPERSEDES.findall(decision):
         if int(target) not in earlier:
             raise KitError(f"R{number}: supersedes R{target}, which is not an earlier ruling")
@@ -155,21 +182,29 @@ def validate(root: Path) -> list[str]:
     except KitError as exc:
         return [str(exc)]
     problems: list[str] = [problem for problem in [rewritten(root)] if problem]
+    try:
+        start, legacy = adoption.ruling_start(root), adoption.legacy_ruling_numbers(root)
+    except KitError as exc:
+        return problems + [str(exc)]
     seen: set[int] = set()
-    expected, previous = 1, 0
+    expected, previous = start, start - 1
     for ruling, line in found:
         number = ruling["number"]
-        if number in seen:
+        if number < start:
+            problems.append(f"rulings.md line {line}: R{number} is below ruling_start R{start} of "
+                            f"{adoption.ADOPTION_FILE}: the rulings before adoption live in the frozen legacy log; "
+                            f"the kit's log runs from R{start}")
+        elif number in seen:
             problems.append(f"rulings.md line {line}: R{number} appears more than once")
         else:
             if number < previous:
                 problems.append(f"rulings.md line {line}: R{number} is out of order after R{previous}")
             elif number != expected:
                 problems.append(f"rulings.md line {line}: R{number} found where R{expected} expected "
-                                f"(numbers run 1, 2, 3 with no gaps)")
+                                f"(numbers run {start}, {start + 1}, {start + 2} with no gaps)")
             expected, previous = number + 1, number
         for target in ruling["supersedes"]:
-            if target not in seen:
+            if target not in seen and not (target < start and target in legacy):
                 problems.append(f"rulings.md line {line}: R{number} supersedes R{target}, "
                                 f"which is not an earlier ruling")
         seen.add(number)
@@ -187,6 +222,16 @@ def cmd_rulings(args: argparse.Namespace) -> int:
             if ruling["supersedes"]:
                 line.append("supersedes " + ", ".join(f"R{n}" for n in ruling["supersedes"]))
             print("\t".join(line))
+    elif action == "show":
+        match = re.fullmatch(r"R(\d+)", args.ruling or "", re.ASCII)
+        if not match:
+            raise KitError(f"pk rulings show takes a ruling as R<n>, not {args.ruling!r}")
+        text = block(root, int(match.group(1)))
+        if text is None:
+            where = (f"the legacy log {adoption.load(root)['legacy_rulings']}"
+                     if int(match.group(1)) < adoption.ruling_start(root) else "program/rulings.md")
+            raise KitError(f"{args.ruling} is not in {where}")
+        print(text, end="")
     elif action == "validate":
         problems = validate(root)
         if problems:
@@ -194,7 +239,7 @@ def cmd_rulings(args: argparse.Namespace) -> int:
             return 1
         print("rulings: ok")
     else:
-        raise KitError("rulings needs an action: add, list or validate")
+        raise KitError("rulings needs an action: add, list, show or validate")
     return 0
 
 
@@ -206,6 +251,9 @@ def _configure(parser: argparse.ArgumentParser) -> None:
     adder.add_argument("--decision", required=True, help="what was decided (may say 'supersedes R<n>')")
     adder.add_argument("--precedent", default="", help="the rule this generalises")
     actions.add_parser("list", help="one line per ruling")
+    shower = actions.add_parser("show", help="print one ruling whole; on an adopted programme a number below "
+                                             "ruling_start is read from the frozen legacy log")
+    shower.add_argument("ruling", metavar="R<n>")
     actions.add_parser("validate", help="check numbering, supersedes links and that no committed ruling changed")
 
 

@@ -43,6 +43,7 @@ import argparse
 import re
 from pathlib import Path
 
+import adoption
 import change as change_module
 import cost as cost_module
 import ctlstate
@@ -88,11 +89,15 @@ def _ruling_lines(root: Path) -> tuple[str, list[str]]:
     """(heading, lines) of the rulings window: the newest RULINGS_SHOWN, newest first, then where the rest are."""
     found = rulings_module.read(root)
     total = len(found)
-    next_number = max((ruling["number"] for ruling in found), default=0) + 1
+    next_number = rulings_module.next_number(root, found)
     lines = [_line(f"R{ruling['number']} ({ruling['date']}): {_clip(ruling['decision'], RULING_CHARS)}")
              for ruling in reversed(found[-RULINGS_SHOWN:])]
     if total > RULINGS_SHOWN:
         lines.append(f"{total - RULINGS_SHOWN} earlier rulings: program/rulings.md, read by number")
+    record = adoption.load(root)
+    if record is not None:  # 0.7.0: the rulings before adoption, frozen
+        lines.append(f"rulings before R{record['ruling_start']}: {record['legacy_rulings']} (adopted "
+                     f"{record['adopted_at'][:10]}; pk rulings show R<n>); legacy hand-off: {record['legacy_handoff']}")
     return f"#### Rulings ({total}; next R{next_number})", lines
 
 

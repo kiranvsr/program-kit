@@ -4,7 +4,8 @@
 The file holds what the controller tracks outside the status records:
 
     stage, queued, parked    {task ID: text}                     notes on register tasks
-    adhoc                    [{id, title, state, note, ruling, updated}]   work that is not in the register
+    adhoc                    [{id, title, state, note, ruling, updated}]   work that is not in the register; on an
+                             adopted programme an imported one also keeps `legacy_id`, its name before adoption
     followups                [{id, area, item, added, tags}]     open follow-ups, F-0001 onward
     closed_followups         the same plus {closed, reason, by, duplicate_of}
     followups_issued         how many follow-up ids were ever given out: the next one is that plus one
@@ -85,16 +86,24 @@ def _adhoc(data: dict) -> list[dict]:
                            "(expected AH-0001 onward)")
         if state not in ADHOC_STATES or not isinstance(item.get("title"), str) or not item["title"].strip():
             raise KitError(f"{STATE_FILE}: 'adhoc' {task_id} needs a title and a state of {', '.join(ADHOC_STATES)}")
+        legacy = item.get("legacy_id")
+        if legacy is not None and not (isinstance(legacy, str) and legacy.strip()):
+            raise KitError(f"{STATE_FILE}: 'adhoc' {task_id}: legacy_id must be the task's name before adoption")
         seen.add(task_id)
         found.append({"id": task_id, "title": item["title"], "state": state, "note": _text(item, "note"),
-                      "ruling": _text(item, "ruling"), "updated": _text(item, "updated", UNKNOWN_DATE)})
+                      "ruling": _text(item, "ruling"), "updated": _text(item, "updated", UNKNOWN_DATE),
+                      **({"legacy_id": legacy} if legacy is not None else {})})
     return found
 
 
 def load(root: Path) -> dict:
     """The controller state, validated and in the current shape; a missing file is an empty state."""
     path = Path(root) / STATE_FILE
-    data = read_json(path) if path.exists() else {}
+    return parse(read_json(path) if path.exists() else {})
+
+
+def parse(data) -> dict:
+    """`data`, the parsed controller state, validated and in the current shape (what `load` returns)."""
     if not isinstance(data, dict):
         raise KitError(f"{STATE_FILE}: expected a mapping with stage, queued, parked and followups")
     taken: set[int] = set()

@@ -69,15 +69,23 @@ def _load(root: Path, name: str, names: tuple[str, ...]) -> dict[str, dict] | No
 class _Entries:
     """Tolerant reads of the entries of one section, collecting shape and ID-pattern problems."""
 
-    def __init__(self, problems: list[str]):
+    def __init__(self, problems: list[str], prefixes=()):
         self.problems = problems
+        self.prefixes = tuple(prefixes)  # legacy phase prefixes of an adopted programme: task IDs may use them
+
+    def matches(self, kind: str, value) -> bool:
+        if kind == "task":  # the register's own rule, so an adopted programme's legacy task IDs are IDs here too
+            return register_module.valid_id("task", value, self.prefixes)
+        return isinstance(value, str) and _KINDS[kind][0].match(value) is not None
+
+    def shape(self, kind: str) -> str:
+        return register_module.shape("task", self.prefixes) if kind == "task" and self.prefixes else _KINDS[kind][1]
 
     def key(self, key, kind: str, file: str | None = None) -> str:
         """Report a malformed key; gate keys appear in two files, so theirs are prefixed by the file."""
-        pattern, shape = _KINDS[kind]
-        if not (isinstance(key, str) and pattern.match(key)):
+        if not self.matches(kind, key):
             prefix = f"{file}: {key} is" if file else f"{key}: is"
-            self.problems.append(f"{prefix} not a valid {kind} id (expected {shape})")
+            self.problems.append(f"{prefix} not a valid {kind} id (expected {self.shape(kind)})")
         return str(key)
 
     def table(self, section: dict, kind: str, file: str) -> dict[str, dict]:
@@ -104,10 +112,10 @@ class _Entries:
         if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
             self.problems.append(f"{who}: {field} must be a list of strings")
             return []
-        pattern, shape = _KINDS[kind]
         for item in value:
-            if not pattern.match(item):
-                self.problems.append(f"{who}: {field} entry {item!r} is not a valid {kind} id (expected {shape})")
+            if not self.matches(kind, item):
+                self.problems.append(f"{who}: {field} entry {item!r} is not a valid {kind} id "
+                                     f"(expected {self.shape(kind)})")
         return value
 
 
@@ -119,7 +127,7 @@ def validate(root: Path, stage: int) -> list[str]:
     gate_file = _load(root, "gates.yaml", ("gates",))  # read at every stage: its IDs are checked everywhere
 
     problems: list[str] = []
-    read = _Entries(problems)
+    read = _Entries(problems, register_module.phase_prefixes(root))
     where = "program/traceability.yaml"
     journeys = read.table(matrix["journeys"], "journey", where)
     requirements = read.table(matrix["requirements"], "requirement", where)

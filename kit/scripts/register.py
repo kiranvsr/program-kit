@@ -5,15 +5,22 @@ The register is phases > milestones > steps > tasks. IDs are P<n>, P<n>-M<nn>,
 P<n>-M<nn>-S<nn> and P<n>-M<nn>-S<nn>-T<nn>. `assign_ids` fills missing IDs from
 position and never changes an ID that is already there; `validate` returns one
 message per problem and raises only when the document has the wrong shape.
+
+An adopted programme (`program/adoption.yaml`, 0.7.0) may also name a phase by one of its legacy phase prefixes,
+so `CX`, `CX-M01`, `CX-M01-S02` and `CX-M01-S02-T01` are IDs there. `valid_id` is the one function that decides
+whether an ID has the shape of its kind, and `is_task_id` whether a string can name a task at all (a register task
+ID or an ad-hoc `AH-<nnnn>`); every place that checks a task ID calls one of them.
 """
 from __future__ import annotations
 
 import argparse
 import copy
+import functools
 import re
 import sys
 from pathlib import Path
 
+import adoption
 from common import KitError, find_root, read_yaml, utc_now, write_yaml
 
 KIT_DIR = Path(__file__).resolve().parent.parent
@@ -30,12 +37,45 @@ ID_PATTERNS = {
     "task": re.compile(r"P\d+-M\d+-S\d+-T\d+\Z", re.ASCII),
 }
 _SHAPE = {"phase": "P<n>", "milestone": "P<n>-M<n>", "step": "P<n>-M<n>-S<n>", "task": "P<n>-M<n>-S<n>-T<n>"}
+_TAIL = {"phase": "", "milestone": r"-M\d+", "step": r"-M\d+-S\d+", "task": r"-M\d+-S\d+-T\d+"}
+_ADHOC = re.compile(r"AH-\d{4}\Z", re.ASCII)  # ctlstate.ADHOC_ID without the group
 _GATE = re.compile(r"G-[A-Z0-9][A-Z0-9_]*\Z")
 _CLOSES = re.compile(r"(?:REQ-\d{3}|NFR-\d{3}|J\d+)\Z", re.ASCII)
 GATE_ID, CLOSES_ID, TASK_ID = _GATE, _CLOSES, ID_PATTERNS["task"]  # public aliases for trace.py (ID_PATTERNS is for briefs.py)
 # How a gate id is written, with the pattern, for every message that refuses one: NAME takes no second hyphen.
 GATE_SHAPE = ("G-<NAME>, pattern G-[A-Z0-9][A-Z0-9_]*: NAME is capitals, digits and _, no hyphen "
               "(G-R1_CORE, not G-R1-CORE)")
+
+
+@functools.lru_cache(maxsize=64)
+def _legacy_pattern(kind: str, prefixes: tuple[str, ...]) -> re.Pattern:
+    return re.compile("(?:" + "|".join(map(re.escape, prefixes)) + ")" + _TAIL[kind] + r"\Z", re.ASCII)
+
+
+def valid_id(kind: str, ident, prefixes=()) -> bool:
+    """Whether `ident` is a `kind` ID (phase, milestone, step or task): P<n> based, or based on one of `prefixes`, the
+    legacy phase prefixes of an adopted programme (`phase_prefixes(root)`). The one place that decides it."""
+    if not isinstance(ident, str):
+        return False
+    if ID_PATTERNS[kind].match(ident):
+        return True
+    prefixes = tuple(prefixes)
+    return bool(prefixes) and _legacy_pattern(kind, prefixes).match(ident) is not None
+
+
+def shape(kind: str, prefixes=()) -> str:
+    """How a `kind` ID is written, for a refusal: `P<n>-M<n>`, and `CX-M<n>` and so on for each legacy prefix."""
+    return " or ".join([_SHAPE[kind], *(prefix + _SHAPE[kind][4:] for prefix in prefixes)])
+
+
+def phase_prefixes(root: Path) -> tuple[str, ...]:
+    """The legacy phase prefixes of the programme at `root` (`program/adoption.yaml`); empty when it has not adopted."""
+    return adoption.phase_prefixes(root)
+
+
+def is_task_id(root: Path, task_id) -> bool:
+    """Whether `task_id` can name a task of the programme at `root`: a register task ID or an ad-hoc AH-<nnnn>."""
+    return isinstance(task_id, str) and bool(_ADHOC.match(task_id) or valid_id("task", task_id, phase_prefixes(root)))
 
 
 def _path(root: Path) -> Path:
@@ -221,11 +261,13 @@ def problems_in(root: Path) -> list[str]:
         return ["program/register.yaml is missing"]
     environments = Path(root) / "program" / "environments.yaml"
     return validate(load(root), read_yaml(environments) if environments.exists() else None,
-                    read_yaml(KIT_DIR / "interview" / "roles.yaml"))
+                    read_yaml(KIT_DIR / "interview" / "roles.yaml"), phase_prefixes(root))
 
 
-def validate(register: dict, environments: dict | None, roles: dict | None) -> list[str]:
-    """Problems with the register, one string each (the offending ID first); empty when valid."""
+def validate(register: dict, environments: dict | None, roles: dict | None, prefixes=()) -> list[str]:
+    """Problems with the register, one string each (the offending ID first); empty when valid.
+
+    `prefixes` are the legacy phase prefixes of an adopted programme (`phase_prefixes(root)`)."""
     _check_shape(register)
     known_envs = None
     if environments is not None:
@@ -252,8 +294,8 @@ def validate(register: dict, environments: dict | None, roles: dict | None) -> l
             who = label
         else:
             who = ident
-            if not ID_PATTERNS[kind].match(ident):
-                problems.append(f"{who}: id is not a valid {kind} id (expected {_SHAPE[kind]})")
+            if not valid_id(kind, ident, prefixes):
+                problems.append(f"{who}: id is not a valid {kind} id (expected {shape(kind, prefixes)})")
             if ident in seen:
                 problems.append(f"{who}: duplicate id")
             seen.add(ident)
@@ -377,7 +419,7 @@ def cmd_register(args: argparse.Namespace) -> int:
     env_path = Path(root) / "program" / "environments.yaml"
     environments = read_yaml(env_path) if env_path.exists() else None
     roles = read_yaml(KIT_DIR / "interview" / "roles.yaml")
-    problems = validate(register, environments, roles)
+    problems = validate(register, environments, roles, phase_prefixes(root))
     if problems:
         print(f"error: register invalid: {len(problems)} problem(s)", file=sys.stderr)
         print("\n".join(f"error: {problem}" for problem in problems), file=sys.stderr)
