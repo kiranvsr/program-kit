@@ -1,0 +1,122 @@
+{
+  "title": "pk adopt source (program-kit.adoption.v1)",
+  "description": "The one file a programme that ran before the kit exports so that `pk adopt <file>` moves it onto the kit, once. Every top-level key is required and no other is allowed. Paths are repository-relative, posix, and name files or directories committed at HEAD.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "programme", "primary_branch", "legacy_phase_prefixes", "register", "statuses", "rulings",
+               "followups", "adhoc", "costs", "handoff", "legacy_evidence_roots"],
+  "properties": {
+    "schema": {"const": "program-kit.adoption.v1"},
+    "programme": {"type": "string", "minLength": 1, "description": "the programme's name"},
+    "primary_branch": {"const": "main", "description": "the kit's primary branch is fixed as main"},
+    "legacy_phase_prefixes": {
+      "type": "array", "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^[A-Z]{1,4}$", "not": {"const": "P"}},
+      "description": "phase IDs the register may use besides P<n>; milestone, step and task IDs follow (CX, CX-M01, CX-M01-S01, CX-M01-S01-T01)"
+    },
+    "register": {
+      "type": "object", "additionalProperties": false, "required": ["phases"],
+      "properties": {"phases": {"type": "array", "description": "exactly the shape of program/register.yaml; `pk register validate` must pass on it"}}
+    },
+    "statuses": {
+      "type": "array",
+      "description": "read for shape only in this kit version: a non-empty list is refused (statuses import arrives in KA-2)",
+      "items": {
+        "type": "object", "additionalProperties": false, "required": ["task_id", "status"],
+        "properties": {
+          "task_id": {"type": "string", "minLength": 1},
+          "status": {"enum": ["done", "not_started"]},
+          "actor": {"type": "string"},
+          "updated_at": {"type": "string"},
+          "references": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["path"],
+                                                    "properties": {"path": {"type": "string", "minLength": 1}}}},
+          "note": {"type": "string"}
+        }
+      }
+    },
+    "rulings": {
+      "type": "object", "additionalProperties": false, "required": ["path", "next"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1, "description": "the legacy rulings log, copied byte for byte to program/legacy/rulings.md; its blocks start at lines `## R<n> ...`"},
+        "next": {"type": "integer", "minimum": 1, "description": "the first ruling number the kit issues: one past the legacy log's last ruling"}
+      }
+    },
+    "followups": {
+      "type": "object", "additionalProperties": false, "required": ["next", "open", "closed"],
+      "description": "F-0001 to F-(next-1) must each be listed once, open or closed: the kit issues F-<next> next",
+      "properties": {
+        "next": {"type": "integer", "minimum": 1, "maximum": 10000},
+        "open": {"type": "array", "items": {"$ref": "#/definitions/open_followup"}},
+        "closed": {"type": "array", "items": {"$ref": "#/definitions/closed_followup"}}
+      }
+    },
+    "adhoc": {
+      "type": "array",
+      "description": "ad-hoc tasks in source order: the n-th becomes AH-<nnnn> and keeps legacy_id; done reads as closed and in_progress as progress",
+      "items": {
+        "type": "object", "additionalProperties": false, "required": ["legacy_id", "title", "state"],
+        "properties": {
+          "legacy_id": {"type": "string", "minLength": 1, "description": "the task's name before adoption; unique, and not a register task ID"},
+          "title": {"type": "string", "minLength": 1},
+          "state": {"enum": ["queued", "progress", "review", "paused", "closed", "done", "in_progress"]},
+          "note": {"type": "string"}
+        }
+      }
+    },
+    "costs": {
+      "type": "array",
+      "description": "the source rows as they are. at, task, role and model are required text, tokens, tool_calls and seconds whole numbers; agent defaults to \"unknown\" and resume to false; other keys are kept. A task that is a register ID is kept, a legacy ad-hoc name becomes its AH- ID, anything else is kept with legacy_task: true (a key the source must not carry)",
+      "items": {
+        "type": "object", "required": ["at", "task", "role", "model", "tokens", "tool_calls", "seconds"],
+        "not": {"required": ["legacy_task"]},
+        "properties": {
+          "at": {"type": "string", "minLength": 1},
+          "task": {"type": "string", "minLength": 1},
+          "role": {"type": "string", "minLength": 1},
+          "model": {"type": "string", "minLength": 1},
+          "agent": {"type": "string"},
+          "tokens": {"type": "integer", "minimum": 0},
+          "tool_calls": {"type": "integer", "minimum": 0},
+          "seconds": {"type": "integer", "minimum": 0},
+          "resume": {"type": "boolean"}
+        }
+      }
+    },
+    "handoff": {
+      "type": "object", "additionalProperties": false, "required": ["path", "now"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1, "description": "the legacy hand-off, copied byte for byte to program/legacy/HANDOFF.md"},
+        "now": {"type": "string", "description": "the controller's one line: what it is doing"}
+      }
+    },
+    "legacy_evidence_roots": {
+      "type": "array", "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1},
+      "description": "directories committed at HEAD that hold the evidence from before adoption"
+    }
+  },
+  "definitions": {
+    "open_followup": {
+      "type": "object", "additionalProperties": false, "required": ["id", "area", "item"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^F-[0-9]{4}$"},
+        "area": {"type": "string", "minLength": 1},
+        "item": {"type": "string", "minLength": 1},
+        "added": {"type": "string"},
+        "tags": {"type": "array", "items": {"type": "string", "minLength": 1}}
+      }
+    },
+    "closed_followup": {
+      "type": "object", "additionalProperties": false, "required": ["id", "area", "item", "reason"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^F-[0-9]{4}$"},
+        "area": {"type": "string", "minLength": 1},
+        "item": {"type": "string", "minLength": 1},
+        "reason": {"type": "string"},
+        "added": {"type": "string"},
+        "tags": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "dup_of": {"type": "string", "pattern": "^F-[0-9]{4}$"}
+      }
+    }
+  }
+}
