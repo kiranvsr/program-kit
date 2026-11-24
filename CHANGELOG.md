@@ -25,6 +25,30 @@ Design choices, each with its reason:
 
 Upgrading from 0.6.2: `sh install.sh /path/to/your-repo --upgrade`. Nothing in `program/` has to change.
 
+### Adopting an existing programme
+
+A programme that ran before the kit moves onto it once, with `pk adopt`, and keeps its history (DESIGN section 9.5, playbook `11_adopt.md`). Without `program/adoption.yaml` nothing changes: every command, record, gate and report behaves as in 0.6.2.
+
+What changed:
+
+- `pk adopt <source.json> [--dry-run]` and `pk adopt --from <importer>` (new). The source is one neutral JSON file, `kit/templates/adoption.schema.json` (`program-kit.adoption.v1`). The whole source is validated before anything is written and every problem is printed; the legacy rulings log, hand-off and the source are copied byte for byte into `program/legacy/`; the register, status records, controller state, cost log and `program/adoption.yaml` are written; `pk register validate`, `pk status validate`, `pk handoff update` and `pk doctor` run after, and a failure puts every file back. It refuses a dirty tree, a branch other than main, a `program/` that holds kit work and a programme that has adopted already. It never commits.
+- `program/adoption.yaml` (new). Every key is required; it and `program/legacy/` are always guarded and no `Guarded edit:` line allows them; `pk doctor` checks the digests of the frozen copies.
+- Identity. Legacy phase prefixes (`CX-M01-S02-T01`) are task IDs at every site that checks one; the kit issues rulings from `ruling_start` and `pk rulings show R<n>` reads the frozen log below it; follow-ups keep their IDs; ad-hoc tasks become `AH-<nnnn>` keeping `legacy_id`; imported cost rows get the kit's keys, are totalled and are never flagged.
+- The `adopted` status (new). A source `done` becomes `adopted`, with `legacy_status`, `legacy_actor`, `legacy_updated_at` and `references` (each `{path, sha256}` under `legacy_evidence_roots`, hashed at HEAD). It is terminal and satisfies dependencies as `done` does, but is never `done`: the hand-off, `pk status list` and the dashboard show it apart, D5 does not count it, `pk change impact` lists it apart, and a gate claim that lists it stays `not_evaluated` and says `adopted; see references`. `pk status validate` checks each reference against the frozen source and the blob at `adopted_commit`. Only `pk adopt` writes it; `pk status set` refuses it; `pk status reopen` moves it to `in_progress` (full tier) with the reason as the audit line.
+- Generic import rules (new). Tasks in flight are imported `not_started` with `legacy_status` and a "re-dispatch <ID> (was <state> at adoption)" follow-up; a `not_started` entry may carry an empty actor and time, and a parked task's note becomes a follow-up; follow-up IDs missing below the import point are recorded as `followup_gaps` and accepted exactly; register entries the granularity rules, role catalog or gate-ID pattern would refuse are recorded as `legacy_register: {tasks, gates, roles}` and held to shape only until they change, through a change request or otherwise.
+- References from new work (new). `Evidence.reference(path)` adds `{path, sha256}` of a legacy file to a results record's `references`. They are never inputs and never drift; the hand-back gate, the binding check and `done` check each at the record's head; `pk evidence history` prints them and the dashboard lists them, with a `reference_resolver` extension's description when one is registered.
+- Dashboard. Adopted tasks are their own state (a tile, a chip, a share of each phase); the open follow-ups are listed newest first under their count.
+- Extensions in a branch. When a task branch changes `program/extensions.yaml` or `program/extensions/`, the hand-back gate and the merge check (and each round member) run `step ext-check`: `pk ext check` in the trial merge with `PK_EXT_FROM=worktree`, in a child process, so an extension that does not import or register fails the gate before it reaches main.
+- Docs: DESIGN sections 3 and 9.5, playbook 11, README and FAQ.
+
+Design choices, each with its reason:
+
+- Nothing from before adoption counts as a kit acceptance: `adopted` is its own state, so a claim, a count or a `done` never rests on a check the kit did not make.
+- References are checked at the commit their record names and never bound: old evidence is history, and a later change to it is information, not a broken record.
+- Grandfathering is tied to the frozen source, not to a list alone: a grandfathered entry keeps its exemption only while it is exactly what was adopted, so any change brings it under the rules.
+- Follow-up gaps are recorded, not filled: the IDs a programme gave out stay its own, and the kit stays gapless from the import point on.
+- `ext-check` runs in a child process on the merged tree: the gates keep judging by main's code, and the branch's code is only loaded, never trusted.
+
 ## 0.6.2
 
 Two findings from running a program on the kit (KF-59 and KF-60 there): a process the kit's own test suite left running for good, and agents' background wait loops and watchers that outlived their hand-back, 146 loops (some ten days old) and 16 orphaned tails under one agent session. Everything is backward compatible: every record, pointer, status file and `checks.yaml` written before reads, validates and runs as it did, `pk drift` counts the same checks, and nothing is ever stopped unless `pk sweep --kill` is run.
