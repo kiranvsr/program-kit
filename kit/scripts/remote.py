@@ -952,8 +952,9 @@ for l in $lanes; do
   else echo "problem lane $l: its origin is not the mirror $base/repo.git"; fi
 done
 case "${DOCKER_HOST:-}" in
-  unix://*) if [ -S "${DOCKER_HOST#unix://}" ]; then echo "ok DOCKER_HOST"
-            else echo "problem DOCKER_HOST names a socket that is not on this host (from another machine?)"; fi ;;
+  unix:*) s="${DOCKER_HOST#unix:}"; s="/${s#"${s%%[!/]*}"}"  # the socket path, its leading slashes made one
+          if [ -S "$s" ]; then echo "ok DOCKER_HOST"
+          else echo "problem DOCKER_HOST names a socket that is not on this host (from another machine?)"; fi ;;
 esac
 if [ -n "${SSL_CERT_FILE:-}" ]; then
   if [ -f "$SSL_CERT_FILE" ]; then echo "ok SSL_CERT_FILE"

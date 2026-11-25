@@ -44,4 +44,4 @@ You have opened the playbook the table names and have read the brief for your ro
 
 ## Next playbook
 
-One of `01_discover.md`, `02_define_product.md`, `03_specify.md`, `04_architect.md`, `05_freeze_review.md`, `06_register.md`, `07_task_specs.md`, `08_execute.md`, as the table says. Later playbooks: `09_handoff.md` for takeover, `10_change.md` for changes after approval and `11_adopt.md` to move a programme that ran before the kit onto it.
+One of `01_discover.md`, `02_define_product.md`, `03_specify.md`, `04_architect.md`, `05_freeze_review.md`, `06_register.md`, `07_task_specs.md`, `08_execute.md`, as the table says. Later playbooks: `09_handoff.md` for takeover, `10_change.md` for changes after approval, `11_adopt.md` to move a programme that ran before the kit onto it and `12_lanes.md` to set up lanes on other machines.

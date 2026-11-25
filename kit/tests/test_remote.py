@@ -672,7 +672,7 @@ class Doctor(TwoHosts):
                 self.assertIn(f"host {var}: ok {what}", result.stdout)
         self.assertIn("remote doctor: ok", result.stdout)
         shutil.rmtree(self.lane("beta-host", "small2"))
-        self.write_section(env={"SSL_CERT_FILE": "/nowhere/cert.pem", "DOCKER_HOST": "unix:///nowhere/docker.sock"})
+        self.write_section(env={"SSL_CERT_FILE": "/nowhere/cert.pem", "DOCKER_HOST": "unix:" + "///nowhere/docker.sock"})
         result = self.pk("doctor", env={**self.env, "PK_A": "gone-host"})
         self.assertEqual(result.returncode, 1)
         out = result.stdout

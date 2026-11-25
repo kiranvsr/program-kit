@@ -170,7 +170,7 @@ Your own program records its rulings in `program/rulings.md` with `pk rulings ad
 
 **Why.** Wait loops burned session budget, and an agent once sat idle for half an hour after its command had finished.
 
-**How to apply.** Start the producer itself as the background task, then read the output file once when it finishes.
+**How to apply.** Start the producer itself as the background task, then read the output file once when it finishes. Gates, plants, fingerprints and full suites are the controller's background commands; an agent is dispatched for judgement, never to sit through one (controller brief, Long runs).
 
 ## K21. Reports are short and fixed in shape
 

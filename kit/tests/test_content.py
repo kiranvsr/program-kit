@@ -15,7 +15,7 @@ RUBRIC_DIR = KIT / "rubrics"
 
 PLAYBOOKS = ["00_START.md", "01_discover.md", "02_define_product.md", "03_specify.md", "04_architect.md",
              "05_freeze_review.md", "06_register.md", "07_task_specs.md", "08_execute.md", "09_handoff.md",
-             "10_change.md", "11_adopt.md"]
+             "10_change.md", "11_adopt.md", "12_lanes.md"]
 LENS_PLAYBOOKS = PLAYBOOKS[1:7]  # stages 1 to 6 are interview stages and name the lenses that are active
 BRIEFS = ["controller.md", "implementer.md", "qa.md", "spec_qa.md"]
 RULES = ["RULES.md", "RULINGS_SEED.md"]  # one canonical rules file, and the seed rulings that point to it
@@ -29,6 +29,7 @@ EXPECTED_NEXT = {name: PLAYBOOKS[i + 1] for i, name in enumerate(PLAYBOOKS[:9])}
 EXPECTED_NEXT["09_handoff.md"] = "08_execute.md"
 EXPECTED_NEXT["10_change.md"] = "08_execute.md"
 EXPECTED_NEXT["11_adopt.md"] = "08_execute.md"
+EXPECTED_NEXT["12_lanes.md"] = "08_execute.md"
 NEEDS_CONTEXT = ["a new dependency", "a security boundary with no precedent", "a change to user scope",
                  "two conflicting rulings"]
 HANDBACK_LINE = "`OK: <branch> passes the hand-back gate at <sha>`"

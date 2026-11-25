@@ -12,7 +12,7 @@ Read top to bottom and stop where your part ends. Every agent: parts 1 and 2. Im
 2. Never claim anything about an environment that `program/environments.yaml` marks `exists: false`. Work that needs one stays `blocked_by` that environment.
 3. Development acceptance is not production readiness. Say "accepted for development" and nothing stronger.
 4. An acceptance lives where the code reads it. A side file that leaves the fields the code reads unaccepted is not an acceptance. Accept in the file the reader reads.
-5. Run the checks and evidence commands from a clean tree. The project must git-ignore the bytecode and build output its test and scan commands write (`__pycache__`, `*.pyc`, `dist/`, `target/`, `node_modules/` and the like). If it does not, an untracked leftover makes the clean-tree check fail. Add the pattern to `.gitignore` before you start.
+5. Run the checks and evidence commands from a clean tree. The project must git-ignore the bytecode and build output its commands write (`__pycache__`, `dist/`, `node_modules/` and the like), or an untracked leftover fails the clean-tree check.
 
 ### Status, register and frozen artifacts
 
@@ -47,10 +47,10 @@ Read top to bottom and stop where your part ends. Every agent: parts 1 and 2. Im
 ## Part 2. Working rules (every agent)
 
 - **W1. Decide, don't ask.** Anything with precedent is decided by the agent and recorded as a deviation citing the precedent. Questions go to the controller only in the four NEEDS_CONTEXT cases of hard rule 19; the controller answers with a numbered ruling.
-- **W2. A gate passes on its OK line.** The implementer runs `pk gate handback <ID> --branch task/<ID>` before any QA round; a hand-back that fails the gate returns without one. Exit code 0 alone is never accepted: read the last line.
-- **W3. Fix rounds and scoped re-checks.** QA numbers its findings, each with severity, location and the exact fix. The same implementer, resumed, fixes them and returns a finding-to-fix table: finding, fix, commit, command that shows it fixed. The same reviewer, resumed, re-checks only those findings and the binding. The implementer re-runs the hand-back gate after the fix; QA never does.
+- **W2. A gate passes on its OK line.** The controller runs `pk gate handback <ID> --branch task/<ID>` after the hand-back, before any QA round; a hand-back that fails it returns without one. Exit code 0 alone is never accepted: read the last line.
+- **W3. Fix rounds and scoped re-checks.** QA numbers its findings, each with severity, location and the exact fix. The same implementer, resumed, fixes them and returns a finding-to-fix table: finding, fix, commit, command that shows it fixed. The same reviewer, resumed, re-checks only those findings and the binding. The controller re-runs the hand-back gate after the fix; QA never does.
 - **W4. Your own folder, your own worktree.** Scratch files go only in a folder named for your task and role; delete only those, by exact path. Before a command that commits or deletes, check where you are (`git rev-parse --show-toplevel`): a shell that drifted into another worktree commits to the wrong branch.
-- **W5. No polling.** Run long commands in the background with output redirected to a file, and wait for completion. Never use sleep loops and never `tail -f`.
+- **W5. No polling.** Run long commands in the background with output redirected to a file, and wait for completion. Never use sleep loops and never `tail -f`. Gates, plants, fingerprints and full suites are the controller's: no other agent sits through one.
 - **W6. The return contract.** Your final message is four things: status, commits, one line of test results, concerns. The full report is a file, under your brief's fixed headings and under 25 lines; the message names its path. Never paste a diff, a log or a SPEC into a message.
 - **W7. Read only what you are pointed at.** Your parts of this file, `program/COMMON.md`, your brief, your task's definition and the rulings it cites, by number. Not the ruling log, the hand-off or another role's brief.
 - **W8. Interruptions.** After a session or rate limit, void partial evidence by exact path, then resume at the interrupted step: resume from the last commit, re-run only the interrupted step. Never restart a task from scratch.
