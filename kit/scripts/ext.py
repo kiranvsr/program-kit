@@ -775,7 +775,8 @@ def git_state(tree) -> dict:
     exclude = common / "info" / "exclude"
     excludes_file = run("config", "--get", "core.excludesFile", codes=(0, 1))
     head = run("rev-parse", "--verify", "--quiet", "HEAD", codes=(0, 1)).stdout.decode().strip()
-    ignored = run("ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--", ":(glob)**/.gitignore")
+    ignored = run("ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--",
+                  ":(glob,icase)**/.gitignore")
     return {
         "info/exclude": sha256_bytes(exclude.read_bytes()) if exclude.is_file() else "absent",
         "core.excludesFile": excludes_file.stdout.decode("utf-8", "replace").strip()
@@ -792,16 +793,19 @@ def _hiding(tree: Path, before: dict, after: dict) -> list[str]:
     ignored by a rule from a file that existed before the call (a `.gitignore` copied inside an ignored dependency
     directory is fine; a self-ignoring `tests/.gitignore` is not)."""
     new = after["ignored .gitignore"] - before["ignored .gitignore"]
-    hiding = []
-    for path in sorted(new):
-        parent = path.rpartition("/")[0]
-        if parent:
-            said = _git(tree, "check-ignore", "-z", "-v", "--stdin", data=os.fsencode(parent + "/") + b"\0")
-            fields = said.stdout.decode("utf-8", "surrogateescape").split("\0")
-            if said.returncode == 0 and len(fields) >= 4 and fields[0] and fields[0] not in new:
-                continue
-        hiding.append(path)
-    return hiding
+    nested = sorted(path for path in new if "/" in path)
+    covered = set()
+    folded = {path.casefold() for path in new}  # git names a rule's file `.gitignore` even when the file is `.GITIGNORE`
+    if nested:  # one git call for every parent: with --non-matching it answers each path, in order, four fields each
+        data = b"".join(os.fsencode(path.rpartition("/")[0] + "/") + b"\0" for path in nested)
+        said = _git(tree, "check-ignore", "-z", "-v", "-n", "--stdin", data=data)
+        fields = said.stdout.decode("utf-8", "surrogateescape").split("\0")
+        if said.returncode in (0, 1) and len(fields) >= 4 * len(nested):
+            for index, path in enumerate(nested):
+                source = fields[4 * index]
+                if source and source.casefold() not in folded:
+                    covered.add(path)
+    return [path for path in sorted(new) if path not in covered]
 
 
 def _git_changes(tree: Path, before: dict, after: dict) -> list[str]:
