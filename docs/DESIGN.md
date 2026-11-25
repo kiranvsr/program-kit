@@ -1,6 +1,6 @@
 # program-kit: a governed delivery framework for agent-run software programs
 
-This is the standing design document for program-kit. It describes the kit as built (version 0.7.3): what it is for, how a program moves from a few lines of intent to a frozen specification and a task register, how tasks are executed and accepted, and why each rule exists. `README.md` has the commands to start; `docs/FAQ.md` answers the questions newcomers ask most. Throughout, `pk` means `python3 kit/scripts/pk.py`.
+This is the standing design document for program-kit. It describes the kit as built (version 0.7.4): what it is for, how a program moves from a few lines of intent to a frozen specification and a task register, how tasks are executed and accepted, and why each rule exists. `README.md` has the commands to start; `docs/FAQ.md` answers the questions newcomers ask most. Throughout, `pk` means `python3 kit/scripts/pk.py`.
 
 ## 1. Purpose
 
@@ -652,8 +652,8 @@ The controller state (`program/controller-state.json`) is written by commands, n
 - Every lighter path is tested by trying to get round its guard: `test_tiers.py` (a lower tier that is not switched on, a full-tier path touched below full, a branch that lowers its own tier, a fast path on the full tier, a light merge nobody inspected, a light task called done), `test_land.py` (an unaccepted branch, a round with a full-tier member, a member or a main that moved, a tested tree that no longer matches, a finish that would lose work) and `test_tracker.py` (a refused step that writes nothing, the hand-off budget, a generator that touches no other tracked file).
 - `install.sh` is tested by installing into a temporary repository with each preset and running `pk doctor`.
 - The suite follows the kit's own rule W12: a fast default and a slow set behind one environment variable. Run either with a private temporary directory so leftovers from other runs cannot confuse the leftover checks:
-  - default: `TMPDIR=$(mktemp -d) python3 -W error -m unittest discover -s kit/tests` runs 1763 tests, 409 of them skipped as slow, in about 405 s (measured: 403 s);
-  - everything: `KIT_TESTS_SLOW=1 TMPDIR=$(mktemp -d) python3 -W error -m unittest discover -s kit/tests` runs all 1763 in about 1,320 s (measured: 22 min 2 s).
+  - default: `TMPDIR=$(mktemp -d) python3 -W error -m unittest discover -s kit/tests` runs 1767 tests, 409 of them skipped as slow, in about 400 s (measured: 398 s);
+  - everything: `KIT_TESTS_SLOW=1 TMPDIR=$(mktemp -d) python3 -W error -m unittest discover -s kit/tests` runs all 1767 in about 1,275 s (measured: 21 min 14 s).
   - No process outlives the run (0.6.2, KF-59): `test_zz_leftovers.py` runs last, reads `ps` once, keeps only the processes descending from the test runner, stops any it finds and fails naming them. Tests that start a long-lived child run it in a session of its own and kill that session in a cleanup, pass or fail, and a child that waits for a file gives up after a deadline.
   - The slow cases are the ones that build whole repositories, run the gate end to end, install the kit or spawn many processes. They are marked with `skip_unless_slow()` from `kit/tests/_slow.py`, and only these modules use it: `test_gate.py`, `test_gate_reuse.py`, `test_gate_steps.py`, `test_land.py`, `test_end_to_end.py`, `test_evidence.py`, `test_ext.py`, `test_parallel_plants.py`, `test_plant_chunks.py`, `test_tiers.py`, `test_rejudge.py` and `test_install.py`. Each keeps fast cases that import and drive its entry point, so a broken import still fails the default run. A test in `test_content.py` fails when the set of modules importing `_slow` differs from this list.
 
