@@ -722,6 +722,19 @@ class MergeTests(LandBase):
         self.assertEqual(status.validate(self.root), [])
         self.assert_no_trial_left()
 
+    def test_merging_a_task_removes_its_kept_logs_and_leaves_another_tasks(self):
+        """0.7.6 (KF-77): a task's kept logs of failed gate steps stay until pk merge merges it."""
+        self.standard()
+        kept = self.root / ".git" / "pk-logs"
+        for task in (TASK, T2):
+            put(kept / task, "20261125T101010Z-test.log", "all of it\n")
+            put(kept / task, "20261125T101010Z-test.digest", "# kept log\n")
+        code, out, err = self.pk("merge", TASK)
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertIn(f"kept logs: removed 2 file(s) of {TASK}", out.splitlines())
+        self.assertFalse((kept / TASK).exists())
+        self.assertEqual(sorted(os.listdir(kept / T2)), ["20261125T101010Z-test.digest", "20261125T101010Z-test.log"])
+
     def test_a_failed_merge_check_merges_nothing(self):
         self.standard(done=False)
         self.work("auth/policy.py")

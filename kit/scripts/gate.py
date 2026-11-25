@@ -47,6 +47,10 @@ Limits:
   Commit both (the evidence commit) or remove the record and restore the pointer by exact path before a re-run.
 - A task whose own inputs did not change since its latest record needs no new record: produce.py may append one,
   or leave the fresh record in place. Other tasks' records are never refreshed because a shared input changed.
+- A failing step prints only the last TAIL_LINES lines of its output. From 0.7.6 (KF-77) its full output is kept on
+  the machine that ran it, at `<git common dir>/pk-logs/<ID>/<stamp>-<step>.log` with a digest of its failure lines
+  beside it, and one `kept log:` line after the tail names both (`keptlogs`). `pk merge` removes a task's kept logs;
+  each keep removes those of tasks main says are done and those older than keptlogs.KEEP_DAYS (14) days.
 - With `evidence.reuse_unchanged_code` (0.5.2, `reuse.py`) a record whose head has byte-identical code is copied
   for the new head instead of running the test step and produce.py; `reused_from` names it, so its commands are
   known to have run at that earlier head. `--no-reuse` runs everything.
@@ -72,6 +76,7 @@ from pathlib import Path, PurePosixPath
 import conflicts
 import evidence as evidence_module
 import ext
+import keptlogs
 import latework
 import reuse as reuse_module
 import rulings as rulings_module
@@ -686,6 +691,44 @@ def _e2e_step(checks: dict, where: Path, reasons: list[str], merge: bool) -> boo
     return _run_commands("e2e", _commands(checks["e2e"]["command"]), where, timeout=step_limit(checks, "e2e"))
 
 
+# --- kept logs of failed steps (0.7.6, KF-77) -----------------------------------------
+
+_KEEPING: dict | None = None  # {root, common, task}: where a failing step of this gate run keeps its full output
+
+
+@contextlib.contextmanager
+def keeping(root: Path, task_id: str):
+    """Within the block, a failing step keeps its full output under `<git common dir>/pk-logs/<task_id>/`
+    (`keptlogs`). Module-wide, so the parallel steps' threads see it; one gate runs per process."""
+    global _KEEPING
+    before = _KEEPING
+    common = Path(git(root, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+    _KEEPING = {"root": Path(root), "common": common, "task": task_id}
+    try:
+        yield
+    finally:
+        _KEEPING = before
+
+
+def _failure_tail(step: str, header: str, output: str, shown: list[str] | None = None) -> list[str]:
+    """The tail lines of a failed step's `output` (the last TAIL_LINES, prefixed), then, inside `keeping`, one
+    `kept log:` line naming the file that holds all of it and the digest of its failure lines. Keeping it also
+    removes the kept logs of tasks main says are done and of any older than keptlogs.KEEP_DAYS days. `shown` (an
+    extension's lines) is tailed in place of `output`'s lines, as before 0.7.6."""
+    lines = [TAIL_PREFIX + line for line in (output.splitlines() if shown is None else shown)[-TAIL_LINES:]]
+    keep = _KEEPING
+    if keep is None:
+        return lines
+    try:
+        log, report, count, failures = keptlogs.keep(keep["common"], keep["task"], step, header, output)
+        keptlogs.prune(keep["common"], keep["root"], MAIN_REF)
+    except (OSError, ValueError) as exc:
+        return [*lines, f"kept log: none ({_show(exc)})"]
+    if not log.exists():  # the clean-up never removes the run's own task unless main says it is done
+        return [*lines, "kept log: none (the task is done on main, so its kept logs were removed)"]
+    return [*lines, f"kept log: {log} (the full output, {count} line(s); {failures} failure line(s) in {report})"]
+
+
 # --- running steps -----------------------------------------------------------------
 
 def _step_lines(step: str, commands: list[tuple[list[str], int]], cwd: Path, env: dict | None = None,
@@ -720,7 +763,7 @@ def _step_lines(step: str, commands: list[tuple[list[str], int]], cwd: Path, env
         if code == 127:
             return False, [*lines, f"FAILED: {step} missing tool: {argv[0]}"]
         lines.append(f"FAILED: {step} {' '.join(argv)} ({exit_text(code)})")
-        lines.extend(TAIL_PREFIX + line for line in output.splitlines()[-TAIL_LINES:])
+        lines.extend(_failure_tail(step, f"step {step}: {' '.join(argv)} ({exit_text(code)})", output))
         return False, lines
     return True, [*lines, f"step {step}: ok"]
 
@@ -1517,8 +1560,8 @@ def ext_check_step(root: Path, checks: dict, branch: str, tree: Path) -> bool:
         return True
     _out(f"FAILED: {EXT_CHECK} {said}, and the merged tree's extensions do not load "
          f"(pk ext check with {ext.ENV}={ext.WORKTREE} in the trial merge: {exit_text(code)})")
-    for line in output.splitlines()[-TAIL_LINES:]:
-        _out(TAIL_PREFIX + line)
+    for line in _failure_tail(EXT_CHECK, f"step {EXT_CHECK}: pk ext check ({exit_text(code)})", output):
+        _out(line)
     return False
 
 
@@ -1538,8 +1581,10 @@ def prepare_tree_step(root: Path, checks: dict, tree: Path, purpose: str, head: 
     for module, problem, lines in results:
         label = f"ext:{module}.prepare_tree"
         _out(f"FAILED: {label} {problem}" if problem else f"step {label}: ok ({purpose} tree)")
-        for line in lines[-TAIL_LINES:]:
-            _out(TAIL_PREFIX + line)
+        tail = (_failure_tail(label, f"step {label}: {problem}", "\n".join(lines), lines) if problem
+                else [TAIL_PREFIX + line for line in lines[-TAIL_LINES:]])
+        for line in tail:
+            _out(line)
         if problem:
             return False
     return True
@@ -1570,8 +1615,10 @@ def ext_steps(gate: str, root: Path, checks: dict, task_id: str, branch: str, he
             _out(f"step {label}: ok")
         else:
             _out(f"FAILED: {label} (not ok)")
-        for line in lines[-TAIL_LINES:]:
-            _out(TAIL_PREFIX + line)
+        tail = (_failure_tail(label, f"step {label}: not ok", "\n".join(lines), lines) if not ok
+                else [TAIL_PREFIX + line for line in lines[-TAIL_LINES:]])
+        for line in tail:
+            _out(line)
         if not ok:
             return 1
     return 0
@@ -1603,7 +1650,7 @@ def handback(root, task_id: str, branch: str, worktree=None, no_reuse: bool = Fa
         return 1
     _accepted_late_work(wt, task_id)
     e2e = e2e_reasons(root, branch, checks, merge=False) if meta["tier"] != "light" else []
-    with heavy(root, checks, f"gate-handback-{task_id}"):
+    with heavy(root, checks, f"gate-handback-{task_id}"), keeping(root, task_id):
         trial = trial_merge(root, branch)
         code = _limited(root, checks, lambda: _with_trial(
             root, trial, lambda: (0 if prepare_tree_step(root, checks, trial, "handback", sha) else 1)
@@ -1734,7 +1781,8 @@ def merge_check(root, branch: str, inspected: str | None = None, suite: bool = T
             return 1
         return ext_steps("merge", root, checks, task_id, branch, sha, trial, trial=trial)
 
-    with heavy(root, checks, f"gate-merge-check-{task_id}") if suite else contextlib.nullcontext():
+    with heavy(root, checks, f"gate-merge-check-{task_id}") if suite else contextlib.nullcontext(), \
+            keeping(root, task_id):
         trial = trial_merge(root, branch)
         code = _limited(root, checks, lambda: _with_trial(root, trial, steps)) if suite else _with_trial(
             root, trial, steps)

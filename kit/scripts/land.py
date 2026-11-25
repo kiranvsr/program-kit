@@ -6,7 +6,8 @@ not accepted (a light-tier task instead needs the controller's `--inspected <tip
 and requires it to pass, merges with `git merge --no-ff` (from 0.6.0 a conflict on the task's own status file takes
 the branch's record, as the trial merge did: `conflicts`), records a light-tier task `merged` with the commit
 that was inspected, rewrites the claim documents of the gates that name the task, regenerates the hand-off
-block and commits exactly the bookkeeping files it wrote. Merges stay one at a time: the command takes one ID
+block, removes the task's kept logs of failed gate steps here (0.7.6, KF-77: `keptlogs`) and commits exactly the
+bookkeeping files it wrote. Merges stay one at a time: the command takes one ID
 and merges one branch.
 
 "Accepted" is derived, never read from a word in a file: the branch tip's status record must say `done`, and
@@ -40,6 +41,7 @@ import ctlstate
 import evidence as evidence_module
 import gate
 import handoff as handoff_module
+import keptlogs
 import latework
 import rulings as rulings_module
 import status as status_module
@@ -523,6 +525,12 @@ def merge(root: Path, task_id: str, inspected: str | None = None, round_name: st
     message = ["-m", f"Merge {branch} ({tier} tier)"] + [part for line in trailers for part in ("-m", line)]
     lines += _merge_resolving(root, branch, f"refs/heads/{branch}", task_id, message)
     lines.append(f"merged: {branch} into {MAIN} at {git(root, 'rev-parse', 'HEAD')}")
+    try:  # 0.7.6 (KF-77): the task is done, so its kept logs of failed gate steps go (a lane's go at its next step)
+        removed = keptlogs.remove(Path(git(root, "rev-parse", "--path-format=absolute", "--git-common-dir")), task_id)
+        if removed:
+            lines.append(f"kept logs: removed {removed} file(s) of {task_id}")
+    except (OSError, ValueError, KitError) as exc:
+        lines.append(f"kept logs: not removed ({gate._show(exc)})")
     wrote = ["program/HANDOFF.md", ctlstate.STATE_FILE, "program/costs.jsonl", "program/rulings.md"]
     problems = []
     if meta["tier"] == "light":

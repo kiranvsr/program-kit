@@ -861,5 +861,108 @@ class KitOfAnOlderBranch(RemoteBase):
         self.assertIn(f"remote: kit on the lane: main's (main's 9.9.9, the run tree's {old})", dry.stdout)
 
 
+# --- 0.7.6: a failed gate step's full output is kept on the lane until the task is done (KF-77) -----------------
+
+# A stand-in for `pk gate handback` on the lane (the section's wrap puts it first): it keeps the step's long output
+# with the lane's own kit (keptlogs, under PK_LOG_STAMP), prints the gate's lines and fails as a failed test step does.
+FAKE_GATE = """import os
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.join(os.getcwd(), "kit", "scripts"))
+import keptlogs
+
+task = sys.argv[sys.argv.index("handback") + 1]
+common = subprocess.run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], capture_output=True,
+                        text=True, check=True).stdout.strip()
+output = "".join("ok %d\\n" % i for i in range(60)) + "FAIL realtime.test.ts > reconnects\\nAssertionError: 1 != 2\\n"
+output += "".join("after %d\\n" % i for i in range(30))
+log, digest, count, failures = keptlogs.keep(common, task, "test", "step test: pnpm -r test (exit 1)", output)
+print("FAILED: test pnpm -r test (exit 1)")
+print("kept log: %s" % log)
+sys.exit(1)
+"""
+
+
+class KeptLogsOnALane(TwoHosts):
+    def setUp(self):
+        super().setUp()
+        (self.root / "fake_gate.py").write_text(FAKE_GATE)
+        self.write_section(wrap=["python3", "fake_gate.py"])
+        self.big = self.lane("beta-host", "big")
+        self.kept = self.big / ".git" / "pk-logs" / TASK
+
+    def test_a_gate_dry_run_names_where_a_failing_step_keeps_its_log_and_the_script_keeps_and_cleans(self):
+        result = self.pk("gate", TASK, "--host", "PK_B", "--lane", "big", "--dry-run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(result.stdout, r"remote: a failing step keeps its full output on the lane, at lanes/big/\.git/"
+                                        rf"pk-logs/{TASK}/[0-9]{{8}}T[0-9]{{6}}Z-<step>\.log \(until {TASK} is merged, "
+                                        r"or 14 days\); its failure digest comes back here; read the log with "
+                                        rf"pk remote log {TASK}")
+        ssh = result.stdout.split("remote: ssh: ", 1)[1]
+        self.assertRegex(ssh, r"export PK_LOG_STAMP=[0-9]{8}T[0-9]{6}Z")
+        self.assertIn("the kept-log clean-up failed; the step runs on", ssh)
+        self.assert_no_destination(result)
+        self.assertEqual(self.ssh_calls(), [])
+
+    def test_a_failed_gate_step_keeps_its_full_log_on_the_lane_brings_its_digest_back_and_log_reads_it(self):
+        result = self.pk("gate", TASK, "--host", "PK_B", "--lane", "big")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        logs = sorted(self.kept.glob("*.log"))
+        self.assertEqual(len(logs), 1, result.stdout + result.stderr)
+        log = logs[0]
+        self.assertEqual(len(log.read_text().splitlines()), 92)
+        self.assertIn(f"kept log: {log}", result.stdout)  # the lane's own line, streamed, with its path there
+        shown = f"lanes/big/.git/pk-logs/{TASK}/{log.name}"  # the runner's: under remote.dir, as the section says
+        self.assertIn(f"remote: kept log on PK_B:big: {shown} (the step's full output; kept until {TASK} is merged, or "
+                      "14 days)", result.stderr)
+        local = self.root / ".git" / "pk-logs" / TASK / f"PK_B-big-{log.stem}.digest"
+        self.assertIn(f"remote: failure digest (2 line(s)) copied to {local}", result.stderr)
+        self.assertEqual(local.read_text().splitlines()[2:], ["61: FAIL realtime.test.ts > reconnects",
+                                                              "62: AssertionError: 1 != 2"])
+        self.assertIn(f"remote: read it: pk remote log {TASK} --host PK_B --lane big --file {log.name} --tail 200",
+                      result.stderr)
+        self.assertEqual(sorted(self.lane("alpha-host", "big").glob(".git/pk-logs/*")), [])
+        listed = self.pk("log", TASK)
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        self.assertEqual(listed.stdout.splitlines(), [f"PK_B:big {log.name} {log.stat().st_size} bytes {shown}"])
+        tail = self.pk("log", TASK, "--tail", "3")
+        self.assertEqual((tail.returncode, tail.stdout), (0, "after 27\nafter 28\nafter 29\n"), tail.stderr)
+        self.assertIn(f"remote: PK_B:big {shown}", tail.stderr)
+        grep = self.pk("log", TASK, "--host", "PK_B", "--grep", "FAIL|Assertion")
+        self.assertEqual(grep.stdout.splitlines(), ["61:FAIL realtime.test.ts > reconnects",
+                                                    "62:AssertionError: 1 != 2"], grep.stderr)
+        dest = self.base / "copied"
+        dest.mkdir()
+        copy = self.pk("log", TASK, "--file", log.name, "--copy", str(dest))
+        self.assertEqual(copy.returncode, 0, copy.stderr)
+        self.assertEqual((dest / log.name).read_bytes(), log.read_bytes())
+        self.assertNotIn("beta-host", result.stderr)  # the lane's streamed lines may name its home; the runner never
+        for done in (listed, tail, grep, copy):
+            self.assert_no_destination(done)
+        none = self.pk("log", TASK, "--host", "PK_A", "--tail", "3")
+        self.assertEqual(none.returncode, 1)
+        self.assertIn(f"no kept log of {TASK} on the lanes", none.stderr)
+
+    def test_a_lane_step_removes_a_done_tasks_and_old_kept_logs_and_keeps_an_unmerged_recent_one(self):
+        status_dir = self.root / "program" / "status"
+        status_dir.mkdir(parents=True)
+        (status_dir / "DONE-1.json").write_text('{"status": "done"}\n')
+        commit(self.root, "DONE-1 is done")
+        self.write_section()  # no stand-in gate: a plain run
+        kept = self.lane("alpha-host", "small1") / ".git" / "pk-logs"
+        for task, days in (("DONE-1", 0), ("OLD-1", 15), (TASK, 0)):
+            (kept / task).mkdir(parents=True)
+            log = kept / task / "20261101T000000Z-test.log"
+            log.write_text("x\n")
+            then = time.time() - days * 86400
+            os.utime(log, (then, then))
+        result = self.run_here("--host", "PK_A", "--lane", "small1")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("remote: removed the kept logs of DONE-1 (done)", result.stdout)
+        self.assertIn("remote: removed the kept logs of OLD-1 (older than 14 days)", result.stdout)
+        self.assertEqual(os.listdir(kept), [TASK])
+
+
 if __name__ == "__main__":
     unittest.main()

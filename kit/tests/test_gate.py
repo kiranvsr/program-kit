@@ -614,8 +614,15 @@ class HandbackTests(HandbackBase):
         rc, out = self.handback()
         self.assertEqual(rc, 1)
         lines = out.splitlines()
-        self.assertEqual(lines[-21], f"FAILED: test {PY} -c {script} (exit 2)")
-        self.assertEqual(lines[-20:], [f"{TAIL}line {i}" for i in range(10, 30)])
+        self.assertEqual(lines[-22], f"FAILED: test {PY} -c {script} (exit 2)")
+        self.assertEqual(lines[-21:-1], [f"{TAIL}line {i}" for i in range(10, 30)])
+        # 0.7.6 (KF-77): the full output is kept outside the worktrees, at the path the last line names
+        kept = self.root / ".git" / "pk-logs" / TASK
+        match = re.match(r"kept log: (\S+) \(the full output, 30 line\(s\); 0 failure line\(s\) in (\S+)\)\Z", lines[-1])
+        self.assertTrue(match, lines[-1])
+        log = Path(match.group(1))
+        self.assertEqual((log.parent, Path(match.group(2))), (kept, log.with_suffix(".digest")))
+        self.assertEqual(log.read_text().splitlines(), [f"line {i}" for i in range(30)])
         self.assertFalse([ln for ln in lines if ln.startswith("OK: ")])
         self.assertFalse(self.fake_log.exists(), "scan ran after test failed")
         self.assertFalse((self.wt / POINTER).exists())

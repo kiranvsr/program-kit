@@ -10,6 +10,7 @@
                      [--dry-run]
     pk remote run [--lane L|auto] [--host VAR] [--size S|any] [--get PATH]... [--force-main] [--dry-run] <owner>
                   -- <command> ...
+    pk remote log <ID> [--host VAR] [--lane L] [--file NAME] [--grep PATTERN | --tail N | --copy DEST]
 
 `<ID>` is any task ID `pk gate handback` takes: a register task or an ad-hoc `AH-<nnnn>` (`pk adhoc add`), with its
 branch `task/<ID>` and its worktree from `pk worktree new <ID>` (0.7.3, KF-71: an ad-hoc batch or chore takes an ID
@@ -70,6 +71,15 @@ names. On each host, under `dir`:
   task worktree; after a plants step only the new plants record files (never `latest.json`), which
   `pk gate plants --adopt` then lists in the local pointer. Only regular files under record names come back (for
   `run`, the `--get` paths). The controller commits them on the task branch as after a local run.
+- Kept logs (0.7.6, KF-77). A failing gate step on a lane keeps its full output in the lane checkout's git dir,
+  `<dir>/<lane>/.git/pk-logs/<ID>/<stamp>-<step>.log`, with a digest of its failure lines beside it (`keptlogs`;
+  the stamp is set by the runner as PK_LOG_STAMP). After a failed gate step the digest comes back to this checkout's
+  `<git common dir>/pk-logs/<ID>/<VAR>-<lane>-<stamp>-<step>.digest`, and the runner names the log on the lane by
+  host variable, lane and path, with a ready `pk remote log` command. `pk remote log <ID>` lists a task's kept logs
+  on every lane (one ssh call per host); `--grep PATTERN`, `--tail N` or `--copy DEST` reads the newest (or
+  `--file NAME`). Every lane step, after the lane's main is reset to the mirror's, removes the kept logs of each
+  task that main says is done and of each older than 14 days (keptlogs.KEEP_DAYS); `pk merge` removes this
+  checkout's.
 - `pk remote status` shows every configured host by its variable name: the base directory's disk use, then each
   lane's size, checkout, lock (free, busy with its holder and age, stale, or missing) and last log lines; a host that
   does not answer is shown as unreachable and status still exits 0.
@@ -101,6 +111,7 @@ from pathlib import Path, PurePosixPath
 import evidence as evidence_module
 import ext as ext_module
 import gate
+import keptlogs
 import latework
 import lock
 import plants as plants_module
@@ -478,6 +489,13 @@ def _mark_lines(settings: dict, name: str) -> list[str]:
     return [f"pk_marks=\"{_common_dir()}/pk-fetch\"", "mkdir -p \"$pk_marks\"", f": > \"$pk_marks\"/{_q(name)}"]
 
 
+def _prune_lines() -> list[str]:
+    """Lines (from the lane root, after its main is reset to the mirror's) that remove the kept logs of failed gate
+    steps (0.7.6, KF-77) of each task the lane's main says is done, and of each older than keptlogs.KEEP_DAYS."""
+    return [f"python3 -c {_q(keptlogs.PRUNE)} \"{_common_dir()}\" {keptlogs.KEEP_DAYS} . HEAD || "
+            "echo 'remote: the kept-log clean-up failed; the step runs on'"]
+
+
 def _disk_lines(settings: dict) -> list[str]:
     """Lines that warn on standard error when the base directory's file system is at least disk_warn_percent full."""
     warn = settings["disk_warn_percent"]
@@ -808,6 +826,36 @@ def _bring_records(wt: Path, task_id: str, files: list[tuple[str, bytes]], kinds
     return written
 
 
+def _kept_digests(root: Path, settings: dict, lane: str, task_id: str, stamp: str) -> None:
+    """After a failed gate step: copy back the failure digest of each log this run kept on the lane (0.7.6, KF-77)
+    into this checkout's `<git common dir>/pk-logs/<ID>/` as `<VAR>-<lane>-<name>.digest`, and say where the full
+    log stays on the lane (by host variable, lane and path, never the host) and how to read it."""
+    listing = (f"{{ d=\"$(git rev-parse --git-common-dir)\"/{keptlogs.DIR}/{_q(task_id)}; if [ -d \"$d\" ]; then "
+               f"find \"$d\" -maxdepth 1 -type f -name {_q(stamp + '-*.digest')} -print0; fi; }}")
+    try:
+        found = _fetch_files(settings, f"{settings['base']}/{lane}", listing)
+    except KitError as exc:
+        _say(f"the failure digest did not come back: {exc}")
+        return
+    var = settings["host_var"]
+    here = keptlogs.folder(Path(git(root, "rev-parse", "--path-format=absolute", "--git-common-dir")), task_id)
+    for name, raw in sorted(found):
+        base = PurePosixPath(name).name
+        if not (base.startswith(stamp + "-") and base.endswith(".digest")):
+            continue
+        text = raw.decode("utf-8", "replace")
+        log = f"{settings['base']}/{lane}/{PurePosixPath(name).parent}/{base[:-len('.digest')]}.log"
+        here.mkdir(parents=True, exist_ok=True)
+        target = here / f"{var}-{lane}-{base}"
+        _write_new(target, raw, None)
+        failures = sum(1 for line in text.splitlines() if not line.startswith("# "))
+        _say(f"kept log on {var}:{lane}: {log} (the step's full output; kept until {task_id} is merged, or "
+             f"{keptlogs.KEEP_DAYS} days)")
+        _say(f"failure digest ({failures} line(s)) copied to {target}")
+        _say(f"read it: pk remote log {task_id} --host {var} --lane {lane} --file {PurePosixPath(log).name} --tail 200 "
+             "(or --grep PATTERN, or --copy DEST)")
+
+
 # --- the steps ----------------------------------------------------------------------------------------------
 
 def _task_checks(root: Path, task_id: str, branch: str, kind: str) -> Path:
@@ -888,12 +936,19 @@ def _step(root: Path, settings: dict, task_id: str, branch: str, kind: str, pk_a
     settings, lane, plan = _target(settings, kind, wanted, host_var, size, dry_run)
     command = [*_prefix(settings, lane), "python3", kit, "gate",
                "handback" if kind == "gate" else "plants", task_id, "--branch", branch, *pk_args]
+    stamp = keptlogs.stamp()  # names this run's kept logs on the lane, so its digest is found (0.7.6, KF-77)
     body = [*_clean_lines(settings, name), *_mark_lines(settings, name), *_prepare_task(task_id, branch),
-            *_prepare_lines(f".worktrees/{name}", head, kit), *_setup_lines(settings, f".worktrees/{name}"),
+            *_prune_lines(), *_prepare_lines(f".worktrees/{name}", head, kit),
+            *_setup_lines(settings, f".worktrees/{name}"), f"export {keptlogs.STAMP_ENV}={_q(stamp)}",
             "exec " + shlex.join(command)]
     script = _lane_script(settings, lane, owner, main_sha, body, head[:12])
     if dry_run:
         _dry(settings, f"{kind} {task_id}", plan, refspecs, command, script, kit_note)
+        if kind == "gate":
+            print(f"remote: a failing step keeps its full output on the lane, at {settings['base']}/{lane}/.git/"
+                  f"{keptlogs.DIR}/{task_id}/{stamp}-<step>.log (until {task_id} is merged, or "
+                  f"{keptlogs.KEEP_DAYS} days); its failure digest comes back here; read the log with "
+                  f"pk remote log {task_id}")
         return 0
     if kit != PK_SCRIPT:
         _say(kit_note)
@@ -914,6 +969,8 @@ def _step(root: Path, settings: dict, task_id: str, branch: str, kind: str, pk_a
                                  (store.PLANTS,), False)
     for path in written:
         _say(f"copied back {path}")
+    if kind == "gate" and proc.returncode != 0:
+        _kept_digests(root, settings, lane, task_id, stamp)
     if kind == "plants" and written:
         with lock.held(f"remote-adopt-{task_id}", name=ADOPT_LOCK, cwd=root):
             plants_module.adopt(root, task_id, branch)
@@ -1195,6 +1252,7 @@ def cmd_run(args) -> int:
         *(_mark_lines(settings, name) if gets else []),
         f"git fetch -q origin +refs/heads/main:refs/remotes/origin/main {_q(f'+refs/runs/{name}:refs/runs/{name}')}",
         "git checkout -q -f -B main origin/main",
+        *_prune_lines(),
         f"if [ -e {r}/.git ]; then",
         f"  git -C {r} reset -q --hard && git -C {r} clean -fdq",
         f"  git -C {r} checkout -q -f --detach {head} && git -C {r} reset -q --hard {head} && git -C {r} clean -fdq",
@@ -1238,6 +1296,103 @@ def cmd_run(args) -> int:
             _say("not there on the lane: " + ", ".join(missing))
     _say(f"exit {proc.returncode}")
     return proc.returncode
+
+
+# --- kept logs (0.7.6, KF-77) ---------------------------------------------------------------------------------
+
+def _kept_logs(settings: dict, task_id: str, lanes: list[str]) -> list[dict] | None:
+    """{lane, size, path} of each kept log of the task on one host's `lanes`, newest name last, `path` relative to the
+    base directory; None when the host does not answer. One ssh call."""
+    script = "\n".join([
+        f"base={_q(settings['base'])}", 'case "$base" in /*) ;; *) base="$(pwd)/$base" ;; esac',
+        "for l in " + " ".join(_q(lane) for lane in lanes) + "; do",
+        '  c=$(git -C "$base/$l" rev-parse --git-common-dir 2>/dev/null) || continue',
+        '  case "$c" in /*) ;; *) c="$base/$l/$c" ;; esac',  # relative to the lane: no symbolic link resolved away
+        f'  for f in "$c"/{keptlogs.DIR}/{_q(task_id)}/*.log; do',
+        '    if [ -f "$f" ] && [ ! -L "$f" ]; then echo "log $l $(wc -c < "$f" | tr -d \' \') ${f#"$base"/}"; fi',
+        "  done", "done", "echo pk-log-end"])
+    proc = _remote(settings, script, capture=True)
+    raw = proc.stdout.decode("utf-8", "replace").splitlines()
+    if proc.returncode != 0 or "pk-log-end" not in raw:
+        return None
+    found = []
+    for line in raw:
+        parts = line.split(" ", 3)
+        if len(parts) == 4 and parts[0] == "log" and parts[1] in lanes and parts[2].isdigit() \
+                and parts[3].startswith(parts[1] + "/") and ".." not in PurePosixPath(parts[3]).parts:
+            found.append({"lane": parts[1], "size": int(parts[2]), "path": parts[3]})
+    return sorted(found, key=lambda item: PurePosixPath(item["path"]).name)
+
+
+def _shown(text: str) -> list[str]:
+    """Lines of a kept log as printed here: colour sequences dropped, control characters escaped, and a line that
+    would read as an `OK:` line prefixed with `| `."""
+    out = []
+    for line in keptlogs.plain(text).splitlines():
+        line = gate._show(line)
+        out.append("| " + line if line.startswith("OK: ") else line)
+    return out
+
+
+def cmd_log(args) -> int:
+    root = find_root()
+    settings = _settings(root, quiet=True)
+    task_id = args.task_id
+    gate._task_branch(task_id, f"task/{task_id}")
+    if args.tail is not None and args.tail < 1:
+        raise KitError("--tail takes a number of lines above 0")
+    if args.file is not None and (not re.match(r"[A-Za-z0-9][A-Za-z0-9._-]*\.log\Z", args.file)):
+        raise KitError(f"--file {gate._show(args.file)}: a kept log's file name, as the listing shows it")
+    pairs = _candidates(settings, args.lane or "auto", args.host, None)
+    order: dict[str, tuple[dict, list[str]]] = {}
+    for host, lane in pairs:
+        order.setdefault(host["var"], (host, []))[1].append(lane)
+    found = []
+    for var, (host, lanes) in order.items():
+        listed = _kept_logs(_on(settings, host), task_id, lanes)
+        if listed is None:
+            _say(f"{var} does not answer; its kept logs are not listed")
+            continue
+        found += [{**item, "var": var, "host": host} for item in listed
+                  if args.file is None or PurePosixPath(item["path"]).name == args.file]
+    action = args.grep is not None or args.tail is not None or args.copy is not None
+    if not action:
+        if not found:
+            print(f"remote: no kept log of {task_id} on the lanes (a failing gate step keeps one; a done task's go)")
+        for item in found:
+            print(gate._show(f"{item['var']}:{item['lane']} {PurePosixPath(item['path']).name} {item['size']} bytes "
+                             f"{settings['base']}/{item['path']}"))
+        return 0
+    if not found:
+        raise KitError(f"no kept log of {task_id}" + (f" named {args.file}" if args.file else "") + " on the lanes")
+    item = max(found, key=lambda entry: PurePosixPath(entry["path"]).name)
+    on, path = _on(settings, item["host"]), item["path"]
+    _say(f"{item['var']}:{item['lane']} {settings['base']}/{path}")
+    where = f"base={_q(settings['base'])}; case \"$base\" in /*) ;; *) base=\"$(pwd)/$base\" ;; esac; f=\"$base\"/{_q(path)}"
+    if args.copy is not None:
+        proc = _remote(on, f"{where}; cat -- \"$f\"", capture=True)
+        if proc.returncode != 0:
+            raise KitError(f"pk remote log: cannot read {path}")
+        target = Path(args.copy)
+        if target.is_dir():
+            target = target / PurePosixPath(path).name
+        _write_new(target, proc.stdout, None)
+        _say(f"copied {len(proc.stdout)} bytes to {target}")
+        return 0
+    if args.tail is not None:
+        script = f"{where}; tail -n {int(args.tail)} -- \"$f\""
+    else:
+        script = f"{where}; grep -n -E -e {_q(args.grep)} -- \"$f\"; rc=$?; [ $rc -le 1 ] && exit 0; exit $rc"
+    proc = _remote(on, script, capture=True)
+    if proc.returncode != 0:
+        raise KitError(f"pk remote log: cannot read {path}: "
+                       + _scrub(on, " ".join(proc.stderr.decode("utf-8", "replace").split()))[:300])
+    lines = _shown(proc.stdout.decode("utf-8", "replace"))
+    for line in lines:
+        print(line)
+    if args.grep is not None and not lines:
+        _say(f"no line matches {args.grep}")
+    return 0
 
 
 def configure(parser) -> None:
@@ -1285,11 +1440,21 @@ def configure(parser) -> None:
     run.add_argument("--dry-run", action="store_true", help=dry_help)
     run.add_argument("owner", help="who runs it (letters, digits, . _ -)")
     run.add_argument("rest", nargs=argparse.REMAINDER, metavar="-- command ...")
+    log = actions.add_parser("log", help="the kept logs of a task's failed gate steps on the lanes: list them, or grep, "
+                                         "tail or copy back the newest (or --file)")
+    log.add_argument("task_id", metavar="ID")
+    log.add_argument("--host", metavar="VAR", help=host_help)
+    log.add_argument("--lane", help="only this lane of remote.lanes")
+    log.add_argument("--file", metavar="NAME", help="the kept log of this name (as listed); default: the newest")
+    what = log.add_mutually_exclusive_group()
+    what.add_argument("--grep", metavar="PATTERN", help="print the log's lines matching this extended regex, numbered")
+    what.add_argument("--tail", type=int, metavar="N", help="print the log's last N lines")
+    what.add_argument("--copy", metavar="DEST", help="copy the log here (a file, or a directory to put it in)")
 
 
 def cmd_remote(args) -> int:
     return {"status": cmd_status, "doctor": cmd_doctor, "gate": cmd_gate, "plants": cmd_plants,
-            "run": cmd_run}[args.action](args)
+            "run": cmd_run, "log": cmd_log}[args.action](args)
 
 
 def register(add_command) -> None:
