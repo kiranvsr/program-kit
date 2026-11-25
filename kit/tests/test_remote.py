@@ -393,9 +393,13 @@ class Hosts(TwoHosts):
         proc = subprocess.Popen([PY, str(PK), "remote", "run", "o", "--", PY, "-c", "print('ran')"], cwd=str(self.wt),
                                 env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
-            deadline = time.time() + 60
-            while sum("pk_free" in call for call in self.ssh_calls()) < 4 and time.time() < deadline:
+            def polls():  # the log is read by line; each poll's script ends with one `echo none` line (and a quote)
+                return sum(call.startswith("echo none") for call in self.ssh_calls())
+
+            deadline = time.time() + 300  # a second poll of both hosts has started, however loaded the machine is
+            while polls() < 4 and time.time() < deadline:
                 time.sleep(0.1)
+            self.assertGreaterEqual(polls(), 4, "no second poll")
             self.assertIsNone(proc.poll())  # both big lanes are free, and still it waits
             self.free("beta-host", "small2")
             out, err = proc.communicate(timeout=120)
