@@ -1435,7 +1435,7 @@ class GateEndToEndTests(HandbackBase):
         self.assertIn("FAILED: ext the handback gate's extension steps refuses: extension module(s) did not load "
                       "from main's committed tree (fixture: ModuleNotFoundError: No module named "
                       "'nonexistent_dependency')", out)
-        self.assertNotIn("step ext:", out)
+        self.assertNotIn("step ext:fixture.check", out)  # no gate step ran (its tree was prepared at the start)
         self.assertEqual([line for line in out.splitlines() if line.startswith("OK:")], [])
 
 
