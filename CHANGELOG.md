@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.7.4
+
+A branch that upgrades the kit could not run on a lane, from the first use of 0.7.3 on a programme: `pk remote run` from a branch carrying 0.7.3 while main still had 0.7.2 failed at once on the lane with `pk ext: invalid choice: 'prepare-tree'`, because the lane ran every kit command with the pushed main's kit while this machine's newer kit had written the step. So a kit-upgrade branch could be neither gated, run nor fingerprinted on a lane until main carried the new kit. Backward compatible: a branch whose kit is not newer than main's runs exactly as before.
+
+What changed:
+
+- The kit on the lane (KF-75, bug fix). `pk remote gate`, `plants` and `run` now run the step's kit commands (`pk gate handback`, `pk gate plants`, `pk ext prepare-tree`) with the run tree's own kit, `.worktrees/<id>/kit/scripts/pk.py` (for `run`, `.worktrees/run-<name>/...` with the shipped changes) from the lane's checkout, when the run tree's `kit/VERSION` (for `run`, as shipped) is newer than main's. A branch whose kit is the same as main's or older, such as one cut before main's last kit upgrade, keeps main's kit, so it is judged on the lane as the main checkout judges it. Only the lane lock is still taken with main's kit (`git archive`); its on-disk format is unchanged across 0.7.x. Trust: the run tree's code already runs on the lane as the step's tests and producer, which can write any record, so running its kit adds no power it lacked; QA re-checks the record and the merge check still runs on this machine with main's kit. KF-73's rule stands: `prepare-tree` runs only when main declares extensions.
+- Refused up front, never mid-step (KF-75). When the kit the lane would use is older than a kit command the step needs (today `pk ext prepare-tree`, 0.7.3, when main declares extensions), `pk remote` refuses before it polls a lane or pushes anything, naming both kits' versions: "the lane would run this step's kit commands with main's kit 0.7.2 (main's 0.7.2, the run tree's 0.7.2), older than 0.7.3 ... Nothing was pushed and nothing ran; run the step here, or merge a kit of that version or later first". `--dry-run` prints which kit the lane uses (`remote: kit on the lane: ...`), and a real step prints it when it is the run tree's.
+
+Upgrading from 0.7.3: `sh install.sh /path/to/your-repo --upgrade`. Nothing in `program/` has to change.
+
 ## 0.7.3
 
 Who runs long runs, from two programmes that had agents sit through them, and `prepare_tree` for the trees lanes and the fingerprint run in: set-up agents waited through 10- to 30-minute gate and fingerprint runs on one, and an implementer held its turn and its context through a 58-minute hand-back gate on the other. The user's principle, relayed by one of them: for tests, builds, gates and fingerprints, where an agent does not need to be engaged the whole time, the controller manages and monitors. Agents are dispatched for judgement only. With it, a `pk remote` fix for a stale scratch clone that could rewind the lanes' mirror, and the lane set-up both programmes had improvised, written down. Backward compatible: a one-host `remote` section and every existing record work unchanged.

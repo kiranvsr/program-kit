@@ -746,5 +746,120 @@ class PrepareTreeOnALane(RemoteBase):
         self.assertNotIn("the step ran", result.stdout)
 
 
+# A stand-in pk.py: it logs which kit ran which command to $KIT_MARK, then hands over to the real kit (pk_real.py)
+# beside it. As main's 0.7.2 it lacks `ext prepare-tree`, failing as that kit's argparse did (KF-75); either kit's
+# `gate` only says who judged it.
+KIT_SHIM = """import os
+import runpy
+import sys
+from pathlib import Path
+
+WHO = "{who}"
+with open(os.environ["KIT_MARK"], "a", encoding="utf-8") as mark:
+    mark.write(WHO + " " + " ".join(sys.argv[1:3]) + "\\n")
+if WHO == "main-kit" and sys.argv[1:3] == ["ext", "prepare-tree"]:
+    sys.stderr.write("pk ext: invalid choice: 'prepare-tree'\\n")
+    sys.exit(2)
+if sys.argv[1:2] == ["gate"]:
+    print(WHO + " judged the gate")
+    sys.exit(0)
+runpy.run_path(str(Path(__file__).with_name("pk_real.py")), run_name="__main__")
+"""
+
+
+class KitFromTheRunTree(RemoteBase):
+    """0.7.4 (KF-75): a branch that upgrades the kit (0.7.4 here, main's 0.7.2) runs its step's kit commands on the
+    lane with its own kit; only the lane lock keeps main's. A lane kit without what the step needs is refused up
+    front, before anything is pushed."""
+
+    def setUp(self):
+        super().setUp()
+        (self.root / ".gitignore").write_text("__pycache__/\n.worktrees/\ndeps\ndeps-cache/\nsetup-ran\n")
+        (self.root / "program" / "extensions").mkdir(parents=True)
+        (self.root / "program" / "extensions.yaml").write_text("api: 1\nmodules:\n  - name: deps\n")
+        (self.root / "program" / "extensions" / "deps.py").write_text(LANE_PREPARER)
+        self.shim(self.root, "main-kit", "0.7.2")
+        commit(self.root, "main: kit 0.7.2 and an extension that prepares trees")
+        sh(self.wt, "git", "merge", "-q", "main")
+        self.shim(self.wt, "tree-kit", "0.7.4")
+        commit(self.wt, "kit: upgrade to 0.7.4")
+        (self.machine / "lane1" / "deps-cache").mkdir()
+        (self.machine / "lane1" / "deps-cache" / "dep.txt").write_text("installed on lane1\n")
+        self.mark = self.base / "kit-mark.log"
+        self.env["KIT_MARK"] = str(self.mark)
+        self.env.pop("PK_EXT_FROM", None)
+
+    @staticmethod
+    def shim(tree, who, version):
+        scripts = tree / "kit" / "scripts"
+        if not (scripts / "pk_real.py").exists():
+            (scripts / "pk.py").rename(scripts / "pk_real.py")
+        (scripts / "pk.py").write_text(KIT_SHIM.replace("{who}", who))
+        (tree / "kit" / "VERSION").write_text(version + "\n")
+
+    def marks(self):
+        return self.mark.read_text().splitlines() if self.mark.exists() else []
+
+    def test_a_kit_upgrade_branch_runs_on_a_lane_with_its_own_kit(self):
+        result = self.pk("run", "--lane", "lane1", "o", "--", PY, "-c", "print('the step ran')", cwd=self.wt)
+        out = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, out)
+        self.assertNotIn("invalid choice", out)
+        self.assertIn("kit on the lane: the run tree's (main's 0.7.2, the run tree's 0.7.4)", out)
+        self.assertIn("step ext:deps.prepare_tree: ok (remote tree)", result.stdout)
+        self.assertIn("the step ran", result.stdout)
+        self.assertEqual(self.marks(), ["main-kit lock run", "tree-kit ext prepare-tree"])
+
+    def test_the_gate_and_prepare_tree_run_through_the_run_trees_kit(self):
+        kit = f".worktrees/{TASK.lower()}/kit/scripts/pk.py"
+        dry = self.pk("gate", TASK, "--lane", "lane1", "--dry-run")
+        self.assertEqual(dry.returncode, 0, dry.stderr)
+        self.assertIn(f"python3 {kit} gate handback {TASK} --branch {BRANCH}", dry.stdout)
+        self.assertIn(f"python3 {kit} ext prepare-tree remote .worktrees/{TASK.lower()} --head ", dry.stdout)
+        self.assertIn("remote: kit on the lane: the run tree's (main's 0.7.2, the run tree's 0.7.4)", dry.stdout)
+        plants = self.pk("plants", TASK, "--rows", "g1", "--lane", "lane1", "--dry-run")
+        self.assertIn(f"python3 {kit} gate plants {TASK} --branch {BRANCH} --rows g1", plants.stdout)
+        result = self.pk("gate", TASK, "--lane", "lane1")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("step ext:deps.prepare_tree: ok (remote tree)", result.stdout)
+        self.assertIn("tree-kit judged the gate", result.stdout)
+        self.assertEqual(self.marks(), ["main-kit lock run", "tree-kit ext prepare-tree", "tree-kit gate handback"])
+
+    def test_a_lane_kit_without_prepare_tree_is_refused_up_front_and_pushes_nothing(self):
+        (self.wt / "kit" / "VERSION").write_text("0.7.2\n")  # the branch's kit is main's again: no prepare-tree
+        commit(self.wt, "kit: back to 0.7.2")
+        for argv, cwd in ((["run", "--lane", "lane1", "o", "--", *PROBE], self.wt),
+                          (["run", "--lane", "lane1", "--dry-run", "o", "--", *PROBE], self.wt),
+                          (["gate", TASK, "--lane", "lane1"], None), (["gate", TASK, "--dry-run"], None),
+                          (["plants", TASK, "--rows", "g1", "--lane", "lane1", "--dry-run"], None)):
+            result = self.pk(*argv, cwd=cwd)
+            self.assertEqual(result.returncode, 1, (argv, result.stdout, result.stderr))
+            said = " ".join(result.stderr.split())
+            self.assertIn("refused before any push: the lane would run this step's kit commands with main's kit 0.7.2 "
+                          "(main's 0.7.2, the run tree's 0.7.2), older than 0.7.3, the first kit with `pk ext "
+                          "prepare-tree`", said, argv)
+            self.assertIn("Nothing was pushed and nothing ran; run the step here, or merge a kit", said, argv)
+            self.assertNotIn("invalid choice", result.stdout + result.stderr)
+        self.assertEqual(self.ssh_calls(), [])  # no lane polled, nothing pushed
+        self.assertEqual(self.marks(), [])
+        self.assertFalse((self.machine / "lane1.log").exists())
+        self.assertNotIn("refs/runs/", sh(self.machine / "repo.git", "git", "for-each-ref", "--format=%(refname)"))
+        (self.wt / "kit" / "VERSION").write_text("0.7.4\n")  # for run, a shipped kit/VERSION is the run tree's
+        dry = self.pk("run", "--lane", "lane1", "--dry-run", "o", "--", *PROBE, cwd=self.wt)
+        self.assertEqual(dry.returncode, 0, dry.stderr)
+        self.assertIn("kit on the lane: the run tree's (main's 0.7.2, the run tree's 0.7.4)", dry.stdout)
+
+
+class KitOfAnOlderBranch(RemoteBase):
+    def test_a_branch_whose_kit_is_older_than_mains_keeps_mains_kit(self):
+        (self.root / "kit" / "VERSION").write_text("9.9.9\n")
+        commit(self.root, "main: a newer kit")
+        old = (KIT / "VERSION").read_text().strip()
+        dry = self.pk("gate", TASK, "--lane", "lane1", "--dry-run")
+        self.assertEqual(dry.returncode, 0, dry.stderr)
+        self.assertIn(f"python3 kit/scripts/pk.py gate handback {TASK}", dry.stdout)
+        self.assertIn(f"remote: kit on the lane: main's (main's 9.9.9, the run tree's {old})", dry.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

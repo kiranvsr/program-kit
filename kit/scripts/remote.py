@@ -40,6 +40,16 @@ names. On each host, under `dir`:
   directory): `lane_wrap[lane]` + `wrap` + the command, with `env` exported and
   PK_PLANT_WORKERS set to `workers`. Output streams back and to `<dir>/<lane>.log`, timestamped, between a start
   and an end line. The exit status is the step's.
+- The kit on the lane (0.7.4, KF-75). The step's kit commands (`pk gate handback`, `pk gate plants`, `pk ext
+  prepare-tree`) run, from the lane root, with the run tree's own kit (`<tree>/kit/scripts/pk.py`) when the run tree's
+  kit/VERSION (for `run`, with the shipped changes) is newer than main's, so a branch that upgrades the kit runs on a
+  lane before main carries it; otherwise with main's, as before, so a branch cut before main's last kit upgrade is
+  judged as the main checkout judges it. Only the lane lock keeps main's kit (its on-disk format is the same across
+  0.7.x). Trust: the run tree's code already runs on the lane as the step's tests and producer, which can write any
+  record, so its kit adds no new power; QA re-checks the record and the merge check runs here with main's kit. When
+  the kit chosen is older than a kit command the step needs (`pk ext prepare-tree`, 0.7.3, when main declares
+  extensions), the step is refused before any lane is polled or anything pushed, never failing mid-step. `--dry-run`
+  names the kit.
 - Lane sizes (0.7.2). A `lanes` entry is a bare name (size `default`) or `{name: L, size: S}`; `sizes: {gate: S,
   plants: S, run: S}` gives the size a step kind takes by default (a kind left out takes any), `--size S|any`
   overrides it. `--lane auto` (the default) polls each host in order, one ssh call per host per poll, and takes the
@@ -114,6 +124,10 @@ _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _LANE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 _OWNER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 _HOST = re.compile(r"[A-Za-z0-9_][A-Za-z0-9@._-]*\Z")
+_VERSION = re.compile(r"[0-9]+(\.[0-9]+)*\Z")
+PK_SCRIPT = "kit/scripts/pk.py"
+KIT_VERSION = "kit/VERSION"
+PREPARE_TREE_SINCE = (0, 7, 3)  # the first kit with `pk ext prepare-tree` (KF-73)
 
 
 # --- the checks.yaml section ------------------------------------------------------------------------------
@@ -474,12 +488,53 @@ def _disk_lines(settings: dict) -> list[str]:
             f"of \"{_q(settings['host_var'])}\" is $pct% used (remote.disk_warn_percent {int(warn)})\" >&2; fi"]
 
 
-def _prepare_lines(tree: str, head: str) -> list[str]:
+def _prepare_lines(tree: str, head: str, kit: str) -> list[str]:
     """Lines that run the extensions' prepare_tree hooks (purpose remote, 0.7.3, KF-73) in the lane's step tree, from
-    the lane root, so `ctx.root` is the lane's checkout; only when main declares extensions."""
+    the lane root, so `ctx.root` is the lane's checkout, with the lane kit `kit` (`_lane_kit`, 0.7.4, KF-75); only
+    when main declares extensions."""
     return [f"if git -C \"$lane_root\" cat-file -e HEAD:{ext_module.DECLARATION} 2>/dev/null; then",
-            f"  (cd \"$lane_root\" && python3 kit/scripts/pk.py ext prepare-tree remote {_q(tree)} --head {_q(head)})",
+            f"  (cd \"$lane_root\" && python3 {_q(kit)} ext prepare-tree remote {_q(tree)} --head {_q(head)})",
             "fi"]
+
+
+def _version_key(text: str | None) -> tuple[int, ...] | None:
+    return tuple(int(part) for part in text.split(".")) if text and _VERSION.match(text) else None
+
+
+def _kit_version_at(root: Path, commit: str) -> str | None:
+    try:
+        return git(root, "show", f"{commit}:{KIT_VERSION}").strip() or None
+    except KitError:
+        return None
+
+
+def _lane_kit(root: Path, main_sha: str, tree: str, tree_version: str | None, what: str) -> tuple[str, str]:
+    """(the pk.py the lane runs the step's kit commands with, relative to the lane root; a line naming that kit).
+
+    0.7.4 (KF-75): the run tree's own kit (`<tree>/kit/scripts/pk.py`) when its kit/VERSION is newer than main's, so a
+    branch that upgrades the kit runs on a lane before main carries the new kit; otherwise main's, as before 0.7.4, so
+    a branch cut before main's last kit upgrade is judged as the main checkout judges it. Only the lane lock stays with
+    main's kit (`_lane_script`). Refused here, before any lane is polled or anything pushed, when the kit chosen is
+    older than a kit command the step needs: `pk ext prepare-tree` (0.7.3) when main declares extensions."""
+    main_version = _kit_version_at(root, main_sha)
+    tree_key, main_key = _version_key(tree_version), _version_key(main_version)
+    newer = tree_key is not None and main_key is not None and tree_key > main_key
+    script, version, whose = ((f"{tree}/{PK_SCRIPT}", tree_version, "the run tree's") if newer
+                              else (PK_SCRIPT, main_version, "main's"))
+    versions = f"main's {main_version or 'unknown'}, the run tree's {tree_version or 'unknown'}"
+    key = _version_key(version)
+    try:
+        git(root, "cat-file", "-e", f"{main_sha}:{ext_module.DECLARATION}")
+        declares = True
+    except KitError:
+        declares = False
+    if declares and key is not None and key < PREPARE_TREE_SINCE:
+        raise KitError(f"pk remote {what}: refused before any push: the lane would run this step's kit commands with "
+                       f"{whose} kit {version} ({versions}), older than "
+                       f"{'.'.join(map(str, PREPARE_TREE_SINCE))}, the first kit with `pk ext prepare-tree`, "
+                       "which the lane runs because main declares extensions (KF-73). Nothing was pushed and nothing "
+                       "ran; run the step here, or merge a kit of that version or later first")
+    return script, f"kit on the lane: {whose} ({versions}); the lane lock takes main's"
 
 
 def _setup_lines(settings: dict, where: str) -> list[str]:
@@ -790,8 +845,10 @@ def _sha(root: Path, ref: str) -> str:
     return git(root, "rev-parse", "--verify", f"{ref}^{{commit}}")
 
 
-def _dry(settings: dict, what: str, plan: str, refspecs: list[str], command: list[str], script: str) -> None:
+def _dry(settings: dict, what: str, plan: str, refspecs: list[str], command: list[str], script: str,
+         kit_note: str) -> None:
     print(f"remote: {gate._show(what)} on {plan}")
+    print(f"remote: {kit_note}")
     print("remote: push (to the lanes' mirror only, never to origin): "
           + shlex.join(_push_argv(settings, refspecs, shown=True)))
     print(f"remote: on the lane, under its pk lock {_lock_name(settings)!r}: {shlex.join(command)}")
@@ -826,17 +883,20 @@ def _step(root: Path, settings: dict, task_id: str, branch: str, kind: str, pk_a
     refspecs = [_main_spec(force_main), f"+refs/heads/{branch}:refs/heads/{branch}"]
     main_sha, head = _sha(root, "refs/heads/main"), _sha(root, f"refs/heads/{branch}")
     owner = f"remote-{kind}-{task_id}"
-    settings, lane, plan = _target(settings, kind, wanted, host_var, size, dry_run)
     name = task_id.lower()
-    command = [*_prefix(settings, lane), "python3", "kit/scripts/pk.py", "gate",
+    kit, kit_note = _lane_kit(root, main_sha, f".worktrees/{name}", _kit_version_at(root, head), f"{kind} {task_id}")
+    settings, lane, plan = _target(settings, kind, wanted, host_var, size, dry_run)
+    command = [*_prefix(settings, lane), "python3", kit, "gate",
                "handback" if kind == "gate" else "plants", task_id, "--branch", branch, *pk_args]
     body = [*_clean_lines(settings, name), *_mark_lines(settings, name), *_prepare_task(task_id, branch),
-            *_prepare_lines(f".worktrees/{name}", head), *_setup_lines(settings, f".worktrees/{name}"),
+            *_prepare_lines(f".worktrees/{name}", head, kit), *_setup_lines(settings, f".worktrees/{name}"),
             "exec " + shlex.join(command)]
     script = _lane_script(settings, lane, owner, main_sha, body, head[:12])
     if dry_run:
-        _dry(settings, f"{kind} {task_id}", plan, refspecs, command, script)
+        _dry(settings, f"{kind} {task_id}", plan, refspecs, command, script, kit_note)
         return 0
+    if kit != PK_SCRIPT:
+        _say(kit_note)
     _push(root, settings, refspecs)
     _say(f"{task_id} {kind} on {_label(settings)}:{lane} at {head[:12]}: {shlex.join(command)}")
     proc = _remote(settings, script)
@@ -1093,6 +1153,18 @@ def _under(rel: str, gets: list[str]) -> bool:
     return ".." not in rel.split("/") and any(rel == g or rel.startswith(g.rstrip("/") + "/") for g in gets)
 
 
+def _worktree_kit_version(wt: Path, shipped: list[str], deleted: list[str], head: str) -> str | None:
+    """The kit/VERSION of the run tree `pk remote run` makes: HEAD's, unless the shipped changes change or delete it."""
+    if KIT_VERSION in deleted:
+        return None
+    if KIT_VERSION in shipped:
+        try:
+            return (wt / KIT_VERSION).read_text(encoding="utf-8").strip() or None
+        except (OSError, UnicodeDecodeError):
+            return None
+    return _kit_version_at(wt, head)
+
+
 def cmd_run(args) -> int:
     root = find_root()
     settings = _settings(root)
@@ -1113,6 +1185,8 @@ def cmd_run(args) -> int:
     head, main_sha = _sha(wt, "HEAD"), _sha(wt, "refs/heads/main")
     refspecs = [f"+{head}:refs/runs/{name}", _main_spec(args.force_main)]
     shipped, deleted = _changed_files(wt)
+    kit, kit_note = _lane_kit(wt, main_sha, f".worktrees/{name}", _worktree_kit_version(wt, shipped, deleted, head),
+                              f"run {owner}")
     settings, lane, plan = _target(settings, "run", args.lane, args.host, args.size, args.dry_run)
     full = [*_prefix(settings, lane), *command]
     r = _q(f".worktrees/{name}")
@@ -1130,19 +1204,21 @@ def cmd_run(args) -> int:
         f"cd {r}",
         "tar -xf -",
         *([f"rm -f -- {' '.join(_q(path) for path in deleted)}"] if deleted else []),
-        *_prepare_lines(f".worktrees/{name}", head),
+        *_prepare_lines(f".worktrees/{name}", head, kit),
         *_setup_lines(settings, "."),
         f"cd ./{_q(sub)}" if sub else ":",
         "exec " + shlex.join(full),
     ]
     script = _lane_script(settings, lane, f"run-{owner}", main_sha, body, head[:12])
     if args.dry_run:
-        _dry(settings, f"run {owner}", plan, refspecs, full, script)
+        _dry(settings, f"run {owner}", plan, refspecs, full, script, kit_note)
         print(f"remote: ships {len(shipped)} changed or untracked file(s)"
               + (": " + ", ".join(shipped[:20]) if shipped else "")
               + (f"; deletes {len(deleted)}: " + ", ".join(deleted[:20]) if deleted else ""))
         return 0
     data = _tar(wt, shipped)
+    if kit != PK_SCRIPT:
+        _say(kit_note)
     _push(wt, settings, refspecs)
     _say(f"{owner} on {_label(settings)}:{lane} at {head[:12]}: {shlex.join(command)}")
     proc = _remote(settings, script, stdin=data)
