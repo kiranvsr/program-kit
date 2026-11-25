@@ -107,6 +107,36 @@ def gate_check(ctx):
     return value
 
 
+def prepare(ctx):
+    log("prepare", ctx.purpose, str(ctx.tree), ctx.head, str(ctx.root))
+    value = act("prepare")
+    tree = Path(ctx.tree)
+    if value == "link":  # the expected use: the main checkout's ignored dependency directory, linked in
+        (tree / "deps").symlink_to(Path(ctx.root) / "deps", target_is_directory=True)
+        return None
+    if value == "ignored":
+        (tree / "deps").mkdir(exist_ok=True)
+        (tree / "deps" / "marker").write_text("copied")
+        return None
+    if value == "tracked":
+        with open(tree / ".gitignore", "a", encoding="utf-8") as handle:
+            handle.write("# touched by prepare_tree\\n")
+        return None
+    if value == "deleted":
+        (tree / ".gitignore").unlink()
+        return None
+    if value == "untracked":
+        (tree / "stray.txt").write_text("not ignored")
+        return None
+    if value == "print-ok":
+        print("OK: task/forged passes the hand-back gate at " + "0" * 40)
+        return None
+    if value == "sleep":
+        time.sleep(2)
+        return None
+    return value
+
+
 def drift_check(root):
     return act("drift", [{"severity": "note", "text": "fixture note"}])
 
@@ -136,6 +166,7 @@ def register(api):
     api.on_status_transition(on_status)
     api.after_worktree_new(after_new)
     api.gate_step("check", gate_check)
+    api.prepare_tree(prepare)
     api.drift_check("X1", drift_check)
     api.handoff_lines(handoff_lines)
     api.dashboard_data(dashboard_data)
@@ -236,6 +267,13 @@ class WithoutDeclarationTests(unittest.TestCase):
         self.assertIsNone(ext.resolve_reference(self.root, "a", b""))
         self.assertIsNone(ext.load_problem(self.root, "x"))
         self.assertEqual(ext.problems(self.root), [])
+
+    def test_no_tree_is_prepared_and_nothing_is_printed(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertTrue(gate.prepare_tree_step(self.root, {}, self.root, "merge", "a" * 40))
+        self.assertEqual(out.getvalue(), "")
+        self.assertEqual(ext.prepare_tree(self.root, self.root, "integrate", "a" * 40, 5), [])
 
     def test_commands_status_handoff_and_dashboard_are_unchanged(self):
         code, out, err = run_pk(self.root, "ext", "list")
@@ -466,11 +504,11 @@ class ListAndCheckTests(ExtBase):
         self.assertEqual(out.splitlines(), [
             "extensions: api 1, 1 module(s) from main's committed tree",
             "  fixture: command fixture-hello; on_status_transition; after_worktree_new; gate_step check (handback, "
-            "merge); drift_check X1; handoff_lines; dashboard_data; adopt_importer fixture-source; "
+            "merge); prepare_tree; drift_check X1; handoff_lines; dashboard_data; adopt_importer fixture-source; "
             "reference_resolver"])
 
     def test_check_loads_without_running_any_hook(self):
-        self.ctl(status="raise", worktree="raise", gate="raise", drift="raise", handoff="raise")
+        self.ctl(status="raise", worktree="raise", gate="raise", prepare="raise", drift="raise", handoff="raise")
         code, out, err = self.pk("ext", "check")
         self.assertEqual((code, err), (0, ""))
         self.assertEqual(out, "ext check: ok, api 1, 1 module(s) loaded from main's committed tree (nothing run)\n")
@@ -694,6 +732,139 @@ class GateStepUnitTests(ExtBase):
         self.commit_main()
         self.assertEqual(ext.steps_for(self.root, "handback"), [])
         self.assertEqual(len(ext.steps_for(self.root, "merge")), 1)
+
+
+class PrepareTreeTests(ExtBase):
+    """`api.prepare_tree` (0.7.1): called with the tree the kit made, refusing on a failure or on any path git sees.
+
+    The tree here is a detached worktree of main, as the gates make one; `deps` (git-ignored) holds the main
+    checkout's dependency marker, which the tree lacks until it is linked in."""
+
+    def setUp(self):
+        super().setUp()
+        put(self.root, ".gitignore", ".worktrees/\n__pycache__/\n*.pyc\ndeps\n")
+        self.commit_main("deps are ignored")
+        put(self.root, "deps/marker", "installed")
+        self.tree = self.scratch / "pk-trial-unit"
+        sh(self.root, "git", "worktree", "add", "-q", "--detach", str(self.tree), "main")
+        self.addCleanup(subprocess.run, ["git", "-C", str(self.root), "worktree", "remove", "--force",
+                                         str(self.tree)], capture_output=True)
+
+    def prepare(self, purpose="merge", **behaviour):
+        self.ctl(**behaviour)
+        out = io.StringIO()
+        checks = {"step_timeout": {"limits": {"default": 5}}}
+        with contextlib.redirect_stdout(out):
+            ok = gate.prepare_tree_step(self.root, checks, self.tree, purpose, "a" * 40)
+        return ok, out.getvalue()
+
+    def test_it_is_called_once_with_the_tree_its_purpose_and_the_head(self):
+        for purpose in ext.PURPOSES:
+            with self.subTest(purpose=purpose):
+                self.log_file.unlink(missing_ok=True)
+                ok, out = self.prepare(purpose)
+                self.assertEqual((ok, out), (True, f"step ext:fixture.prepare_tree: ok ({purpose} tree)\n"))
+                self.assertEqual(self.logged("prepare"),
+                                 [["prepare", purpose, str(self.tree), "a" * 40, str(self.root)]])
+
+    def test_a_symlink_to_the_main_checkout_s_ignored_directory_is_accepted(self):
+        self.assertFalse((self.tree / "deps" / "marker").exists())
+        ok, out = self.prepare(prepare="link")
+        self.assertTrue(ok, out)
+        self.assertEqual((self.tree / "deps" / "marker").read_text(), "installed")
+
+    def test_an_ignored_write_is_accepted(self):
+        ok, out = self.prepare(prepare="ignored")
+        self.assertTrue(ok, out)
+
+    def test_a_tracked_write_or_deletion_refuses_naming_the_path(self):
+        for value in ("tracked", "deleted"):
+            with self.subTest(value=value):
+                sh(self.tree, "git", "checkout", "-q", "--", ".gitignore")
+                ok, out = self.prepare(prepare=value)
+                self.assertFalse(ok)
+                self.assertEqual(out, "FAILED: ext:fixture.prepare_tree changed what git sees in the tree, where only "
+                                      "git-ignored paths may be written: .gitignore\n")
+
+    def test_a_second_write_to_a_path_already_changed_refuses_too(self):
+        put(self.tree, ".gitignore", ".worktrees/\n__pycache__/\n*.pyc\ndeps\n# already changed\n")
+        ok, out = self.prepare(prepare="tracked")
+        self.assertFalse(ok)
+        self.assertIn("only git-ignored paths may be written: .gitignore", out)
+
+    def test_an_untracked_write_that_is_not_ignored_refuses_naming_it(self):
+        ok, out = self.prepare(prepare="untracked")
+        self.assertFalse(ok)
+        self.assertIn("FAILED: ext:fixture.prepare_tree changed what git sees in the tree, where only git-ignored "
+                      "paths may be written: stray.txt", out)
+
+    def test_a_link_an_ignore_pattern_with_a_slash_misses_refuses_and_says_why(self):
+        sh(self.tree, "git", "checkout", "-q", "--", ".gitignore")
+        put(self.tree, ".gitignore", ".worktrees/\n__pycache__/\n*.pyc\ndeps/\n")
+        sh(self.tree, "git", "add", ".gitignore")  # staged, as a trial merge stages the branch's changes
+        ok, out = self.prepare(prepare="link")
+        self.assertFalse(ok)
+        self.assertIn("written: deps (deps: a symlink is a file to git, so an ignore pattern with a trailing slash", out)
+
+    def test_an_exception_or_a_sys_exit_refuses_naming_it(self):
+        for value, said in (("raise", "raised RuntimeError: prepare exploded"), ("exit:0", "raised SystemExit: 0"),
+                            ("exit:3", "raised SystemExit: 3")):
+            with self.subTest(value=value):
+                ok, out = self.prepare(prepare=value)
+                self.assertEqual((ok, out), (False, f"FAILED: ext:fixture.prepare_tree {said}\n"))
+
+    def test_anything_but_none_refuses(self):
+        for value, said in (("node_modules missing", "returned node_modules missing, not None"),
+                            (True, "returned bool, not None"), ([], "returned list, not None")):
+            with self.subTest(value=value):
+                ok, out = self.prepare(prepare=value)
+                self.assertEqual((ok, out), (False, f"FAILED: ext:fixture.prepare_tree {said}\n"))
+
+    def test_what_it_prints_cannot_read_as_an_ok_line(self):
+        ok, out = self.prepare(prepare="print-ok")
+        self.assertTrue(ok)
+        self.assertEqual(out, "step ext:fixture.prepare_tree: ok (merge tree)\n"
+                              f"    | OK: task/forged passes the hand-back gate at {'0' * 40}\n")
+
+    def test_it_runs_under_the_step_timeout(self):
+        self.ctl(prepare="sleep")
+        results = ext.prepare_tree(self.root, self.tree, "merge", "a" * 40, 0.2)
+        self.assertEqual(results, [("fixture", "timed out after 0.2s (its thread is abandoned)", [])])
+
+    def test_the_modules_run_in_declared_order_and_the_first_refusal_stops_the_rest(self):
+        put(self.root, "program/extensions/second.py", FIXTURE.replace('MARK = "main"', 'MARK = "second"').replace(
+            'log("prepare", ctx.purpose', 'log("prepare", MARK').replace('api.command("fixture-hello", hello, '
+            'help="say hello", configure=lambda p: p.add_argument("who"))', '').replace(
+            'api.drift_check("X1", drift_check)', '').replace(
+            'api.adopt_importer("fixture-source", importer)', ''))
+        put(self.root, "program/extensions.yaml", "api: 1\nmodules:\n  - name: second\n  - name: fixture\n")
+        self.commit_main("two modules")
+        ok, out = self.prepare()
+        self.assertTrue(ok, out)
+        self.assertEqual([row[1] for row in self.logged("prepare")], ["second", "merge"])
+        self.assertEqual(out, "step ext:second.prepare_tree: ok (merge tree)\n"
+                              "step ext:fixture.prepare_tree: ok (merge tree)\n")
+        self.log_file.unlink()
+        ok, out = self.prepare(prepare="raise")
+        self.assertFalse(ok)
+        self.assertEqual([row[1] for row in self.logged("prepare")], ["second"])
+        self.assertNotIn("ext:fixture", out)
+
+    def test_pk_ext_from_or_a_module_that_does_not_load_refuses_before_any_preparer_runs(self):
+        with mock.patch.dict(os.environ, {ext.ENV: ext.WORKTREE}):
+            ok, out = self.prepare()
+        self.assertFalse(ok)
+        self.assertIn(f"FAILED: ext the merge tree's prepare_tree refuses to run while {ext.ENV} is set", out)
+        put(self.root, "program/extensions/fixture.py", "import nonexistent_dependency\n")
+        self.commit_main("a module that does not import")
+        ok, out = self.prepare()
+        self.assertFalse(ok)
+        self.assertIn("FAILED: ext the merge tree's prepare_tree refuses: extension module(s) did not load", out)
+        self.assertEqual(self.logged("prepare"), [])
+
+    def test_an_unknown_purpose_is_a_kit_error(self):
+        with self.assertRaises(KitError):
+            ext.prepare_tree(self.root, self.tree, "deploy", "a" * 40, 5)
 
 
 class GateRefusalTests(ExtBase):
@@ -1269,6 +1440,92 @@ class GateEndToEndTests(HandbackBase):
 
 
 
+# A build command that needs what the programme keeps git-ignored: the trees the kit makes lack it until prepared.
+NEEDS_DEPS = [sys.executable, "-c", "import pathlib, sys; sys.exit(0 if pathlib.Path('deps/marker').is_file() else 3)"]
+
+
+def needs_deps(case, root):
+    """Main ignores `deps`, its checkout holds deps/marker, and the build fails in a tree without it."""
+    gate_put(root, ".gitignore", "__pycache__/\n.worktrees/\ndeps\n")
+    case.write_checks(build=[[sys.executable, "-m", "compileall", "-q", "."], NEEDS_DEPS])
+    gate_commit(root, "the build needs the ignored deps")
+    gate_put(root, "deps/marker", "installed")
+
+
+@skip_unless_slow()
+class PrepareTreeGateTests(HandbackBase):
+    """Both gates call prepare_tree in their trial merge, before any step there, so a step that needs the main
+    checkout's ignored dependencies passes; a refusal fails the gate before its first step."""
+
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(ext.close)
+        os.environ.pop(ext.ENV, None)
+        gate_put(self.root, "program/extensions.yaml", DECLARATION)
+        gate_put(self.root, "program/extensions/fixture.py", FIXTURE)
+        gate_commit(self.root, "the fixture extension")
+        needs_deps(self, self.root)
+        sh(self.wt, "git", "merge", "-q", "main")
+        self.sha = sh(self.wt, "git", "rev-parse", "HEAD").strip()
+        self.ctl_file = self.root.parent / "ctl.json"
+        self.log_file = self.root.parent / "log.jsonl"
+        patcher = mock.patch.dict(os.environ, {"EXT_FIXTURE_CTL": str(self.ctl_file),
+                                               "EXT_FIXTURE_LOG": str(self.log_file)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def prepared(self):
+        rows = [json.loads(line) for line in self.log_file.read_text().splitlines()] if self.log_file.exists() else []
+        return [row[1:] for row in rows if row[0] == "prepare"]
+
+    def test_without_the_link_the_build_fails_in_the_trial_merge(self):
+        rc, out = self.handback()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("step ext:fixture.prepare_tree: ok (handback tree)", out)
+        self.assertIn("FAILED: build", out)
+
+    def test_the_link_is_made_before_the_first_step_and_the_build_that_needs_it_passes(self):
+        self.ctl_file.write_text(json.dumps({"prepare": "link"}))
+        rc, out = self.handback()
+        self.assertEqual(rc, 0, out)
+        lines = out.splitlines()
+        first = lines.index("step ext:fixture.prepare_tree: ok (handback tree)")
+        self.assertLess(first, lines.index("step ext-check: ok (the merged tree's extensions load)"))
+        self.assertLess(first, min(i for i, line in enumerate(lines) if line.startswith("step build")))
+        self.assertEqual(out.count("prepare_tree"), 1)
+        sh(self.wt, "git", "add", "-A")
+        sh(self.wt, "git", "commit", "-q", "-m", "evidence")
+        sha = sh(self.wt, "git", "rev-parse", "HEAD").strip()
+        rc, out = self.merge_check()
+        self.assertEqual(rc, 0, out)
+        lines = out.splitlines()
+        self.assertLess(lines.index("step ext:fixture.prepare_tree: ok (merge tree)"),
+                        min(i for i, line in enumerate(lines) if line.startswith("step ")
+                            and "prepare_tree" not in line))
+        calls = self.prepared()
+        self.assertEqual([(purpose, head) for purpose, _, head, _ in calls], [("handback", self.sha), ("merge", sha)])
+        for _, tree, _, root in calls:
+            self.assertTrue(Path(tree).name.startswith("pk-trial-"), tree)  # the trial merge, not the worktree
+            self.assertEqual(root, str(self.root))
+        self.assertEqual(self.trial_dirs(), [])  # the trial merges are gone (the registry's own directory stays)
+
+    def test_a_refusing_preparer_fails_both_gates_before_their_first_step(self):
+        for value, said in (("tracked", "changed what git sees in the tree, where only git-ignored paths may be "
+                                        "written: .gitignore"),
+                            ("untracked", "changed what git sees in the tree, where only git-ignored paths may be "
+                                          "written: stray.txt"),
+                            ("raise", "raised RuntimeError: prepare exploded"),
+                            ("exit:0", "raised SystemExit: 0")):
+            self.ctl_file.write_text(json.dumps({"prepare": value}))
+            for name, run in (("handback", self.handback), ("merge", self.merge_check)):
+                with self.subTest(value=value, gate=name):
+                    rc, out = run()
+                    self.assertEqual(rc, 1, out)
+                    self.assertIn(f"FAILED: ext:fixture.prepare_tree {said}", out)
+                    self.assertEqual([line for line in out.splitlines() if line.startswith("step ")], [], out)
+                    self.assertEqual(self.trial_dirs(), [])
+
+
 from test_land import T2 as ROUND_T2, LandBase  # noqa: E402
 
 
@@ -1307,6 +1564,64 @@ class RoundEndToEndTests(LandBase):
         self.assertEqual(code, 1, out)
         self.assertIn("FAILED: ext:fixture.check (not ok)\n    | not in this round", out)
         self.assertNotIn("OK: ", out)
+
+
+@skip_unless_slow()
+class PrepareTreeRoundTests(LandBase):
+    """`pk integrate check` prepares the round's combined tree before its suite, and `pk integrate close --recheck`
+    its trial of main; a refusal fails the round before its first step."""
+
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(ext.close)
+        os.environ.pop(ext.ENV, None)
+        gate_put(self.root, "program/extensions.yaml", DECLARATION)
+        gate_put(self.root, "program/extensions/fixture.py", FIXTURE)
+        gate_commit(self.root, "the fixture extension")
+        needs_deps(self, self.root)
+        self.standard()
+        self.wt2 = self.second_task()
+        self.ctl_file = self.root.parent / "ctl.json"
+        self.log_file = self.root.parent / "log.jsonl"
+        patcher = mock.patch.dict(os.environ, {"EXT_FIXTURE_CTL": str(self.ctl_file),
+                                               "EXT_FIXTURE_LOG": str(self.log_file)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def prepared(self):
+        rows = [json.loads(line) for line in self.log_file.read_text().splitlines()] if self.log_file.exists() else []
+        return [row[1:] for row in rows if row[0] == "prepare"]
+
+    def test_the_combined_tree_is_prepared_before_the_suite(self):
+        self.assertEqual(self.pk("integrate", "start", "r1", TASK, ROUND_T2)[0], 0)
+        round_tree = self.root / ".worktrees" / "round-r1"
+        head = sh(round_tree, "git", "rev-parse", "HEAD").strip()
+        self.ctl_file.write_text(json.dumps({"prepare": "untracked"}))
+        code, out, err = self.pk("integrate", "check", "r1")
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("FAILED: ext:fixture.prepare_tree changed what git sees in the tree, where only git-ignored "
+                      "paths may be written: stray.txt", out)
+        self.assertNotIn("step build", out)
+        (round_tree / "stray.txt").unlink()
+        self.ctl_file.write_text(json.dumps({"prepare": "link"}))
+        code, out, err = self.pk("integrate", "check", "r1")
+        self.assertEqual((code, err), (0, ""), out)
+        lines = out.splitlines()
+        self.assertLess(lines.index("step ext:fixture.prepare_tree: ok (integrate tree)"),
+                        min(i for i, line in enumerate(lines) if line.startswith("step build")))
+        self.assertEqual(self.prepared()[-1], ["integrate", str(round_tree), head, str(self.root)])
+        for task_id in (TASK, ROUND_T2):  # each member's merge check prepares its own trial merge
+            code, out, err = self.pk("merge", task_id, "--round", "r1")
+            self.assertEqual(code, 0, out + err)
+        gate_put(self.root, "second.py", "VALUE = 4\n")
+        gate_commit(self.root, "a small fix after the round")
+        main = sh(self.root, "git", "rev-parse", "HEAD").strip()
+        code, out, err = self.pk("integrate", "close", "r1", "--recheck")
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertIn("step ext:fixture.prepare_tree: ok (integrate tree)", out)
+        purpose, tree, head, _ = self.prepared()[-1]
+        self.assertEqual((purpose, head), ("integrate", main))
+        self.assertTrue(Path(tree).name.startswith("pk-trial-"), tree)
 
 
 @skip_unless_slow()

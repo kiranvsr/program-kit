@@ -24,6 +24,11 @@ Registration. Each module defines `register(api)` and calls these, and only thes
 - `api.after_worktree_new(fn)`: `fn(task_id, path, root)`; when it raises, `pk worktree new` removes what it made.
 - `api.gate_step(name, fn, gates=("handback", "merge"))`: `fn(ctx)` returns `(ok, lines)`; runs after the kit's own
   steps and before the `OK:` line, as `step ext:<module>.<name>`, under the kit's step timeout.
+- `api.prepare_tree(fn)` (0.7.1): `fn(ctx)` with `ctx.root`, `ctx.tree`, `ctx.purpose` (handback, merge or
+  integrate) and `ctx.head`; called once in each tree the kit makes to run a gate's commands in (the trial merge of
+  the hand-back gate and of the merge check, the integration round's combined tree), after the kit made it and before
+  any step runs there. It returns None. It may write only git-ignored paths: `git status --porcelain
+  --untracked-files=all` of the tree is the same before and after the call, or the gate refuses, naming the paths.
 - `api.drift_check(code, fn)`: code `X<n>`; `fn(root)` returns `[{severity: "note"|"fail", text}]`.
 - `api.handoff_lines(fn)`: `fn(root)` returns a list of strings for the hand-off's Now list, after the kit's lines.
 - `api.dashboard_data(fn)`: `fn(root)` returns a JSON-serialisable dict, shown under `extensions.<module>` (one per
@@ -33,8 +38,9 @@ Registration. Each module defines `register(api)` and calls these, and only thes
 
 Extensions add and refuse, never loosen. Nothing a hook returns can make the kit accept what its own checks refuse:
 the hooks run after those checks, a status hook sees a copy, and anything but the exact accepting value (None from a
-status hook, `(True, [str])` from a gate step) is a refusal. An exception or a sys.exit (HOOK_FAILURES) in a refusing
-point (status transition, gate step, after-worktree, importer) is a refusal naming it, and so is a module that did not
+status hook or a tree preparer, `(True, [str])` from a gate step) is a refusal. An exception or a sys.exit
+(HOOK_FAILURES) in a refusing point (status transition, gate step, prepare-tree, after-worktree, importer) is a
+refusal naming it, and so is a module that did not
 load in the registry the point reads. An exception or a sys.exit in an informational point (drift, hand-off,
 dashboard, resolver) is a note, and the command still runs.
 
@@ -76,8 +82,10 @@ WORKTREE = "worktree"
 DECLARATION_KEYS = ("api", "modules")
 MODULE_KEYS = ("name",)
 GATES = ("handback", "merge")
-POINTS = ("command", "on_status_transition", "after_worktree_new", "gate_step", "drift_check", "handoff_lines",
-          "dashboard_data", "adopt_importer", "reference_resolver")
+POINTS = ("command", "on_status_transition", "after_worktree_new", "gate_step", "prepare_tree", "drift_check",
+          "handoff_lines", "dashboard_data", "adopt_importer", "reference_resolver")
+PURPOSES = ("handback", "merge", "integrate")  # the trees prepare_tree is called for (0.7.1)
+SHOWN_PATHS = 10  # changed paths a prepare_tree refusal names
 SEVERITIES = ("note", "fail")
 RESOLVED_KEYS = ("kind", "task_id", "decision", "summary")
 DESCRIBE_CHARS = 300
@@ -259,6 +267,17 @@ class GateContext:
     trial: Path | None = None
 
 
+@dataclass(frozen=True)
+class TreeContext:
+    """What a tree preparer gets (0.7.1): `tree` is the tree the kit just made, `root` the main checkout, `purpose`
+    one of PURPOSES (the gate the tree is for: integrate for an integration round's tree) and `head` the commit
+    judged there (the branch tip for handback and merge, the round's head or main's tip for integrate)."""
+    root: Path
+    tree: Path
+    purpose: str
+    head: str
+
+
 @dataclass
 class Registry:
     """What the declared modules registered, and every module that did not load (`errors`)."""
@@ -271,6 +290,7 @@ class Registry:
     status_hooks: list[tuple] = field(default_factory=list)  # (module, fn)
     worktree_hooks: list[tuple] = field(default_factory=list)  # (module, fn)
     gate_steps: list[tuple] = field(default_factory=list)  # (module, name, fn, gates)
+    tree_hooks: list[tuple] = field(default_factory=list)  # (module, fn)
     drift_checks: list[tuple] = field(default_factory=list)  # (module, code, fn)
     handoff: list[tuple] = field(default_factory=list)  # (module, fn)
     dashboard: list[tuple] = field(default_factory=list)  # (module, fn)
@@ -338,6 +358,10 @@ class Api:
                 or any(gate not in GATES for gate in gates) or len(set(gates)) != len(gates):
             raise ExtensionError(f"gate_step {name}: gates must be a non-empty list of {' and '.join(GATES)}")
         self._add("gate_step", (name, fn, tuple(gates)), f"gate_step {name} ({', '.join(gates)})")
+
+    def prepare_tree(self, fn):
+        _callable(fn, "prepare_tree")
+        self._add("prepare_tree", fn, "prepare_tree")
 
     def drift_check(self, code, fn):
         if not isinstance(code, str) or not _DRIFT.match(code):
@@ -411,6 +435,7 @@ def _merge(registry: Registry, module: str, api: Api) -> None:
     registry.status_hooks += [(module, fn) for fn, _ in found["on_status_transition"]]
     registry.worktree_hooks += [(module, fn) for fn, _ in found["after_worktree_new"]]
     registry.gate_steps += [(module, name, fn, gates) for (name, fn, gates), _ in found["gate_step"]]
+    registry.tree_hooks += [(module, fn) for fn, _ in found["prepare_tree"]]
     registry.drift_checks += [(module, code, fn) for (code, fn), _ in found["drift_check"]]
     registry.handoff += [(module, fn) for fn, _ in found["handoff_lines"]]
     registry.dashboard += [(module, fn) for fn, _ in found["dashboard_data"]]
@@ -651,6 +676,29 @@ def _descriptors_into(sink):
             os.close(kept)
 
 
+def _call_captured(fn, arg, timeout: float) -> tuple[dict, list[str], bool]:
+    """Call `fn(arg)` in a thread under `timeout` seconds: (box, printed, timed_out). `box` holds "value" or "error"
+    (an exception or a sys.exit, HOOK_FAILURES); `printed` is what it printed, and what a child process it started
+    wrote to the standard descriptors, while it ran."""
+    box: dict = {}
+    captured = io.StringIO()
+
+    def target():
+        try:
+            box["value"] = fn(arg)
+        except HOOK_FAILURES as exc:  # a hook's SystemExit is a failure too, never the gate's exit
+            box["error"] = exc
+
+    worker = threading.Thread(target=target, name="pk-ext-gate-hook", daemon=True)
+    with tempfile.TemporaryFile() as sink:
+        with _descriptors_into(sink), contextlib.redirect_stdout(captured), contextlib.redirect_stderr(captured):
+            worker.start()
+            worker.join(timeout)
+        sink.seek(0)
+        children = sink.read().decode("utf-8", "replace")
+    return box, captured.getvalue().splitlines() + children.splitlines(), worker.is_alive()
+
+
 def run_step(fn, ctx: GateContext, timeout: float) -> tuple[bool, list[str]]:
     """Run one gate step under `timeout` seconds: (ok, lines). Its own printing, and what a child process it starts
     writes to the standard descriptors while it runs, are captured into the lines.
@@ -659,24 +707,8 @@ def run_step(fn, ctx: GateContext, timeout: float) -> tuple[bool, list[str]]:
     why. After a timeout the step's thread is abandoned but keeps running (Python cannot stop it): what it prints
     afterwards reaches the gate's streams unprefixed, after the gate's FAILED line, and its child processes run on.
     """
-    box: dict = {}
-    captured = io.StringIO()
-
-    def target():
-        try:
-            box["value"] = fn(ctx)
-        except HOOK_FAILURES as exc:  # a step's SystemExit is a failure too, never the gate's exit
-            box["error"] = exc
-
-    worker = threading.Thread(target=target, name="pk-ext-gate-step", daemon=True)
-    with tempfile.TemporaryFile() as sink:
-        with _descriptors_into(sink), contextlib.redirect_stdout(captured), contextlib.redirect_stderr(captured):
-            worker.start()
-            worker.join(timeout)
-        sink.seek(0)
-        children = sink.read().decode("utf-8", "replace")
-    printed = captured.getvalue().splitlines() + children.splitlines()
-    if worker.is_alive():
+    box, printed, timed_out = _call_captured(fn, ctx, timeout)
+    if timed_out:
         return False, [*printed, f"timed out after {timeout:g}s (the step's thread is abandoned)"]
     if "error" in box:
         return False, [*printed, f"raised {describe(box['error'])}"]
@@ -686,6 +718,99 @@ def run_step(fn, ctx: GateContext, timeout: float) -> tuple[bool, list[str]]:
         return False, [*printed, f"returned {type(value).__name__}, not (ok, lines) with ok True or False and lines "
                                  "a list of text"]
     return value[0], [*printed, *value[1]]
+
+
+# --- prepare_tree (0.7.1) ----------------------------------------------------------------------------
+
+def tree_state(tree) -> dict[str, tuple]:
+    """{path: (status, content)} of `git status --porcelain --untracked-files=all` in `tree`, ignored files excluded.
+
+    `content` is the sha256 of what is in the tree now (a symlink's target, "missing" for a deleted path) for every
+    entry whose working-tree side differs from the index, so a second write to a path git already lists as changed is
+    a difference too; None when the working tree matches the index. KitError when git cannot say.
+    """
+    tree = Path(tree)
+    listed = _git(tree, "status", "--porcelain", "-z", "--untracked-files=all", "--no-renames")
+    if listed.returncode != 0:
+        said = listed.stderr.decode("utf-8", "replace").strip().splitlines()
+        raise KitError(f"cannot read the status of {tree}: {said[0] if said else f'exit {listed.returncode}'}")
+    state = {}
+    for entry in listed.stdout.decode("utf-8", "surrogateescape").split("\0"):
+        if not entry:
+            continue
+        code, path = entry[:2], entry[3:]
+        content = None
+        if code[1] != " ":
+            target = tree / path
+            if target.is_symlink():
+                content = "link:" + sha256_bytes(os.fsencode(os.readlink(target)))
+            elif target.is_file():
+                content = sha256_bytes(target.read_bytes())
+            else:
+                content = "missing" if not target.exists() else "other"
+        state[path] = (code, content)
+    return state
+
+
+def _changed(before: dict, after: dict) -> list[str]:
+    return sorted(path for path in set(before) | set(after) if before.get(path) != after.get(path))
+
+
+def _named(paths: list[str]) -> str:
+    shown = ", ".join(paths[:SHOWN_PATHS])
+    return shown + (f" and {len(paths) - SHOWN_PATHS} more" if len(paths) > SHOWN_PATHS else "")
+
+
+def _link_hint(tree: Path, paths: list[str]) -> str:
+    links = [path for path in paths if (tree / path).is_symlink()]
+    if not links:
+        return ""
+    return (f" ({_named(links)}: a symlink is a file to git, so an ignore pattern with a trailing slash, such as "
+            "`deps/`, does not match it; ignore it without the slash)")
+
+
+def prepare_tree(root, tree, purpose: str, head: str, timeout: float) -> list[tuple[str, str | None, list[str]]]:
+    """Run every registered tree preparer in `tree`, in declaration order: [(module, problem, lines)], stopping at
+    the first problem (a refusal of the gate). [] without extensions or preparers: nothing runs and nothing changes.
+
+    A preparer passes when it returns None within `timeout` seconds and the tree's `git status --porcelain
+    --untracked-files=all` (ignored files excluded, `tree_state`) is the same after the call as before it: it may
+    write only git-ignored paths. An exception, a sys.exit, a timeout, any other return or a changed path is the
+    problem, naming the reason or the paths. KitError when PK_EXT_FROM is set or a module did not load (it may hold a
+    preparer the gate needs).
+    """
+    if purpose not in PURPOSES:
+        raise KitError(f"prepare_tree: unknown purpose {purpose!r} (one of {', '.join(PURPOSES)})")
+    what = f"the {purpose} tree's prepare_tree"
+    registry = load(root)
+    if registry is None:
+        return []
+    problem = development_refusal(what) or _not_loaded(registry, what)
+    if problem:
+        raise KitError(problem)
+    tree = Path(tree)
+    ctx = TreeContext(root=Path(root), tree=tree, purpose=purpose, head=head)
+    results = []
+    for module, fn in registry.tree_hooks:
+        before = tree_state(tree)
+        box, printed, timed_out = _call_captured(fn, ctx, timeout)
+        changed = _changed(before, tree_state(tree))
+        reasons = []
+        if timed_out:
+            reasons.append(f"timed out after {timeout:g}s (its thread is abandoned)")
+        elif "error" in box:
+            reasons.append(f"raised {describe(box['error'])}")
+        elif box.get("value") is not None:
+            said = box["value"]
+            reasons.append(f"returned {_one_line(said) if isinstance(said, str) else type(said).__name__}, not None")
+        if changed:
+            reasons.append(f"changed what git sees in the tree, where only git-ignored paths may be written: "
+                           f"{_named(changed)}{_link_hint(tree, changed)}")
+        problem = "; ".join(reasons) or None
+        results.append((module, problem, printed))
+        if problem:
+            break
+    return results
 
 
 def drift_results(root) -> tuple[list[tuple[str, bool, str]], list[tuple[str, str]]]:

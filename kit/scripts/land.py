@@ -368,6 +368,8 @@ def round_check(root: Path, name: str) -> int:
                   for reason in gate.e2e_reasons(root, member["branch"], checks, merge=True)})
 
     def suite() -> int:
+        if not gate.prepare_tree_step(root, checks, worktree, "integrate", data["head"]):  # 0.7.1, before the suite
+            return 1
         for step in SUITE:
             if not gate._run_commands(step, gate._commands(checks[step]), worktree,
                                       timeout=gate.step_limit(checks, step)):
@@ -467,9 +469,10 @@ def round_close(root: Path, name: str, recheck: bool = False, commit: bool = Tru
         with gate.heavy(root, checks, f"integrate-close-{name}"):
             trial = Path(tempfile.mkdtemp(prefix="pk-trial-"))
             git(root, "worktree", "add", "--detach", str(trial), MAIN)
-            code = gate._limited(root, checks, lambda: gate._with_trial(root, trial, lambda: 0 if all(
-                gate._run_commands(step, gate._commands(checks[step]), trial, timeout=gate.step_limit(checks, step))
-                for step in SUITE) else 1))
+            code = gate._limited(root, checks, lambda: gate._with_trial(root, trial, lambda: 0 if (
+                gate.prepare_tree_step(root, checks, trial, "integrate", git(trial, "rev-parse", "HEAD"))
+                and all(gate._run_commands(step, gate._commands(checks[step]), trial,
+                                           timeout=gate.step_limit(checks, step)) for step in SUITE)) else 1))
         if code:
             raise KitError(f"round {name}: the re-check failed on {MAIN}; fix it before anything else merges")
         lines.append(f"re-checked {len(differing)} changed path(s): {MAIN}'s checks pass on the final tree")
