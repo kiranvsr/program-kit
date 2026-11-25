@@ -204,7 +204,13 @@ class Registry(unittest.TestCase):
     def test_a_tracked_run_argv_registers_and_removes_its_child(self):
         out = self.root.parent / (self.root.name + "-entries")
         self.addCleanup(lambda: out.unlink(missing_ok=True))
-        code = f"import os; open({str(out)!r}, 'w').write(' '.join(os.listdir({str(self.folder)!r})))"
+        # The folder and the entry (through a temporary dot-file) are written just after the child starts: wait for
+        # them, up to 10 s.
+        code = (f"import os, time\nd = {str(self.folder)!r}\nend = time.time() + 10\n"
+                "def ready():\n    return os.path.isdir(d) and any(n.endswith('.json') for n in os.listdir(d))\n"
+                "while time.time() < end and not ready():\n"
+                "    time.sleep(0.02)\n"
+                f"open({str(out)!r}, 'w').write(' '.join(n for n in os.listdir(d) if not n.startswith('.')))")
         status, _ = common.run_argv([PY, "-c", code], self.root, track="gate step test")
         self.assertEqual(status, 0)
         self.assertRegex(out.read_text(), r"^\d+\.json$")
