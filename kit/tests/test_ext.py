@@ -165,6 +165,11 @@ def prepare(ctx):
         (tree / "tests" / ".GITIGNORE").write_text("*\\n")
         (tree / "tests" / "conftest.py").write_text("import os\\n")
         return None
+    if value == "listed-gitignore":  # lists itself and the file it hides, not the directory
+        (tree / "tests").mkdir(exist_ok=True)
+        (tree / "tests" / ".gitignore").write_text(".gitignore\\nconftest.py\\n")
+        (tree / "tests" / "conftest.py").write_text("import os\\n")
+        return None
     if value == "copied-gitignore":  # a dependency's own .gitignore, inside the ignored deps
         (tree / "deps" / "pkg").mkdir(parents=True, exist_ok=True)
         (tree / "deps" / "pkg" / ".gitignore").write_text("build/\\n")
@@ -878,13 +883,21 @@ class PrepareTreeTests(ExtBase):
 
     def test_a_differently_cased_self_ignoring_gitignore_is_refused(self):
         """Fix round 2, M-b: on a case-insensitive file system git reads tests/.GITIGNORE as a .gitignore."""
-        probe = Path(tempfile.mkdtemp()) / "probe"
+        scratch = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, scratch, ignore_errors=True)
+        probe = Path(scratch) / "probe"
         probe.write_text("x")
         insensitive = (probe.parent / "PROBE").exists()
         if not insensitive:
             self.skipTest("a case-sensitive file system: git does not read .GITIGNORE as an ignore file")
         self.git_refusal("upper-gitignore", "a new git-ignored .gitignore that can hide files from git: "
                                             "tests/.GITIGNORE")
+
+    def test_a_negated_match_is_not_an_ignored_directory(self):
+        """Fix round 3, R2-M1: under `*` and `!*/` a `tests/` is reported with a `!` rule; it is not ignored."""
+        put(self.tree, ".gitignore", "*\n!*/\n")
+        self.git_refusal("listed-gitignore", "a new git-ignored .gitignore that can hide files from git: "
+                                             "tests/.gitignore")
 
     def test_a_gitignore_copied_inside_an_ignored_directory_is_accepted(self):
         ok, out = self.prepare(prepare="copied-gitignore")

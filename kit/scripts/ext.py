@@ -790,8 +790,8 @@ def git_state(tree) -> dict:
 
 def _hiding(tree: Path, before: dict, after: dict) -> list[str]:
     """New git-ignored `.gitignore` files that can hide other files from git: each one, unless its directory is
-    ignored by a rule from a file that existed before the call (a `.gitignore` copied inside an ignored dependency
-    directory is fine; a self-ignoring `tests/.gitignore` is not)."""
+    ignored by a rule from a file other than the new ignored `.gitignore` files, and not by a negating (`!`) rule (a
+    `.gitignore` copied inside an ignored dependency directory is fine; a self-ignoring `tests/.gitignore` is not)."""
     new = after["ignored .gitignore"] - before["ignored .gitignore"]
     nested = sorted(path for path in new if "/" in path)
     covered = set()
@@ -802,8 +802,10 @@ def _hiding(tree: Path, before: dict, after: dict) -> list[str]:
         fields = said.stdout.decode("utf-8", "surrogateescape").split("\0")
         if said.returncode in (0, 1) and len(fields) >= 4 * len(nested):
             for index, path in enumerate(nested):
-                source = fields[4 * index]
-                if source and source.casefold() not in folded:
+                source, pattern, named = fields[4 * index], fields[4 * index + 2], fields[4 * index + 3]
+                # an answer for another path, or a negating pattern, is not "the directory is ignored": refuse
+                if named == path.rpartition("/")[0] + "/" and source and not pattern.startswith("!") \
+                        and source.casefold() not in folded:
                     covered.add(path)
     return [path for path in sorted(new) if path not in covered]
 
