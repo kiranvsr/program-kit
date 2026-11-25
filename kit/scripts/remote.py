@@ -2,10 +2,18 @@
 """`pk remote`: run heavy steps on other machines over plain ssh, git and tar (0.6.0), opt-in by checks.yaml.
 
     pk remote status
-    pk remote gate <ID> [--lane L|auto] [--host VAR] [--size S|any] [--dry-run] [-- extra pk gate handback args]
+    pk remote doctor
+    pk remote gate <ID> [--lane L|auto] [--host VAR] [--size S|any] [--force-main] [--dry-run]
+                   [-- extra pk gate handback args]
     pk remote plants <ID> (--rows ID,... | --all-pending) [--chunk-seconds N [--per-row-seconds S]
-                     [--chunk K/M | --plan]] [--rejudge] [--lane L|auto] [--host VAR] [--size S|any] [--dry-run]
-    pk remote run [--lane L|auto] [--host VAR] [--size S|any] [--get PATH]... [--dry-run] <owner> -- <command> ...
+                     [--chunk K/M | --plan]] [--rejudge] [--lane L|auto] [--host VAR] [--size S|any] [--force-main]
+                     [--dry-run]
+    pk remote run [--lane L|auto] [--host VAR] [--size S|any] [--get PATH]... [--force-main] [--dry-run] <owner>
+                  -- <command> ...
+
+`<ID>` is any task ID `pk gate handback` takes: a register task or an ad-hoc `AH-<nnnn>` (`pk adhoc add`), with its
+branch `task/<ID>` and its worktree from `pk worktree new <ID>` (0.7.3, KF-71: an ad-hoc batch or chore takes an ID
+first, then runs its gate here like any task).
 
 Provider-neutral and host-neutral: the kit names no host, user, path or provider. The `remote` section of main's
 program/checks.yaml says where (`parse`); the ssh destination is read at run time from the environment variable
@@ -15,9 +23,12 @@ skipped with a note, and none set is the refusal of an unset `host_env`. Every h
 names. On each host, under `dir`:
 
 - `<dir>/repo.git`, a bare mirror. The runner pushes main and the task branch (for `run`, the worktree's HEAD as
-  `refs/runs/<name>`, and main) to the chosen host's mirror ONLY, by its ssh path, with a forced update: the mirror
-  is the lanes' alone. It never pushes to origin or to any other remote, and the remote machine needs no credential
-  of the project's host.
+  `refs/runs/<name>`, and main) to the chosen host's mirror ONLY, by its ssh path, in one atomic push: the mirror is
+  the lanes' alone. It never pushes to origin or to any other remote, and the remote machine needs no credential of
+  the project's host. The task branch and `refs/runs/<name>` are forced, as before 0.7.3. From 0.7.3 (KF-67) main
+  is not: when the mirror's main is not an ancestor of this checkout's main (a stale clone, or a main that has
+  diverged), the push is refused, nothing is pushed and nothing runs, because a step queued on the mirror's newer
+  main would run on old code; `--force-main` replaces the mirror's main anyway.
 - `<dir>/<lane>` for each lane, a clone of the mirror; each is its own checkout, so each has its own `pk lock`. On
   the lane, under that lane's lock (taken with the kit of the pushed main, extracted with `git archive`, so a lane's
   own checkout may be older), the step first removes every other entry of the lane's `.worktrees/` (0.7.2, below),
@@ -50,6 +61,11 @@ names. On each host, under `dir`:
 - `pk remote status` shows every configured host by its variable name: the base directory's disk use, then each
   lane's size, checkout, lock (free, busy with its holder and age, stale, or missing) and last log lines; a host that
   does not answer is shown as unreachable and status still exits 0.
+- `pk remote doctor` (0.7.3, KF-72) checks each configured host with one ssh call, with `remote.env` exported as a
+  step has it: python3 3.11 or later, git and tar on PATH, `<dir>/repo.git` a bare repository, each lane a checkout
+  whose origin is that mirror, and that a DOCKER_HOST socket or SSL_CERT_FILE the lane's environment names exists
+  there (a value carried over from another machine does not). It prints `ok` or `problem:` lines per host and exits
+  1 on any problem, an unreachable host included. `kit/playbooks/12_lanes.md` is the set-up.
 - Every value that reaches a shell is quoted (shlex); IDs, lanes, sizes and owners are checked; an argument naming
   this machine's home or worktree is refused (the command runs elsewhere). `--dry-run` prints the push, the lane plan
   and the ssh command, and runs nothing.
@@ -89,6 +105,7 @@ POLL_ENV = "PK_REMOTE_POLL"
 POLL_SECONDS = 20.0
 SSH_DEFAULT = ("ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", "-o", "ServerAliveInterval=60")
 PUSH_TRIES = 3
+MAIN_SPEC = "refs/heads/main:refs/heads/main"
 ADOPT_LOCK = "pk-remote-adopt"  # the local lock around adopting, so parallel chunks never race on latest.json
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _LANE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
@@ -502,12 +519,28 @@ def _ssh_argv(settings: dict, script: str, shown: bool = False) -> list[str]:
     return [*_ssh(), _dest(settings, shown), "sh -c " + _q(script)]
 
 
+def _main_spec(force_main: bool) -> str:
+    """The refspec of main: a fast-forward only, unless `--force-main` (KF-67)."""
+    return ("+" if force_main else "") + MAIN_SPEC
+
+
 def _push_argv(settings: dict, refspecs: list[str], shown: bool = False) -> list[str]:
-    return ["git", "push", "-q", "-f", f"{_dest(settings, shown)}:{settings['base']}/repo.git", *refspecs]
+    return ["git", "push", "-q", "--atomic", "--porcelain", f"{_dest(settings, shown)}:{settings['base']}/repo.git",
+            *refspecs]
+
+
+def _main_refused(output: str) -> bool:
+    """Whether the porcelain output of a push says the mirror refused main as not a fast-forward."""
+    for line in output.splitlines():
+        fields = line.split("\t")
+        if len(fields) >= 3 and fields[0] == "!" and fields[1] == MAIN_SPEC and fields[2].startswith("[rejected]"):
+            return True
+    return False
 
 
 def _push(root: Path, settings: dict, refspecs: list[str]) -> None:
-    """Push `refspecs` to the lanes' mirror by its ssh path (never to a named remote), retried on a lost ref race."""
+    """Push `refspecs` to the lanes' mirror by its ssh path (never to a named remote), all or none, retried on a lost
+    ref race; KitError at once when the mirror's main is not an ancestor of the main pushed (KF-67)."""
     env = dict(os.environ)
     if not env.get("GIT_SSH_COMMAND"):
         env["GIT_SSH_COMMAND"] = shlex.join(_ssh())
@@ -515,6 +548,12 @@ def _push(root: Path, settings: dict, refspecs: list[str]) -> None:
         proc = subprocess.run(_push_argv(settings, refspecs), cwd=str(root), env=env, capture_output=True, text=True)
         if proc.returncode == 0:
             return
+        if _main_refused(proc.stdout):
+            raise KitError("pk remote: refused: the main of the lanes' mirror is not an ancestor of this checkout's "
+                           "main (this main is behind it or has diverged), so pushing would rewind the mirror and a "
+                           "step queued there would run on old code. Nothing was pushed and nothing ran. Bring this "
+                           "main up to date (or run from the checkout whose main is current) and try again; "
+                           "--force-main replaces the mirror's main anyway")
         if attempt == PUSH_TRIES:
             raise KitError(f"pk remote: the push to the lanes' mirror {settings['base']}/repo.git failed: "
                            + _scrub(settings, " ".join((proc.stderr or proc.stdout).split()))[:600])
@@ -710,7 +749,8 @@ def _task_checks(root: Path, task_id: str, branch: str, kind: str) -> Path:
     gate; for plants, clean but for plants records and the pointer, with the latest results record committed."""
     wt = root / ".worktrees" / task_id.lower()
     if not wt.is_dir():
-        raise KitError(f"pk remote {kind}: no local task worktree {wt} (pk worktree new {task_id})")
+        raise KitError(f"pk remote {kind}: no local task worktree {wt} (pk worktree new {task_id}; ad-hoc work takes "
+                       "an ID first: pk adhoc add)")
     try:
         git(root, "rev-parse", "-q", "--verify", f"refs/heads/{branch}")
     except KitError:
@@ -765,14 +805,14 @@ def _target(settings: dict, kind: str, wanted: str, host_var: str | None, size: 
 
 
 def _step(root: Path, settings: dict, task_id: str, branch: str, kind: str, pk_args: list[str], wanted: str,
-          dry_run: bool, host_var: str | None = None, size: str | None = None) -> int:
+          dry_run: bool, host_var: str | None = None, size: str | None = None, force_main: bool = False) -> int:
     """Push main and the task branch, run one pk step for the task on a lane under its lock, and copy back what the
     step wrote (for plants, then adopt it)."""
     wt = None if dry_run else _task_checks(root, task_id, branch, kind)
     problem = _local_paths_problem(pk_args, root)
     if problem:
         raise KitError(f"pk remote {kind}: {problem}")
-    refspecs = ["refs/heads/main:refs/heads/main", f"refs/heads/{branch}:refs/heads/{branch}"]
+    refspecs = [_main_spec(force_main), f"+refs/heads/{branch}:refs/heads/{branch}"]
     main_sha, head = _sha(root, "refs/heads/main"), _sha(root, f"refs/heads/{branch}")
     owner = f"remote-{kind}-{task_id}"
     settings, lane, plan = _target(settings, kind, wanted, host_var, size, dry_run)
@@ -891,15 +931,79 @@ def cmd_status(args) -> int:
     return 0
 
 
+# Run with `sh` on each host by `pk remote doctor`, after the exports and `base=`: one `ok <what>` or
+# `problem <what>` line per check, then `pk-doctor-end`.
+_DOCTOR = r"""
+v=$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2]); raise SystemExit(sys.version_info[:2] < (3, 11))' \
+  2>/dev/null) && echo "ok python3 $v" || echo "problem python3 3.11 or later is not on PATH (found: ${v:-none})"
+for t in git tar; do command -v "$t" >/dev/null 2>&1 && echo "ok $t" || echo "problem $t is not on PATH"; done
+if [ "$(git --git-dir="$base/repo.git" rev-parse --is-bare-repository 2>/dev/null)" = true ]; then
+  echo "ok mirror"
+else
+  echo "problem no bare mirror at $base/repo.git (git init --bare, then push main once)"
+fi
+mirror=$(cd "$base/repo.git" 2>/dev/null && pwd -P)
+for l in $lanes; do
+  if ! o=$(git -C "$base/$l" config remote.origin.url 2>/dev/null); then
+    echo "problem lane $l: no checkout at $base/$l (git clone $base/repo.git $base/$l)"; continue
+  fi
+  case "$o" in /*) ;; *) o="$base/$l/$o" ;; esac
+  if [ -n "$mirror" ] && [ "$(cd "$o" 2>/dev/null && pwd -P)" = "$mirror" ]; then echo "ok lane $l"
+  else echo "problem lane $l: its origin is not the mirror $base/repo.git"; fi
+done
+case "${DOCKER_HOST:-}" in
+  unix://*) if [ -S "${DOCKER_HOST#unix://}" ]; then echo "ok DOCKER_HOST"
+            else echo "problem DOCKER_HOST names a socket that is not on this host (from another machine?)"; fi ;;
+esac
+if [ -n "${SSL_CERT_FILE:-}" ]; then
+  if [ -f "$SSL_CERT_FILE" ]; then echo "ok SSL_CERT_FILE"
+  else echo "problem SSL_CERT_FILE names a file that is not on this host (from another machine?)"; fi
+fi
+echo pk-doctor-end
+"""
+
+
+def _host_doctor(settings: dict) -> list[str]:
+    """The doctor lines of one host, from one ssh call; one problem line when the host does not answer."""
+    script = "\n".join([*_exports(settings), f"base={_q(settings['base'])}",
+                        'case "$base" in /*) ;; *) base="$(pwd)/$base" ;; esac',
+                        "lanes=" + _q(" ".join(settings["lanes"])), _DOCTOR])
+    proc = _remote(settings, script, capture=True)
+    raw = proc.stdout.decode("utf-8", "replace").splitlines()
+    if "pk-doctor-end" not in raw:
+        return [f"host {settings['host_var']}: problem: unreachable"]
+    out = []
+    for line in raw:
+        word, _, rest = line.partition(" ")
+        if word in ("ok", "problem"):
+            out.append(f"host {settings['host_var']}: {word if word == 'ok' else 'problem:'} {rest}")
+    return [gate._show(_scrub(settings, line)) for line in out]
+
+
+def cmd_doctor(args) -> int:
+    root = find_root()
+    settings = _settings(root, quiet=True)
+    bad = False
+    for var in settings["host_vars"]:
+        host = next((item for item in settings["hosts"] if item["var"] == var), None)
+        lines = [f"host {var}: not set (skipped)"] if host is None else _host_doctor(_on(settings, host))
+        for line in lines:
+            bad = bad or ": problem:" in line
+            print(line, flush=True)
+    print("remote doctor: " + ("problems found" if bad else "ok"), flush=True)
+    return 1 if bad else 0
+
+
 def cmd_gate(args) -> int:
     root = find_root()
     settings = _settings(root)
-    found, extra = _take(list(args.rest), {"--lane": True, "--host": True, "--size": True, "--dry-run": False})
+    found, extra = _take(list(args.rest), {"--lane": True, "--host": True, "--size": True, "--dry-run": False,
+                                           "--force-main": False})
     task_id = args.task_id
     gate._task_branch(task_id, f"task/{task_id}")
     return _step(root, settings, task_id, f"task/{task_id}", "gate", extra, found.get("--lane", args.lane),
                  bool(found.get("--dry-run") or args.dry_run), found.get("--host", args.host),
-                 found.get("--size", args.size))
+                 found.get("--size", args.size), bool(found.get("--force-main") or args.force_main))
 
 
 def cmd_plants(args) -> int:
@@ -934,7 +1038,8 @@ def cmd_plants(args) -> int:
             pk_args += ["--chunk", args.chunk]
     if args.rejudge:
         pk_args.append("--rejudge")
-    return _step(root, settings, task_id, branch, "plants", pk_args, args.lane, args.dry_run, args.host, args.size)
+    return _step(root, settings, task_id, branch, "plants", pk_args, args.lane, args.dry_run, args.host, args.size,
+                 args.force_main)
 
 
 def _run_name(wt: Path) -> str:
@@ -993,7 +1098,7 @@ def cmd_run(args) -> int:
         raise KitError(f"pk remote run: {problem}")
     name = _run_name(wt)
     head, main_sha = _sha(wt, "HEAD"), _sha(wt, "refs/heads/main")
-    refspecs = [f"{head}:refs/runs/{name}", "refs/heads/main:refs/heads/main"]
+    refspecs = [f"+{head}:refs/runs/{name}", _main_spec(args.force_main)]
     shipped, deleted = _changed_files(wt)
     settings, lane, plan = _target(settings, "run", args.lane, args.host, args.size, args.dry_run)
     full = [*_prefix(settings, lane), *command]
@@ -1048,21 +1153,26 @@ def cmd_run(args) -> int:
 def configure(parser) -> None:
     actions = parser.add_subparsers(dest="action", metavar="action", required=True, parser_class=type(parser))
     actions.add_parser("status", help="each host's disk use and each lane's size, checkout, lock and last log lines")
+    actions.add_parser("doctor", help="check each host's lane set-up: python3, git, tar, the mirror, each lane's "
+                                      "origin, and the DOCKER_HOST and SSL_CERT_FILE its environment names")
     lane_help = ("a lane of remote.lanes (on any host, unless --host), or auto (default): the first free one of the "
                  "wanted size, in host order then lane order, waiting while all are busy")
     host_help = "only the host whose ssh destination this variable of remote.hosts_env (or host_env) holds"
     size_help = "the lane size for auto (default: remote.sizes for this kind of step, else any), or any"
     dry_help = "print the push, the lane plan and the ssh command; run nothing"
+    force_help = ("replace the mirror's main even when it is not an ancestor of this main (by default such a push is "
+                  "refused: it would rewind the mirror)")
 
     def where(parser) -> None:
         parser.add_argument("--lane", default="auto", help=lane_help)
         parser.add_argument("--host", metavar="VAR", help=host_help)
         parser.add_argument("--size", metavar="SIZE", help=size_help)
+        parser.add_argument("--force-main", action="store_true", help=force_help)
 
     step = actions.add_parser("gate", help="pk gate handback for the task on a lane; copies its evidence back")
     where(step)
     step.add_argument("--dry-run", action="store_true", help=dry_help)
-    step.add_argument("task_id", metavar="ID")
+    step.add_argument("task_id", metavar="ID", help="a register task or an ad-hoc AH-<nnnn>, with its worktree")
     step.add_argument("rest", nargs=argparse.REMAINDER, metavar="-- args", help="passed to pk gate handback")
     chunk = actions.add_parser("plants", help="pk gate plants for the task on a lane; copies the new plants records "
                                               "back and adopts them")
@@ -1088,7 +1198,8 @@ def configure(parser) -> None:
 
 
 def cmd_remote(args) -> int:
-    return {"status": cmd_status, "gate": cmd_gate, "plants": cmd_plants, "run": cmd_run}[args.action](args)
+    return {"status": cmd_status, "doctor": cmd_doctor, "gate": cmd_gate, "plants": cmd_plants,
+            "run": cmd_run}[args.action](args)
 
 
 def register(add_command) -> None:

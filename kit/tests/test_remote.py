@@ -159,9 +159,9 @@ class DryRun(RemoteBase):
         out = result.stdout
         self.assertIn(f"remote: gate {TASK} on lanes-host, lane auto (the first free of lane1, lane2; waits while all "
                       "are busy)", out)
-        self.assertIn(f"remote: push (to the lanes' mirror only, never to origin): git push -q -f "
+        self.assertIn(f"remote: push (to the lanes' mirror only, never to origin): git push -q --atomic --porcelain "
                       f"lanes-host:{self.machine}/repo.git refs/heads/main:refs/heads/main "
-                      f"refs/heads/{BRANCH}:refs/heads/{BRANCH}", out)
+                      f"+refs/heads/{BRANCH}:refs/heads/{BRANCH}", out)
         self.assertIn(f"remote: on the lane, under its pk lock 'pk-heavy': env PINNED=1 env WRAPPED=yes python3 "
                       f"kit/scripts/pk.py gate handback {TASK} --branch {BRANCH} --no-reuse '$(touch pwned)'", out)
         self.assertIn("remote: dry run: nothing pushed, nothing run", out)
@@ -442,7 +442,7 @@ class Hosts(TwoHosts):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(f"remote: gate {TASK} on PK_A or PK_B (in that order), lane auto (the first free big lane of "
                       "big; waits while all are busy)", result.stdout)
-        self.assertIn("git push -q -f '<PK_A>:lanes/repo.git'", result.stdout)
+        self.assertIn("git push -q --atomic --porcelain '<PK_A>:lanes/repo.git'", result.stdout)
         self.assert_no_destination(result)
         result = self.pk("plants", TASK, "--rows", "g1", "--host", "PK_B", "--size", "any", "--dry-run")
         self.assertIn(f"remote: plants {TASK} on PK_B, lane auto (the first free of big, small1, small2;",
@@ -537,6 +537,153 @@ class Status(TwoHosts):
         result = self.run_here()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertRegex(result.stderr, r"remote: warning: the disk of PK_A is \d+% used \(remote.disk_warn_percent 1\)")
+
+
+# --- 0.7.3: main reaches the mirror as a fast-forward only (KF-67), ad-hoc tasks (KF-71), the fingerprint on a lane
+# (KF-70) and pk remote doctor (KF-72) ---------------------------------------------------------------------------
+
+PROBE = [PY, "-c", "print('ran')"]
+
+
+class MirrorMain(RemoteBase):
+    """The task branch and refs/runs/<name> stay forced; main is pushed only as a fast-forward of the mirror's."""
+
+    def mirror(self, ref):
+        return sh(self.machine / "repo.git", "git", "rev-parse", "-q", "--verify", ref).strip()
+
+    def local(self, ref):
+        return sh(self.root, "git", "rev-parse", ref).strip()
+
+    def advance_mirror(self) -> str:
+        """The mirror's main moves past this checkout's, as when a current checkout pushed meanwhile."""
+        other = self.base / "other"
+        sh(self.base, "git", "clone", "-q", "--no-local", str(self.machine / "repo.git"), str(other))
+        sh(other, "git", "config", "user.name", "Test")
+        sh(other, "git", "config", "user.email", "test@example.com")
+        (other / "later.txt").write_text("later\n")
+        commit(other, "a later main")
+        sh(other, "git", "push", "-q", "origin", "main")
+        return self.mirror("refs/heads/main")
+
+    def test_a_fast_forward_of_main_is_pushed_and_the_task_branch_is_still_forced(self):
+        (self.root / "more.txt").write_text("more\n")
+        commit(self.root, "main moves on")
+        sh(self.wt, "git", "commit", "-q", "--amend", "-m", "task work, amended")  # the branch is rewritten
+        result = self.pk("gate", TASK, "--lane", "lane1", "--dry-run")
+        self.assertIn(f"refs/heads/main:refs/heads/main +refs/heads/{BRANCH}:refs/heads/{BRANCH}", result.stdout)
+        result = self.pk("run", "--lane", "lane1", "o", "--", *PROBE, cwd=self.wt)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.mirror("refs/heads/main"), self.local("main"))
+        self.assertEqual(self.mirror(f"refs/runs/run-{TASK.lower()}"), self.local(BRANCH))
+        sh(self.wt, "git", "commit", "-q", "--amend", "-m", "task work, amended again")
+        result = self.pk("run", "--lane", "lane1", "o", "--", *PROBE, cwd=self.wt)  # a rewritten run ref is forced
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.mirror(f"refs/runs/run-{TASK.lower()}"), self.local(BRANCH))
+
+    def test_a_stale_main_is_refused_and_nothing_is_pushed_or_run(self):
+        newer = self.advance_mirror()
+        branch_before = self.mirror(f"refs/heads/{BRANCH}")
+        (self.wt / "calc.py").write_text("changed\n")
+        commit(self.wt, "more task work")
+        for argv, cwd in ((["run", "--lane", "lane1", "o", "--", *PROBE], self.wt),
+                          (["gate", TASK, "--lane", "lane1"], None)):
+            result = self.pk(*argv, cwd=cwd)
+            self.assertEqual(result.returncode, 1, (argv, result.stdout, result.stderr))
+            self.assertIn("refused: the main of the lanes' mirror is not an ancestor of this checkout's main",
+                          result.stderr, argv)
+            self.assertIn("Nothing was pushed and nothing ran", result.stderr)
+            self.assertIn("--force-main", result.stderr)
+        self.assertEqual(self.mirror("refs/heads/main"), newer)
+        self.assertEqual(self.mirror(f"refs/heads/{BRANCH}"), branch_before)  # atomic: the branch did not go either
+        self.assertNotIn("refs/runs/", sh(self.machine / "repo.git", "git", "for-each-ref", "--format=%(refname)"))
+        self.assertFalse((self.machine / "lane1.log").exists())
+        self.assertEqual(sum("git-receive-pack" in call for call in self.ssh_calls()), 2)  # one try each, no retry
+
+    def test_force_main_replaces_the_mirror_main(self):
+        self.advance_mirror()
+        dry = self.pk("gate", TASK, "--lane", "lane1", "--force-main", "--dry-run")
+        self.assertEqual(dry.returncode, 0, dry.stderr)
+        self.assertIn(" +refs/heads/main:refs/heads/main ", dry.stdout)
+        self.assertNotIn("--force-main", dry.stdout)  # a pk remote option, never passed to the gate
+        result = self.pk("run", "--lane", "lane1", "--force-main", "o", "--", *PROBE, cwd=self.wt)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ran", result.stdout)
+        self.assertEqual(self.mirror("refs/heads/main"), self.local("main"))
+
+
+class AdHoc(RemoteBase):
+    """`pk remote gate` takes an ad-hoc AH-<nnnn> as `pk gate handback` does."""
+
+    def test_an_ad_hoc_task_runs_its_gate_on_a_lane_like_a_register_task(self):
+        adhoc, wt = "AH-0001", self.root / ".worktrees" / "ah-0001"
+        missing = self.pk("gate", adhoc, "--lane", "lane2")
+        self.assertEqual(missing.returncode, 1)
+        self.assertIn("pk worktree new AH-0001; ad-hoc work takes an ID first: pk adhoc add", missing.stderr)
+        sh(self.root, "git", "worktree", "add", "-q", "-b", f"task/{adhoc}", str(wt))
+        (wt / "chore.txt").write_text("a chore\n")
+        commit(wt, "the chore")
+        dry = self.pk("gate", adhoc, "--dry-run")
+        self.assertEqual(dry.returncode, 0, dry.stderr)
+        self.assertIn(f"python3 kit/scripts/pk.py gate handback {adhoc} --branch task/{adhoc}", dry.stdout)
+        # On the lane, echo stands in for the gate (wrap), so the test sees the command the lane ran.
+        write_yaml(self.root / "program" / "checks.yaml",
+                   checks_data(remote=section(self.machine, wrap=["echo", "lane-ran"], lane_wrap={})))
+        commit(self.root, "echo on the lanes")
+        result = self.pk("gate", adhoc, "--lane", "lane2")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"lane-ran python3 kit/scripts/pk.py gate handback {adhoc} --branch task/{adhoc}", result.stdout)
+        lane_wt = self.machine / "lane2" / ".worktrees" / "ah-0001"
+        self.assertEqual((lane_wt / "chore.txt").read_text(), "a chore\n")
+        self.assertEqual(sh(lane_wt, "git", "rev-parse", "HEAD"), sh(wt, "git", "rev-parse", "HEAD"))
+
+
+class FingerprintOnALane(RemoteBase):
+    """The release fingerprint runs through `pk remote run` from a clean checkout, and its record comes back with
+    `--get` (the command playbook 08 and 12_lanes.md give)."""
+
+    def test_the_documented_command_brings_back_a_record_that_validates(self):
+        shutil.copytree(KIT / "templates", self.root / "kit" / "templates")  # the record's schema
+        write_yaml(self.root / "program" / "checks.yaml", checks_data(remote=section(self.machine, setup=[])))
+        write_yaml(self.root / "program" / "release-set.yaml", {"toolchain": [], "entries": [
+            {"id": "unit", "argv": ["python3", "-c", "print('release ok')"], "track": "plain", "kind": "check"}]})
+        commit(self.root, "a release set")
+        head12 = self.local("HEAD")[:12]
+        result = self.pk("run", "--lane", "lane1", "--get", f"program/evidence/fingerprint/{head12}", "fingerprint",
+                         "--", "python3", "kit/scripts/pk.py", "fingerprint", "run")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"fingerprint {head12}: complete true, all as expected true", result.stdout)
+        record = self.root / "program" / "evidence" / "fingerprint" / head12 / "fingerprint.json"
+        self.assertTrue(record.is_file())
+        check = subprocess.run([PY, str(PK), "fingerprint", "validate", str(record)], cwd=str(self.root),
+                               env=self.env, capture_output=True, text=True, timeout=120)
+        self.assertEqual(check.returncode, 0, check.stdout + check.stderr)
+
+    local = MirrorMain.local
+
+
+class Doctor(TwoHosts):
+    def test_doctor_checks_each_host_and_names_each_problem(self):
+        for var in ("SSL_CERT_FILE", "DOCKER_HOST"):  # the fake ssh passes this machine's environment on
+            self.env.pop(var, None)
+        result = self.pk("doctor")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for var in HOSTS:
+            for what in ("python3 3.", "git", "tar", "mirror", "lane big", "lane small1", "lane small2"):
+                self.assertIn(f"host {var}: ok {what}", result.stdout)
+        self.assertIn("remote doctor: ok", result.stdout)
+        shutil.rmtree(self.lane("beta-host", "small2"))
+        self.write_section(env={"SSL_CERT_FILE": "/nowhere/cert.pem", "DOCKER_HOST": "unix:///nowhere/docker.sock"})
+        result = self.pk("doctor", env={**self.env, "PK_A": "gone-host"})
+        self.assertEqual(result.returncode, 1)
+        out = result.stdout
+        self.assertIn("host PK_A: problem: unreachable", out)
+        self.assertIn("host PK_B: problem: lane small2: no checkout at", out)
+        self.assertIn("host PK_B: ok lane small1", out)
+        self.assertIn("host PK_B: problem: SSL_CERT_FILE names a file that is not on this host", out)
+        self.assertIn("host PK_B: problem: DOCKER_HOST names a socket that is not on this host", out)
+        self.assertIn("remote doctor: problems found", out)
+        self.assert_no_destination(result)
+        self.assertNotIn("gone-host", out + result.stderr)
 
 
 if __name__ == "__main__":
