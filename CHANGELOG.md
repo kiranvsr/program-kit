@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.7.2
+
+Lane sizes, several hosts and lane worktree clean-up in `pk remote`, from a programme with two 8-core machines that wants one big lane and two small lanes on each, gates only on a big lane, planted-bug judging and small runs on small lanes, and `--lane auto` choosing across both machines. Before, there was one host, every lane was alike and auto took the first free lane, so a full gate could land on a 2-core lane; and every step left its `.worktrees/<id>` or `.worktrees/run-<name>`, dependencies installed, on the lane for good, until hundreds of them filled a 400 GB disk to 72% (KF-66 there, fixed here). Everything is backward compatible: a 0.7.0 `remote` section parses to the same settings and its steps run on its one host and print as before; what it sees new is that old lane worktrees are removed (`keep_worktrees: true` keeps them) and a fuller `pk remote status`.
+
+What changed:
+
+- Several hosts (new). `remote.hosts_env: [VAR, ...]` is the alternative to `host_env`; giving both is refused. Each variable holds one ssh destination; one that is unset or empty at run time is skipped with one note, and none set is the refusal of an unset `host_env`. Hosts are tried in list order, and each has its own `<dir>/repo.git` and lanes with the same names. `--host VAR` pins a step to one host.
+- Lane sizes (new). A `lanes` entry is a bare name, as before (size `default`), or `{name: lane1, size: big}`, a size being a free word. `sizes: {gate, plants, run}` gives each kind of step its default size; a kind it leaves out takes any. `--size S|any` overrides it, and `--lane L` still pins one lane, on any host unless `--host` is given (`--lane` and `--size` together are refused). A size no lane has is refused, in `sizes` and on the command line.
+- Choosing across hosts. Auto polls each host, one ssh call per host per poll, and takes the first free or stale lane of the wanted size in host order, then lane order. It never falls back to another size: it waits, saying which size it waits for. A host that does not answer is skipped for that poll with one note per host; a lone host is retried, as before. The mirror is pushed to the chosen host only, and the step runs there under the lane's lock exactly as before.
+- No destination in the output. With `hosts_env` the chosen lane is printed as `VAR:lane` and the lane log's start line ends `on VAR:lane`; dry runs print `<VAR>` for the destination, and push and copy-back errors have it replaced. A `host_env` section prints as 0.7.0 did.
+- Lane worktree clean-up (KF-66, bug fix). At the start of every step, inside the lane script under the lane's lock and before the step's own worktree is prepared, every direct child of the lane's `.worktrees/` but the one the step is about to use is removed, then `git worktree prune` runs, so at most one worktree stays per lane. The removal resolves `<lane root>/.worktrees`, acts on its direct children only, unlinks a symbolic link without following it (inside a removed tree too) and does nothing when `.worktrees` is itself a link. `remote.keep_worktrees: true` turns it off.
+- Copy-back marks. A gate, plants or `run --get` step marks its worktree in the lane's git dir (`pk-fetch/<name>`) and its copy-back removes the mark; the next step on the lane waits for the mark, at most 120 seconds, before it removes or resets that worktree.
+- `pk remote status` lists every configured host by its variable name (one not set says so): the base directory's disk use from `df -P`, then each lane's size, checkout, lock (free, busy with its holder and age, stale, or missing), owner lines and last log lines. An unreachable host is shown as unreachable and status exits 0. With `remote.disk_warn_percent` (1 to 99), status and each step's start print a warning line when the disk is at least that full.
+- A relative `dir` now works for the lane log too (bug fix): the lane script resolves it against the home the ssh session starts in before it changes into the lane (the log was written relative to the lane before).
+- Docs: DESIGN sections 9.3 and 10.2 (with a two-host example), README.
+
+Design choices, each with its reason:
+
+- The 0.7.2 keys appear in the parsed section only when used, so a 0.7.0 section parses to exactly the same mapping and every reader of it is unchanged; `remote.config` fills the defaults.
+- Auto never takes another size: a gate on a small lane is the slow, misleading run the sizes exist to stop, and waiting is visible while a wrong lane is not.
+- Variable names, not destinations, in the output: a destination can carry a user or an internal name, and logs and transcripts are shared. A `host_env` section keeps 0.7.0's lines so that existing tooling and tests read them unchanged.
+- One ssh call per host per poll, stopping at the first host with a free lane: polling stays as cheap as with one host when the first host has room.
+- Clean-up under the lane's lock, at the start of the next step rather than at the end of this one: the step's own worktree stays for its copy-back and for a quick re-run of the same task, and nothing else can be using the others while the lock is held. The copy-back runs after the lock is released, so the mark keeps a waiting step from removing a worktree whose records are still being read; the wait is bounded so a copy-back that never comes costs one step two minutes, not the lane.
+- The removal is done by a short Python program on the lane rather than `rm -rf` on a glob: it can resolve the directory, test each entry for a link before touching it and leave anything outside `.worktrees` alone.
+
+Upgrading from 0.7.1: `sh install.sh /path/to/your-repo --upgrade`. Nothing in `program/` has to change; to use several machines or lane sizes, edit the `remote` section of `program/checks.yaml` (a guarded edit, with the user's word) as in DESIGN section 10.2 and export one variable per machine.
+
 ## 0.7.1
 
 A gate can now run steps that need what the programme keeps git-ignored. Opt-in: without `program/extensions.yaml`, or without a `prepare_tree` in it, every gate behaves exactly as on 0.7.0.
