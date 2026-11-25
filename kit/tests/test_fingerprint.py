@@ -817,6 +817,23 @@ class Immutability(Repo):
         self.assertEqual(store.rewritten(self.root),
                          [f"evidence history rewritten: {BASE}/{head12}/fingerprint.json deleted in {commit}"])
 
+    def test_a_file_deleted_and_restored_with_identical_bytes_is_no_rewrite(self):
+        head12 = self.committed_record()  # KF-76 (0.7.5): not named by a digest, so its blob is compared
+        path = self.root / BASE / head12 / "fingerprint.json"
+        table = self.root / BASE / head12 / "one.json"
+        raw = path.read_bytes()
+        table.write_text("{}\n")
+        self.commit("a second file")
+        table_raw = table.read_bytes()
+        path.unlink()
+        table.unlink()
+        deleted = self.commit("remove both")
+        path.write_bytes(raw)
+        table.write_bytes(table_raw + b"\n")
+        self.commit("restore both, one with other bytes")
+        self.assertEqual(store.rewritten(self.root),
+                         [f"evidence history rewritten: {BASE}/{head12}/one.json deleted in {deleted}"])
+
     def test_a_table_file_is_covered_too(self):
         self.release(entry("t", say("test_a (m.C.test_a) ... ok"), derives="unittest"))
         head12 = self.run_ok()[3]["head12"]

@@ -11,7 +11,8 @@ name is the sha256 of the file's bytes. The kit creates a record once, read-only
 hard-linked to its final name (an existing name is never replaced), and never modifies or deletes one.
 Immutability is enforced through git, not a file system boundary (`integrity`): a record whose bytes no longer hash
 to its name is refused as "immutable record altered", and a commit that modifies or deletes a record file is refused
-as "evidence history rewritten".
+as "evidence history rewritten", unless HEAD has the record's bytes back (0.7.5, KF-76: a record committed by
+mistake, deleted, then restored byte for byte stays the record its name proves).
 
 Each task has one pointer, `program/evidence/<task_id>/latest.json`, the only mutable evidence file: it names the
 task's latest `results` and latest `acceptance` record (digest, repository-relative path, and a few fields of the
@@ -27,7 +28,9 @@ task records and have no pointer, but they are immutable in the same way: `rewri
 or deleted a tracked file under that directory.
 
 Known limits: records are not signed; a record rewritten consistently together with its name and its pointer, in
-a history that is itself rewritten, is not detected.
+a history that is itself rewritten, is not detected; a record deleted or changed and later restored byte for byte
+(for a digest-named record, bytes that hash to its name; for a fingerprint file, the blob from before the change)
+is not reported, although commits between saw it gone or different (a check run there failed on it).
 """
 from __future__ import annotations
 
@@ -464,7 +467,12 @@ def history(root, task_id: str) -> list[dict]:
 
 def rewritten(root, base: str | None = None, head: str = "HEAD") -> list[str]:
     """`evidence history rewritten: <path> modified|deleted in <commit>` for every commit in `base..head` (the whole
-    history up to `head` when `base` is None) that modified or deleted a record file. Empty without commits."""
+    history up to `head` when `base` is None) that modified or deleted a record file. Empty without commits.
+
+    A change undone byte for byte by `head` is not reported (0.7.5, KF-76): the path is in `head`'s tree and, for a
+    digest-named record, its bytes there hash to its name, else its blob there is the blob from before the change.
+    A record deleted and later restored with identical bytes (a mistaken commit, then its revert) is then no
+    rewrite; one still gone or different at `head` is."""
     span = f"{base}..{head}" if base else head
     try:
         git(root, "rev-parse", "--verify", "--quiet", f"{head}^{{commit}}")
@@ -472,19 +480,55 @@ def rewritten(root, base: str | None = None, head: str = "HEAD") -> list[str]:
         return []
     # `-m` shows a merge commit's changes against each parent, so a record dropped or edited while resolving a
     # merge (every task reaches main by a merge) is seen; a file that is merely new on one side shows as added.
-    listing = git(root, "log", "-m", "--diff-filter=MD", "--no-renames", "--name-status", "--format=commit %H", span,
-                  "--", *RECORD_PATHSPECS)
-    found, commit = [], "?"
+    listing = git(root, "log", "-m", "--diff-filter=MD", "--no-renames", "--raw", "--no-abbrev", "--format=commit %H",
+                  span, "--", *RECORD_PATHSPECS)
+    changes, commit = [], "?"
     for line in listing.splitlines():
         if line.startswith("commit "):
             commit = line.split()[1]
-        elif "\t" in line:
-            status, path = line.split("\t", 1)
-            how = "modified" if status.startswith("M") else "deleted"
-            message = f"evidence history rewritten: {path} {how} in {commit}"
-            if message not in found:  # one line per (path, commit), however many parents showed it
-                found.append(message)
+        elif line.startswith(":") and "\t" in line:
+            meta, path = line.split("\t", 1)  # `:<old mode> <new mode> <old blob> <new blob> <status>`
+            fields = meta.split()
+            changes.append((commit, path, "modified" if fields[4].startswith("M") else "deleted", fields[2]))
+    unchanged = _unchanged_at(root, head, {(path, before) for _, path, _, before in changes}) if changes else set()
+    found = []
+    for commit, path, how, before in changes:
+        message = f"evidence history rewritten: {path} {how} in {commit}"
+        # one line per (path, commit), however many parents showed it
+        if (path, before) not in unchanged and message not in found:
+            found.append(message)
     return found
+
+
+def _unchanged_at(root, head: str, changed: set[tuple[str, str]]) -> set[tuple[str, str]]:
+    """The (path, blob before a change) pairs whose bytes `head` proves unchanged (KF-76): the path is in `head`'s
+    tree and, digest-named, its bytes there hash to its name; otherwise its blob there is the blob before.
+
+    Two git processes at most, however many paths: one `ls-tree` of `head` and one `cat-file --batch`."""
+    tree = {}
+    for line in git(root, "ls-tree", "-r", "--full-tree", head, "--", BASE).splitlines():
+        meta, _, path = line.partition("\t")
+        mode_, kind, blob = meta.split()
+        if kind == "blob" and mode_ != "120000":
+            tree[path] = blob
+    named = sorted({tree[path] for path, _ in changed if path in tree and _NAME.match(PurePosixPath(path).name)})
+    hashed = {}
+    if named:
+        out, at = _git_raw(root, "cat-file", "--batch", data="".join(f"{blob}\n" for blob in named).encode()), 0
+        for blob in named:
+            end = out.index(b"\n", at)
+            size = int(out[at:end].split()[2])
+            hashed[blob] = sha256_bytes(out[end + 1:end + 1 + size])
+            at = end + 1 + size + 1
+    unchanged = set()
+    for path, before in changed:
+        now = tree.get(path)
+        if now is None:
+            continue
+        match = _NAME.match(PurePosixPath(path).name)
+        if (hashed[now][:12] == match.group(2)) if match else now == before:
+            unchanged.add((path, before))
+    return unchanged
 
 
 def integrity(root, base: str | None = None, uncommitted: set[str] | frozenset = frozenset(),
@@ -695,12 +739,13 @@ def tree_problems(root, base: str | None = None, task_id: str | None = None) -> 
     return problems
 
 
-def _git_raw(root: Path, *args: str) -> bytes:
-    """git's stdout as bytes, never stripped (a status line may start with a space, a blob is exact bytes)."""
+def _git_raw(root: Path, *args: str, data: bytes | None = None) -> bytes:
+    """git's stdout as bytes, never stripped (a status line may start with a space, a blob is exact bytes); `data`
+    is its stdin."""
     import subprocess
 
     try:
-        proc = subprocess.run(["git", "-C", str(root), *args], capture_output=True)
+        proc = subprocess.run(["git", "-C", str(root), *args], capture_output=True, input=data)
     except OSError as exc:
         raise KitError(f"cannot run git: {exc.strerror or exc}") from exc
     if proc.returncode != 0:

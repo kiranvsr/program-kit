@@ -1883,9 +1883,11 @@ class BindingTests(HandbackBase):
         self.assertEqual(out, "")
         self.assertEqual(len(problems), 1, problems)
         self.assertTrue(problems[0].startswith(f"immutable record altered: {entry['path']} "), problems)
-        path.write_text(original)  # the bytes are back, the rewrite stays in the history
-        restored = commit(self.wt, "put the bytes back")
-        self.assertEqual(self.bind(), ([f"evidence history rewritten: {entry['path']} modified in {restored}"], ""))
+        path.write_text(original)  # the bytes are back: the change is undone byte for byte (KF-76, 0.7.5)
+        commit(self.wt, "put the bytes back")
+        problems, out = self.bind()
+        self.assertEqual(problems, [])
+        self.assertTrue(out.startswith("binding holds: "), out)
 
     def test_binding_fails_when_head_is_not_an_ancestor(self):
         self.produce_and_commit()

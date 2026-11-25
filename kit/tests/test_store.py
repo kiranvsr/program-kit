@@ -214,15 +214,85 @@ class Integrity(Base):
         modified = self.commit("rewrite a record")
         sh(self.root, "git", "rm", "-q", gone["path"])
         deleted = self.commit("delete a record")
-        self.edit(kept, store.encode({"head": "a" * 40}).decode())
-        restored = self.commit("put the bytes back")
+        self.edit(kept, '{"head": "c"}\n')
+        again = self.commit("rewrite it again")
         problems = store.rewritten(self.root, base)
         self.assertIn(f"evidence history rewritten: {kept['path']} modified in {modified}", problems)
         self.assertIn(f"evidence history rewritten: {gone['path']} deleted in {deleted}", problems)
         self.assertEqual(store.rewritten(self.root, deleted),
-                         [f"evidence history rewritten: {kept['path']} modified in {restored}"])
+                         [f"evidence history rewritten: {kept['path']} modified in {again}"])
         self.assertEqual(len([p for p in store.integrity(self.root) if p.startswith("evidence history rewritten")]),
                          3)
+
+    # KF-76 (0.7.5): a change undone byte for byte by HEAD is no rewrite; one still visible at HEAD is.
+    def committed(self, *tasks):
+        appended = [store.record(self.root, task, "results", {"head": "a" * 40}) for task in tasks]
+        self.commit("evidence")
+        return [(a, a["file"].read_bytes()) for a in appended]
+
+    def drop(self, *appended):
+        for a in appended:
+            a["file"].chmod(0o644)
+            sh(self.root, "git", "rm", "-q", a["path"])
+        return self.commit("drop them")
+
+    def restore(self, *pairs):
+        for a, raw in pairs:
+            a["file"].parent.mkdir(parents=True, exist_ok=True)
+            if a["file"].exists():
+                a["file"].chmod(0o644)
+            a["file"].write_bytes(raw)
+        return self.commit("restore them")
+
+    def test_a_record_deleted_and_restored_with_identical_bytes_is_no_rewrite(self):
+        [(appended, raw)] = self.committed("T-1")
+        self.drop(appended)  # the mistake: a record committed by a directory-wide add, then removed
+        self.restore((appended, raw))
+        self.assertEqual(store.rewritten(self.root), [])
+        self.assertEqual(store.integrity(self.root), [])
+
+    def test_a_record_modified_and_restored_with_identical_bytes_is_no_rewrite(self):
+        [(appended, raw)] = self.committed("T-1")
+        self.edit(appended, '{"head": "b"}\n')
+        self.commit("rewrite it")
+        self.restore((appended, raw))
+        self.assertEqual(store.rewritten(self.root), [])
+
+    def test_a_record_restored_with_different_bytes_is_still_a_rewrite(self):
+        [(same, same_raw), (other, other_raw)] = self.committed("T-1", "T-2")
+        deleted = self.drop(same, other)
+        self.restore((same, same_raw), (other, other_raw.replace(b'"a', b'"b', 1)))
+        self.assertEqual(store.rewritten(self.root),
+                         [f"evidence history rewritten: {other['path']} deleted in {deleted}"])
+        self.edit(same, '{"head": "c"}\n')  # a later edit of the restored one is a rewrite again
+        edited = self.commit("edit it")
+        self.assertEqual(store.rewritten(self.root),
+                         [f"evidence history rewritten: {same['path']} modified in {edited}",
+                          f"evidence history rewritten: {same['path']} deleted in {deleted}",
+                          f"evidence history rewritten: {other['path']} deleted in {deleted}"])
+
+    def test_a_record_deleted_and_not_restored_is_still_a_rewrite(self):
+        [(same, same_raw), (gone, _)] = self.committed("T-1", "T-2")
+        deleted = self.drop(same, gone)
+        self.restore((same, same_raw))
+        self.assertEqual(store.rewritten(self.root),
+                         [f"evidence history rewritten: {gone['path']} deleted in {deleted}"])
+
+    def test_a_record_deleted_through_a_merge_and_restored_with_identical_bytes_is_no_rewrite(self):
+        [(appended, raw)] = self.committed("T-1")
+        sh(self.root, "git", "checkout", "-q", "-b", "task/T-2")
+        deleted = self.drop(appended)
+        sh(self.root, "git", "checkout", "-q", "main")
+        (self.root / "a.txt").write_text("main moves\n")
+        self.commit("main moves")
+        self.merge("task/T-2")  # the deletion reaches main inside the merge commit (its -m view against main)
+        merge = sh(self.root, "git", "rev-parse", "HEAD").strip()
+        self.assertCountEqual(store.rewritten(self.root),
+                              [f"evidence history rewritten: {appended['path']} deleted in {deleted}",
+                               f"evidence history rewritten: {appended['path']} deleted in {merge}"])
+        self.restore((appended, raw))
+        self.assertEqual(store.rewritten(self.root), [])
+        self.assertEqual(store.integrity(self.root), [])
 
     def test_the_pointer_and_other_files_may_change_freely(self):
         store.record(self.root, "T-1", "results", {"head": "a" * 40})

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.7.5
+
+A record restored byte for byte read as a rewrite forever, from a programme whose `pk doctor` failed for good: a lane fingerprint record was committed by mistake (a directory-wide add), deleted, then restored with identical bytes, and every later `pk doctor` failed with "evidence history rewritten: ... deleted in <commit>" although no evidence was missing or changed. Backward compatible: a history that was reported before is reported the same, except for changes HEAD has undone byte for byte.
+
+What changed:
+
+- The history check skips an undone change (KF-76, bug fix). `store.rewritten`, behind `pk doctor`, `pk evidence validate`, `pk evidence check-tree`, the hand-back gate's evidence step, `pk gate binding` and `pk merge`, no longer reports a commit that modified or deleted a record file when HEAD (the `head` checked) has that path with its bytes proven unchanged: for a digest-named task record, its bytes at HEAD hash to the digest in its name; for any other file (a fingerprint record's files), its blob at HEAD is the blob from before the change. A record still gone or still different at HEAD is reported as before, merge commits' per-parent view included. It costs at most two more git processes per check, an `ls-tree` of HEAD and one `cat-file --batch`, however many paths, and none when nothing was reported.
+- Known limit, in the store's docstring and DESIGN: the commits between the change and the restore saw the record gone or different, and a check run there failed on it; the history check no longer names them once the bytes are back.
+- Tests: Integrity in test_store (deleted and restored identically, modified and restored identically, restored with other bytes, not restored, and the deletion reaching main through a merge commit and then restored), Immutability in test_fingerprint (a fingerprint file restored identically next to one restored with other bytes), and the binding test in test_gate, which now holds after the bytes are put back.
+
+Upgrading from 0.7.4: `sh install.sh /path/to/your-repo --upgrade`. Nothing in `program/` has to change; a `pk doctor` that failed only on such a restore passes.
+
 ## 0.7.4
 
 A branch that upgrades the kit could not run on a lane, from the first use of 0.7.3 on a programme: `pk remote run` from a branch carrying 0.7.3 while main still had 0.7.2 failed at once on the lane with `pk ext: invalid choice: 'prepare-tree'`, because the lane ran every kit command with the pushed main's kit while this machine's newer kit had written the step. So a kit-upgrade branch could be neither gated, run nor fingerprinted on a lane until main carried the new kit. Backward compatible: a branch whose kit is not newer than main's runs exactly as before.
