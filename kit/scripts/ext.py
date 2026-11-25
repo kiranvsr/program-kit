@@ -31,9 +31,11 @@ Registration. Each module defines `register(api)` and calls these, and only thes
   `pk remote gate`, `plants` or `run` prepares on a lane, with `ctx.root` that lane's checkout (whose git-ignored
   dependencies the lane has), called on the lane before the `remote.setup` commands; and `fingerprint`, the tree
   `pk fingerprint run` runs the release set in, with `ctx.root` the main checkout of its repository (the lane's
-  checkout when it runs on a lane), called before the toolchain and the tracks. It returns None. It may write only
-  git-ignored paths: `git status --porcelain --untracked-files=all` of the tree is the same before and after the
-  call, and so are the exclude configuration, HEAD and the index (`git_state`), or the gate (the step, the
+  checkout when it runs on a lane), called before the toolchain and the tracks; from 0.7.7 (KF-78) `worktree`, the
+  task worktree the hand-back gate runs its test, scan, extra-gate, e2e, plan and evidence steps in (made by `pk
+  worktree new`, not by the gate), called after the trial merge's `handback` and before any step. It returns None.
+  It may write only git-ignored paths: `git status --porcelain --untracked-files=all` of the tree is the same before
+  and after the call, and so are the exclude configuration, HEAD and the index (`git_state`), or the gate (the step, the
   fingerprint) refuses, naming what changed.
 - `api.drift_check(code, fn)`: code `X<n>`; `fn(root)` returns `[{severity: "note"|"fail", text}]`.
 - `api.handoff_lines(fn)`: `fn(root)` returns a list of strings for the hand-off's Now list, after the kit's lines.
@@ -90,8 +92,8 @@ MODULE_KEYS = ("name",)
 GATES = ("handback", "merge")
 POINTS = ("command", "on_status_transition", "after_worktree_new", "gate_step", "prepare_tree", "drift_check",
           "handoff_lines", "dashboard_data", "adopt_importer", "reference_resolver")
-PURPOSES = ("handback", "merge", "integrate", "remote", "fingerprint")  # the trees prepare_tree is called for
-# (0.7.1; remote and fingerprint from 0.7.3, KF-73)
+PURPOSES = ("handback", "merge", "integrate", "remote", "fingerprint", "worktree")  # the trees prepare_tree is
+# called for (0.7.1; remote and fingerprint from 0.7.3, KF-73; worktree from 0.7.7, KF-78)
 SHOWN_PATHS = 10  # changed paths a prepare_tree refusal names
 SEVERITIES = ("note", "fail")
 RESOLVED_KEYS = ("kind", "task_id", "decision", "summary")
@@ -278,9 +280,9 @@ class GateContext:
 class TreeContext:
     """What a tree preparer gets (0.7.1): `tree` is the tree the kit just made, `root` the main checkout (for remote,
     the lane's checkout), `purpose` one of PURPOSES (the gate the tree is for: integrate for an integration round's
-    tree; remote for a lane's step tree and fingerprint for the release set's, 0.7.3) and `head` the commit judged
-    there (the branch tip for handback and merge, the round's head or main's tip for integrate, the tree's HEAD for
-    remote and fingerprint)."""
+    tree; remote for a lane's step tree and fingerprint for the release set's, 0.7.3; worktree for the hand-back
+    gate's task worktree, 0.7.7) and `head` the commit judged there (the branch tip for handback, merge and
+    worktree, the round's head or main's tip for integrate, the tree's HEAD for remote and fingerprint)."""
     root: Path
     tree: Path
     purpose: str

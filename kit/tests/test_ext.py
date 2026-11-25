@@ -109,6 +109,8 @@ def gate_check(ctx):
 
 def prepare(ctx):
     log("prepare", ctx.purpose, str(ctx.tree), ctx.head, str(ctx.root))
+    if ctl().get("prepare_only") not in (None, ctx.purpose):  # act on one purpose's tree only
+        return None
     value = act("prepare")
     tree = Path(ctx.tree)
     if value == "link":  # the expected use: the main checkout's ignored dependency directory, linked in
@@ -1595,7 +1597,7 @@ class PrepareTreeGateTests(HandbackBase):
         first = lines.index("step ext:fixture.prepare_tree: ok (handback tree)")
         self.assertLess(first, lines.index("step ext-check: ok (the merged tree's extensions load)"))
         self.assertLess(first, min(i for i, line in enumerate(lines) if line.startswith("step build")))
-        self.assertEqual(out.count("prepare_tree"), 1)
+        self.assertEqual(out.count("prepare_tree"), 2)  # the trial merge, then the task worktree (0.7.7, KF-78)
         sh(self.wt, "git", "add", "-A")
         sh(self.wt, "git", "commit", "-q", "-m", "evidence")
         sha = sh(self.wt, "git", "rev-parse", "HEAD").strip()
@@ -1606,9 +1608,13 @@ class PrepareTreeGateTests(HandbackBase):
                         min(i for i, line in enumerate(lines) if line.startswith("step ")
                             and "prepare_tree" not in line))
         calls = self.prepared()
-        self.assertEqual([(purpose, head) for purpose, _, head, _ in calls], [("handback", self.sha), ("merge", sha)])
-        for _, tree, _, root in calls:
-            self.assertTrue(Path(tree).name.startswith("pk-trial-"), tree)  # the trial merge, not the worktree
+        self.assertEqual([(purpose, head) for purpose, _, head, _ in calls],
+                         [("handback", self.sha), ("worktree", self.sha), ("merge", sha)])
+        for purpose, tree, _, root in calls:
+            if purpose == "worktree":
+                self.assertEqual(tree, str(self.wt.resolve()))
+            else:
+                self.assertTrue(Path(tree).name.startswith("pk-trial-"), tree)  # the trial merge
             self.assertEqual(root, str(self.root))
         self.assertEqual(self.trial_dirs(), [])  # the trial merges are gone (the registry's own directory stays)
 
@@ -1627,6 +1633,87 @@ class PrepareTreeGateTests(HandbackBase):
                     self.assertIn(f"FAILED: ext:fixture.prepare_tree {said}", out)
                     self.assertEqual([line for line in out.splitlines() if line.startswith("step ")], [], out)
                     self.assertEqual(self.trial_dirs(), [])
+
+    # 0.7.7 (KF-78): the hand-back gate's test, scan, extra-gate, e2e, plan and evidence steps run in the task
+    # worktree, which before 0.7.7 no preparer touched; it is now prepared with purpose `worktree`.
+
+    def tests_need_deps(self):
+        """Main's test step needs the ignored deps too (the build already does), and the branch has that main."""
+        self.write_checks(build=[[sys.executable, "-m", "compileall", "-q", "."], NEEDS_DEPS],
+                          test=[[sys.executable, "-m", "unittest", "-q"], NEEDS_DEPS])
+        gate_commit(self.root, "the test step needs the ignored deps")
+        sh(self.wt, "git", "merge", "-q", "main")
+        self.sha = sh(self.wt, "git", "rev-parse", "HEAD").strip()
+
+    def test_the_task_worktree_is_prepared_so_a_test_step_that_needs_it_passes(self):
+        self.tests_need_deps()
+        self.ctl_file.write_text(json.dumps({"prepare": "link"}))
+        rc, out = self.handback()
+        self.assertEqual(rc, 0, out)
+        lines = out.splitlines()
+        trial = lines.index("step ext:fixture.prepare_tree: ok (handback tree)")
+        own = lines.index("step ext:fixture.prepare_tree: ok (worktree tree)")
+        first_step = min(i for i, line in enumerate(lines) if line.startswith("step ") and "prepare_tree" not in line)
+        self.assertLess(trial, own)
+        self.assertLess(own, first_step)  # before ext-check, the build and the test step
+        self.assertIn("step test", out)
+        calls = self.prepared()
+        self.assertEqual([(purpose, tree, head) for purpose, tree, head, _ in calls][1:],
+                         [("worktree", str(self.wt.resolve()), self.sha)])
+        self.assertEqual(calls[0][0], "handback")
+        self.assertEqual({root for *_, root in calls}, {str(self.root)})
+
+    def test_a_preparer_that_links_only_the_trial_merge_fails_the_test_step(self):
+        """What every gate did before 0.7.7: the build passed in the prepared trial, the test step failed in the
+        unprepared worktree."""
+        self.tests_need_deps()
+        self.ctl_file.write_text(json.dumps({"prepare": "link", "prepare_only": "handback"}))
+        rc, out = self.handback()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("step ext:fixture.prepare_tree: ok (worktree tree)", out)
+        self.assertIn("step build: ok", out)
+        self.assertIn("FAILED: test", out)
+
+    def test_a_refusing_worktree_preparer_fails_the_gate_before_its_first_step(self):
+        self.ctl_file.write_text(json.dumps({"prepare": "raise", "prepare_only": "worktree"}))
+        rc, out = self.handback()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("step ext:fixture.prepare_tree: ok (handback tree)", out)
+        self.assertIn("FAILED: ext:fixture.prepare_tree raised RuntimeError: prepare exploded", out)
+        self.assertEqual([line for line in out.splitlines() if line.startswith("step ")
+                          and "prepare_tree" not in line], [], out)
+        self.assertEqual(self.trial_dirs(), [])
+
+
+# The hand-back gate's step lines without extensions, as 0.7.6 printed them (KF-78 adds nothing to them).
+STEPS_WITHOUT_EXTENSIONS = ["step build", "step test", "step scan", "step plan", "step evidence"]
+
+
+@skip_unless_slow()
+class PrepareTreeWithoutExtensionsGateTests(HandbackBase):
+    """0.7.7 (KF-78): without program/extensions.yaml the hand-back gate prepares nothing and prints the same steps."""
+
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(ext.close)
+        os.environ.pop(ext.ENV, None)
+
+    def test_no_tree_is_prepared_and_the_steps_are_unchanged(self):
+        calls = []
+        original = ext.prepare_tree
+
+        def spy(root, tree, purpose, head, timeout):
+            said = original(root, tree, purpose, head, timeout)
+            calls.append((purpose, said))
+            return said
+
+        with mock.patch.object(ext, "prepare_tree", spy):
+            rc, out = self.handback()
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("prepare_tree", out)
+        self.assertEqual(calls, [("handback", []), ("worktree", [])])
+        steps = [line.split(":", 1)[0] for line in out.splitlines() if line.startswith("step ")]
+        self.assertEqual(steps, STEPS_WITHOUT_EXTENSIONS, out)
 
 
 from test_land import T2 as ROUND_T2, LandBase  # noqa: E402

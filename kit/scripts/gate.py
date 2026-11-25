@@ -1654,6 +1654,8 @@ def handback(root, task_id: str, branch: str, worktree=None, no_reuse: bool = Fa
         trial = trial_merge(root, branch)
         code = _limited(root, checks, lambda: _with_trial(
             root, trial, lambda: (0 if prepare_tree_step(root, checks, trial, "handback", sha) else 1)
+            # 0.7.7 (KF-78): and the task worktree, where test, scan, extra_gate, e2e, plan and evidence run
+            or (0 if prepare_tree_step(root, checks, wt, "worktree", sha) else 1)
             or (0 if ext_check_step(root, checks, branch, trial) else 1)
             or _run_steps(checks, task_id, wt, trial, authoritative, meta, no_reuse, e2e)
             or ext_steps("handback", root, checks, task_id, branch, sha, wt, worktree=wt, trial=trial)))
