@@ -1050,5 +1050,68 @@ class FixRound(Repo):
             fp.parse_release_set("entries:\n  - id: e\n    argv:\n      - ''\n    track: t\n    kind: check\n")
 
 
+
+# --- 0.7.3 (KF-73): the release set's tree is prepared by the extensions' prepare_tree, purpose fingerprint ---------
+
+PREPARER = """import json
+import os
+from pathlib import Path
+
+
+def prepare(ctx):
+    if os.environ.get("FP_PREPARE_STRAY"):
+        (Path(ctx.tree) / "stray.txt").write_text("not ignored")
+        return None
+    (Path(ctx.tree) / "deps").mkdir(exist_ok=True)
+    (Path(ctx.tree) / "deps" / "ctx.json").write_text(json.dumps({
+        "purpose": ctx.purpose, "root": str(ctx.root), "tree": str(ctx.tree), "head": ctx.head,
+        "installed": (Path(ctx.root) / "deps-cache" / "dep.txt").read_text()}))
+
+
+def register(api):
+    api.prepare_tree(prepare)
+"""
+
+
+class PrepareTree(Repo):
+    """A worktree of the repository lacks the main checkout's git-ignored dependencies; the preparer brings them in
+    before the toolchain and the tracks run, with the main checkout as ctx.root and the worktree as ctx.tree."""
+
+    def setUp(self):
+        super().setUp()
+        import ext
+        self.addCleanup(ext.close)
+        ext.close()
+        os.environ.pop(ext.ENV, None)
+        (self.root / ".gitignore").write_text("__pycache__/\n*.pyc\ndeps\ndeps-cache/\n")
+        (self.root / "program" / "extensions").mkdir(parents=True)
+        (self.root / "program" / "extensions.yaml").write_text("api: 1\nmodules:\n  - name: deps\n")
+        (self.root / "program" / "extensions" / "deps.py").write_text(PREPARER)
+        (self.root / "deps-cache").mkdir()
+        (self.root / "deps-cache" / "dep.txt").write_text("installed here\n")  # the checkout's ignored dependency
+        self.release(entry("needs-deps", "import json; print(json.load(open('deps/ctx.json'))['purpose'])"))
+        self.tree = self.root.parent / "wt"
+        sh(self.root, "git", "worktree", "add", "-q", "--detach", str(self.tree), "main")
+
+    def test_the_tree_is_prepared_with_the_main_checkout_as_root_before_the_set_runs(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            record, dirty = fp.run(self.tree, scratch=self.scratch)
+        self.assertEqual((record["complete"], record["all_as_expected"], dirty), (True, True, []))
+        self.assertIn("step ext:deps.prepare_tree: ok (fingerprint tree)", out.getvalue())
+        seen = json.loads((self.tree / "deps" / "ctx.json").read_text())
+        head = sh(self.tree, "git", "rev-parse", "HEAD").strip()
+        self.assertEqual(seen, {"purpose": "fingerprint", "root": str(self.root), "tree": str(self.tree),
+                                "head": head, "installed": "installed here\n"})
+
+    def test_a_refusing_preparer_stops_the_run_before_anything_ran(self):
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {"FP_PREPARE_STRAY": "1"}), contextlib.redirect_stdout(out), \
+                self.assertRaisesRegex(KitError, "the fingerprint tree's prepare_tree refused"):
+            fp.run(self.tree, scratch=self.scratch)
+        self.assertIn("FAILED: ext:deps.prepare_tree changed what git sees in the tree", out.getvalue())
+        self.assertFalse((self.tree / BASE).exists())
+
+
 if __name__ == "__main__":
     unittest.main()

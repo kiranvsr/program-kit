@@ -686,5 +686,65 @@ class Doctor(TwoHosts):
         self.assertNotIn("gone-host", out + result.stderr)
 
 
+
+LANE_PREPARER = """import json
+import os
+from pathlib import Path
+
+
+def prepare(ctx):
+    if os.environ.get("LANE_PREPARE_STRAY"):
+        (Path(ctx.tree) / "stray.txt").write_text("not ignored")
+        return None
+    (Path(ctx.tree) / "deps").mkdir(exist_ok=True)
+    (Path(ctx.tree) / "deps" / "ctx.json").write_text(json.dumps({
+        "purpose": ctx.purpose, "root": str(ctx.root), "tree": str(ctx.tree), "head": ctx.head,
+        "installed": (Path(ctx.root) / "deps-cache" / "dep.txt").read_text()}))
+
+
+def register(api):
+    api.prepare_tree(prepare)
+"""
+
+
+class PrepareTreeOnALane(RemoteBase):
+    """0.7.3 (KF-73): a lane's step tree is prepared by the extensions' prepare_tree, purpose remote, with the lane's
+    checkout (which holds the lane's git-ignored dependencies) as ctx.root, before setup and the step."""
+
+    def setUp(self):
+        super().setUp()
+        (self.root / ".gitignore").write_text("__pycache__/\n.worktrees/\ndeps\ndeps-cache/\nsetup-ran\n")
+        (self.root / "program" / "extensions").mkdir(parents=True)
+        (self.root / "program" / "extensions.yaml").write_text("api: 1\nmodules:\n  - name: deps\n")
+        (self.root / "program" / "extensions" / "deps.py").write_text(LANE_PREPARER)
+        commit(self.root, "an extension that prepares trees")
+        sh(self.wt, "git", "merge", "-q", "main")
+        (self.machine / "lane1" / "deps-cache").mkdir()
+        (self.machine / "lane1" / "deps-cache" / "dep.txt").write_text("installed on lane1\n")
+        self.env.pop("PK_EXT_FROM", None)
+
+    def test_the_lane_tree_is_prepared_with_the_lane_checkout_as_root(self):
+        probe = [PY, "-c", "import json; print('seen', json.dumps(json.load(open('deps/ctx.json'))))"]
+        result = self.pk("run", "--lane", "lane1", "o", "--", *probe, cwd=self.wt)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("step ext:deps.prepare_tree: ok (remote tree)", result.stdout)
+        import json
+        seen = json.loads(result.stdout.split("seen ", 1)[1].splitlines()[0])
+        lane = (self.machine / "lane1").resolve()
+        self.assertEqual(seen, {"purpose": "remote", "root": str(lane),
+                                "tree": str(lane / ".worktrees" / f"run-{TASK.lower()}"),
+                                "head": sh(self.wt, "git", "rev-parse", "HEAD").strip(),
+                                "installed": "installed on lane1\n"})
+        dry = self.pk("gate", TASK, "--lane", "lane1", "--dry-run")
+        self.assertIn(f"ext prepare-tree remote .worktrees/{TASK.lower()} --head ", dry.stdout)
+
+    def test_a_refusing_preparer_fails_the_step_before_it_runs(self):
+        result = self.pk("run", "--lane", "lane1", "o", "--", PY, "-c", "print('the step ran')", cwd=self.wt,
+                         env={**self.env, "LANE_PREPARE_STRAY": "1"})
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("FAILED: ext:deps.prepare_tree changed what git sees in the tree", result.stdout)
+        self.assertNotIn("the step ran", result.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

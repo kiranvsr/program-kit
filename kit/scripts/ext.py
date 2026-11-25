@@ -24,12 +24,17 @@ Registration. Each module defines `register(api)` and calls these, and only thes
 - `api.after_worktree_new(fn)`: `fn(task_id, path, root)`; when it raises, `pk worktree new` removes what it made.
 - `api.gate_step(name, fn, gates=("handback", "merge"))`: `fn(ctx)` returns `(ok, lines)`; runs after the kit's own
   steps and before the `OK:` line, as `step ext:<module>.<name>`, under the kit's step timeout.
-- `api.prepare_tree(fn)` (0.7.1): `fn(ctx)` with `ctx.root`, `ctx.tree`, `ctx.purpose` (handback, merge or
-  integrate) and `ctx.head`; called once in each tree the kit makes to run a gate's commands in (the trial merge of
-  the hand-back gate and of the merge check, the integration round's combined tree), after the kit made it and before
-  any step runs there. It returns None. It may write only git-ignored paths: `git status --porcelain
-  --untracked-files=all` of the tree is the same before and after the call, and so are the exclude configuration,
-  HEAD and the index (`git_state`), or the gate refuses, naming what changed.
+- `api.prepare_tree(fn)` (0.7.1): `fn(ctx)` with `ctx.root`, `ctx.tree`, `ctx.purpose` and `ctx.head`; called once
+  in each tree the kit makes to run steps in, after the kit made it and before any step runs there. The purposes:
+  `handback` and `merge`, the trial merge of the hand-back gate and of the merge check, and `integrate`, the
+  integration round's combined tree (0.7.1; `ctx.root` the main checkout); from 0.7.3 (KF-73) `remote`, the worktree
+  `pk remote gate`, `plants` or `run` prepares on a lane, with `ctx.root` that lane's checkout (whose git-ignored
+  dependencies the lane has), called on the lane before the `remote.setup` commands; and `fingerprint`, the tree
+  `pk fingerprint run` runs the release set in, with `ctx.root` the main checkout of its repository (the lane's
+  checkout when it runs on a lane), called before the toolchain and the tracks. It returns None. It may write only
+  git-ignored paths: `git status --porcelain --untracked-files=all` of the tree is the same before and after the
+  call, and so are the exclude configuration, HEAD and the index (`git_state`), or the gate (the step, the
+  fingerprint) refuses, naming what changed.
 - `api.drift_check(code, fn)`: code `X<n>`; `fn(root)` returns `[{severity: "note"|"fail", text}]`.
 - `api.handoff_lines(fn)`: `fn(root)` returns a list of strings for the hand-off's Now list, after the kit's lines.
 - `api.dashboard_data(fn)`: `fn(root)` returns a JSON-serialisable dict, shown under `extensions.<module>` (one per
@@ -85,7 +90,8 @@ MODULE_KEYS = ("name",)
 GATES = ("handback", "merge")
 POINTS = ("command", "on_status_transition", "after_worktree_new", "gate_step", "prepare_tree", "drift_check",
           "handoff_lines", "dashboard_data", "adopt_importer", "reference_resolver")
-PURPOSES = ("handback", "merge", "integrate")  # the trees prepare_tree is called for (0.7.1)
+PURPOSES = ("handback", "merge", "integrate", "remote", "fingerprint")  # the trees prepare_tree is called for
+# (0.7.1; remote and fingerprint from 0.7.3, KF-73)
 SHOWN_PATHS = 10  # changed paths a prepare_tree refusal names
 SEVERITIES = ("note", "fail")
 RESOLVED_KEYS = ("kind", "task_id", "decision", "summary")
@@ -270,9 +276,11 @@ class GateContext:
 
 @dataclass(frozen=True)
 class TreeContext:
-    """What a tree preparer gets (0.7.1): `tree` is the tree the kit just made, `root` the main checkout, `purpose`
-    one of PURPOSES (the gate the tree is for: integrate for an integration round's tree) and `head` the commit
-    judged there (the branch tip for handback and merge, the round's head or main's tip for integrate)."""
+    """What a tree preparer gets (0.7.1): `tree` is the tree the kit just made, `root` the main checkout (for remote,
+    the lane's checkout), `purpose` one of PURPOSES (the gate the tree is for: integrate for an integration round's
+    tree; remote for a lane's step tree and fingerprint for the release set's, 0.7.3) and `head` the commit judged
+    there (the branch tip for handback and merge, the round's head or main's tip for integrate, the tree's HEAD for
+    remote and fingerprint)."""
     root: Path
     tree: Path
     purpose: str
@@ -1041,10 +1049,41 @@ def _listing(registry: Registry) -> list[str]:
     return lines
 
 
+def checkout_of(tree) -> Path:
+    """The main checkout of the repository `tree` belongs to (the parent of its git common dir); `tree` itself when
+    that is not a `.git` directory."""
+    tree = Path(tree).resolve()
+    said = _git(tree, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    common = Path(said.stdout.decode("utf-8", "surrogateescape").strip()) if said.returncode == 0 else None
+    return common.parent if common is not None and common.name == ".git" else tree
+
+
+def _prepare_tree_cli(args: argparse.Namespace) -> int:
+    """`pk ext prepare-tree <purpose> <tree> [--head SHA]` (0.7.3, KF-73): the preparers in `tree`, with the checkout
+    pk runs in as `ctx.root`; what `pk remote` runs on a lane. 0 when every one passed, or there are none."""
+    import gate  # late: gate imports this module
+
+    root = find_root()
+    tree = Path(args.tree).resolve()
+    if not tree.is_dir():
+        raise KitError(f"prepare-tree: no tree at {tree}")
+    head = args.head
+    if not head:
+        said = _git(tree, "rev-parse", "--verify", "HEAD")
+        head = said.stdout.decode().strip() if said.returncode == 0 else ""
+    try:
+        checks = gate.load_checks_at(root, gate.MAIN)
+    except KitError:
+        checks = {}
+    return 0 if gate.prepare_tree_step(root, checks, tree, args.purpose, head) else 1
+
+
 def cmd_ext(args: argparse.Namespace) -> int:
     action = getattr(args, "ext_action", None)
-    if action not in ("list", "check"):
-        raise KitError("ext needs an action: list or check")
+    if action not in ("list", "check", "prepare-tree"):
+        raise KitError("ext needs an action: list, check or prepare-tree")
+    if action == "prepare-tree":
+        return _prepare_tree_cli(args)
     root = find_root()
     registry = load(root)
     if registry is None:
@@ -1067,8 +1106,14 @@ def _configure(parser: argparse.ArgumentParser) -> None:
     actions = parser.add_subparsers(dest="ext_action", metavar="action", parser_class=type(parser))
     actions.add_parser("list", help="each extension module and the points it registered")
     actions.add_parser("check", help="load and validate every extension module without running any of its hooks")
+    prep = actions.add_parser("prepare-tree", help="run the prepare_tree hooks in a tree the kit made (pk remote runs "
+                                                   "it on a lane, purpose remote)")
+    prep.add_argument("purpose", choices=PURPOSES)
+    prep.add_argument("tree", help="the tree to prepare; ctx.root is the checkout pk runs in")
+    prep.add_argument("--head", metavar="SHA", help="the commit judged there (default: the tree's HEAD)")
 
 
 def register(add_command) -> None:
-    add_command("ext", cmd_ext, help="the programme's extensions (program/extensions.yaml): list, check",
+    add_command("ext", cmd_ext, help="the programme's extensions (program/extensions.yaml): list, check, "
+                                     "prepare-tree",
                 configure=_configure)

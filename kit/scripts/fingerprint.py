@@ -494,6 +494,21 @@ def record_dir_name(head: str) -> str:
     return head[:12]
 
 
+def _prepare(root: Path, head: str) -> None:
+    """The extensions' prepare_tree hooks in the tree the release set runs in (purpose fingerprint, 0.7.3, KF-73),
+    with the repository's main checkout as `ctx.root`: a tree without its git-ignored dependencies (a worktree, a lane's
+    step tree) gets them before anything runs. KitError, before any command ran, when one refuses."""
+    import gate  # late: the gate's step printer and limits
+
+    try:
+        checks = gate.load_checks_at(root, gate.MAIN)
+    except KitError:
+        checks = {}
+    if not gate.prepare_tree_step(ext.checkout_of(root), checks, root, "fingerprint", head):
+        raise KitError("the fingerprint tree's prepare_tree refused (the line above); nothing ran and no record was "
+                       "written")
+
+
 def run(root, only: str | None = None, scratch: Path | None = None) -> tuple[dict, list[str]]:
     """Run the release set at HEAD and write the record; return (record, dirty paths the run left behind).
 
@@ -531,6 +546,7 @@ def run(root, only: str | None = None, scratch: Path | None = None) -> tuple[dic
         raise KitError(f"the scratch directory {scratch} is inside the repository: full output is never kept there")
     scratch.mkdir(parents=True, exist_ok=True)
     scrub = _scrubber(root, scratch.resolve(), [v for e in release["entries"] for v in e["env"].values()])
+    _prepare(root, head)
 
     versions = _toolchain_versions(root, release["toolchain"], scrub)  # before the tracks: the tree check sees them
     results: dict[str, dict] = {}

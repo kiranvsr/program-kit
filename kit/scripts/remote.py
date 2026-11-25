@@ -34,8 +34,10 @@ names. On each host, under `dir`:
   own checkout may be older), the step first removes every other entry of the lane's `.worktrees/` (0.7.2, below),
   then resets the lane's main to the mirror's, checks the task branch out in `.worktrees/<id lowercased>` (for
   `run`, a detached `.worktrees/run-<name>` with this worktree's uncommitted changes, deletions included, laid over
-  it), runs each `setup` argv in that worktree (PK_LANE_ROOT names the lane root), then the step from the lane root
-  (for `run`, from the same relative directory): `lane_wrap[lane]` + `wrap` + the command, with `env` exported and
+  it), runs the extensions' prepare_tree hooks there with purpose `remote` and the lane's checkout as `ctx.root`
+  (0.7.3, KF-73; only when main declares extensions; a refusal fails the step), runs each `setup` argv in that
+  worktree (PK_LANE_ROOT names the lane root), then the step from the lane root (for `run`, from the same relative
+  directory): `lane_wrap[lane]` + `wrap` + the command, with `env` exported and
   PK_PLANT_WORKERS set to `workers`. Output streams back and to `<dir>/<lane>.log`, timestamped, between a start
   and an end line. The exit status is the step's.
 - Lane sizes (0.7.2). A `lanes` entry is a bare name (size `default`) or `{name: L, size: S}`; `sizes: {gate: S,
@@ -87,6 +89,7 @@ import time
 from pathlib import Path, PurePosixPath
 
 import evidence as evidence_module
+import ext as ext_module
 import gate
 import latework
 import lock
@@ -471,6 +474,14 @@ def _disk_lines(settings: dict) -> list[str]:
             f"of \"{_q(settings['host_var'])}\" is $pct% used (remote.disk_warn_percent {int(warn)})\" >&2; fi"]
 
 
+def _prepare_lines(tree: str, head: str) -> list[str]:
+    """Lines that run the extensions' prepare_tree hooks (purpose remote, 0.7.3, KF-73) in the lane's step tree, from
+    the lane root, so `ctx.root` is the lane's checkout; only when main declares extensions."""
+    return [f"if git -C \"$lane_root\" cat-file -e HEAD:{ext_module.DECLARATION} 2>/dev/null; then",
+            f"  (cd \"$lane_root\" && python3 kit/scripts/pk.py ext prepare-tree remote {_q(tree)} --head {_q(head)})",
+            "fi"]
+
+
 def _setup_lines(settings: dict, where: str) -> list[str]:
     return [f"(cd {_q(where)} && PK_LANE_ROOT=\"$lane_root\" {shlex.join(argv)})" for argv in settings["setup"]]
 
@@ -820,7 +831,8 @@ def _step(root: Path, settings: dict, task_id: str, branch: str, kind: str, pk_a
     command = [*_prefix(settings, lane), "python3", "kit/scripts/pk.py", "gate",
                "handback" if kind == "gate" else "plants", task_id, "--branch", branch, *pk_args]
     body = [*_clean_lines(settings, name), *_mark_lines(settings, name), *_prepare_task(task_id, branch),
-            *_setup_lines(settings, f".worktrees/{name}"), "exec " + shlex.join(command)]
+            *_prepare_lines(f".worktrees/{name}", head), *_setup_lines(settings, f".worktrees/{name}"),
+            "exec " + shlex.join(command)]
     script = _lane_script(settings, lane, owner, main_sha, body, head[:12])
     if dry_run:
         _dry(settings, f"{kind} {task_id}", plan, refspecs, command, script)
@@ -1118,6 +1130,7 @@ def cmd_run(args) -> int:
         f"cd {r}",
         "tar -xf -",
         *([f"rm -f -- {' '.join(_q(path) for path in deleted)}"] if deleted else []),
+        *_prepare_lines(f".worktrees/{name}", head),
         *_setup_lines(settings, "."),
         f"cd ./{_q(sub)}" if sub else ":",
         "exec " + shlex.join(full),
