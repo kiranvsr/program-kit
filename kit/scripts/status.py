@@ -63,7 +63,7 @@ ADHOC_ID = re.compile(r"AH-\d{4}\Z")  # work outside the register, listed in con
 # (from, to) -> roles allowed to make that move.
 TRANSITIONS: dict[tuple[str, str], set[str]] = {
     ("not_started", "in_progress"): {"controller"},
-    ("in_progress", "review"): {"implementer"},
+    ("in_progress", "review"): {"implementer", "controller"},  # 0.7.3 (KF-69): the controller runs the gate
     ("review", "in_progress"): {"qa"},
     ("review", "done"): {"qa"},
     ("not_started", "blocked"): {"controller"},

@@ -127,7 +127,7 @@ class StatusTests(unittest.TestCase):
                                            "adopted"))  # adopted (0.7.0): written by pk adopt alone
         self.assertEqual(status.TRANSITIONS, {
             ("not_started", "in_progress"): {"controller"},
-            ("in_progress", "review"): {"implementer"},
+            ("in_progress", "review"): {"implementer", "controller"},  # 0.7.3 (KF-69): after the gate it ran
             ("review", "in_progress"): {"qa"},
             ("review", "done"): {"qa"},
             ("not_started", "blocked"): {"controller"},
@@ -149,8 +149,7 @@ class StatusTests(unittest.TestCase):
         self.assertEqual((rec["task_id"], rec["status"], rec["role"], rec["note"]),
                          (TID, "in_progress", "controller", "dispatched"))
         self.assertEqual(read_json(self.record_path()), rec)
-        for wrong in ("controller", "qa"):
-            self.refused("implementer", TID, "review", wrong)
+        self.refused("controller or implementer", TID, "review", "qa")
         status.transition(self.root, TID, "review", "implementer")
         self.refused("qa", TID, "in_progress", "controller")
         rec = status.transition(self.root, TID, "in_progress", "qa", note="finding 1")
@@ -158,6 +157,13 @@ class StatusTests(unittest.TestCase):
         self.assertEqual([h["role"] for h in rec["history"]], ["controller", "implementer", "qa"])
         self.assertTrue(all(h["at"].endswith("Z") for h in rec["history"]))
         self.assertEqual(rec["updated_at"], rec["history"][-1]["at"])
+
+    def test_the_controller_moves_a_task_to_review_after_the_gate_it_ran(self):
+        """0.7.3 (KF-69): the implementer hands back before the gate; the controller runs it and moves the status."""
+        status.transition(self.root, TID, "in_progress", "controller")
+        rec = status.transition(self.root, TID, "review", "controller", evidence=["program/evidence/x.json"])
+        self.assertEqual([h["role"] for h in rec["history"]], ["controller", "controller"])
+        self.assertEqual(rec["status"], "review")
 
     def test_disallowed_edges_unknown_status_and_unknown_role_are_refused(self):
         self.refused("not allowed", TID, "review", "implementer")        # skips in_progress
