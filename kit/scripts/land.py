@@ -343,8 +343,11 @@ def round_check(root: Path, name: str) -> int:
         return 1
     data = _round(root, name)
     worktree = root / ".worktrees" / f"round-{name}"
-    if not worktree.is_dir() or git(worktree, "rev-parse", "HEAD") != data["head"] or gate._changes(worktree):
-        raise KitError(f"round {name}: {worktree} must be clean and at the round's head {data['head']}")
+    dirty = gate._changes(worktree) if worktree.is_dir() else []
+    if not worktree.is_dir() or git(worktree, "rev-parse", "HEAD") != data["head"] or dirty:
+        said = (f"; git sees changes there: {gate._listed(dirty)} (a refused prepare_tree leaves what it wrote: clean "
+                "them by hand, or start a new round)" if dirty else "")
+        raise KitError(f"round {name}: {worktree} must be clean and at the round's head {data['head']}{said}")
     if _outside_round(root, data):
         raise KitError(f"round {name}: {MAIN} moved since the round started; start a new round")
     checks = gate.load_checks_at(root, MAIN, require=("build", "test", "scan"))

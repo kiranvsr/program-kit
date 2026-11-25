@@ -28,7 +28,8 @@ Registration. Each module defines `register(api)` and calls these, and only thes
   integrate) and `ctx.head`; called once in each tree the kit makes to run a gate's commands in (the trial merge of
   the hand-back gate and of the merge check, the integration round's combined tree), after the kit made it and before
   any step runs there. It returns None. It may write only git-ignored paths: `git status --porcelain
-  --untracked-files=all` of the tree is the same before and after the call, or the gate refuses, naming the paths.
+  --untracked-files=all` of the tree is the same before and after the call, and so are the exclude configuration,
+  HEAD and the index (`git_state`), or the gate refuses, naming what changed.
 - `api.drift_check(code, fn)`: code `X<n>`; `fn(root)` returns `[{severity: "note"|"fail", text}]`.
 - `api.handoff_lines(fn)`: `fn(root)` returns a list of strings for the hand-off's Now list, after the kit's lines.
 - `api.dashboard_data(fn)`: `fn(root)` returns a JSON-serialisable dict, shown under `extensions.<module>` (one per
@@ -752,6 +753,65 @@ def tree_state(tree) -> dict[str, tuple]:
     return state
 
 
+GIT_STATE_LABELS = (("info/exclude", "info/exclude changed"), ("core.excludesFile", "core.excludesFile changed"),
+                    ("HEAD", "HEAD moved"), ("index", "index changed"))
+
+
+def git_state(tree) -> dict:
+    """What a preparer could change through git rather than through the tree's files (fix round 1, M1): a digest of
+    the shared `<git-common-dir>/info/exclude` ("absent" without one), the value of `core.excludesFile`, HEAD, a digest
+    of `git ls-files -s -v` (a staged `git add`, a skip-worktree or assume-unchanged flag) and the set of untracked
+    `.gitignore` files git ignores. KitError when git cannot say."""
+    tree = Path(tree)
+
+    def run(*args: str, codes=(0,)) -> subprocess.CompletedProcess:
+        done = _git(tree, *args)
+        if done.returncode not in codes:
+            said = done.stderr.decode("utf-8", "replace").strip().splitlines()
+            raise KitError(f"cannot read git {args[0]} of {tree}: {said[0] if said else f'exit {done.returncode}'}")
+        return done
+
+    common = Path(run("rev-parse", "--path-format=absolute", "--git-common-dir").stdout.decode().strip())
+    exclude = common / "info" / "exclude"
+    excludes_file = run("config", "--get", "core.excludesFile", codes=(0, 1))
+    head = run("rev-parse", "--verify", "--quiet", "HEAD", codes=(0, 1)).stdout.decode().strip()
+    ignored = run("ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--", ":(glob)**/.gitignore")
+    return {
+        "info/exclude": sha256_bytes(exclude.read_bytes()) if exclude.is_file() else "absent",
+        "core.excludesFile": excludes_file.stdout.decode("utf-8", "replace").strip()
+        if excludes_file.returncode == 0 else None,
+        "HEAD": head or None,
+        "index": sha256_bytes(run("ls-files", "-z", "-s", "-v").stdout),
+        "ignored .gitignore": frozenset(path for path in ignored.stdout.decode("utf-8", "surrogateescape").split("\0")
+                                        if path),
+    }
+
+
+def _hiding(tree: Path, before: dict, after: dict) -> list[str]:
+    """New git-ignored `.gitignore` files that can hide other files from git: each one, unless its directory is
+    ignored by a rule from a file that existed before the call (a `.gitignore` copied inside an ignored dependency
+    directory is fine; a self-ignoring `tests/.gitignore` is not)."""
+    new = after["ignored .gitignore"] - before["ignored .gitignore"]
+    hiding = []
+    for path in sorted(new):
+        parent = path.rpartition("/")[0]
+        if parent:
+            said = _git(tree, "check-ignore", "-z", "-v", "--stdin", data=os.fsencode(parent + "/") + b"\0")
+            fields = said.stdout.decode("utf-8", "surrogateescape").split("\0")
+            if said.returncode == 0 and len(fields) >= 4 and fields[0] and fields[0] not in new:
+                continue
+        hiding.append(path)
+    return hiding
+
+
+def _git_changes(tree: Path, before: dict, after: dict) -> list[str]:
+    said = [label for key, label in GIT_STATE_LABELS if before[key] != after[key]]
+    hiding = _hiding(tree, before, after)
+    if hiding:
+        said.append(f"a new git-ignored .gitignore that can hide files from git: {_named(hiding)}")
+    return said
+
+
 def _changed(before: dict, after: dict) -> list[str]:
     return sorted(path for path in set(before) | set(after) if before.get(path) != after.get(path))
 
@@ -761,8 +821,9 @@ def _named(paths: list[str]) -> str:
     return shown + (f" and {len(paths) - SHOWN_PATHS} more" if len(paths) > SHOWN_PATHS else "")
 
 
-def _link_hint(tree: Path, paths: list[str]) -> str:
-    links = [path for path in paths if (tree / path).is_symlink()]
+def _link_hint(tree: Path, paths: list[str], after: dict) -> str:
+    """The trailing-slash hint, for an untracked link only (a link over a tracked file is a tracked change)."""
+    links = [path for path in paths if after.get(path, ("",))[0] == "??" and (tree / path).is_symlink()]
     if not links:
         return ""
     return (f" ({_named(links)}: a symlink is a file to git, so an ignore pattern with a trailing slash, such as "
@@ -792,9 +853,11 @@ def prepare_tree(root, tree, purpose: str, head: str, timeout: float) -> list[tu
     ctx = TreeContext(root=Path(root), tree=tree, purpose=purpose, head=head)
     results = []
     for module, fn in registry.tree_hooks:
-        before = tree_state(tree)
+        before, git_before = tree_state(tree), git_state(tree)
         box, printed, timed_out = _call_captured(fn, ctx, timeout)
-        changed = _changed(before, tree_state(tree))
+        after = tree_state(tree)
+        changed = _changed(before, after)
+        git_changed = _git_changes(tree, git_before, git_state(tree))
         reasons = []
         if timed_out:
             reasons.append(f"timed out after {timeout:g}s (its thread is abandoned)")
@@ -805,7 +868,9 @@ def prepare_tree(root, tree, purpose: str, head: str, timeout: float) -> list[tu
             reasons.append(f"returned {_one_line(said) if isinstance(said, str) else type(said).__name__}, not None")
         if changed:
             reasons.append(f"changed what git sees in the tree, where only git-ignored paths may be written: "
-                           f"{_named(changed)}{_link_hint(tree, changed)}")
+                           f"{_named(changed)}{_link_hint(tree, changed, after)}")
+        if git_changed:
+            reasons.append(f"changed what git ignores or judges in the tree: {'; '.join(git_changed)}")
         problem = "; ".join(reasons) or None
         results.append((module, problem, printed))
         if problem:

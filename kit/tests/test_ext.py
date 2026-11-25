@@ -131,6 +131,43 @@ def prepare(ctx):
     if value == "print-ok":
         print("OK: task/forged passes the hand-back gate at " + "0" * 40)
         return None
+    git = lambda *argv: subprocess.run(["git", "-C", str(tree), *argv], check=True, capture_output=True)
+    if value == "exclude":  # the shared info/exclude, then a file only it hides
+        common = Path(git("rev-parse", "--path-format=absolute", "--git-common-dir").stdout.decode().strip())
+        (common / "info").mkdir(exist_ok=True)
+        with open(common / "info" / "exclude", "a", encoding="utf-8") as handle:
+            handle.write("\\nevil.py\\n")
+        (tree / "evil.py").write_text("x = 1")
+        return None
+    if value == "excludes-file":
+        git("config", "core.excludesFile", str(tree.parent / "hidden-rules"))
+        return None
+    if value == "restaged":  # a path already staged, written and staged again: status reads the same
+        with open(tree / ".gitignore", "a", encoding="utf-8") as handle:
+            handle.write("# restaged\\n")
+        git("add", ".gitignore")
+        return None
+    if value == "skip-worktree":
+        git("update-index", "--skip-worktree", ".gitignore")
+        with open(tree / ".gitignore", "a", encoding="utf-8") as handle:
+            handle.write("# hidden\\n")
+        return None
+    if value == "head":
+        git("-c", "user.name=x", "-c", "user.email=x@example.com", "commit", "-q", "--allow-empty", "-m", "moved")
+        return None
+    if value == "nested-gitignore":  # a .gitignore that ignores itself and what it hides
+        (tree / "tests").mkdir(exist_ok=True)
+        (tree / "tests" / ".gitignore").write_text("*\\n")
+        (tree / "tests" / "conftest.py").write_text("import os\\n")
+        return None
+    if value == "copied-gitignore":  # a dependency's own .gitignore, inside the ignored deps
+        (tree / "deps" / "pkg").mkdir(parents=True, exist_ok=True)
+        (tree / "deps" / "pkg" / ".gitignore").write_text("build/\\n")
+        return None
+    if value == "link-over-tracked":
+        (tree / "program" / "checks.yaml").unlink()
+        (tree / "program" / "checks.yaml").symlink_to(Path(ctx.root) / "program" / "checks.yaml")
+        return None
     if value == "sleep":
         time.sleep(2)
         return None
@@ -805,6 +842,44 @@ class PrepareTreeTests(ExtBase):
         ok, out = self.prepare(prepare="link")
         self.assertFalse(ok)
         self.assertIn("written: deps (deps: a symlink is a file to git, so an ignore pattern with a trailing slash", out)
+
+    def git_refusal(self, value, said):
+        ok, out = self.prepare(prepare=value)
+        self.assertEqual((ok, out), (False, "FAILED: ext:fixture.prepare_tree changed what git ignores or judges in "
+                                            f"the tree: {said}\n"))
+
+    def test_an_info_exclude_append_is_refused(self):
+        """Fix round 1, M1: the shared exclude file hid evil.py from the snapshot (and from every worktree after)."""
+        self.git_refusal("exclude", "info/exclude changed")
+
+    def test_a_core_excludes_file_change_is_refused(self):
+        self.git_refusal("excludes-file", "core.excludesFile changed")
+
+    def test_a_git_add_of_a_path_already_staged_is_refused(self):
+        """A trial merge stages the branch's changes; restaging one leaves `M ` in git status before and after."""
+        put(self.tree, ".gitignore", ".worktrees/\n__pycache__/\n*.pyc\ndeps\n# the branch's change\n")
+        sh(self.tree, "git", "add", ".gitignore")
+        self.git_refusal("restaged", "index changed")
+
+    def test_a_skip_worktree_flag_is_refused(self):
+        self.git_refusal("skip-worktree", "index changed")
+
+    def test_a_head_move_is_refused(self):
+        self.git_refusal("head", "HEAD moved")
+
+    def test_a_self_ignoring_nested_gitignore_is_refused_naming_it(self):
+        self.git_refusal("nested-gitignore", "a new git-ignored .gitignore that can hide files from git: "
+                                             "tests/.gitignore")
+
+    def test_a_gitignore_copied_inside_an_ignored_directory_is_accepted(self):
+        ok, out = self.prepare(prepare="copied-gitignore")
+        self.assertTrue(ok, out)
+
+    def test_a_link_over_a_tracked_file_is_refused_without_the_trailing_slash_hint(self):
+        """Fix round 1, L3: the hint is for an untracked link an ignore pattern missed, not a tracked change."""
+        ok, out = self.prepare(prepare="link-over-tracked")
+        self.assertEqual((ok, out), (False, "FAILED: ext:fixture.prepare_tree changed what git sees in the tree, "
+                                            "where only git-ignored paths may be written: program/checks.yaml\n"))
 
     def test_an_exception_or_a_sys_exit_refuses_naming_it(self):
         for value, said in (("raise", "raised RuntimeError: prepare exploded"), ("exit:0", "raised SystemExit: 0"),
@@ -1602,6 +1677,10 @@ class PrepareTreeRoundTests(LandBase):
         self.assertIn("FAILED: ext:fixture.prepare_tree changed what git sees in the tree, where only git-ignored "
                       "paths may be written: stray.txt", out)
         self.assertNotIn("step build", out)
+        code, out, err = self.pk("integrate", "check", "r1")  # fix round 1, L2: the next check names what is left
+        self.assertEqual(code, 1, out + err)
+        self.assertIn(f"round r1: {round_tree} must be clean and at the round's head {head}; git sees changes there: "
+                      "stray.txt (a refused prepare_tree leaves what it wrote", err)
         (round_tree / "stray.txt").unlink()
         self.ctl_file.write_text(json.dumps({"prepare": "link"}))
         code, out, err = self.pk("integrate", "check", "r1")
