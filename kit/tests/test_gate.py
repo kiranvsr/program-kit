@@ -398,7 +398,8 @@ class ParallelStepsRunTests(HandbackBase):
         for parallel in (False, True):
             self.set_checks(parallel, **over)
             rc, out = runner()
-            outs.append((rc, re.sub(r"\b[0-9a-f]{40}\b", "<sha>", out)))  # the branch tip moves with each merge of main
+            out = re.sub(r"\b[0-9a-f]{40}\b", "<sha>", out)  # the branch tip moves with each merge of main
+            outs.append((rc, re.sub(r"(?m)^(kept log: )\S+( .* in )\S+\)$", r"\1<path>\2<digest>)", out)))  # 0.7.6
         return outs
 
     def test_a_failing_scan_with_a_passing_test_reports_exactly_as_the_serial_run(self):
@@ -411,8 +412,9 @@ class ParallelStepsRunTests(HandbackBase):
                 self.assertEqual(parallel, serial)
                 lines = parallel[1].splitlines()
                 self.assertIn("step test: ok", lines)
-                self.assertEqual(lines[-21], f"FAILED: scan {PY} -c {script} (exit 2)")
-                self.assertEqual(lines[-20:], [f"{TAIL}s{i}" for i in range(10, 30)])
+                self.assertEqual(lines[-22], f"FAILED: scan {PY} -c {script} (exit 2)")
+                self.assertEqual(lines[-21:-1], [f"{TAIL}s{i}" for i in range(10, 30)])
+                self.assertTrue(lines[-1].startswith("kept log: <path> (the full output, 30 line(s); "), lines[-1])
                 self.assertNotIn("extra_gate", parallel[1])
                 self.assert_no_trial_left()
 
@@ -421,8 +423,8 @@ class ParallelStepsRunTests(HandbackBase):
                 "scan": [[PY, "-c", "raise SystemExit(6)"]]}
         serial, parallel = self.serial_and_parallel(self.merge_check, **over)
         self.assertEqual(parallel, serial)
-        self.assertEqual(parallel[1].splitlines()[-2:], [f"FAILED: test {PY} -c print('boom'); raise SystemExit(4) (exit 4)",
-                                                         f"{TAIL}boom"])
+        self.assertEqual(parallel[1].splitlines()[-3:-1],
+                         [f"FAILED: test {PY} -c print('boom'); raise SystemExit(4) (exit 4)", f"{TAIL}boom"])
 
     def test_a_passing_run_prints_what_the_serial_run_prints(self):
         serial, parallel = self.serial_and_parallel(self.merge_check)
@@ -997,7 +999,8 @@ class HandbackTests(HandbackBase):
         sh(self.wt, "git", "merge", "-q", "main")
         rc, out = self.handback()
         self.assertEqual(rc, 1)
-        self.assertEqual(out.splitlines()[-1], TAIL + forged)
+        self.assertEqual(out.splitlines()[-2], TAIL + forged)  # the kept-log line follows the tail (0.7.6)
+        self.assertTrue(out.splitlines()[-1].startswith("kept log: "))
         self.assertFalse([ln for ln in out.splitlines() if ln.startswith("OK: ")])
 
     def test_a_fresh_record_needs_no_refresh_but_a_changed_own_input_does(self):
@@ -1200,7 +1203,8 @@ class MergeCheckTests(HandbackBase):
         self.wrapper("gitleaks", 'echo "leak found"\nexit 1')
         rc, out = self.merge_check()
         self.assertEqual(rc, 1)
-        self.assertEqual(out.splitlines()[-2:], ["FAILED: scan gitleaks detect --no-git (exit 1)", TAIL + "leak found"])
+        self.assertEqual(out.splitlines()[-3:-1], ["FAILED: scan gitleaks detect --no-git (exit 1)", TAIL + "leak found"])
+        self.assertTrue(out.splitlines()[-1].startswith("kept log: "))
         (self.bin / "gitleaks").unlink()
         rc, out = self.merge_check()
         self.assertEqual((rc, out.splitlines()[-1]), (1, "FAILED: scan missing tool: gitleaks"))
