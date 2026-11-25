@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.7.1
+
+A gate can now run steps that need what the programme keeps git-ignored. Opt-in: without `program/extensions.yaml`, or without a `prepare_tree` in it, every gate behaves exactly as on 0.7.0.
+
+What changed:
+
+- `api.prepare_tree(fn)` (new extension point, api 1 unchanged). `fn(ctx)` gets `root`, `tree`, `purpose` (`handback`, `merge` or `integrate`) and `head`, and is called once in each tree the kit makes to run a gate's steps in, after making it and before any step runs there: the trial merge of the hand-back gate and of the merge check, the integration round's combined tree at `pk integrate check`, and the trial of main at `pk integrate close --recheck`. Every module's preparer runs in declared order; it prints `step ext:<module>.prepare_tree: ok (<purpose> tree)`.
+- It refuses, never loosens. An exception, a `sys.exit`, a run past the step timeout or any return but None fails the gate with `FAILED: ext:<module>.prepare_tree <reason>` before its first step, and so does any change to the tree's `git status --porcelain --untracked-files=all` (git-ignored files excluded), naming the paths: a preparer may write only git-ignored paths, so it never changes what the gate judges. The same guard refuses a change through git itself, naming it: the shared `info/exclude` or `core.excludesFile`, HEAD, the index (`git ls-files -s -v`: a restaged path, a skip-worktree flag) or a new self-ignoring `.gitignore`. That is the whole guard: a refusal does not undo a change git does not show, and git's global ignore file, attributes and filter drivers are not watched (DESIGN 9.6).
+- `pk ext list` shows the point. Docs: DESIGN section 9.6 (with an example that links the main checkout's ignored dependency directories), README.
+
+Why: the trees a gate makes hold only what git tracks, so the programme's installed dependencies are missing there, and a step that needs them (a Python test discovery, a UI type-check, a JavaScript test runner) failed in the trial merge while it passed in the task worktree. A link to the main checkout's own install, made before the steps, mends that without the gate installing anything, and the ignored-paths-only rule keeps the judged tree exactly the merge of the branch.
+
+Upgrading from 0.7.0: `sh install.sh /path/to/your-repo --upgrade`. Nothing in `program/` has to change.
+
 ## 0.7.0
 
 The kit stays generic and is open to extension, and it can take over a programme that was run another way. Both are opt-in: without `program/extensions.yaml` and `program/adoption.yaml` a programme runs exactly as on 0.6.2.

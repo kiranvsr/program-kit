@@ -343,8 +343,11 @@ def round_check(root: Path, name: str) -> int:
         return 1
     data = _round(root, name)
     worktree = root / ".worktrees" / f"round-{name}"
-    if not worktree.is_dir() or git(worktree, "rev-parse", "HEAD") != data["head"] or gate._changes(worktree):
-        raise KitError(f"round {name}: {worktree} must be clean and at the round's head {data['head']}")
+    dirty = gate._changes(worktree) if worktree.is_dir() else []
+    if not worktree.is_dir() or git(worktree, "rev-parse", "HEAD") != data["head"] or dirty:
+        said = (f"; git sees changes there: {gate._listed(dirty)} (a refused prepare_tree leaves what it wrote: clean "
+                "them by hand, or start a new round)" if dirty else "")
+        raise KitError(f"round {name}: {worktree} must be clean and at the round's head {data['head']}{said}")
     if _outside_round(root, data):
         raise KitError(f"round {name}: {MAIN} moved since the round started; start a new round")
     checks = gate.load_checks_at(root, MAIN, require=("build", "test", "scan"))
@@ -368,6 +371,8 @@ def round_check(root: Path, name: str) -> int:
                   for reason in gate.e2e_reasons(root, member["branch"], checks, merge=True)})
 
     def suite() -> int:
+        if not gate.prepare_tree_step(root, checks, worktree, "integrate", data["head"]):  # 0.7.1, before the suite
+            return 1
         for step in SUITE:
             if not gate._run_commands(step, gate._commands(checks[step]), worktree,
                                       timeout=gate.step_limit(checks, step)):
@@ -467,9 +472,10 @@ def round_close(root: Path, name: str, recheck: bool = False, commit: bool = Tru
         with gate.heavy(root, checks, f"integrate-close-{name}"):
             trial = Path(tempfile.mkdtemp(prefix="pk-trial-"))
             git(root, "worktree", "add", "--detach", str(trial), MAIN)
-            code = gate._limited(root, checks, lambda: gate._with_trial(root, trial, lambda: 0 if all(
-                gate._run_commands(step, gate._commands(checks[step]), trial, timeout=gate.step_limit(checks, step))
-                for step in SUITE) else 1))
+            code = gate._limited(root, checks, lambda: gate._with_trial(root, trial, lambda: 0 if (
+                gate.prepare_tree_step(root, checks, trial, "integrate", git(trial, "rev-parse", "HEAD"))
+                and all(gate._run_commands(step, gate._commands(checks[step]), trial,
+                                           timeout=gate.step_limit(checks, step)) for step in SUITE)) else 1))
         if code:
             raise KitError(f"round {name}: the re-check failed on {MAIN}; fix it before anything else merges")
         lines.append(f"re-checked {len(differing)} changed path(s): {MAIN}'s checks pass on the final tree")

@@ -1522,6 +1522,29 @@ def ext_check_step(root: Path, checks: dict, branch: str, tree: Path) -> bool:
     return False
 
 
+def prepare_tree_step(root: Path, checks: dict, tree: Path, purpose: str, head: str) -> bool:
+    """The extensions' tree preparers (0.7.1) in `tree`, the tree the kit just made, before any step runs there.
+
+    Each prints `step ext:<module>.prepare_tree: ok (<purpose> tree)` or `FAILED: ext:<module>.prepare_tree <why>`;
+    what it printed follows with the tail prefix. False on the first refusal: one that raised, exited, timed out,
+    returned anything but None or changed what `git status` shows (a path that is not git-ignored). Without
+    extensions, or without a preparer, it prints nothing and returns True.
+    """
+    try:
+        results = ext.prepare_tree(root, tree, purpose, head, step_limit(checks, "ext"))
+    except KitError as exc:
+        _out(f"FAILED: ext {exc}")
+        return False
+    for module, problem, lines in results:
+        label = f"ext:{module}.prepare_tree"
+        _out(f"FAILED: {label} {problem}" if problem else f"step {label}: ok ({purpose} tree)")
+        for line in lines[-TAIL_LINES:]:
+            _out(TAIL_PREFIX + line)
+        if problem:
+            return False
+    return True
+
+
 def ext_steps(gate: str, root: Path, checks: dict, task_id: str, branch: str, head: str, path: Path,
               worktree: Path | None = None, trial: Path | None = None) -> int:
     """The extensions' gate steps for `gate` (0.7.0), after the kit's own and before the `OK:` line: 0 when all pass.
@@ -1583,7 +1606,8 @@ def handback(root, task_id: str, branch: str, worktree=None, no_reuse: bool = Fa
     with heavy(root, checks, f"gate-handback-{task_id}"):
         trial = trial_merge(root, branch)
         code = _limited(root, checks, lambda: _with_trial(
-            root, trial, lambda: (0 if ext_check_step(root, checks, branch, trial) else 1)
+            root, trial, lambda: (0 if prepare_tree_step(root, checks, trial, "handback", sha) else 1)
+            or (0 if ext_check_step(root, checks, branch, trial) else 1)
             or _run_steps(checks, task_id, wt, trial, authoritative, meta, no_reuse, e2e)
             or ext_steps("handback", root, checks, task_id, branch, sha, wt, worktree=wt, trial=trial)))
     if code:
@@ -1690,6 +1714,8 @@ def merge_check(root, branch: str, inspected: str | None = None, suite: bool = T
     e2e = e2e_reasons(root, branch, checks, merge=True) if suite and meta["tier"] != "light" else []
 
     def steps() -> int:
+        if not prepare_tree_step(root, checks, trial, "merge", sha):  # 0.7.1: before anything runs in the trial
+            return 1
         if _definition(root, trial, task_id, meta) is None or not _tier_unchanged(trial, task_id, meta):
             return 1
         if not ext_check_step(root, checks, branch, trial):  # 0.7.0: a round member's merged tree too
